@@ -284,6 +284,16 @@ def _line_row(line: Mapping[str, object]) -> str:
         parts.append("not in the project file")
     if line.get("held_by") is not None and line.get("condition") != "held":
         parts.append(f"held by {line.get('held_by')}")
+    whole = line.get("cost_whole")
+    if isinstance(whole, dict):
+        # Round 15, item 1. A daemon from before round 15 gives no whole cost.
+        cost = cast(Mapping[str, object], whole)
+        text = f"${cost.get('usd')} in {cost.get('turns')} turns in all"
+        if cost.get("estimated_usd") not in (None, "0.000000"):
+            text += f", ${cost.get('estimated_usd')} of it estimated"
+        if cost.get("unknown_cost") not in (None, 0):
+            text += f", {cost.get('unknown_cost')} of unknown cost"
+        parts.append(text)
     return ", ".join(parts)
 
 
@@ -2096,6 +2106,7 @@ ROLE_TERMS: Final = (
     "handoff_seconds",
     "failover",
     "handoff_below_percent",
+    "reviews",
 )
 """Each term option of ``dromon role create`` and ``update``, whose attribute is
 also its argument of ``role_create`` and ``role_update``."""
@@ -2131,7 +2142,7 @@ def _role_change(
         value: object = getattr(arguments, key)
         if value is None:
             continue
-        if key == "seats":
+        if key in ("seats", "reviews"):
             value = [
                 part.strip() for part in cast(str, value).split(",") if part.strip()
             ]
@@ -2212,6 +2223,12 @@ def _print_role(role: Mapping[str, object]) -> None:
             f"  line {line_id} waits, since it could write the worktree and is not a"
             " seat"
         )
+    # Round 15, item 5. Read with get, since an older daemon sends neither.
+    reviews = cast(list[str], role.get("reviews", []))
+    if reviews:
+        print(f"  reviews {', '.join(reviews)}")
+    for pair in cast(list[Mapping[str, object]], role.get("review_diversity", [])):
+        print(f"  {pair['text']}")
 
 
 def _seat_budget_mark(budget: object) -> str:
@@ -3488,6 +3505,14 @@ def build_parser() -> argparse.ArgumentParser:
                 help="for create and update, the seats in failover order, separated"
                 " by commas, each a line that exists. For update it replaces the"
                 " seats, so it adds, removes and reorders them",
+            )
+            command.add_argument(
+                "--reviews",
+                help="for create and update, the roles whose work this role reviews,"
+                " separated by commas, each a role that exists. For update it"
+                " replaces the list, and an empty value clears it. Nothing is"
+                " refused for it, and role_status says when a reviewer's owner runs"
+                " the same engine and model as an author's",
             )
             command.add_argument(
                 "--no-own",

@@ -96,7 +96,15 @@ from dromon.driver import (
     DriverError,
     Strategy,
 )
-from dromon.eventlog import EventLog, LogError, read_entries, snapshot, utc_now
+from dromon.eventlog import (
+    EventLog,
+    LogError,
+    check_snapshot,
+    read_entries,
+    snapshot,
+    utc_now,
+)
+from dromon.statesnapshot import snapshot_path
 from dromon.sealed import SealedStore, store_path
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
@@ -2205,10 +2213,11 @@ ROLE_CREATE_ARGS: Final = frozenset(
         "handoff_seconds",
         "failover",
         "handoff_below_percent",
+        "reviews",
     }
 )
 """What ``role_create`` takes. ``role_id``, ``operator``, ``workdir`` and ``seats``
-are required."""
+are required. ``reviews`` was added in round 15, item 5."""
 
 ROLE_UPDATE_ARGS: Final = ROLE_CREATE_ARGS | {"may_own"}
 """What ``role_update`` takes. Only ``role_id`` and ``operator`` are required, and
@@ -2325,6 +2334,10 @@ def role_wanted(
         ),
         order=order,
         seats=seats,
+        # Round 15, item 5. Given, it replaces the list, so an empty one clears it.
+        reviews=_names_arg(args, "reviews")
+        if "reviews" in args
+        else (() if role is None else role.reviews),
     )
 
 
@@ -3633,6 +3646,34 @@ def report_unsealed(scheduler: Scheduler) -> None:
         )
 
 
+def report_start(log: EventLog, live_log: Path, check_only: bool) -> None:
+    """Tell the operator, at start, how the state was rebuilt. **Round 15, item 4.**
+    A start names whether it used the snapshot beside the log, or why it ignored one
+    and replayed the whole log, and how many events it replayed in how long. A check
+    opens its own copy of the log without the snapshot and compares the two later,
+    so it says only that."""
+    if check_only:
+        print(
+            "dromond: the check replays its copy of the log in full and compares the"
+            f" snapshot beside {live_log.name} with it",
+            file=sys.stderr,
+        )
+        return
+    start = log.start
+    milliseconds = round(start.seconds * 1000)
+    if start.snapshot == "used":
+        said = (
+            f"restored the state from the snapshot at event {start.snapshot_seq}"
+            f" and replayed {start.replayed} later events in {milliseconds} ms"
+        )
+    else:
+        said = (
+            f"replayed all {start.replayed} events in {milliseconds} ms, since the"
+            f" snapshot was ignored: {start.reason}"
+        )
+    print(f"dromond: {said}", file=sys.stderr)
+
+
 def private_dirs(paths: ProjectPaths) -> tuple[Path, ...]:
     """Every private directory Dromon owns under the project, which a start creates
     or checks. The peers' token store is checked by ``check_token_store``, and a
@@ -3770,7 +3811,8 @@ def run(
             scratch = check_scratch(paths)
             log_path = scratch / paths.event_log.name
             snapshot(paths.event_log, log_path)
-        with EventLog(log_path) as log:
+        with EventLog(log_path, snapshots=not check_only) as log:
+            report_start(log, paths.event_log, check_only)
             scheduler = Scheduler(
                 log,
                 engine_factory(
@@ -3854,6 +3896,12 @@ def run(
                 # start before any socket is made.
                 daemon.relay_routes(config)
                 if check_only:
+                    agrees, said = check_snapshot(
+                        snapshot_path(paths.event_log), log_path
+                    )
+                    print(f"dromond: {said}", file=sys.stderr)
+                    if not agrees:
+                        return exits.FAILURE
                     print(CHECK_PASSED, file=sys.stderr)
                     return exits.OK
                 entry = open_registration(

@@ -20,6 +20,7 @@ from dromon.engine import BackgroundEnd, TurnReport
 from dromon.eventlog import EventLog, read_entries
 from dromon.limits import Limits
 from dromon.model import (
+    INSTANT_ECHO_CHARACTERS,
     HoldCause,
     MAX_WAKE_NOTE_BYTES,
     EventRejected,
@@ -32,6 +33,7 @@ from dromon.model import (
     State,
     TaskNoted,
     WakeScheduled,
+    check_instant,
     format_due,
     parse_due,
 )
@@ -94,6 +96,40 @@ def test_due_times_are_utc_to_the_second() -> None:
     assert parse_due("2026-10-26T09:00:00Z") == START
     with pytest.raises(InvalidField, match="aware"):
         format_due(datetime(2026, 10, 26, 9, 0, 0))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026-10-26T09:00:00.5Z",
+        "2026-10-26T09:00:00+00:00",
+        "2026-10-26T09:00:00z",
+        "2026-10-26 09:00:00Z",
+        "2026-02-30T09:00:00Z",
+        "\ud800",
+        "",
+    ],
+)
+def test_an_instant_in_any_other_form_is_refused_naming_the_form(value: str) -> None:
+    """Round 15, item 6. Every near miss, whether too long or merely malformed, gets
+    the one message that names the form accepted."""
+    with pytest.raises(InvalidField, match="of the form YYYY-MM-DDTHH:MM:SSZ"):
+        check_instant("resets_at", value)
+    check_instant("resets_at", format_due(START))
+
+
+def test_a_long_malformed_instant_is_cut_in_its_error() -> None:
+    value = "9" * 10_000
+    with pytest.raises(InvalidField) as caught:
+        check_instant("resets_at", value)
+    shown = value[:INSTANT_ECHO_CHARACTERS]
+    assert repr(shown + "...") in str(caught.value)
+    assert len(str(caught.value)) < 2 * INSTANT_ECHO_CHARACTERS + 80
+
+
+def test_an_instant_that_is_not_text_is_refused_by_type() -> None:
+    with pytest.raises(InvalidField, match="resets_at is not text: int"):
+        check_instant("resets_at", 20261026)
 
 
 def test_a_new_wake_replaces_the_pending_one_and_its_note_fires_once() -> None:

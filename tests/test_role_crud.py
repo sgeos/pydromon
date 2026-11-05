@@ -50,7 +50,7 @@ from dromon.model import (
     format_due,
 )
 from dromon.paths import ProjectPaths, project_paths
-from dromon.projectconfig import ProjectConfig, config_path, parse
+from dromon.projectconfig import ConfigFileError, ProjectConfig, config_path, parse
 from dromon.protocol import Operation, Response
 from dromon.roles import plan_file_roles, shared_worktree
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
@@ -1330,3 +1330,251 @@ def test_status_names_a_line_the_file_dropped_and_a_retired_one(
     assert status.ok and status.result is not None
     retired = cast(list[dict[str, object]], status.result["retired_lines"])
     assert [entry["line_id"] for entry in retired] == ["gone"]
+
+
+# Round 15, item 5. Reviews and review diversity.
+
+OPUS = "claude-opus-5-5"
+DOCS_LINES = LINES + f'[lines.docs-luna]\nmodel = "{HAIKU}"\nworkdir = "{DOCS}"\n'
+DOCS_ROLE = f'\n[roles.docs]\nworkdir = "{DOCS}"\nseats = ["docs-luna"]\n'
+"""A second role in its own worktree, since one inside core's is refused."""
+
+
+def reviewing_docs(desk: Desk, dromon: Run, owner: str = "echo") -> None:
+    """Role docs, made to review role core, owned by ``owner``. Role core is owned
+    by alpha, on Haiku, as the desk makes it."""
+    status, _, err = dromon(
+        "role", "create", "docs", "--workdir", DOCS, "--seats", "echo,fox,golf",
+        "--reviews", "core",
+    )  # fmt: skip
+    assert status == exits.OK, err
+    desk.scheduler.give_ownership(ANA, "docs", owner)
+
+
+@pytest.fixture
+def golf(desk: Desk) -> str:
+    """Line golf, on Opus in role docs's worktree, where echo and fox run Haiku."""
+    desk.scheduler.create_line(
+        "golf", OPUS, Strategy.SUBSCRIPTION, LineConfig(workdir=DOCS)
+    )
+    return "golf"
+
+
+def test_create_records_reviews_and_both_roles_show_them(
+    desk: Desk, dromon: Run, golf: str
+) -> None:
+    reviewing_docs(desk, dromon)
+    assert desk.log.state.roles["docs"].reviews == ("core",)
+    docs = desk.scheduler.role_view("docs")
+    core = desk.scheduler.role_view("core")
+    assert (docs["reviews"], docs["reviewed_by"]) == (["core"], [])
+    assert (core["reviews"], core["reviewed_by"]) == ([], ["docs"])
+
+
+def test_reviews_survive_a_restart(desk: Desk, dromon: Run, golf: str) -> None:
+    reviewing_docs(desk, dromon)
+    desk.log.close()
+    with EventLog(desk.paths.event_log) as reopened:
+        assert reopened.state.roles["docs"].reviews == ("core",)
+    desk.log = EventLog(desk.paths.event_log)
+
+
+def test_a_reviewer_on_the_authors_model_is_told_on_both_roles(
+    desk: Desk, dromon: Run, golf: str
+) -> None:
+    reviewing_docs(desk, dromon, owner="echo")
+    model = desk.scheduler.model_of("echo")
+    assert model == desk.scheduler.model_of("alpha")
+    for role_id in ("docs", "core"):
+        pairs = cast(
+            list[dict[str, object]],
+            desk.scheduler.role_view(role_id)["review_diversity"],
+        )
+        assert [(p["reviewer"], p["reviewer_owner"]) for p in pairs] == [
+            ("docs", "echo")
+        ]
+        assert [(p["author"], p["author_owner"], p["model"]) for p in pairs] == [
+            ("core", "alpha", model)
+        ]
+        assert "Nothing is refused" in str(pairs[0]["text"])
+    # The same pairs in role_status, which a seat calls.
+    assert (
+        desk.scheduler.role_status("fox")["review_diversity"]
+        == (desk.scheduler.role_view("docs")["review_diversity"])
+    )
+
+
+def test_a_reviewer_on_another_model_is_not_told(
+    desk: Desk, dromon: Run, golf: str
+) -> None:
+    reviewing_docs(desk, dromon, owner=golf)
+    assert desk.scheduler.model_of(golf) != desk.scheduler.model_of("alpha")
+    assert desk.scheduler.role_view("docs")["review_diversity"] == []
+    assert desk.scheduler._review_notice(golf) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_vacant_role_has_no_pair(desk: Desk, dromon: Run, golf: str) -> None:
+    status, _, err = dromon(
+        "role", "create", "docs", "--workdir", DOCS, "--seats", "echo,fox",
+        "--reviews", "core",
+    )  # fmt: skip
+    assert status == exits.OK, err
+    assert desk.log.state.roles["docs"].owner is None
+    assert desk.scheduler.role_view("docs")["review_diversity"] == []
+
+
+def test_the_reviewers_owner_is_told_at_each_turn_and_the_author_is_not(
+    desk: Desk, dromon: Run, golf: str
+) -> None:
+    reviewing_docs(desk, dromon, owner="echo")
+    notice = desk.scheduler._review_notice("echo")  # pyright: ignore[reportPrivateUsage]
+    assert notice is not None and notice.startswith("REVIEW DIVERSITY. ")
+    assert notice == desk.scheduler._review_notice("echo")  # pyright: ignore[reportPrivateUsage]
+    for line_id in ("alpha", "fox", "delta"):
+        assert desk.scheduler._review_notice(line_id) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_move_onto_the_authors_model_is_said_in_the_role_notice(
+    desk: Desk, dromon: Run, golf: str
+) -> None:
+    reviewing_docs(desk, dromon, owner=golf)
+    desk.scheduler.give_ownership(ANA, "docs", "echo")
+    notice = desk.scheduler._role_notice("echo")  # pyright: ignore[reportPrivateUsage]
+    assert notice is not None
+    pair = cast(
+        list[dict[str, object]], desk.scheduler.role_view("docs")["review_diversity"]
+    )
+    assert str(pair[0]["text"]) in notice
+    # The move to golf was off the author's model, so its notice said nothing.
+    desk.scheduler.give_ownership(ANA, "docs", golf)
+    moved = desk.scheduler._role_notice(golf)  # pyright: ignore[reportPrivateUsage]
+    assert moved is not None and "not independent" not in moved
+
+
+def test_update_replaces_and_clears_reviews(desk: Desk, dromon: Run, golf: str) -> None:
+    reviewing_docs(desk, dromon)
+    status, out, err = dromon("role", "update", "docs", "--reviews", "")
+    assert status == exits.OK, err
+    assert desk.log.state.roles["docs"].reviews == ()
+    assert "reviews" not in out.replace("reviews nothing", "")
+    status, _, err = dromon("role", "update", "core", "--reviews", "docs")
+    assert status == exits.OK, err
+    assert desk.log.state.roles["core"].reviews == ("docs",)
+
+
+@pytest.mark.parametrize(
+    ("reviews", "reason"),
+    [
+        ("nowhere", "reviews names role nowhere, which the log does not hold"),
+        ("docs", "cannot review itself"),
+        ("core,core", "names a role twice"),
+    ],
+)
+def test_update_refuses_reviews_of_no_role(
+    desk: Desk, dromon: Run, golf: str, reviews: str, reason: str
+) -> None:
+    reviewing_docs(desk, dromon)
+    before = desk.log.state.roles["docs"]
+    status, _, err = dromon("role", "update", "docs", "--reviews", reviews)
+    assert status != exits.OK
+    assert reason in err
+    assert desk.log.state.roles["docs"] == before
+
+
+def test_reviews_of_a_retired_role_are_refused_and_say_so(
+    desk: Desk, dromon: Run, golf: str
+) -> None:
+    reviewing_docs(desk, dromon)
+    desk.scheduler.give_ownership(ANA, "docs", None)
+    status, _, err = dromon("role", "delete", "docs")
+    assert status == exits.OK, err
+    status, _, err = dromon("role", "update", "core", "--reviews", "docs")
+    assert status != exits.OK
+    assert "which was retired by @ana" in err
+
+
+def test_a_reviewer_is_kept_when_its_author_is_retired(
+    desk: Desk, dromon: Run, golf: str
+) -> None:
+    """The model does not require a reviewed role to exist, so retiring an author
+    leaves the reviewer as it was, and the pair is no longer shown."""
+    status, _, err = dromon(
+        "role", "create", "docs", "--workdir", DOCS, "--seats", "echo,fox",
+    )  # fmt: skip
+    assert status == exits.OK, err
+    status, _, err = dromon("role", "update", "core", "--reviews", "docs")
+    assert status == exits.OK, err
+    assert dromon("role", "delete", "docs")[0] == exits.OK
+    assert desk.log.state.roles["core"].reviews == ("docs",)
+    assert desk.scheduler.role_view("core")["review_diversity"] == []
+
+
+def test_the_client_prints_reviews_and_the_diversity(
+    desk: Desk, dromon: Run, golf: str
+) -> None:
+    reviewing_docs(desk, dromon, owner="echo")
+    status, out, err = dromon("role", "update", "docs", "--handoff-seconds", "900")
+    assert status == exits.OK, err
+    lines = out.splitlines()
+    assert "  reviews core" in lines
+    assert any(line.strip().startswith("Role docs, owned by echo") for line in lines)
+
+
+def reload_with_docs(reloads: Reloads, roles: str) -> list[str]:
+    """Reload a file that declares line docs-luna in role docs's worktree."""
+    (reloads.paths.root / DOCS).mkdir(parents=True, exist_ok=True)
+    reloads.file.write_text(project(roles, DOCS_LINES))
+    response = reloads.ask("reload_project")
+    assert response.ok, response.error_message
+    assert response.result is not None
+    return [
+        str(notice) for notice in cast(list[object], response.result["role_notices"])
+    ]
+
+
+def test_the_file_declares_reviews_and_checks_each_names_a_role(
+    reloads: Reloads,
+) -> None:
+    reload_with_docs(reloads, CORE + DOCS_ROLE + 'reviews = ["core"]\n')
+    assert reloads.log.state.roles["docs"].reviews == ("core",)
+    unknown = parse(project(CORE + DOCS_ROLE + 'reviews = ["nowhere"]\n', DOCS_LINES))
+    with pytest.raises(ProjectMismatch, match="reviews names nowhere"):
+        check_roles(reloads.daemon.scheduler, reloads.log, unknown)
+
+
+def test_a_role_only_in_the_log_may_be_named_by_the_file(reloads: Reloads) -> None:
+    reload_with_docs(reloads, CORE)
+    reload_with_docs(reloads, DOCS_ROLE + 'reviews = ["core"]\n')
+    assert reloads.log.state.roles["docs"].reviews == ("core",)
+
+
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        ('"core"', "must be a list of role identifiers"),
+        ('["docs"]', "cannot review itself"),
+        ('["core", "core"]', "names a role twice"),
+        ("[1]", "reviews"),
+    ],
+)
+def test_the_file_refuses_malformed_reviews(value: str, reason: str) -> None:
+    with pytest.raises(ConfigFileError, match=reason) as caught:
+        parse(project(CORE + DOCS_ROLE + f"reviews = {value}\n", DOCS_LINES))
+    assert caught.value.key == "roles.docs.reviews"
+
+
+def test_a_file_that_differs_in_reviews_names_the_difference(
+    reloads: Reloads,
+) -> None:
+    reload_with_docs(reloads, CORE + DOCS_ROLE)
+    update: dict[str, object] = {
+        "role_id": "docs",
+        "operator": "ana",
+        "reviews": ["core"],
+    }
+    assert reloads.ask("role_update", update).ok
+    notices = reload_with_docs(reloads, CORE + DOCS_ROLE)
+    assert any(
+        "Reviews is none in the file and core in the log" in notice
+        for notice in notices
+    )

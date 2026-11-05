@@ -24,6 +24,7 @@ from dromon.model import (
     LineAddress,
     Message,
     MessageKind,
+    OperatorAddress,
     RemoteAddress,
     State,
     asks_reply_of,
@@ -165,11 +166,20 @@ def counts_unanswered(state: State, message: Message) -> bool:
     later note naming it, since the correction is the one left to answer. A note
     that asks nothing is never counted. As before, a reply to a question Dromon
     asked when it held a line, a note from the owner to itself and a note from the
-    harness are not counted."""
+    harness are not counted.
+
+    **Round 15, item 2, required by the operator.** So wake notes, which a line
+    sends itself, and harness notices, which include every role notice since the
+    harness ``!dromon`` sends them, never count. An operator's note to a line also
+    leaves the count once the line replies to a later note from the same operator
+    in the same thread, which ``Message.answered_in_thread`` records. A thread is
+    the chain of ``reply_to``, so two task notes that each start a thread stay
+    apart, and replying to the second does not close the first."""
     return (
         not message.replied
         and not message.acknowledged
         and message.corrected_by is None
+        and message.answered_in_thread is None
         and asks_reply(message)
         and message.reply_to not in state.hold_questions
         and not is_own_note(message, message.recipient)
@@ -334,16 +344,45 @@ def listing(
     return matches[offset : offset + limit], len(matches)
 
 
+def unanswered_reason(message: Message) -> str:
+    """Why ``message``, which ``counts_unanswered`` counts, asks a reply, and how it
+    may leave the count. **Round 15, item 2.** Fixed text, so no part of the body
+    or of the sender's words reaches it."""
+    if message.kind is MessageKind.QUESTION:
+        why = "a question, which always asks a reply"
+    elif message.kind is MessageKind.ISSUE:
+        why = "an issue, which always asks a reply"
+    elif message.reply_to is not None:
+        # A counted reply asks, by its sender's word or as a correction of a note
+        # that asked, as ``dromon.model.asks_reply_of`` gives the rule.
+        why = "a reply that asks a reply, by its sender's word or the note it corrects"
+    elif message.asks_reply is True:
+        why = "a note whose sender asked a reply"
+    else:
+        why = "a note that starts a thread, which asks a reply by default"
+    close = "Reply to it or acknowledge it"
+    if message.kind is MessageKind.NOTE and isinstance(message.sender, OperatorAddress):
+        close = (
+            "Reply to it, or to a later note of its sender in its thread, or"
+            " acknowledge it"
+        )
+    return f"{why}. {close}."
+
+
 def outcome(message_id: str, message: Message, replied: set[str]) -> str:
-    """``replied``, ``acknowledged``, ``corrected`` or ``unanswered``, from the
-    recipient's side. ``corrected`` means the sender named it with a later note
-    before the recipient answered."""
+    """``replied``, ``acknowledged``, ``corrected``, ``answered in thread`` or
+    ``unanswered``, from the recipient's side. ``corrected`` means the sender named
+    it with a later note before the recipient answered. ``answered in thread`` means
+    the recipient replied to a later note of the same sender in the same thread,
+    as ``counts_unanswered`` says."""
     if message_id in replied:
         return "replied"
     if message.acknowledged:
         return "acknowledged"
     if message.corrected_by is not None:
         return "corrected"
+    if message.answered_in_thread is not None:
+        return "answered in thread"
     return "unanswered"
 
 

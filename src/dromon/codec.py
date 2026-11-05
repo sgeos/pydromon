@@ -63,6 +63,7 @@ from dromon.model import (
     TaskNoted,
     RestartNoted,
     LineCostMarked,
+    LineCostRecorded,
     ProcessesLeft,
     StopUnverified,
     WalkLimited,
@@ -180,6 +181,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     ),
     "restart_noted": ("line_id", "message_id", "body"),
     "line_cost_marked": ("line_id", "engine_session", "total_micro_usd"),
+    "line_cost_recorded": ("line_id", "cost_micro_usd", "estimated", "between"),
     "processes_left": ("line_id", "cause", "pids", "commands", "more"),
     "stop_unverified": ("line_id", "note"),
     "walk_limited": ("note",),
@@ -200,6 +202,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "seats",
         "failover",
         "handoff_below_percent",
+        "reviews",
     ),
     "seat_bound": ("line_id", "role_id", "may_own"),
     "seat_unbound": ("line_id", "role_id"),
@@ -375,9 +378,9 @@ def _upgraded(kind: str, data: object) -> object:
         return data
     fields = cast(dict[str, object], data)
     if kind == "role_declared" and frozenset(fields) == ROLE_DECLARED_FIRST_FIELDS:
-        return {
+        fields = {
             **fields,
-            "seats": [],
+            "seats": list[object](),
             "failover": FailoverPolicy.AUTOMATIC.value,
             "handoff_below_percent": DEFAULT_HANDOFF_BELOW_PERCENT,
         }
@@ -403,6 +406,8 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "line_held": ("cause",),
     "run_started": ("commit", "checkout"),
     "line_configured": ("sealed",),
+    "line_cost_recorded": ("estimated", "between"),
+    "role_declared": ("reviews",),
 }
 """The fields left out of the wire when they are null, which a log written before
 them never held, so decoding reads an absent one as null. **Task of 2026-10-29,
@@ -417,7 +422,9 @@ so a daemon that predates it still reads every configuration without a literal
 value. **Porting hazard.** A port must omit these fields when null, not write them
 as null, so that its log stays readable by a daemon that predates them, and must
 read an absent one as null. A daemon predating ``window`` does not read an event
-that names one."""
+that names one. ``reviews`` was added to ``role_declared`` in round 15, item 5, and
+is left out when empty, as ``sealed`` is, so a daemon that predates it still reads
+every role that reviews nothing."""
 
 
 def _without_nulls(kind: str, data: dict[str, object]) -> dict[str, object]:
@@ -607,6 +614,13 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "engine_session": event.engine_session,
                 "total_micro_usd": event.total_micro_usd,
             }
+        case LineCostRecorded():
+            return "line_cost_recorded", {
+                "line_id": event.line_id,
+                "cost_micro_usd": event.cost_micro_usd,
+                "estimated": event.estimated,
+                "between": event.between,
+            }
         case ProcessesLeft():
             return "processes_left", {
                 "line_id": event.line_id,
@@ -657,6 +671,9 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "seats": list(event.seats),
                 "failover": event.failover.value,
                 "handoff_below_percent": event.handoff_below_percent,
+                # Round 15, item 5. Left out when empty, so a log of roles that
+                # review nothing stays readable by a daemon that predates it.
+                "reviews": list(event.reviews) or None,
             }
         case SeatBound():
             return "seat_bound", {
@@ -964,6 +981,13 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "engine_session"),
                 _int(data, "total_micro_usd"),
             )
+        case "line_cost_recorded":
+            return LineCostRecorded(
+                _str(data, "line_id"),
+                _optional_int(data, "cost_micro_usd"),
+                _optional_bool(data, "estimated"),
+                _optional_bool(data, "between"),
+            )
         case "processes_left":
             return ProcessesLeft(
                 _str(data, "line_id"),
@@ -1011,6 +1035,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 tuple(_list(data, "seats", str)),
                 _member(data, "failover", FailoverPolicy),
                 _int(data, "handoff_below_percent"),
+                _reviews(data),
             )
         case "seat_bound":
             return SeatBound(
@@ -1220,6 +1245,17 @@ def _optional_str(data: dict[str, object], name: str) -> str | None:
     if not isinstance(value, str):
         raise DecodeError(f"{name} is not a string or null")
     return value
+
+
+def _reviews(data: dict[str, object]) -> tuple[str, ...]:
+    """The roles a ``role_declared`` reviews, or none when it names none. An empty
+    array is refused, as ``_sealed`` refuses one, so each event has one encoding."""
+    if data["reviews"] is None:
+        return ()
+    names = tuple(_list(data, "reviews", str))
+    if not names:
+        raise DecodeError("reviews is not a non-empty array")
+    return names
 
 
 def _sealed(data: dict[str, object]) -> tuple[SealedValue, ...]:

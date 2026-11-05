@@ -170,6 +170,7 @@ from dromon.grok import GrokLine
 from dromon.antigravity import AntigravityLine
 from dromon.cursor import CursorLine
 from dromon.pi import PiLine
+from dromon.prices import ESTIMATE_NOTE, estimate_micro_usd, priced
 from dromon import __version__
 from dromon.engine import ENGINE_NAME as ENGINE_NAME_CLAUDE
 from dromon.engine import (
@@ -284,6 +285,7 @@ from dromon.mailbox import (
     replied_ids,
     header,
     listing,
+    unanswered_reason,
     sent,
     summary,
 )
@@ -391,6 +393,8 @@ from dromon.model import (
     TaskNoted,
     RestartNoted,
     LineCostMarked,
+    LineCost,
+    LineCostRecorded,
     ProcessesLeft,
     QuestionWithdrawn,
     StopUnverified,
@@ -705,6 +709,16 @@ which the limit never measured, so such a line is bounded by its autonomous-turn
 alone and ``cost_usd.limit_enforced`` says so. On the ``api`` strategy the cost is money
 and nothing would bound it, so Dromon **refuses** that pairing and does not substitute
 a guessed per-turn charge."""
+WHOLE_COST_SINCE: Final = (
+    "the first turn a daemon with line_cost_recorded ran, since earlier turns were"
+    " never recorded"
+)
+"""What the whole cost counts from. Round 15, item 1."""
+TOKEN_PRICED_ENGINES: Final = frozenset({codex.ENGINE_NAME})
+"""The engines in ``COST_UNREPORTED_ENGINES`` whose turns report token counts, so
+that Dromon estimates their cost from ``dromon.prices``. **Round 15, item 1, read
+from the adapters on 2026-11-05.** Codex reports tokens. Grok and Cursor Agent report
+neither cost nor tokens, so their lines keep ``limit_enforced`` false."""
 UNREPORTED_ENGINE_NOTE: Final = (
     "This line's engine reports no cost, so max_cost_usd never holds it. Its turns"
     " are bounded by the autonomous-turn limit, and by the hold after a failed turn,"
@@ -795,6 +809,11 @@ the forwarder's backoff, since every line waits on the scheduler."""
 
 LINE_STATUS_TOOL_NAME: Final = "line_status"
 MAX_LINE_STATUS_DEFAULT_BYTES: Final = 8192
+MAX_UNANSWERED_LISTED: Final = 8
+"""How many unanswered messages ``line_status`` lists, oldest first, each with its
+reason. **Round 15, item 2.** The rest are counted in ``unanswered_omitted``, and
+``list_mail`` with ``unanswered_only`` pages through them all. Bounded so that the
+default answer stays within ``MAX_LINE_STATUS_DEFAULT_BYTES``."""
 INFERRED_LIMIT_NOTE: Final = (
     ", read from inferred wording that was never observed live, so Dromon recorded no"
     " budget and moved no role. dromon budget set and dromon role take do either"
@@ -2251,6 +2270,9 @@ class Scheduler:
         make a caller wait on git. Round 9 review, F4."""
         self._behind_told: dict[str, str] = {}
         """Each line's worktree commit whose older daemon code its prompt last told."""
+        self._daemon_pair_told: dict[str, tuple[str, str]] = {}
+        """Each line's pair of daemon and checkout commits whose difference its
+        prompt last told in full. Round 15, item 3."""
         self._confining = confining_engines
         """The engines that can make a role's worktree read only to a seat, as
         ``roles.CONFINING_ENGINES`` says. A seat on any other engine waits while
@@ -2509,6 +2531,9 @@ class Scheduler:
         self._cost_unknown: dict[str, int] = {}
         """How many turns since each line's release reported no cost, so an unknown
         cost is never shown as zero. Row 8 of the T3 Code review."""
+        self._cost_estimated: dict[str, int] = {}
+        """How many turns since each line's release had a cost Dromon estimated
+        from tokens. Round 15, item 1."""
         """Estimated cost of each line's turns since its last release."""
         self._last_turn_end: dict[str, float] = {}
         self._brief_owed: set[str] = set()
@@ -4980,6 +5005,9 @@ class Scheduler:
             if not unknown
             else f"${cost:.2f} and {unknown} turns of unknown cost, counted as $0.00"
         )
+        if self._estimates_cost(line_id):
+            # Round 15, item 1. Every estimate from tokens says that it is one.
+            spent += f", {ESTIMATE_NOTE}"
         if self._cost_reported(line_id):
             line = (
                 f"Autonomous turns in a row without operator mail: {used} of"
@@ -5377,10 +5405,8 @@ class Scheduler:
             return
         costs = self._turn_costs.setdefault(line_id, deque(maxlen=RECENT_TURN_COSTS))
         costs.append(_between_entry(kind, cost, usage))
-        if cost is None:
-            self._cost_unknown[line_id] = self._cost_unknown.get(line_id, 0) + 1
+        if not self._count_cost(line_id, cost, usage, between=True):
             return
-        self._cost[line_id] = self._cost.get(line_id, 0.0) + cost
         limits = self.limits_for(line_id)
         total = self._cost[line_id]
         held = self._state().lines[line_id].held_by is not None
@@ -5391,6 +5417,51 @@ class Scheduler:
                 f" the budget of ${limits.max_cost_usd:.2f}",
                 cause=HoldCause.COST,
             )
+
+    def _count_cost(
+        self,
+        line_id: str,
+        reported: float | None,
+        usage: Mapping[str, int] | None,
+        *,
+        between: bool,
+    ) -> bool:
+        """Count one turn's or one spend's cost toward the line's window since its
+        release, and record it in ``line_cost_recorded`` for the line's whole cost,
+        and say whether a cost is known. **Round 15, item 1.** The engine's own cost
+        is used where it reports one. Otherwise, for an engine in
+        ``TOKEN_PRICED_ENGINES``, the cost is estimated from its token counts by
+        ``dromon.prices``, counted toward ``max_cost_usd`` like a reported one and
+        counted apart in ``estimated_turns``. Where neither is known, the turn is
+        counted as of unknown cost, as before."""
+        micro: int | None = None
+        estimated: bool | None = None
+        if reported is not None:
+            micro = min(max(round(reported * 1_000_000), 0), MAX_COST_MICRO_USD)
+        elif self._estimates_cost(line_id):
+            found = estimate_micro_usd(self.model_of(line_id), usage)
+            if found is not None:
+                micro = min(found, MAX_COST_MICRO_USD)
+                estimated = True
+        self._log.append(
+            LineCostRecorded(line_id, micro, estimated, True if between else None)
+        )
+        if micro is None:
+            # A turn that reported no cost, or ended without a report, may still
+            # have cost something, so it is counted apart rather than as zero.
+            self._cost_unknown[line_id] = self._cost_unknown.get(line_id, 0) + 1
+            return False
+        added = reported if reported is not None else micro / 1_000_000
+        self._cost[line_id] = self._cost.get(line_id, 0.0) + added
+        if estimated:
+            self._cost_estimated[line_id] = self._cost_estimated.get(line_id, 0) + 1
+        return True
+
+    def _estimates_cost(self, line_id: str) -> bool:
+        """Whether a turn of ``line_id`` that reports no cost is estimated from its
+        tokens, because its engine reports tokens and its model has a price."""
+        model = self.model_of(line_id)
+        return ENGINE_OF.get(model) in TOKEN_PRICED_ENGINES and priced(model)
 
     def _remember(
         self,
@@ -5688,6 +5759,7 @@ class Scheduler:
             "leases": self.leases_of(line_id),
             "scheduled_wake": _scheduled_summary(pending),
             **summary(state, LineAddress(line_id), 0).counts(),
+            **self._unanswered_mail(state, line_id),
             "pending": len(self.pending(line_id)),
             "model": self.model_of(line_id),
             "strategy": line.strategy,
@@ -5719,6 +5791,36 @@ class Scheduler:
             },
             "other_line_count": len(state.lines) - 1,
             **({} if others_view is None else {"other_lines": others_view}),
+        }
+
+    def _unanswered_mail(self, state: State, line_id: str) -> dict[str, object]:
+        """The oldest unanswered messages of ``line_id``, each with its sender, kind,
+        how long it has waited and why it counts, and how many more there are.
+        **Round 15, item 2, required by the operator.** A count alone did not say
+        which message needed the line. Nothing of a body leaves here, and the reason
+        is fixed text, as ``dromon.mailbox.unanswered_reason`` gives it."""
+        page, total = listing(
+            state,
+            LineAddress(line_id),
+            unanswered_only=True,
+            limit=MAX_UNANSWERED_LISTED,
+        )
+        now = self._wall_clock()
+        listed: list[dict[str, object]] = []
+        for message_id, message in page:
+            age = _age_seconds(self._log.times.unanswered_since(message_id), now)
+            listed.append(
+                {
+                    "message_id": message_id,
+                    "sender": str(message.sender),
+                    "kind": message.kind.value,
+                    "waited": None if age is None else _age_words(age),
+                    "reason": unanswered_reason(message),
+                }
+            )
+        return {
+            "unanswered_mail": listed,
+            "unanswered_omitted": total - len(listed),
         }
 
     def _other_lines(self, state: State, line_id: str) -> list[dict[str, object]]:
@@ -6034,29 +6136,59 @@ class Scheduler:
         unknown = self._cost_unknown.get(line_id, 0)
         basis = "exact" if not unknown else "lower_bound" if known else "unknown"
         enforced = self._cost_reported(line_id)
+        estimated = self._cost_estimated.get(line_id, 0)
+        note = (
+            None
+            if enforced and not unknown
+            else UNREPORTED_ENGINE_NOTE
+            if not enforced
+            else f"{unknown} turns since the last release reported no cost, so"
+            " the budget holds the line only on what the others reported"
+        )
+        if estimated:
+            # Round 15, item 1. An estimate is always labelled as one.
+            told = f"{estimated} turns since the last release were {ESTIMATE_NOTE}"
+            note = told if note is None else f"{note}. {told}"
         return {
             "estimate": (
                 UNKNOWN if basis == "unknown" else f"{self._cost.get(line_id, 0.0):.4f}"
             ),
             "basis": basis,
+            "estimated_turns": estimated,
             "unknown_turns": unknown,
             "unknown_counts_as_usd": f"{UNKNOWN_TURN_COST_USD:.4f}",
             "counting": UNKNOWN_COST_RULE,
             "limit": f"{limits.max_cost_usd:.2f}",
             "limit_enforced": enforced,
-            "note": (
-                None
-                if enforced and not unknown
-                else UNREPORTED_ENGINE_NOTE
-                if not enforced
-                else f"{unknown} turns since the last release reported no cost, so"
-                " the budget holds the line only on what the others reported"
-            ),
+            "note": note,
+            "whole": self.whole_cost(line_id),
+        }
+
+    def whole_cost(self, line_id: str) -> dict[str, object]:
+        """The line's whole cost and turns, which no release resets and which a
+        restart rebuilds from ``line_cost_recorded``. **Round 15, item 1, required
+        by the operator.** Costs are decimal text of whole millionths of a dollar,
+        as ``correlation_totals`` gives them, so no float rounds a sum. ``since``
+        says that turns before this change were never recorded, so the totals count
+        from the first daemon that recorded them."""
+        found = self._state().line_costs.get(line_id, LineCost())
+        return {
+            "usd": _micro_text(found.total_micro_usd),
+            "reported_usd": _micro_text(found.reported_micro_usd),
+            "estimated_usd": _micro_text(found.estimated_micro_usd),
+            "turns": found.turns,
+            "between_turns": found.between,
+            "unknown_cost": found.unknown,
+            "since": WHOLE_COST_SINCE,
         }
 
     def _cost_reported(self, line_id: str) -> bool:
-        """Whether the line's engine reports costs at all, so that ``max_cost_usd``
-        can hold it. ``False`` for an engine in ``COST_UNREPORTED_ENGINES``."""
+        """Whether the line's engine reports costs, or Dromon estimates them from its
+        tokens, so that ``max_cost_usd`` can hold it. ``False`` for an engine in
+        ``COST_UNREPORTED_ENGINES`` whose costs are not estimated, as for Grok and
+        Cursor Agent, which report no tokens either. **Round 15, item 1.**"""
+        if self._estimates_cost(line_id):
+            return True
         return ENGINE_OF.get(self.model_of(line_id)) not in COST_UNREPORTED_ENGINES
 
     def _summary_cost(self, line_id: str) -> object:
@@ -6199,6 +6331,8 @@ class Scheduler:
             else None,
             "compaction": "none",
             "unsealed_lines": self.unsealed_lines(),
+            # Round 15, item 4. How this process rebuilt the state at its start.
+            "start": self._log.start.wire(),
         }
 
     def _workdir_commit(self, line_id: str) -> str | None:
@@ -6398,17 +6532,32 @@ class Scheduler:
             else read_head_commit(self._daemon_checkout)
         )
         if started is not None and current is not None:
-            text = (
-                f"The daemon loaded commit {started[:12]}, and its checkout is at"
-                f" {current[:12]}."
-            )
-            if started != current:
-                text += (
-                    " WARNING: they differ, so the running daemon may lack code its"
-                    " checkout holds until an operator restarts it."
-                )
-            parts.append(text)
+            parts.append(self._daemon_pair_sentence(line_id, started, current))
         return " ".join(parts) if parts else None
+
+    def _daemon_pair_sentence(self, line_id: str, started: str, current: str) -> str:
+        """The daemon's pair of commits as ``line_id``'s turn is told it. **Round 15,
+        item 3, required by the operator.** The warning that they differ is given in
+        full when the pair first differs and whenever either commit changes, and in
+        one short sentence while the pair stays as told, since the same full warning
+        at every turn had become noise. **Failure mode.** What was told is held in
+        memory, so a restart, which loads another commit in any case, tells it in
+        full again, and a turn whose prompt never reached its engine still counts as
+        told."""
+        text = (
+            f"The daemon loaded commit {started[:12]}, and its checkout is at"
+            f" {current[:12]}."
+        )
+        if started == current:
+            self._daemon_pair_told.pop(line_id, None)
+            return text
+        if self._daemon_pair_told.get(line_id) == (started, current):
+            return text + " They still differ, as told before."
+        self._daemon_pair_told[line_id] = (started, current)
+        return text + (
+            " WARNING: they differ, so the running daemon may lack code its"
+            " checkout holds until an operator restarts it."
+        )
 
     def _behind_notice(self, line_id: str) -> str | None:
         """What ``line_id``'s next turn is told when the daemon runs code older than
@@ -7158,6 +7307,7 @@ class Scheduler:
                     "model": self.model_of(seat_id),
                     "provider": engine,
                     "budget": _budget_entry(engine, budget),
+                    "cost_whole": self.whole_cost(seat_id),
                     "workdir_commit": self._workdir_commit(seat_id),
                     "recent_tasks": [
                         self._seat_task_view(record, viewer == seat_id)
@@ -7214,7 +7364,91 @@ class Scheduler:
                 _entry_view(entry, with_body=index == len(entries) - 1)
                 for index, entry in enumerate(entries)
             ],
+            "reviews": list(role.reviews),
+            "reviewed_by": self._reviewers_of(role_id),
+            "review_diversity": self.review_diversity(role_id),
         }
+
+    def _review_notice(self, line_id: str) -> str | None:
+        """What every turn of ``line_id`` is told while it owns a reviewing role
+        whose owner runs the same engine and model as the owner of a role it
+        reviews, or ``None``. **Round 15, item 5.** Told at each turn while the
+        match holds, as the operator approved, since a review brief may arrive in
+        any turn. It names the pairs, and refuses nothing."""
+        seat = self._state().seats.get(line_id)
+        if seat is None:
+            return None
+        texts = [
+            str(pair["text"])
+            for pair in self.review_diversity(seat.role_id)
+            if pair["reviewer_owner"] == line_id and pair["reviewer"] == seat.role_id
+        ]
+        if not texts:
+            return None
+        return "REVIEW DIVERSITY. " + " ".join(texts)
+
+    def _reviewers_of(self, role_id: str) -> list[str]:
+        """The roles that name ``role_id`` in their ``reviews``, in name order.
+        Bounded by the roles the log holds."""
+        return sorted(
+            other
+            for other, role in self._state().roles.items()
+            if role_id in role.reviews
+        )
+
+    def review_diversity(self, role_id: str) -> list[dict[str, object]]:
+        """Each pair of a reviewing role and a role it reviews, ``role_id`` being
+        either, whose owners run the same engine and model, with a sentence that says
+        so. **Round 15, item 5, as the operator approved in reply to
+        q-cc52ba26bc44.** A review by the same engine and model as the work's author
+        is less independent than one by another, so it is told, and nothing is
+        refused. A pair either role of which is vacant, or names a role the log no
+        longer holds, is left out, since there is no owner to compare.
+
+        **Residual.** The author is taken to be the author role's current owner,
+        since the daemon does not record who wrote a commit. Work written by an
+        earlier owner on another model is compared with the wrong seat, and a
+        review asked of a line that is no seat of a reviewing role is not seen.
+        Bounded by the roles, each naming at most ``MAX_ROLE_REVIEWS``."""
+        state = self._state()
+        role = state.roles.get(role_id)
+        if role is None:
+            return []
+        pairs = [(role_id, author) for author in role.reviews] + [
+            (reviewer, role_id) for reviewer in self._reviewers_of(role_id)
+        ]
+        found: list[dict[str, object]] = []
+        for reviewer, author in pairs:
+            reviewing = state.roles.get(reviewer)
+            authored = state.roles.get(author)
+            if reviewing is None or authored is None:
+                continue
+            first, second = reviewing.owner, authored.owner
+            if first is None or second is None:
+                continue
+            model = self.model_of(first)
+            # The engine is a function of the model, through ENGINE_OF, so one
+            # model on both owners is one engine and model.
+            if self.model_of(second) != model:
+                continue
+            engine = ENGINE_OF.get(model)
+            found.append(
+                {
+                    "reviewer": reviewer,
+                    "reviewer_owner": first,
+                    "author": author,
+                    "author_owner": second,
+                    "model": model,
+                    "provider": engine,
+                    "text": (
+                        f"Role {reviewer}, owned by {first}, reviews role {author},"
+                        f" owned by {second}, and both run {model} on {engine}, so"
+                        " the review is not independent of the author's engine and"
+                        " model. Nothing is refused for it."
+                    ),
+                }
+            )
+        return found
 
     async def report_role_ready(self, line_id: str) -> str:
         """``line_id`` reports its role ready, and returns what was reported, which
@@ -8564,6 +8798,10 @@ class Scheduler:
         if change.owner != line_id or change.cause is OwnershipCause.DECLARED:
             return None
         text = self._role_transition_package(line_id, role_id, change, caused)
+        # Round 15, item 5. A change that puts a reviewer and an author on the
+        # same engine and model says so to the new owner, on either side.
+        for pair in self.review_diversity(role_id):
+            text += f"\n\n{pair['text']}"
         if change.cause in (
             OwnershipCause.RECOVERY,
             OwnershipCause.OPERATOR,
@@ -9956,6 +10194,7 @@ class Scheduler:
         self._autonomous.pop(line_id, None)
         self._cost.pop(line_id, None)
         self._cost_unknown.pop(line_id, None)
+        self._cost_estimated.pop(line_id, None)
         self._failed.discard(line_id)
         self._disclosure_spent.discard(line_id)
         self._work.set()
@@ -9986,14 +10225,12 @@ class Scheduler:
                 line_id, deque(maxlen=RECENT_TURN_COSTS)
             )
             costs.append(_turn_entry(report, self._turn_posture(line_id, report)))
-        if report is not None and report.cost_estimate_usd is not None:
-            self._cost[line_id] = (
-                self._cost.get(line_id, 0.0) + report.cost_estimate_usd
-            )
-        else:
-            # A turn that reported no cost, or ended without a report, may still
-            # have cost something, so it is counted apart rather than as zero.
-            self._cost_unknown[line_id] = self._cost_unknown.get(line_id, 0) + 1
+        self._count_cost(
+            line_id,
+            None if report is None else report.cost_estimate_usd,
+            None if report is None else report.usage,
+            between=False,
+        )
         cost = self._cost.get(line_id, 0.0)
         limits = self.limits_for(line_id)
         reason: str | None = None
@@ -10257,6 +10494,9 @@ class Scheduler:
             commits = self._commits_notice(line_id)
             if commits is not None:
                 prompt = f"{commits}\n\n{prompt}"
+            diversity = self._review_notice(line_id)
+            if diversity is not None:
+                prompt = f"{diversity}\n\n{prompt}"
             owed = self._handoff(line_id, messages)
             if owed is not None and owed[1] is not None:
                 prompt = f"{owed[1].text}\n\n{prompt}"
@@ -10755,16 +10995,49 @@ class Scheduler:
             self._brief_owed.discard(line_id)
             return None
         lead = (
-            "Your engine session is new since your last turn, so it leads with the"
-            f" standing brief you last set, at {brief.set_at}, with your worktree at"
-            f" commit {brief.workdir_commit[:12] or 'unknown'}. It is your own"
-            " earlier text and may be stale. Check it against the worktree and your"
-            " mail, and set it again with set_brief when your task changes."
+            f"{self._brief_standing(line_id, brief)}"
             f"{self._mail_since_brief(line_id, brief)}\n"
             f"{self._brief_block(brief)}"
         )
         self._brief_owed.discard(line_id)
         return lead
+
+    def _brief_standing(self, line_id: str, brief: BriefSet) -> str:
+        """The sentences that open the brief's lead, which say whether ``brief`` was
+        set at the worktree's current commit. **Round 15, item 3, required by the
+        operator.** A brief set before the worktree's last change is flagged as stale
+        at the head of the turn and never presented as current, since a line resumed
+        a task from a brief whose branch had been merged and moved on. The change
+        read is the commit at ``HEAD``. **Residual.** Uncommitted changes are not
+        read, so a brief set before the line's own later edits at the same commit
+        is presented as current, which those edits, being the line's own, need not
+        undo."""
+        head = self._workdir_commit(line_id)
+        named = brief.workdir_commit
+        if named and head is not None and named != head:
+            return (
+                "STALE BRIEF. Your engine session is new since your last turn. The"
+                f" standing brief below was set at {brief.set_at}, at worktree commit"
+                f" {named[:12]}, before your worktree moved to {head[:12]}, so it"
+                " describes an earlier state and is not your current task. Read"
+                f" git log --oneline {named[:12]}..{head[:12]} and your mail before"
+                " acting on any of it, and set a new brief with set_brief."
+            )
+        if not named or head is None:
+            return (
+                "Your engine session is new since your last turn, so it leads with the"
+                f" standing brief you last set, at {brief.set_at}. The daemon could"
+                " not compare the commit it names with your worktree's, so treat it"
+                " as possibly stale. Check it against the worktree and your mail,"
+                " and set it again with set_brief when your task changes."
+            )
+        return (
+            "Your engine session is new since your last turn, so it leads with the"
+            f" standing brief you last set, at {brief.set_at}, at your worktree's"
+            f" current commit {named[:12]}. It is your own earlier text, and mail may"
+            " have changed the task since. Set it again with set_brief when your"
+            " task changes."
+        )
 
     def _mail_since_brief(self, line_id: str, brief: BriefSet) -> str:
         """One sentence for the brief's lead when an operator mailed ``line_id``
@@ -12119,6 +12392,8 @@ class Scheduler:
                 # reported none, since that cost is unknown, not zero.
                 "cost_estimate_usd": self._summary_cost(line_id),
                 "cost_unknown_turns": self._cost_unknown.get(line_id, 0),
+                "cost_estimated_turns": self._cost_estimated.get(line_id, 0),
+                "cost_whole": self.whole_cost(line_id),
                 "held_by": line.held_by,
                 "tool_policy": self.effective_config(line_id).tool_policy.value,
                 "scheduled_wake": _scheduled_summary(state.scheduled.get(line_id)),
@@ -12492,6 +12767,11 @@ def _age_words(seconds: int) -> str:
     return f"{secs}s"
 
 
+def _micro_text(micro: int) -> str:
+    """Whole millionths of a dollar as a decimal text of dollars."""
+    return f"{micro // 1_000_000}.{micro % 1_000_000:06d}"
+
+
 def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
     """Select the bounded, list-free fields shown by ``line_status`` by default."""
     autonomous = cast(dict[str, object], full["autonomous_turns"])
@@ -12537,6 +12817,8 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
             "counting": cost["counting"],
             "limit": cost["limit"],
             "limit_enforced": cost["limit_enforced"],
+            "estimated_turns": cost["estimated_turns"],
+            "whole": cost["whole"],
         },
         "provider_budget": full["provider_budget"],
         "disclosure": full["disclosure"],
@@ -12544,6 +12826,8 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         "scheduled_wake": full["scheduled_wake"],
         "unread": full["unread"],
         "unanswered": full["unanswered"],
+        "unanswered_mail": full["unanswered_mail"],
+        "unanswered_omitted": full["unanswered_omitted"],
         "own_notes": full["own_notes"],
         "pending": full["pending"],
         "peers": full["peers"],

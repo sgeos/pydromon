@@ -26,6 +26,7 @@ from dromon.gitssh import GitSshAccess
 from dromon.lineconfig import ConfigError, LineConfig, ToolPolicy, encode_config
 from dromon.overrides import OverrideError
 from dromon.model import (
+    LineCostRecorded,
     HoldCause,
     HARNESS,
     AgentAccess,
@@ -367,7 +368,9 @@ def test_a_message_wakes_an_idle_line_and_is_delivered(make_world: MakeWorld) ->
     message_id = next(e.message_id for e in events if isinstance(e, MessageSent))
     wake = wakes_for(target, "alpha")
     assert [w.message_id for w in wake] == [message_id]
-    tail = events[-7:]
+    # Round 15, item 1. The turn's cost is recorded as it is counted.
+    assert events[-1] == LineCostRecorded("alpha", None)
+    tail = events[-8:-1]
     assert isinstance(tail[0], WakeRequested)
     assert tail[1] == WakeIssued(wake[0].wake_id)
     assert tail[2] == LineStateChanged("alpha", LineState.RUNNING)

@@ -133,6 +133,11 @@ def file_differences(
             role.handoff_below_percent,
         ),
         ("seats", ", ".join(definition.seats), ", ".join(role.seats)),
+        (
+            "reviews",
+            ", ".join(definition.reviews) or "none",
+            ", ".join(role.reviews) or "none",
+        ),
     )
     for name, written, recorded in terms:
         if written != recorded:
@@ -228,6 +233,16 @@ def plan_file_roles(
             # Round 10 review, F5. The pass goes on, so the file's first owner is
             # recorded now rather than at the next start or reload. The terms and
             # seats agree, so the steps before the owner's add nothing.
+        unknown = [
+            name
+            for name in definition.reviews
+            if name not in config.roles and name not in trial.roles
+        ]
+        if unknown:
+            raise RoleConflict(
+                f"role {role_id}: reviews names {', '.join(unknown)}, which the"
+                " project file does not declare and the log holds no role of"
+            )
         declared = RoleDeclared(
             role_id,
             definition.workdir,
@@ -235,6 +250,7 @@ def plan_file_roles(
             definition.seats,
             definition.failover,
             definition.handoff_below_percent,
+            definition.reviews,
         )
         if role is None or role_terms(role) != role_terms(declared):
             add(role_id, declared)
@@ -286,6 +302,9 @@ class RoleWanted:
     handoff_below_percent: int
     order: tuple[str, ...]
     seats: tuple[tuple[str, bool], ...]
+    reviews: tuple[str, ...] = ()
+    """The roles whose work it reviews, each of which ``plan_role_set`` requires to
+    be a role the log holds. **Round 15, item 5.**"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,6 +367,14 @@ def plan_role_set(
             f"a role has 1 to {MAX_ROLE_SEATS} seats. Retire it with dromon role"
             " delete instead of leaving it none"
         )
+    for name in wanted.reviews:
+        if name in state.roles:
+            continue
+        retired = state.retired_roles.get(name)
+        detail = "" if retired is None else f", which was retired by {retired.by}"
+        raise RoleConflict(
+            f"reviews names role {name}, which the log does not hold{detail}"
+        )
     for line_id, _ in wanted.seats:
         if line_id not in state.lines:
             raise RoleConflict(
@@ -388,6 +415,7 @@ def plan_role_set(
             wanted.order,
             wanted.failover,
             wanted.handoff_below_percent,
+            wanted.reviews,
         )
     except InvalidField as error:
         raise RoleConflict(str(error)) from error
@@ -401,6 +429,7 @@ def plan_role_set(
                 bound.append(line_id)
     if not events:
         raise RoleConflict(f"role {role_id} is so already")
+
     if by.operator_id not in state.operators:
         events.insert(0, OperatorRegistered(by.operator_id))
     if state.holder_of(role_id) is not RoleHolder.OPERATOR:

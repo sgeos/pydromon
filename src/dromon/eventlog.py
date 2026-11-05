@@ -34,6 +34,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Final, Self, cast
 
+from dromon import statesnapshot
 from dromon.codec import DecodeError, decode, encode
 from dromon.mailbox import counts_unanswered
 from dromon.model import (
@@ -105,18 +106,29 @@ class EventLog:
     threads. Use one instance per process and one writer per log file.
     """
 
-    def __init__(self, path: Path, clock: Clock = utc_now) -> None:
+    def __init__(
+        self, path: Path, clock: Clock = utc_now, *, snapshots: bool = False
+    ) -> None:
+        """Open the log at ``path``, creating it if absent, and rebuild the state.
+        **Round 15, item 4.** With ``snapshots`` the state is restored from the
+        snapshot beside the log when it can be trusted, and the events after it are
+        replayed, and a snapshot is written as the log grows and when it closes, as
+        ``dromon.statesnapshot`` specifies. Without it, as in every test that does
+        not ask, nothing is read or written beside the log."""
         _create_private(path)
         self._connection = sqlite3.connect(path, isolation_level=None)
         self._clock = clock
         self.path = path
         self._times = RecordedTimes()
+        self._snapshots = snapshots
+        started = time.monotonic()
         try:
             _initialize(self._connection)
-            self._state, self._last_seq = _replay(self._connection, self._times)
+            self.start = self._open(snapshots)
         except BaseException:
             self._connection.close()
             raise
+        self.start.seconds = time.monotonic() - started
         self.opened_seq = self._last_seq
         """The newest sequence number when this process opened the log."""
         self.opened_bytes = self.size_bytes()
@@ -134,7 +146,65 @@ class EventLog:
         self.close()
 
     def close(self) -> None:
-        self._connection.close()
+        """Close the log, first writing a snapshot of a log that grew since the last
+        one, when snapshots are on, so the next start replays little."""
+        try:
+            if self._snapshots and self._last_seq > self.start.snapshot_seq:
+                self.write_snapshot()
+        finally:
+            self._connection.close()
+
+    def _open(self, snapshots: bool) -> "StartReport":
+        """Rebuild the state, from the snapshot when ``snapshots`` and it can be
+        trusted, and otherwise from every event."""
+        if not snapshots:
+            self._state, self._last_seq = _replay(self._connection, self._times)
+            return StartReport("off", 0, None, self._last_seq)
+        reason: str | None = None
+        with _transaction(self._connection, "BEGIN") as reading:
+            try:
+                loaded = statesnapshot.read(
+                    statesnapshot.snapshot_path(self.path),
+                    SCHEMA_VERSION,
+                    lambda seq: _row(reading, seq),
+                )
+            except statesnapshot.SnapshotRefused as refused:
+                loaded = None
+                reason = str(refused)
+        if loaded is None:
+            self._state, self._last_seq = _replay(self._connection, self._times)
+            return StartReport("ignored", 0, reason, self._last_seq)
+        self._times.restore(loaded.times)
+        self._state, self._last_seq = _replay(
+            self._connection, self._times, loaded.state, loaded.seq
+        )
+        return StartReport("used", loaded.seq, None, self._last_seq - loaded.seq)
+
+    def write_snapshot(self) -> None:
+        """Write a snapshot of the state at the newest event. A failure is recorded
+        in ``start.write_failure`` and never raised, since a snapshot is a cache."""
+        if self._last_seq < 1:
+            return
+        try:
+            with _transaction(self._connection, "BEGIN") as reading:
+                first = _row(reading, 1)
+                nth = _row(reading, self._last_seq)
+            if first is None or nth is None:
+                raise LogError("the log has no row to digest")
+            statesnapshot.write(
+                statesnapshot.snapshot_path(self.path),
+                schema_version=SCHEMA_VERSION,
+                seq=self._last_seq,
+                first_row=statesnapshot.row_digest(*first),
+                nth_row=statesnapshot.row_digest(*nth),
+                state=self._state,
+                times=self._times.maps(),
+            )
+        except (OSError, TypeError, ValueError, LogError, sqlite3.Error) as error:
+            self.start.write_failure = f"{type(error).__name__}: {error}"
+            return
+        self.start.snapshot_seq = self._last_seq
+        self.start.write_failure = None
 
     @property
     def state(self) -> State:
@@ -205,7 +275,44 @@ class EventLog:
         self._last_seq = expected
         entry = Entry(expected, recorded_at, event)
         self._times.note(entry, self._state)
+        if (
+            self._snapshots
+            and expected - self.start.snapshot_seq >= statesnapshot.SNAPSHOT_EVERY
+        ):
+            # Round 15, item 4. The append is already stored, so a snapshot that
+            # fails to write is only recorded.
+            self.write_snapshot()
         return entry
+
+
+@dataclass(slots=True)
+class StartReport:
+    """How this process rebuilt the state when it opened the log. **Round 15, item
+    4.** ``snapshot`` is ``off`` when snapshots were not asked for, ``used`` when the
+    state was restored from one, or ``ignored`` with the ``reason`` when one could not
+    be trusted, which ``reason`` names, and the whole log was replayed."""
+
+    snapshot: str
+    snapshot_seq: int
+    """The sequence number of the snapshot used or last written, or 0."""
+    reason: str | None
+    replayed: int
+    """The events applied at the open, after the snapshot when one was used."""
+    seconds: float = 0.0
+    write_failure: str | None = None
+    """Why the latest snapshot this process tried to write was not written."""
+
+    def wire(self) -> dict[str, object]:
+        """The report as a status gives it. Whole milliseconds, since the client
+        protocol carries no floats."""
+        return {
+            "snapshot": self.snapshot,
+            "snapshot_seq": self.snapshot_seq or None,
+            "reason": self.reason,
+            "replayed": self.replayed,
+            "open_milliseconds": round(self.seconds * 1000),
+            "write_failure": self.write_failure,
+        }
 
 
 LINE_CHANGES: Final = (
@@ -257,6 +364,20 @@ class RecordedTimes:
         """When each message counted as unanswered was sent or received, by its
         identifier."""
 
+    def maps(self) -> dict[str, dict[str, str]]:
+        """The three maps by the names ``dromon.statesnapshot`` keeps them under."""
+        return {
+            "line_changed": self.line_changed,
+            "message_recorded": self.message_recorded,
+            "unanswered_recorded": self.unanswered_recorded,
+        }
+
+    def restore(self, maps: dict[str, dict[str, str]]) -> None:
+        """Take the three maps from a snapshot, in their order."""
+        self.line_changed = dict(maps["line_changed"])
+        self.message_recorded = dict(maps["message_recorded"])
+        self.unanswered_recorded = dict(maps["unanswered_recorded"])
+
     def unanswered_since(self, message_id: str) -> str | None:
         """When ``message_id`` was sent or received, while it is counted as
         unanswered, or ``None``."""
@@ -277,7 +398,12 @@ class RecordedTimes:
             if counts_unanswered(state, state.messages[event.message_id]):
                 self.unanswered_recorded.setdefault(event.message_id, entry.recorded_at)
             if event.reply_to is not None:
-                self._drop_answered(state, event.reply_to)
+                # Round 15, item 2. A reply closes the message it names and can
+                # close earlier notes of its thread, which only the state names, so
+                # every kept time is read again. Bounded by the unanswered mail, as
+                # the map is.
+                for message_id in list(self.unanswered_recorded):
+                    self._drop_answered(state, message_id)
         elif isinstance(event, MessageRead):
             self.message_recorded.pop(event.message_id, None)
         elif isinstance(event, MessageAcknowledged):
@@ -298,6 +424,58 @@ def replay(path: Path) -> State:
         return state
     finally:
         connection.close()
+
+
+def replay_through(path: Path, seq: int) -> tuple[State, dict[str, dict[str, str]]]:
+    """The state and the recorded times of the log at ``path`` after its first
+    ``seq`` events, read only, as ``dromond --check`` compares them with a snapshot
+    taken at ``seq``. Raises ``LogCorrupt`` when the log holds fewer."""
+    connection = _connect_read_only(path)
+    times = RecordedTimes()
+    try:
+        state, last = _replay(connection, times, through=seq)
+    finally:
+        connection.close()
+    if last != seq:
+        raise LogCorrupt(f"the log holds {last} events, fewer than {seq}")
+    return state, times.maps()
+
+
+def check_snapshot(snapshot_file: Path, log_copy: Path) -> tuple[bool, str]:
+    """Whether the snapshot at ``snapshot_file`` agrees with a full replay of the log
+    copy at ``log_copy``, with a sentence saying so. **Round 15, item 4.** The copy
+    is replayed from its first event up to the snapshot's ``seq`` and its state and
+    recorded times are encoded and compared with the snapshot's, byte for byte. A
+    difference means the code applies events differently from the code that wrote
+    the snapshot without raising ``STATE_VERSION``, and fails the check. No snapshot,
+    or one a start would ignore, passes with its reason, since a start would then
+    replay the whole log, which is always correct."""
+    connection = _connect_read_only(log_copy)
+    try:
+        with _transaction(connection, "BEGIN") as reading:
+            try:
+                loaded = statesnapshot.read(
+                    snapshot_file, SCHEMA_VERSION, lambda seq: _row(reading, seq)
+                )
+            except statesnapshot.SnapshotRefused as refused:
+                return (
+                    True,
+                    f"the snapshot is not used, so nothing is compared: {refused}",
+                )
+    finally:
+        connection.close()
+    state, times = replay_through(log_copy, loaded.seq)
+    replayed = statesnapshot.canonical(statesnapshot.encode_state(state, times))
+    stored = statesnapshot.canonical(
+        statesnapshot.encode_state(loaded.state, loaded.times)
+    )
+    if replayed != stored:
+        return False, (
+            f"the snapshot at event {loaded.seq} differs from a full replay of the"
+            " log, so this code applies events differently from the code that wrote"
+            " it without a new state version"
+        )
+    return True, f"the snapshot at event {loaded.seq} agrees with a full replay"
 
 
 def read_entries(path: Path) -> list[Entry]:
@@ -574,12 +752,30 @@ def _initialize(connection: sqlite3.Connection) -> None:
             creating.execute(statement)
 
 
-def _entries(connection: sqlite3.Connection) -> Iterator[Entry]:
-    """Yield each stored entry in order, checking that the sequence has no gaps."""
+def _row(connection: sqlite3.Connection, seq: int) -> tuple[str, str] | None:
+    """The ``recorded_at`` and ``payload`` of row ``seq``, or ``None`` past the end."""
+    found = connection.execute(
+        "SELECT recorded_at, payload FROM events WHERE seq = ?", (seq,)
+    ).fetchone()
+    if found is None:
+        return None
+    recorded_at, payload = cast(tuple[object, object], found)
+    if not isinstance(recorded_at, str) or not isinstance(payload, str):
+        raise LogCorrupt(f"row {seq} is not text")
+    return recorded_at, payload
+
+
+def _entries(
+    connection: sqlite3.Connection, after: int = 0, through: int | None = None
+) -> Iterator[Entry]:
+    """Yield each stored entry after ``after``, up to ``through`` when given, in
+    order, checking that the sequence has no gaps."""
     rows = connection.execute(
-        "SELECT seq, recorded_at, payload FROM events ORDER BY seq"
+        "SELECT seq, recorded_at, payload FROM events WHERE seq > ? AND seq <= ?"
+        " ORDER BY seq",
+        (after, (1 << 62) if through is None else through),
     )
-    expected = 1
+    expected = after + 1
     for seq, recorded_at, payload in rows:
         if seq != expected:
             raise LogCorrupt(f"the log skips from {expected - 1} to {seq}")
@@ -592,14 +788,19 @@ def _entries(connection: sqlite3.Connection) -> Iterator[Entry]:
 
 
 def _replay(
-    connection: sqlite3.Connection, times: RecordedTimes | None = None
+    connection: sqlite3.Connection,
+    times: RecordedTimes | None = None,
+    start: State | None = None,
+    after: int = 0,
+    through: int | None = None,
 ) -> tuple[State, int]:
-    """Apply every stored event to an empty state inside one read transaction, and
-    note their times in ``times`` when it is given."""
-    state = State()
-    last_seq = 0
+    """Apply every stored event after ``after`` to ``start``, or to an empty state,
+    inside one read transaction, up to ``through`` when given, and note their times
+    in ``times`` when it is given."""
+    state = State() if start is None else start
+    last_seq = after
     with _transaction(connection, "BEGIN") as reading:
-        for entry in _entries(reading):
+        for entry in _entries(reading, after, through):
             try:
                 state.apply(entry.event)
             except EventRejected as error:
