@@ -409,6 +409,38 @@ the socket tests were deselected and that seven launcher tests that read the pro
 table were skipped. A run executes outside every engine sandbox, as the trust section
 says, so it can run the whole gate.
 
+**Round 15, items 1 and 2. What the gate states about itself.** The gate type-checks
+every Python version the workflow's matrix lists, on both platforms. It reads the list
+from `.github/workflows/ci.yml` with `scripts/ci_pythons.py`, which fails when it finds
+no versions in the one-line form `python: ["3.12", "3.15"]`, so a gate that read none
+cannot pass having checked none. **Fact.** Pyright reads the standard library stubs for
+the version it is given, so the other interpreters need not be installed, and each run
+took about 20 seconds on the author's host, four in all. **Fact.** The earlier gate
+checked the interpreter it ran on, and the workflow's other interpreter found Python
+3.12 errors it had missed. The last line of the pytest summary is now one line,
+`not run here: N socket tests (...), N live tests (...), N process-table tests (...)`,
+naming each kind left out and why, or `(all run)`, so a green gate cannot be read as
+having run what it left out. **Limit.** The process-table kind is recognised by its
+skip reason, which every such test shares, and a test finds one that does not. Another
+kind of omission appears in the grouped list above that line, not in it.
+
+**Round 15 review, V1 and G4. Reading the matrix strictly, and testing the loop.** The
+reader first read only the one flow line, so a matrix `include` entry such as
+`- python: "3.13"` added a version CI tested and the gate did not (fact, shown by the
+reviewer). It now refuses a workflow with any other `python` key, in block, entry or
+inline form, with an `include` or `exclude` key, or with an unquoted entry, which YAML
+reads as a number, so `3.10` would become 3.1. **Inference.** A failure is the safe
+direction, since a version the reader cannot see would otherwise go unchecked, and the
+cost is that an operator who adds such a key must change the reader or the workflow.
+**Limit.** The reader still does not parse YAML, so a version supplied by an expression
+such as `fromJSON` is not seen. It is refused only if the line shape is absent, and the
+other operating systems the workflow lists are not read, since the gate checks Linux
+and macOS as written. The loop in `check.sh` is now run by tests with a stand-in `uv`,
+in `tests/test_changelog_fragments.py`. They check the four calls, a failure of any one,
+no call at all when the versions cannot be read, no default when the reader fails, and
+the failure when a reader succeeds with no version. Removing the no-version check, or
+defaulting a failed read, fails them (shown by editing the script and running them).
+
 **The declaration.**
 
 ```toml
