@@ -729,6 +729,18 @@ UNREPORTED_ENGINE_NOTE: Final = (
 )
 SCRATCH_AREA: Final = "scratch"
 REPORTS_AREA: Final = "reports"
+DEFAULT_REPORT_DIRECTORY: Final = "reports"
+"""The directory under ``tmp/`` that a reports area falls back to for a line that
+writes ``tmp/`` and declares none. Round 15, item 3."""
+
+
+class DisclosureOutcome(NamedTuple):
+    """What ``check_disclosure_outcome`` answered. ``cached`` is true when the bytes
+    had already passed and the call spent no check. Round 15, item 4."""
+
+    matched: int
+    left: int
+    cached: bool
 
 
 class ScratchWrite(NamedTuple):
@@ -768,6 +780,8 @@ MAX_CHECKED_BYTES: Final = 1024 * 1024
 **Round 14, item 3.** A file is checked in parts of at most this size, split after a
 newline, and the counts are summed, so a longer file costs one check and not several."""
 MAX_CHECKED_TOTAL_BYTES: Final = 16 * 1024 * 1024
+MAX_CLEAN_CHECKED: Final = 64
+"""How many passed contents a line keeps, oldest first out. Round 15, item 4."""
 """The largest combined files ``check_disclosure`` reads in one check. A bound on
 memory and time, since the parts are held together before they are split."""
 MAX_CHECKED_PATHS: Final = 8
@@ -1303,6 +1317,12 @@ class LineToolRefused(ValueError):
     """A line tool cannot do what the line asked."""
 
 
+def _scratch_refused(rule: str, detail: str) -> LineToolRefused:
+    """A refusal of ``write_scratch`` that names the rule that applied, so a line
+    does not have to guess which of its limits it met. **Round 15, item 3.**"""
+    return LineToolRefused(f"write_scratch refused by the {rule} rule: {detail}")
+
+
 class TurnRefused(RuntimeError):
     """The scheduler refused to start a line's turn, for the reason it gives."""
 
@@ -1443,6 +1463,13 @@ class LineEngine(Protocol):
     session_id: str | None
 
     async def run_turn(self, prompt: str) -> TurnReport: ...
+
+
+@runtime_checkable
+class StartCheckEngine(Protocol):
+    """An adapter with a no-prompt check of its ordinary startup path."""
+
+    async def check_start(self) -> None: ...
 
 
 @runtime_checkable
@@ -2303,6 +2330,19 @@ class Scheduler:
         self._quiet_tasks: dict[str, QuietTurn] = {}
         """What a silent turn left running, by line, for the next prompt. In memory,
         so a restart forgets it, as it ends the kept session whose tasks it names."""
+        self._clean_checked: dict[str, dict[tuple[str, str], None]] = {}
+        """Per line, the contents that passed the disclosure list, as ``(path,
+        SHA-256 of the bytes)`` with an empty path for a text. A file whose bytes are
+        listed is answered as a pass without another check. In memory, bounded by
+        ``MAX_CLEAN_CHECKED``, emptied when the list is replaced. **Round 15, item
+        4.**"""
+        self._clean_context: dict[str, LineConfig] = {}
+        """The configuration each line's remembered passes were made under. A pass is
+        bound to a path relative to the working directory, and the operator's accepted
+        lines to the project path it resolves to, so a line configured with another
+        working directory, or any other setting, could otherwise be answered for a
+        file of the new directory that has the same relative name and bytes. The
+        memory is dropped when the configuration differs. **Round 15 review, G1.**"""
         self._disclosure_spent: set[str] = set()
         """Lines that spent their disclosure limit and are held for it. Every
         disclosure-checked tool answers ``DISCLOSURE_HELD`` for them until an
@@ -2979,6 +3019,39 @@ class Scheduler:
             relative = ""
         return self._disclosure_accepted.get(relative, ())
 
+    def _clean_memory(self, line_id: str) -> dict[tuple[str, str], None]:
+        """The line's remembered passes, emptied first when the line's effective
+        configuration is not the one they were made under. A configuration change
+        of any kind forgets them, which costs the line at most one more check of a
+        file, and the working directory is the change that matters. **Round 15
+        review, G1.**"""
+        current = self.effective_config(line_id)
+        if self._clean_context.get(line_id) != current:
+            self._clean_checked.pop(line_id, None)
+            self._clean_context[line_id] = current
+        return self._clean_checked.setdefault(line_id, {})
+
+    def _remember_clean(self, line_id: str, path: str, data: bytes) -> None:
+        """Record that ``data`` passed the list, for ``path`` or, with an empty path,
+        for any. Nothing is recorded while no list is configured, since nothing was
+        checked then."""
+        if not self._disclosure:
+            return
+        kept = self._clean_memory(line_id)
+        key = (path, hashlib.sha256(data).hexdigest())
+        kept.pop(key, None)
+        kept[key] = None
+        while len(kept) > MAX_CLEAN_CHECKED:
+            del kept[next(iter(kept))]
+
+    def _is_clean(self, line_id: str, path: str, data: bytes) -> bool:
+        """Whether ``data`` already passed the list as a text, as ``path`` or as a
+        file ``write_scratch`` wrote. The pass is bound to the exact bytes by their
+        digest, so an edit of one byte is not covered."""
+        kept = self._clean_memory(line_id)
+        digest = hashlib.sha256(data).hexdigest()
+        return ("", digest) in kept or (path, digest) in kept
+
     def _checked_matches(self, line_id: str, path: str | None, text: str) -> int:
         return disclosure.matching_lines(
             self._disclosure, text, self._accepted_lines(line_id, path)
@@ -3027,6 +3100,8 @@ class Scheduler:
     def set_disclosure_terms(self, terms: Sequence[str]) -> None:
         """Replace the disclosure terms the tools check, already case folded."""
         self._disclosure = tuple(terms)
+        self._clean_checked.clear()
+        self._clean_context.clear()
 
     def discloses(self, *texts: str) -> bool:
         """Whether any of ``texts`` holds a term of the project's disclosure list."""
@@ -6615,23 +6690,38 @@ class Scheduler:
         list covers, and ``reports`` when no report directory is declared. Every
         other directory stays refused."""
         if area not in (SCRATCH_AREA, REPORTS_AREA):
-            raise LineToolRefused(f"area must be {SCRATCH_AREA} or {REPORTS_AREA}")
+            raise _scratch_refused(
+                "area", f"area must be {SCRATCH_AREA} or {REPORTS_AREA}"
+            )
         if not path or "\x00" in path or path.startswith(("/", "~")):
-            raise LineToolRefused(
+            raise _scratch_refused(
+                "relative path",
                 "path must be a relative path under tmp/ or the report directory,"
-                " not an absolute one"
+                " not an absolute one",
             )
         parts = Path(path).parts
         if ".." in parts or not parts:
-            raise LineToolRefused("path may not contain ..")
+            raise _scratch_refused("no parent component", "path may not contain ..")
         data = text.encode("utf-8")
         if len(data) > MAX_SCRATCH_BYTES:
-            raise LineToolRefused(f"text is over {MAX_SCRATCH_BYTES} bytes")
+            raise _scratch_refused("size", f"text is over {MAX_SCRATCH_BYTES} bytes")
         refusal = self.refuse_disclosed(line_id, ("text", text), ("path", path))
         if refusal is not None:
-            raise LineToolRefused(refusal)
+            if refusal == DISCLOSURE_HELD:
+                # Alike for every tool, so a held line learns nothing from its form.
+                raise LineToolRefused(refusal)
+            raise _scratch_refused("disclosure list", refusal)
         workdir = self._workdir_of(line_id)
         scratch = self._area_parts(line_id, area)
+        if (
+            area == REPORTS_AREA
+            and len(parts) > len(scratch)
+            and parts[: len(scratch)] == scratch
+        ):
+            # Round 15, item 3. A path that already names the report directory names
+            # the place the area is, so it is written there once and not nested
+            # below itself.
+            parts = parts[len(scratch) :]
         read_only = resolve_read_only_paths(self._read_only_paths, workdir)
         target = Path(os.path.normpath(workdir.joinpath(*scratch, *parts)))
         if any(
@@ -6640,30 +6730,37 @@ class Scheduler:
             or target in protected_path.parents
             for protected_path in read_only
         ):
-            raise LineToolRefused(f"{path} is under a project read_only_paths entry")
+            raise _scratch_refused(
+                "read_only_paths", f"{path} is under a project read_only_paths entry"
+            )
         # Every component is opened relative to its parent's descriptor without
         # following links, so no link swapped in at any level can redirect the
         # write, however the race falls.
         try:
             parent = os.open(workdir, os.O_RDONLY | os.O_DIRECTORY)
         except OSError as error:
-            raise LineToolRefused(
-                f"cannot open the working directory: {error.strerror}"
+            raise _scratch_refused(
+                "working directory",
+                f"cannot open the working directory: {error.strerror}",
             ) from error
         try:
             names = [*scratch, *parts[:-1]]
             for index, name in enumerate(names):
-                entered = _enter(parent, name, path, scratch_root=index == 0)
+                try:
+                    entered = _enter(parent, name, path, scratch_root=index == 0)
+                except LineToolRefused as error:
+                    raise _scratch_refused("path walk", str(error)) from error
                 if (
                     area == REPORTS_AREA
                     and index == 1
                     and _is_reserved(parent, entered)
                 ):
                     os.close(entered)
-                    raise LineToolRefused(
+                    raise _scratch_refused(
+                        "reserved report directory",
                         f"the report directory {'/'.join(scratch)} is, on this"
                         f" volume, one of tmp/{', tmp/'.join(REPORT_RESERVED)}, which"
-                        " hold other lines' and roles' files"
+                        " hold other lines' and roles' files",
                     )
                 os.close(parent)
                 parent = entered
@@ -6672,18 +6769,24 @@ class Scheduler:
                 descriptor = os.open(parts[-1], flags, 0o644, dir_fd=parent)
             except OSError as error:
                 if error.errno == errno.ELOOP:
-                    raise LineToolRefused(
-                        f"{path} is a symbolic link, which is not overwritten"
+                    raise _scratch_refused(
+                        "no overwrite of a link",
+                        f"{path} is a symbolic link, which is not overwritten",
                     ) from error
                 if error.errno == errno.EISDIR:
-                    raise LineToolRefused(f"{path} is a directory") from error
-                raise LineToolRefused(
-                    f"cannot write {path}: {error.strerror}"
+                    raise _scratch_refused(
+                        "file target", f"{path} is a directory"
+                    ) from error
+                raise _scratch_refused(
+                    "operating system", f"cannot write {path}: {error.strerror}"
                 ) from error
         finally:
             os.close(parent)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
+        # The text passed the list above, so a later check of this file, unchanged,
+        # is answered without spending a check. Round 15, item 4.
+        self._remember_clean(line_id, "", data)
         relative = Path(*scratch, *parts)
         return ScratchWrite(
             str(relative), str(Path(os.path.realpath(workdir)) / relative), len(data)
@@ -6692,23 +6795,38 @@ class Scheduler:
     def _area_parts(self, line_id: str, area: str) -> tuple[str, ...]:
         """The components of the directory ``write_scratch`` writes under for
         ``area``: the line's scratch, or the report directory its configuration
-        declares. ``LineToolRefused`` when the area is reports and none is declared."""
+        declares. ``LineToolRefused`` when the area is reports and the line may not
+        use it, naming the rule.
+
+        **Round 15, item 3.** A line whose scratch is ``tmp/`` already reaches
+        ``tmp/reports``, so a reports area asked for by such a line with no report
+        directory declared writes there instead of refusing. The file lands where
+        the same path under the scratch area would put it, and no limit is relaxed,
+        which is why this is accepted and a seat's request is not. A seat that does
+        not own its role has a scratch of its own, so ``tmp/reports`` is the owner's
+        place and its request is still refused."""
         if area == SCRATCH_AREA:
             return self.scratch_parts(line_id)
         declared = self.effective_config(line_id).report_directory
-        if declared is not None and self.scratch_parts(line_id) != (SCRATCH_DIRECTORY,):
+        owner_scratch = self.scratch_parts(line_id) == (SCRATCH_DIRECTORY,)
+        if declared is not None and not owner_scratch:
             # Default deny. A line whose scratch is its own subdirectory does not
             # write its working directory, as a seat that does not own its role, so
             # a report directory there would be the owner's files.
-            raise LineToolRefused(
+            raise _scratch_refused(
+                "reports area is for the owner",
                 "the reports area is refused while you do not own your role's"
                 " worktree, since you never write the owner's files. Write under"
-                " your scratch instead"
+                " your scratch instead",
             )
         if declared is None:
-            raise LineToolRefused(
-                "this line's configuration declares no report_directory, so the"
-                " reports area is refused. Write under your scratch instead"
+            if owner_scratch:
+                return (SCRATCH_DIRECTORY, DEFAULT_REPORT_DIRECTORY)
+            raise _scratch_refused(
+                "reports area is declared",
+                "this line's configuration declares no report_directory and its"
+                f" scratch is not {SCRATCH_DIRECTORY}/, so the reports area is"
+                " refused. Write under your scratch instead",
             )
         return tuple(declared.split("/"))
 
@@ -6719,6 +6837,46 @@ class Scheduler:
         path: str | None,
         paths: Sequence[str] | None = None,
     ) -> tuple[int, int]:
+        """What ``check_disclosure_outcome`` answers, as the count of matching lines
+        and the checks the line has left in the window."""
+        outcome = self.check_disclosure_outcome(line_id, text, path, paths)
+        return outcome.matched, outcome.left
+
+    def _checks_left(self, line_id: str, now: datetime) -> int:
+        recent = self._state().disclosure_checks.get(line_id, ())
+        window = timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS)
+        used = sum(1 for time in recent if now - parse_due(time) < window)
+        return max(0, MAX_DISCLOSURE_CHECKS - used)
+
+    def _read_listed(
+        self, line_id: str, path: str | None, paths: Sequence[str] | None
+    ) -> list[tuple[str, bytes]]:
+        """The files ``check_disclosure`` was given, each as its path relative to the
+        working directory and its bytes, read as ``_read_checked`` reads them within
+        the combined bound."""
+        listed = [path] if path is not None else list(cast(Sequence[str], paths))
+        files: list[tuple[str, bytes]] = []
+        total_bytes = 0
+        for file_path in listed:
+            relative = self._workdir_relative(line_id, file_path)
+            data = self._read_checked(
+                line_id,
+                relative,
+                MAX_CHECKED_TOTAL_BYTES - total_bytes
+                if paths is not None
+                else MAX_CHECKED_TOTAL_BYTES,
+            )
+            total_bytes += len(data)
+            files.append((relative, data))
+        return files
+
+    def check_disclosure_outcome(
+        self,
+        line_id: str,
+        text: str | None,
+        path: str | None,
+        paths: Sequence[str] | None = None,
+    ) -> DisclosureOutcome:
         """**Item B2 of 2026-10-28.** Check ``text``, the file at ``path``, or the
         files at ``paths`` in the line's working directory, against the project's
         disclosure list, record
@@ -6731,7 +6889,20 @@ class Scheduler:
         since it reveals nothing of the list, so a spent limit refuses here without
         holding the line, unlike ``refuse_disclosed``. The window is read from the
         recorded times on the wall clock, so it survives a restart, and a clock set
-        back lengthens it while one set forward shortens it."""
+        back lengthens it while one set forward shortens it.
+
+        **Round 15, item 4. A file already checked is not checked again.** A check
+        that passes, and a ``write_scratch`` whose text passed the list, remember the
+        SHA-256 of the exact bytes. A later check of a file whose bytes have that
+        digest answers a pass with ``cached`` set, records nothing and spends no
+        check, so the instruction to check a draft and then the file that holds it
+        costs one check and not two. It is answered even at the limit, because it
+        reveals nothing the line did not learn when the bytes passed. Any edit
+        changes the digest and the file is checked and counted as before. A text
+        check is never answered from memory. **Limits.** The memory is in the
+        daemon's process and is emptied by a restart and when the list is replaced,
+        so the next check then spends. It holds the 64 most recent passes of a line.
+        A held line is refused first, as before."""
         if line_id in self._disclosure_spent:
             raise LineToolRefused(DISCLOSURE_HELD)
         offered = sum(value is not None for value in (text, path, paths))
@@ -6748,6 +6919,11 @@ class Scheduler:
                 " check cannot pass or fail without a list."
             )
         now = self._wall_clock()
+        files: list[tuple[str, bytes]] = []
+        if text is None:
+            files = self._read_listed(line_id, path, paths)
+            if all(self._is_clean(line_id, name, data) for name, data in files):
+                return DisclosureOutcome(0, self._checks_left(line_id, now), True)
         reopens = self._disclosure_reopens(line_id, now)
         if reopens is not None:
             raise LineToolRefused(
@@ -6758,30 +6934,20 @@ class Scheduler:
         if text is not None and len(text.encode("utf-8")) > MAX_CHECKED_BYTES:
             raise LineToolRefused(f"text is over {MAX_CHECKED_BYTES} bytes")
         matched_lines = 0
-        if paths is not None:
-            total_bytes = 0
-            for file_path in paths:
-                relative = self._workdir_relative(line_id, file_path)
-                file_bytes = self._read_checked(
-                    line_id, relative, MAX_CHECKED_TOTAL_BYTES - total_bytes
-                )
-                total_bytes += len(file_bytes)
-                matched_lines += self._checked_file_matches(
-                    line_id, relative, file_bytes
-                )
-        elif path is not None:
-            relative = self._workdir_relative(line_id, path)
-            matched_lines = self._checked_file_matches(
-                line_id, relative, self._read_checked(line_id, relative)
-            )
+        if text is None:
+            for name, data in files:
+                matched_lines += self._checked_file_matches(line_id, name, data)
         else:
-            matched_lines = self._checked_matches(line_id, None, cast(str, text))
+            matched_lines = self._checked_matches(line_id, None, text)
         matched = min(matched_lines, MAX_DISCLOSURE_MATCHES)
         self._log.append(DisclosureChecked(line_id, format_due(now), matched))
-        recent = self._state().disclosure_checks[line_id]
-        window = timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS)
-        used = sum(1 for time in recent if now - parse_due(time) < window)
-        return matched, max(0, MAX_DISCLOSURE_CHECKS - used)
+        if matched_lines == 0:
+            if text is None:
+                for name, data in files:
+                    self._remember_clean(line_id, name, data)
+            else:
+                self._remember_clean(line_id, "", text.encode("utf-8"))
+        return DisclosureOutcome(matched, self._checks_left(line_id, now), False)
 
     def _disclosure_reopens(self, line_id: str, now: datetime) -> datetime | None:
         """When the line's window of disclosure checks and refusals next has room,
@@ -9429,9 +9595,11 @@ class Scheduler:
                 " id>/ otherwise, so that you never write the owner's files. The"
                 " owner's scratch is tmp/, which you may read. With area reports the"
                 " path is relative to the report directory your configuration declares,"
-                " if it declares one. Directories below the area are created. The"
-                " result gives the absolute path written and the bytes written, and"
-                " check_disclosure accepts that path."
+                " or tmp/reports when you write tmp/ and it declares none, and a path"
+                " that already begins with that directory is not nested. Directories"
+                " below the area are created. The result gives the absolute path"
+                " written and the bytes written, and check_disclosure accepts that"
+                " path. A refusal names the rule that applied."
             ),
             input_schema=WRITE_SCRATCH_SCHEMA,
             handler=handler,
@@ -9458,17 +9626,23 @@ class Scheduler:
                     return _tool_error("paths must be a list of text")
                 paths = path_values
             try:
-                matched, left = self.check_disclosure(
+                answered = self.check_disclosure_outcome(
                     line_id, text, path, cast(list[str] | None, paths)
                 )
             except (LineToolRefused, EventRejected) as error:
                 return _tool_error(str(error))
+            matched, left = answered.matched, answered.left
             lines = "1 line holds" if matched == 1 else f"{matched} lines hold"
             outcome = "pass" if matched == 0 else "fail"
+            kept = (
+                " These bytes had already passed, so this call spent no check."
+                if answered.cached
+                else ""
+            )
             return _tool_text(
                 f"{outcome}, {lines} a term from the project's disclosure list."
                 f" You have {left} of {MAX_DISCLOSURE_CHECKS} checks left in"
-                f" {DISCLOSURE_CHECK_WINDOW_SECONDS} seconds."
+                f" {DISCLOSURE_CHECK_WINDOW_SECONDS} seconds.{kept}"
             )
 
         return SdkMcpTool(
@@ -9481,8 +9655,11 @@ class Scheduler:
                 " many lines hold a listed term, never the term. The listed files are"
                 " checked independently and their counts are summed, so a match does"
                 " not span files. A file is read in parts of at most 1 MiB split after"
-                " a newline and the counts summed, for one check, so check the file"
-                " you wrote and not a draft. Their combined content is at most 16 MiB,"
+                " a newline and the counts summed, for one check. Check a draft as text"
+                " before you write it, then the file you wrote: a file whose bytes"
+                " already passed, as text or as written by write_scratch, is"
+                " answered as a pass and spends no check. Their combined content is at"
+                " most 16 MiB,"
                 " a line may not exceed 1 MiB, and text is at most 1 MiB. A path may"
                 " be the absolute path write_scratch reported."
                 " Checks are limited per hour and recorded."
@@ -10443,6 +10620,9 @@ class Scheduler:
                 line_id, (message for _, message in messages)
             ):
                 continue
+            if self._nothing_new(line_id, messages):
+                self._deliver_without_turn(messages)
+                continue
             self._begin_turn(line_id, messages)
         self._post_office.update(self._sent)
         self._sent.clear()
@@ -10567,6 +10747,42 @@ class Scheduler:
                 await asyncio.sleep(0)
                 if not self._work_waiting():
                     return
+
+    def _already_seen(self, message: Message) -> bool:
+        """Whether the recipient has already replied to ``message`` or acknowledged
+        it. A reply names the message by its identifier, which a line can know before
+        a turn has shown it. Reading a message delivers it, so a message that was
+        read is never waiting."""
+        return message.replied or message.acknowledged
+
+    def _nothing_new(self, line_id: str, messages: list[tuple[str, Message]]) -> bool:
+        """Whether a turn started by ``messages`` would only repeat what the line
+        already dealt with. **Round 15, item 5.** A line can answer a message by its
+        identifier before any turn has shown it, and the message then stays
+        undelivered until a tick starts a turn to show it. That turn, and the one a
+        resume starts for mail whose answer was already given, only prompt the line
+        to answer again, and each costs a turn against its limits. They are not
+        started. **Exceptions.** A compaction wake and a restart note carry an
+        effect beyond their text, so they always start a turn. **Failure mode.** A
+        message the line replied to by mistake before seeing it is not shown to it
+        in a prompt, though its mailbox still holds it as delivered."""
+        wakes = {
+            self._context_compaction_wake_ids.get(line_id),
+            self._compact_wake.get(line_id),
+        }
+        return all(
+            self._already_seen(message)
+            and message_id not in wakes
+            and not message.restart_note
+            for message_id, message in messages
+        )
+
+    def _deliver_without_turn(self, messages: list[tuple[str, Message]]) -> None:
+        """Mark ``messages`` delivered and take them out of the post office, as a turn
+        would, without starting one."""
+        for message_id, _ in messages:
+            self._log.append(MessageDelivered(message_id))
+            self._post_office.discard(message_id)
 
     def _begin_turn(self, line_id: str, messages: list[tuple[str, Message]]) -> None:
         """Wake ``line_id`` and deliver its mail now, then run the turn as a task.
@@ -12509,7 +12725,7 @@ class Scheduler:
             "tasks": status.get("tasks", []),
         }
 
-    def engine_for(self, line_id: str) -> LineEngine:
+    def engine_for(self, line_id: str, *, startup_only: bool = False) -> LineEngine:
         """The line's engine, built on first use and kept for the session's life."""
         engine = self._engines.get(line_id)
         if engine is None:
@@ -12543,7 +12759,20 @@ class Scheduler:
                     self.engine_budget_reported(line_id, remaining, reset, note, window)
                 ),
             )
-            engine = self._engine_factory(spec, self.own_tools(line_id))
+            tools = self.own_tools(line_id)
+            if startup_only:
+
+                async def refused(args: dict[str, Any]) -> dict[str, Any]:
+                    del args
+                    return {
+                        "content": [
+                            {"type": "text", "text": "startup check refuses tool calls"}
+                        ],
+                        "isError": True,
+                    }
+
+                tools = [replace(tool, handler=refused) for tool in tools]
+            engine = self._engine_factory(spec, tools)
             self._engines[line_id] = engine
             self._engine_built[line_id] = time.time_ns()
         return engine

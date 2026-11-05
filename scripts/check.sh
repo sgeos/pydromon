@@ -358,10 +358,25 @@ uv run --no-sync ruff format --check .
 pass "ruff lint and format"
 
 # Both platforms the daemon supports, since pyright skips a branch for another
-# platform as unreachable, which once let a Linux-only type error reach main.
-uv run --no-sync pyright --pythonplatform Linux
-uv run --no-sync pyright --pythonplatform Darwin
-pass "pyright strict, for Linux and macOS"
+# platform as unreachable, which once let a Linux-only type error reach main. And every
+# Python version the workflow tests, since the gate once checked only the interpreter it
+# ran on and the other one found Python 3.12 errors it missed. The versions are read
+# from the workflow by scripts/ci_pythons.py, which fails when it finds none, so the
+# gate cannot pass having checked no version. pyright reads the stubs for the version it
+# is given, so no other interpreter needs to be installed.
+if ! ci_versions="$(python3 -I scripts/ci_pythons.py)"; then
+    fail "the workflow's Python versions could not be read, explained above"
+fi
+checked_versions=()
+while IFS= read -r version; do
+    [[ -n "$version" ]] || continue
+    for platform in Linux Darwin; do
+        uv run --no-sync pyright --pythonplatform "$platform" --pythonversion "$version"
+    done
+    checked_versions+=("$version")
+done < <(printf '%s\n' "$ci_versions")
+((${#checked_versions[@]} > 0)) || fail "the workflow lists no Python version to check"
+pass "pyright strict, for Linux and macOS, on Python ${checked_versions[*]}"
 
 # Warnings are errors. pytest exits non-zero when it collects nothing, so an empty
 # selection fails here rather than passing.

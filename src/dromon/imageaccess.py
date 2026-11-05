@@ -26,6 +26,12 @@ caught only at the check. The size limit is on the file's bytes, which bounds th
 transfer and not the model's cost, since that follows the image's dimensions, and
 Dromon does not decode an image, only checks that the whole file is one complete
 container of the type its name claims.
+
+**Round 15, item 6, not done.** Re-encoding the pixels or stripping the non-pixel
+chunks was asked for. Dromon never holds the bytes the engine reads, it reads a file to
+check it and discards them, so the engine would have to be made to read a copy, which
+only Claude Code's ``PreToolUse`` hook might allow, unverified, and Codex and Grok
+cannot be given. ``docs/protocol/LINE_CONFIG.md`` records the rest.
 """
 
 import os

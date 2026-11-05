@@ -907,7 +907,7 @@ def test_confining_engines_follow_the_capability_table() -> None:
         )
         == CONFINING_ENGINES
     )
-    assert "grok-build" not in CONFINING_ENGINES
+    assert "grok-build" in CONFINING_ENGINES
 
 
 def test_the_former_and_the_new_owner_are_told_at_their_next_turn(

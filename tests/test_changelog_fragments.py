@@ -785,13 +785,34 @@ def test_a_dry_run_changes_nothing(release_root: Path) -> None:
 # The gate and the documents.
 
 
-def test_the_gate_shows_a_skip_as_a_skip(tmp_path: Path) -> None:
-    """Run the real check.sh with a stand-in `uv`, so the gate's own lines are read."""
+UV_STAND_IN = """#!/bin/sh
+case "$*" in *pyright*) echo "$*" >> "$UV_LOG" ;; esac
+if [ -n "$UV_FAIL" ]; then
+    case "$*" in *"$UV_FAIL"*) exit 3 ;; esac
+fi
+exit 0
+"""
+"""A `uv` that records each pyright call in `$UV_LOG`, fails a call containing
+`$UV_FAIL`, and succeeds for everything else, so check.sh runs end to end."""
+
+
+def gate_repository(tmp_path: Path, workflow: str | None = None) -> tuple[Path, Path]:
+    """A repository holding the real check.sh and a stand-in `uv`, and the directory
+    of the stand-in. `workflow` replaces the continuous integration workflow."""
     root = tmp_path / "repository"
     root.mkdir()
     (root / "scripts").mkdir()
     shutil.copy2(REPOSITORY / "scripts" / "check.sh", root / "scripts" / "check.sh")
     shutil.copy2(SCRIPT, root / "scripts" / "assemble_changelog.py")
+    shutil.copy2(
+        REPOSITORY / "scripts" / "ci_pythons.py", root / "scripts" / "ci_pythons.py"
+    )
+    (root / ".github" / "workflows").mkdir(parents=True)
+    target = root / ".github" / "workflows" / "ci.yml"
+    if workflow is None:
+        shutil.copy2(REPOSITORY / ".github" / "workflows" / "ci.yml", target)
+    else:
+        target.write_text(workflow, encoding="utf-8")
     (root / "CHANGELOG.md").write_text(collapse_text(REPEATED), encoding="utf-8")
     (root / "README.md").write_text("# Example\n", encoding="utf-8")
     ignore = "/tm" + "p/*\n!/tm" + "p/.gitkeep\n"
@@ -800,7 +821,7 @@ def test_the_gate_shows_a_skip_as_a_skip(tmp_path: Path) -> None:
     (root / "tmp" / ".gitkeep").write_text("", encoding="utf-8")
     stand_in = tmp_path / "bin"
     stand_in.mkdir()
-    (stand_in / "uv").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (stand_in / "uv").write_text(UV_STAND_IN, encoding="utf-8")
     (stand_in / "uv").chmod(0o755)
     git(root, "init", "-q")
     git(root, "config", "user.name", "Test")
@@ -808,6 +829,26 @@ def test_the_gate_shows_a_skip_as_a_skip(tmp_path: Path) -> None:
     git(root, "checkout", "-q", "-b", "side")
     git(root, "add", ".")
     git(root, "commit", "-q", "-m", "base")
+    return root, stand_in
+
+
+def run_gate(
+    root: Path, stand_in: Path, **extra: str
+) -> subprocess.CompletedProcess[str]:
+    environment = {**os.environ, "PATH": f"{stand_in}:{os.environ['PATH']}", **extra}
+    return subprocess.run(  # noqa: S603
+        ["bash", "scripts/check.sh"],  # noqa: S607
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+
+
+def test_the_gate_shows_a_skip_as_a_skip(tmp_path: Path) -> None:
+    """Run the real check.sh with a stand-in `uv`, so the gate's own lines are read."""
+    root, stand_in = gate_repository(tmp_path)
     environment = {**os.environ, "PATH": f"{stand_in}:{os.environ['PATH']}"}
     skipped = subprocess.run(  # noqa: S603
         ["bash", "scripts/check.sh"],  # noqa: S607
@@ -866,3 +907,83 @@ def test_the_contributor_documents_describe_fragments(path: str) -> None:
     text = (REPOSITORY / path).read_text(encoding="utf-8")
     assert "changes/" in text
     assert "entry under `[Unreleased]`" not in text
+
+
+# Round 15 review, G4. The gate's pyright loop, run end to end with a stand-in `uv`.
+
+CALLS = [
+    "run --no-sync pyright --pythonplatform Linux --pythonversion 3.12",
+    "run --no-sync pyright --pythonplatform Darwin --pythonversion 3.12",
+    "run --no-sync pyright --pythonplatform Linux --pythonversion 3.15",
+    "run --no-sync pyright --pythonplatform Darwin --pythonversion 3.15",
+]
+
+
+def test_the_gate_runs_pyright_for_every_version_and_platform(tmp_path: Path) -> None:
+    root, stand_in = gate_repository(tmp_path)
+    log = tmp_path / "uv.log"
+    done = run_gate(root, stand_in, UV_LOG=str(log))
+    assert done.returncode == 0, done.stderr
+    assert log.read_text(encoding="utf-8").splitlines() == CALLS
+    assert "ok: pyright strict, for Linux and macOS, on Python 3.12 3.15" in done.stdout
+
+
+@pytest.mark.parametrize("failing", CALLS)
+def test_the_gate_fails_when_pyright_fails_for_any_one_version_or_platform(
+    tmp_path: Path, failing: str
+) -> None:
+    root, stand_in = gate_repository(tmp_path)
+    log = tmp_path / "uv.log"
+    needle = failing.removeprefix("run --no-sync pyright ")
+    done = run_gate(root, stand_in, UV_LOG=str(log), UV_FAIL=needle)
+    assert done.returncode != 0
+    assert "ok: pyright" not in done.stdout and "ok: pytest" not in done.stdout
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        "name: CI\n",
+        "python:\n  - '3.12'\n",
+        'python: ["3.12"]\ninclude:\n  - python: "3.13"\n',
+    ],
+)
+def test_the_gate_fails_without_running_pyright_when_the_versions_cannot_be_read(
+    tmp_path: Path, workflow: str
+) -> None:
+    root, stand_in = gate_repository(tmp_path, workflow)
+    log = tmp_path / "uv.log"
+    done = run_gate(root, stand_in, UV_LOG=str(log))
+    assert done.returncode != 0
+    assert "could not be read" in done.stdout + done.stderr
+    assert not log.exists(), "pyright ran although the versions could not be read"
+    assert "ok: pyright" not in done.stdout
+
+
+def test_the_gate_does_not_default_a_version_when_the_reader_fails(
+    tmp_path: Path,
+) -> None:
+    """A reader that prints a version and then fails must not pass the gate, which
+    pins the failed-read check against being turned into a default."""
+    root, stand_in = gate_repository(tmp_path)
+    (root / "scripts" / "ci_pythons.py").write_text(
+        "import sys\nprint('3.12')\nsys.exit(1)\n", encoding="utf-8"
+    )
+    log = tmp_path / "uv.log"
+    done = run_gate(root, stand_in, UV_LOG=str(log))
+    assert done.returncode != 0
+    assert not log.exists() and "ok: pyright" not in done.stdout
+
+
+def test_the_gate_fails_when_the_reader_succeeds_with_no_version(
+    tmp_path: Path,
+) -> None:
+    """Pins the check that at least one version was checked, which no workflow reaches
+    through the real reader, since it already fails on none."""
+    root, stand_in = gate_repository(tmp_path)
+    (root / "scripts" / "ci_pythons.py").write_text("", encoding="utf-8")
+    log = tmp_path / "uv.log"
+    done = run_gate(root, stand_in, UV_LOG=str(log))
+    assert done.returncode != 0
+    assert "lists no Python version" in done.stdout + done.stderr
+    assert not log.exists() and "ok: pyright" not in done.stdout

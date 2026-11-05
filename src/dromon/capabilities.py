@@ -268,20 +268,21 @@ GROK: Final = EngineTable(
     engine="grok-build",
     display="Grok",
     minimum_version=None,
-    tested_on=None,
+    tested_on="2026-11-05",
     resume=Known.YES,
     kept_session=Known.NO,
     own_tools=Known.UNKNOWN,
     deny_before_run=Known.UNKNOWN,
-    read_only_workdir=Known.UNKNOWN,
+    read_only_workdir=Known.YES,
     cost_report=Known.NO,
     max_turns=Known.NO,
     credential_visible=Known.UNKNOWN,
     sign_in_check=Known.UNKNOWN,
     mcp_http_sse_headers=Known.NO,
 )
-"""Grok Build, never run for a turn, as ``GROK.md`` records. An ``initialize`` answer
-from Grok Build 1.0.70, which runs no model, was observed, and it advertised
+"""Grok Build. Operator live checks are recorded in ``GROK.md``.
+An ``initialize`` answer from Grok Build 1.0.70, which runs no model, was observed.
+It advertised
 ``loadSession``, which the adapter uses to resume. Kept sessions are refused, and Grok
 reports no cost and the driver's ``max_turns`` is not enforced. Whether Dromon's tools
 reach Grok under the ``toolName`` the adapter requires is the first step of
@@ -289,10 +290,10 @@ reach Grok under the ``toolName`` the adapter requires is the first step of
 built-in tool asks before it runs in the ``default`` mode is not documented, so
 ``deny_before_run`` is unknown. Grok names its cached sign-in, and that it is a
 subscription is an inference, so ``credential_visible`` is unknown. The adapter
-selects the ``dromon-reader`` profile for a read-only workdir, but no live run has shown
-that profile deny a write to the worktree, so ``read_only_workdir`` is unknown. **Review
-of read-only seats, finding 3.** The adapter refuses a read-only working directory while
-this is not ``YES``, so a probe that confirms the profile lifts the refusal here.
+selects the ``dromon-reader`` profile for a read-only workdir. **Fact, operator probe
+of 2026-11-05 on Grok Build 1.0.70 at daemon 9296036.** Shell writes to both the
+worktree and tmp failed with Operation not permitted and created no file, so
+``read_only_workdir`` is ``YES``. Profile checks remain required on every turn.
 **Second round, findings 1 and 2.**"""
 
 ANTIGRAVITY: Final = EngineTable(

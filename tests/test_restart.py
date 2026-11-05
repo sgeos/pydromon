@@ -883,7 +883,7 @@ def test_dromon_restart_stops_nothing_when_the_installed_code_does_not_start(
     monkeypatch.setattr(cli, "_preflight", refuse)
     assert cli._restart(cli_paths, namespace()) == exits.FAILURE  # pyright: ignore[reportPrivateUsage]
     assert sent == [Operation.STATUS]
-    assert checked and checked[0][-2:] == ["--hold-wakes", "--check"]
+    assert checked and checked[0][-3:] == ["--hold-wakes", "--check", "--check-engines"]
     assert "was not stopped: status 1: SyntaxError" in capsys.readouterr().err
 
 
@@ -1441,6 +1441,7 @@ def test_the_preflight_runs_the_daemon_s_check_with_the_running_options(
         "--tick-seconds",
         "0.5",
         "--check",
+        "--check-engines",
     ]
     assert cli._options_of({"options": ["--hold-wakes", 3]}) == []  # pyright: ignore[reportPrivateUsage]
     assert cli._options_of({"options": "--hold-wakes"}) == []  # pyright: ignore[reportPrivateUsage]
@@ -1617,6 +1618,18 @@ def test_a_restart_the_preflight_passes_goes_on_to_the_successor(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    real_preflight = cli._preflight  # pyright: ignore[reportPrivateUsage]
+
+    def preflight(
+        argv: Sequence[str],
+        runtime_dir: Path | None = None,
+        environment: Mapping[str, str] | None = None,
+    ) -> str | None:
+        # Keep this real static check, while adapter handshakes use scripted tests.
+        assert argv[-1] == "--check-engines"
+        return real_preflight(argv[:-1], runtime_dir, environment)
+
+    monkeypatch.setattr(cli, "_preflight", preflight)
     monkeypatch.setattr(restart, "POLL_SECONDS", 1e-6)
     monkeypatch.setattr(cli, "RESTART_POLL_SECONDS", 0.0)
     config_path(paths.state_dir).write_text(AGREEING)
@@ -1637,3 +1650,315 @@ def test_a_restart_the_preflight_passes_goes_on_to_the_successor(
     assert sent[:3] == [Operation.STATUS, Operation.START_CONTEXT, Operation.RESTART]
     assert "restarted, pid 4242" in capsys.readouterr().out
     assert "gamma" not in replay(paths.event_log).lines
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_launch_checks_report_each_line_and_never_run_turns(
+    world: World,
+    paths: ProjectPaths,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failed: bool,
+) -> None:
+    from dromon.engine import EngineRefused
+
+    checked: list[str] = []
+    closed: list[bool] = []
+
+    class Checked:
+        async def check_start(self) -> None:
+            checked.append("checked")
+            if failed and len(checked) == 1:
+                raise EngineRefused("unexpected argument --deny")
+
+        async def run_turn(self, prompt: str) -> TurnReport:
+            raise AssertionError("startup checks must not send a prompt")
+
+    def build(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> Checked:
+        assert tools
+        assert spec.config == world.scheduler.engine_config(spec.line_id)
+        return Checked()
+
+    class Server:
+        async def __aenter__(self) -> "Server":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            closed.append(True)
+
+    socket_path = tmp_path / "check.sock"
+
+    async def start(*args: object, **kwargs: object) -> Server:
+        socket_path.touch()
+        return Server()
+
+    monkeypatch.setattr(world.scheduler, "_engine_factory", build)
+    monkeypatch.setattr(daemon.asyncio, "start_unix_server", start)
+    target = make_daemon(world, paths)
+    assert asyncio.run(daemon.check_engine_launches(target, socket_path)) == (
+        not failed
+    )
+    assert len(checked) == 2
+    assert closed == [True]
+    assert not socket_path.exists()
+    output = capsys.readouterr().err
+    assert "line beta engine claude-code passed" in output
+    assert ("line alpha engine claude-code failed" in output) == failed
+    assert world.prompts == {}
+
+
+def test_engine_launch_checks_are_opt_in_for_check_mode(
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options: list[bool] = []
+
+    def run_checks(paths: ProjectPaths, **kwargs: object) -> int:
+        assert kwargs["check_only"] is True
+        options.append(kwargs["launch_checks"] is True)
+        return exits.OK
+
+    monkeypatch.setattr(daemon, "run", run_checks)
+    base = ["--project", str(paths.root), "--runtime-dir", str(paths.runtime_dir)]
+    assert daemon.main([*base, "--check"]) == exits.OK
+    assert daemon.main([*base, "--check", "--check-engines"]) == exits.OK
+    assert daemon.main([*base, "--check-engines"]) == exits.USAGE
+    assert options == [False, True]
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_check_mode_runs_effective_lines_without_changing_the_live_log(
+    live: World,
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    failed: bool,
+) -> None:
+    config_path(paths.state_dir).write_text(AGREEING)
+    before = digest(paths.event_log)
+    checked: list[str] = []
+
+    async def check(target: Daemon, socket_path: Path) -> bool:
+        assert socket_path.parent != paths.runtime_dir
+        assert target.log.path != paths.event_log
+        checked.extend(sorted(target.log.state.lines))
+        return not failed
+
+    monkeypatch.setattr(daemon, "check_engine_launches", check)
+    expected = exits.FAILURE if failed else exits.OK
+    assert daemon.run(paths, check_only=True, launch_checks=True) == expected
+    assert checked == ["alpha", "gamma"]
+    assert digest(paths.event_log) == before
+    assert leftovers(paths) == []
+
+
+def test_startup_tool_handlers_refuse_without_running_the_original(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools_seen: list[SdkMcpTool[Any]] = []
+
+    def build(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> Scripted:
+        tools_seen.extend(tools)
+        return Scripted(spec, world)
+
+    monkeypatch.setattr(world.scheduler, "_engine_factory", build)
+    before = len(world.log.state.messages)
+    world.scheduler.engine_for("alpha", startup_only=True)
+    assert tools_seen
+
+    async def call_tool() -> dict[str, Any]:
+        return await tools_seen[0].handler({})
+
+    result = asyncio.run(call_tool())
+    assert result["isError"] is True
+    assert len(world.log.state.messages) == before
+
+
+@pytest.mark.socket
+def test_private_startup_bridge_serves_tools_but_refuses_calls(
+    world: World,
+    paths: ProjectPaths,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dromon.protocol import decode_response
+
+    short_runtime.mkdir(mode=0o700)
+    socket_path = short_runtime / "check.sock"
+    target = make_daemon(world, paths)
+    listed: list[str] = []
+
+    class Checked:
+        session_id: str | None = None
+
+        def __init__(self, line_id: str) -> None:
+            self.line_id = line_id
+
+        async def check_start(self) -> None:
+            reader, writer = await asyncio.open_unix_connection(socket_path)
+            args: dict[str, object] = {
+                "line": self.line_id,
+                "token": target.line_tokens.issue(self.line_id),
+            }
+            try:
+                writer.write(
+                    encode_request(Request("tools", Operation.AGENT_TOOLS, args))
+                )
+                await writer.drain()
+                response = decode_response(await reader.readline())
+                assert response.ok and response.result is not None
+                assert response.result["tools"]
+                listed.append(self.line_id)
+                writer.write(
+                    encode_request(Request("call", Operation.AGENT_CALL, args))
+                )
+                await writer.drain()
+                response = decode_response(await reader.readline())
+                assert not response.ok
+                assert (
+                    response.error_message
+                    == "engine startup checks permit tool discovery only"
+                )
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        async def run_turn(self, prompt: str) -> TurnReport:
+            raise AssertionError("no prompts")
+
+    def build(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> Checked:
+        return Checked(spec.line_id)
+
+    monkeypatch.setattr(world.scheduler, "_engine_factory", build)
+    assert asyncio.run(daemon.check_engine_launches(target, socket_path))
+    assert listed == ["alpha", "beta"]
+    assert not socket_path.exists()
+
+
+@pytest.mark.parametrize("code", [0, 1])
+def test_operator_engine_check_shows_per_line_results_and_returns_failure(
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    code: int,
+) -> None:
+    def execute(
+        argv: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        assert argv[-2:] == ["--check", "--check-engines"]
+        assert kwargs["capture_output"] is True
+        result = "passed" if code == 0 else "failed: invalid MCP merge"
+        return subprocess.CompletedProcess(
+            argv, code, "", f"dromond: line alpha engine codex {result}\n"
+        )
+
+    monkeypatch.setattr(cli.subprocess, "run", execute)
+    result = cli.main(
+        [
+            "--project",
+            str(paths.root),
+            "--runtime-dir",
+            str(paths.runtime_dir),
+            "check-engines",
+        ]
+    )
+    assert result == (exits.OK if code == 0 else exits.FAILURE)
+    assert "line alpha engine codex" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("retired", [False, True])
+def test_inactive_line_does_not_build_an_engine_or_block_checks(
+    world: World,
+    paths: ProjectPaths,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    retired: bool,
+) -> None:
+    if retired:
+        world.scheduler.retire_line(ANA, "alpha")
+    else:
+        world.scheduler.hibernate("alpha")
+    built: list[str] = []
+
+    class Checked:
+        async def check_start(self) -> None:
+            return
+
+        async def run_turn(self, prompt: str) -> TurnReport:
+            raise AssertionError("no prompt")
+
+    def build(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> Checked:
+        assert spec.line_id != "alpha", "inactive worktree must not be opened"
+        built.append(spec.line_id)
+        return Checked()
+
+    class Server:
+        async def __aenter__(self) -> "Server":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return
+
+    socket_path = tmp_path / "inactive.sock"
+
+    async def start(*args: object, **kwargs: object) -> Server:
+        socket_path.touch()
+        return Server()
+
+    monkeypatch.setattr(world.scheduler, "_engine_factory", build)
+    monkeypatch.setattr(daemon.asyncio, "start_unix_server", start)
+    assert asyncio.run(
+        daemon.check_engine_launches(make_daemon(world, paths), socket_path)
+    )
+    assert built == ["beta"]
+    condition = "retired" if retired else "hibernated"
+    assert f"line alpha skipped because it is {condition}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("engine_name", ["cursor-agent", "antigravity"])
+def test_uncheckable_engines_are_not_launched_and_do_not_refuse_restart(
+    world: World,
+    paths: ProjectPaths,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    engine_name: str,
+) -> None:
+    # Select each real model-to-engine mapping through the scheduler boundary.
+    model = next(
+        name for name, engine in daemon.ENGINE_OF.items() if engine == engine_name
+    )
+
+    def model_of(line_id: str) -> str:
+        return model
+
+    monkeypatch.setattr(world.scheduler, "model_of", model_of)
+
+    def build(*args: object, **kwargs: object) -> None:
+        raise AssertionError("uncheckable engines must not be constructed")
+
+    class Server:
+        async def __aenter__(self) -> "Server":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return
+
+    socket_path = tmp_path / "uncheckable.sock"
+
+    async def start(*args: object, **kwargs: object) -> Server:
+        socket_path.touch()
+        return Server()
+
+    monkeypatch.setattr(world.scheduler, "_engine_factory", build)
+    monkeypatch.setattr(daemon.asyncio, "start_unix_server", start)
+    assert asyncio.run(
+        daemon.check_engine_launches(make_daemon(world, paths), socket_path)
+    )
+    output = capsys.readouterr().err
+    for line_id in ("alpha", "beta"):
+        assert f"line {line_id} engine {engine_name} not checkable" in output
+    assert "passed" not in output
+    assert not socket_path.exists()

@@ -95,7 +95,7 @@ message and leaving the old daemon running.
 
 - **How.** The client reads `status`, whose `options` give the running daemon's
   command line, and runs `python -m dromon.daemon --project ROOT --runtime-dir DIR
-  OPTIONS --check` on its own interpreter, which loads the code installed now, as the
+  OPTIONS --check --check-engines` on its own interpreter, which loads the code installed now, as the
   successor will. The check is `run` in `dromon.daemon` itself with `check_only`, so
   every check a start makes is a check of the preflight, in the same order, and a
   check added to a start later is covered without a second list to keep.
@@ -146,8 +146,8 @@ message and leaving the old daemon running.
 - **The reason.** The client prints the check's lines that begin `dromond:`, which are
   the reasons a real start prints, or else its last line, as for code that does not
   import.
-- **Its bound.** The check may take 120 seconds, since it replays the whole log as a
-  start does.
+- **Its bound.** The check may take 1800 seconds. Each engine startup has a
+  90 second deadline within that total. A timeout refuses the restart.
 
 | The check covers | Because |
 |---|---|
@@ -162,12 +162,12 @@ message and leaving the old daemon running.
 | Only a real start reveals | Because |
 |---|---|
 | The lock | The running daemon holds it, so the check does not take it |
-| Sockets, the TLS listener and peer connections | The check makes none, and never removes the running daemon's |
+| Operator sockets, the TLS listener and peer connections | The check makes only a private tool discovery socket and never removes the running daemon's sockets |
 | The open-federation registry | Registering would meet the running daemon's own entry, so the check does not write it, and the refusals of a name on the disclosure list or a registry inside the project are found only at the start |
 | The fleet index | A check writes nothing of the operator's, so it neither makes the index nor writes an entry in it, and a failure to make or write it is found only at the start, which starts unlisted then, as [`FLEET.md`](../architecture/FLEET.md) gives |
 | The teacher | Bringing it up loads a model, so the check does not |
 | Recovery, the survivor scan and the process-table probe | They run in `serve`, or touch the process table, which the check does not |
-| Engines | No engine is built until a line's first turn, at a start as at a check |
+| Model responses and post-prompt checks | Startup checks send no prompt and cannot verify a model response or checks requiring one |
 | What the drain records | The copy is taken before the request, so mail, lines or roles recorded during the drain are not checked. A line created during a drain can still make the successor refuse |
 | The rest of the daemon's environment | From round 14, item 6, the check takes the daemon's `SSH_AUTH_SOCK` and `DROMON_REGISTRY_DIR`, but any other variable is the client's, so a refusal that depended on one would differ. None is known to |
 | An installed checkout that moves after the check | The successor loads what is installed when it starts |
@@ -211,3 +211,47 @@ the start path with a flag that swaps the log for a copy and stops before the fi
 side effect outside the copy, so a port keeps one start path, not two. The copy is the
 schema and the events below a sequence bound read once, which a port with any store can
 make.
+
+## Engine startup preflight
+
+Fact. Restart preflight now includes `--check-engines`. An operator can run
+`dromond --check --check-engines` or `dromon check-engines` outside engine sandboxes.
+Plain `dromond --check` retains its static checks without launching engines.
+Hibernated and retired lines are skipped with an explicit note before their
+worktrees or engine configurations are opened. They cannot refuse a restart.
+Each remaining effective line in the copied state is built through the production factory,
+including lines recorded only in the event log and the current role access policy.
+The check reports each supported line and engine as passed or failed.
+Cursor and Antigravity have no no-prompt startup check. They are reported as not
+checkable and skipped without refusing restart before adapter construction.
+Their launch arguments and configuration remain unverified by preflight. Any failure refuses
+restart before the client sends its restart request.
+
+Fact. Codex reuses launch preparation, initialization, account reading, fresh thread
+creation and isolation checks. Grok reuses home and profile validation,
+initialization and fresh session creation with its model and server checks.
+Pi reuses credential checking and session state inspection. Claude Code connects
+through the same Software Development Kit factory and control initialization as a
+turn. Every adapter closes before sending its first prompt. Unsupported adapters
+are refused rather than tested with a model turn. Kept connections are closed too.
+
+Fact. The engine arguments, permissions, environment construction and tool schemas
+come from the turn startup paths. Grok and Codex checks open fresh sessions so they
+do not compete with active resumed sessions. Bridge based engines use a private
+runtime socket and fresh tokens in the copied state. The socket allows discovery
+only. In process Dromon tool handlers also refuse every call during the check.
+Launch reports belong to the private check directory. The live event log and the
+running daemon sockets are not modified.
+
+Fact. Launching can create engine session records and execute ordinary engine
+startup hooks or start configured Model Context Protocol servers. The check does
+not issue a model query. It does not prove that third party startup code is free
+of effects or spending. Operators should run it with the same trusted engine and
+server configuration that they intend to restart.
+
+Fact. Claude Code emits its later `system/init` evidence with a prompt. The check
+therefore verifies its control initialization but cannot verify the model,
+credential and tool evidence carried only by that later message. Checks after a
+prompt and real model responses remain turn time checks. Scripted regression
+servers cover rejected launch arguments and rejected Model Context Protocol
+configuration merges. These tests do not establish installed engine compatibility.

@@ -269,6 +269,19 @@ undelivered message starts in the post office. Lines send through an in-process
 `send_message` tool whose sender the daemon fixes, and operators through `dromon send`.
 A per-line turn cap stops a runaway exchange until the conversation limits of task 7.
 
+**Round 15, item 5. No turn that only repeats an answer.** A line can reply to a
+message by its identifier before any turn has shown it, and the message stays
+undelivered. A tick used to start a turn to show it, and a release of a held line did
+the same, so the line was woken only to answer what it had answered, and the turn
+counted against its limits. A tick now delivers such mail without a turn when every
+message waiting for the line has been replied to or acknowledged, and the release of a
+held line takes the same path. One unanswered message among them starts the turn as
+before and the answered ones are shown with it. A compaction wake and a restart note
+always start their turn, because the turn is how they take effect. **Limit.** The rule
+reads the line's own reply, so it cannot tell a reply made by mistake from one made
+with understanding. Reading a message delivers it, so a message the line read never
+waits.
+
 **Inference.** The tick is the unit a batched update loop of Keleusma stream processors
 schedules, so the Keleusma version can keep these semantics exactly.
 
