@@ -117,6 +117,7 @@ relay = "tail"          # the route of operator ana's mail
 | `leases.ttl_seconds` | integer in [60, 86400] | 10800 | How long an acquired lease lasts unless released first |
 | `runs.commands` | table of names to arrays of text | none | The commands lines may start as supervised runs, at most 64, each name an identifier and each command its program and at most 63 arguments, never a shell string, as [`RUNS.md`](../architecture/RUNS.md) specifies. A declared command runs with the daemon's authority, outside any line's sandbox. Added on 2026-10-31 |
 | `runs.commit_commands` | table of names to arrays of text | none | Commands a line, a line that only reads its working directory included, may start on a commit it names, in a checkout the daemon makes in its state directory, as the commit run section of [`RUNS.md`](../architecture/RUNS.md) specifies. Each as in `runs.commands`, and no name may be in both tables. Declaring one requires `runs.commit_refs.patterns`. Added in round 14 |
+| `runs.parameters.COMMAND.NAME` | table with `pattern` text and an optional `description` | none | A parameter of the declared command COMMAND, whose argument `{NAME}` a line's `start_run` replaces with a value it gives in `arguments`. `pattern` is a regular expression of at most 256 bytes without `(?`, backreferences or possessive quantifiers, which the whole value must match, and `description` printable text of at most 256 bytes. Every placeholder of a command must be declared and every declaration used, at most eight a command. A value is also 1 to 256 printable bytes and never begins with `-`, as the parameter section of [`RUNS.md`](../architecture/RUNS.md) specifies with its trust argument. Added in the task of 2026-11-05 |
 | `runs.commit_refs.patterns` | array of text | none | The ref patterns, 1 to 16, each beginning `refs/remotes/REMOTE/` with a remote named without wildcards, without spaces or `..`, as `git for-each-ref` reads them. A commit run's commit must be the tip of a ref matching one. A pattern under `refs/heads`, `refs/tags` or anywhere else outside `refs/remotes` is refused, since a line's sandbox may write those refs. Added in round 14, and narrowed to remote-tracking tips in its review of 1449c5c |
 | `limits.*` | as in `CLIENT.md` | 12, 2, 0 | The conversation limits of every line |
 | `wake.every_ticks` | integer in [1, 3600] | 1 | The wake policy of every line |
@@ -350,6 +351,12 @@ stops the start, or refuses the reload and keeps the previous list.
   or `note`, only when the call offered text in that one field. A call offering
   several fields receives a generic refusal even when only one matches. The round 4
   review F1 rule prevents learning more than one bit from each counted refusal.
+  **Task of 2026-11-05, item 1, the operator's decision.** `set_brief` is the exception. Its
+  refusal names the one field among `task`, `decisions`, `next_action` and
+  `artifacts` that matched, so a line knows what to reword, at a cost of at most two
+  bits a refusal. Two or more matching fields still get the generic refusal, so no
+  refusal names more than one field, and none names a term, a line or a position,
+  which the operator declined.
 - **Not checked.** Messages from operators, who hold authority, and the questions the
   daemon asks on a held line's behalf.
 - **Secrecy.** Terms are never logged, returned or stored. Errors about the file name
@@ -377,9 +384,17 @@ stops the start, or refuses the reload and keeps the previous list.
   including a list, is recorded as one
   `disclosure_checked` event, without the text or its name, as [`EVENT_LOG.md`](EVENT_LOG.md)
   specifies. **Proposed.** A line may
-  check at most 10 times in any 3,600 seconds, counted from the recorded times on the
+  have at most 10 failing checks in any 3,600 seconds, counted from the recorded times on the
   wall clock, so the limit survives a restart. Every answer says whether a text holds
-  a term, so an unlimited check would let a line test candidate words one by one. A
+  a term, so an unlimited check would let a line test candidate words one by one.
+  **Task of 2026-11-05, item 1, the operator's decision.** A check that passes is recorded and
+  spends nothing, as a tool's text that passes never did, and the answer says which
+  happened. Once the failures reach the limit, every check is refused unread, one that
+  would pass too, since answering only the passes would tell a line which texts fail.
+  **Residual risk.** A line may now test candidates without limit until one fails, so
+  the limit bounds the terms a line can confirm in an hour rather than the candidates
+  it tries. This was already true of the other tools, whose passing text was never
+  counted, and the guard is against accidents, as the limits above say. A
   file is read as `write_scratch` writes, walked without following a link, and only
   when it is a regular file of the daemon's user with one name, outside every
   directory Dromon protects, and at most 16 MiB combined. A refusal, of a missing list, a limit

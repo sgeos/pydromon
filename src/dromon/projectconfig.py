@@ -55,7 +55,8 @@ from dromon.model import (
     LineSession,
     check_workdir,
 )
-from dromon import commitruns
+from dromon import commitruns, runparams
+from dromon.runparams import RunParameter
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, SandboxError, merge, parse_sandbox
 from dromon.settings import SettingsConfig, SettingsError, parse_settings
@@ -113,8 +114,11 @@ LIMIT_KEYS: Final = frozenset(
 )
 WAKE_KEYS: Final = frozenset({"every_ticks"})
 LEASE_KEYS: Final = frozenset({"names", "ttl_seconds"})
-RUN_KEYS: Final = frozenset({"commands", "commit_commands", "commit_refs"})
+RUN_KEYS: Final = frozenset(
+    {"commands", "commit_commands", "commit_refs", "parameters"}
+)
 REF_KEYS: Final = frozenset({"patterns"})
+PARAMETER_KEYS: Final = frozenset({"pattern", "description"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +128,11 @@ class RunTables:
     commands: dict[str, tuple[str, ...]]
     commit_commands: dict[str, tuple[str, ...]]
     commit_refs: tuple[str, ...]
+    parameters: dict[str, dict[str, RunParameter]] = field(
+        default_factory=dict[str, dict[str, RunParameter]]
+    )
+    """**Task of 2026-11-05, item 3.** Each command's parameters, by command and
+    name, for the commands that declare any."""
 
 
 MAX_RUN_COMMANDS: Final = 64
@@ -311,6 +320,11 @@ class ProjectConfig:
     on a commit it names, in a checkout the daemon makes."""
     run_commit_refs: tuple[str, ...] = ()
     """The ref patterns one of which must contain a commit run's commit."""
+    run_parameters: dict[str, dict[str, RunParameter]] = field(
+        default_factory=dict[str, dict[str, RunParameter]]
+    )
+    """**Task of 2026-11-05, item 3.** The parameters a line supplies, by command
+    and name, for the commands that declare any."""
     read_only_paths: tuple[str, ...] = ()
     """Project-relative-path entries denied write access under every line's workdir."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
@@ -512,6 +526,7 @@ class _Reader:
             run_commands=run_tables.commands,
             run_commit_commands=run_tables.commit_commands,
             run_commit_refs=run_tables.commit_refs,
+            run_parameters=run_tables.parameters,
             read_only_paths=read_only_paths,
             lines=lines,
             roles=roles,
@@ -620,7 +635,66 @@ class _Reader:
                 commitruns.check_patterns(found)
             except commitruns.CommitRefused as error:
                 raise self.fail("runs.commit_refs.patterns", str(error)) from error
-        return RunTables(commands, commit_commands, found)
+        parameters = self.run_parameters(
+            document.get("parameters", {}), {**commands, **commit_commands}
+        )
+        return RunTables(commands, commit_commands, found, parameters)
+
+    def run_parameters(
+        self, value: object, argvs: Mapping[str, tuple[str, ...]]
+    ) -> dict[str, dict[str, RunParameter]]:
+        """The ``[runs.parameters]`` table, one table per command of one table per
+        parameter, each with its ``pattern`` and an optional ``description``.
+        **Task of 2026-11-05, item 3.** Each command named must be declared, and
+        its placeholders and parameters must be the same, as
+        ``runparams.check_declared`` says, so a command holding a placeholder that no
+        parameter declares is refused too."""
+        if not isinstance(value, dict):
+            raise self.fail("runs.parameters", "must be a table")
+        found: dict[str, dict[str, RunParameter]] = {}
+        for command, declared in sorted(cast(dict[str, object], value).items()):
+            where = f"runs.parameters.{command}"
+            if command not in argvs:
+                raise self.fail(where, "names a command no run table declares")
+            if not isinstance(declared, dict):
+                raise self.fail(where, "must be a table")
+            entries = cast(dict[str, object], declared)
+            if len(entries) > runparams.MAX_PARAMETERS:
+                raise self.fail(
+                    where, f"declares more than {runparams.MAX_PARAMETERS} parameters"
+                )
+            parameters: dict[str, RunParameter] = {}
+            for name, entry in sorted(entries.items()):
+                key = f"{where}.{name}"
+                if runparams.NAME_PATTERN.fullmatch(name) is None:
+                    raise self.fail(key, f"{name!r} is not a parameter name")
+                fields = self.table(entry, key, PARAMETER_KEYS)
+                pattern = fields.get("pattern")
+                description = fields.get("description", "")
+                if not isinstance(pattern, str):
+                    raise self.fail(f"{key}.pattern", "must be a string")
+                if (
+                    not isinstance(description, str)
+                    or len(description.encode()) > runparams.MAX_DESCRIPTION_BYTES
+                    or not description.isprintable()
+                ):
+                    raise self.fail(
+                        f"{key}.description",
+                        "must be printable text of at most"
+                        f" {runparams.MAX_DESCRIPTION_BYTES} bytes",
+                    )
+                try:
+                    runparams.check_pattern(pattern)
+                except runparams.ParameterRefused as error:
+                    raise self.fail(f"{key}.pattern", str(error)) from error
+                parameters[name] = RunParameter(name, pattern, description)
+            found[command] = parameters
+        for command, argv in sorted(argvs.items()):
+            try:
+                runparams.check_declared(argv, found.get(command, {}))
+            except runparams.ParameterRefused as error:
+                raise self.fail(f"runs.parameters.{command}", str(error)) from error
+        return {name: declared for name, declared in found.items() if declared}
 
     def run_commands(self, value: object, where: str) -> dict[str, tuple[str, ...]]:
         """One table of run commands, each a program and its arguments."""

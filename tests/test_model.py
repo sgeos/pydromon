@@ -818,9 +818,18 @@ def test_a_line_keeps_only_its_latest_disclosure_check_times() -> None:
         for minute in range(model.MAX_DISCLOSURE_CHECKS + 2)
     ]
     for time in times:
-        state.apply(DisclosureChecked("alpha", time, 0))
+        state.apply(DisclosureChecked("alpha", time, 1))
     assert state.disclosure_checks == {
         "alpha": tuple(times[-model.MAX_DISCLOSURE_CHECKS :])
     }
+    # Task of 2026-11-05, item 1. A check that passed is recorded but keeps no time,
+    # so it
+    # spends nothing of the limit.
+    state.apply(DisclosureChecked("alpha", "2026-10-28T20:00:00Z", 0))
+    assert state.disclosure_checks["alpha"] == tuple(
+        times[-model.MAX_DISCLOSURE_CHECKS :]
+    )
+    state.apply(DisclosureChecked("beta", times[0], 0))
+    assert "beta" not in state.disclosure_checks
     with pytest.raises(EventRejected, match="no line"):
         state.apply(DisclosureChecked("omega", times[0], 0))

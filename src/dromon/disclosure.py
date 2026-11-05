@@ -45,16 +45,24 @@ def field_refusal(fields: Iterable[str]) -> str:
     return f"the {joined} {noun} {verb} a term from the project's disclosure list"
 
 
-def refusal(matched: Iterable[str], offered: int) -> str:
-    """Name a field only when the call offered text in that one field.
+def refusal(
+    matched: Iterable[str], offered: int, *, name_single_match: bool = False
+) -> str:
+    """Name a field only when the call offered text in that one field, or, with
+    ``name_single_match``, when exactly one of the fields offered matched.
 
     Round 4 review F1 bounds each counted refusal to one bit. Calls offering
     several fields receive the generic refusal even if only one field matches.
-    """
+    **Task of 2026-11-05, item 1, the operator's decision.** ``set_brief`` names the
+    one field that matched among the four it offers, so a refusal tells it what to
+    reword. That
+    answer says which of the fields matched, at most two bits for four fields, and
+    still never the term, its line or its position. Two or more matching fields get
+    the generic refusal, so no refusal names more than one field."""
     names = tuple(dict.fromkeys(matched))
     if not names:
         raise ValueError("a disclosure refusal must name at least one field")
-    if offered == 1 and len(names) == 1:
+    if len(names) == 1 and (offered == 1 or name_single_match):
         return field_refusal(names)
     return REFUSAL
 

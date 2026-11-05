@@ -23,7 +23,7 @@ from typing import Final, cast
 
 import dromon
 from dromon import __version__, buildinputs, exits, fleet, land, registry, restart, runs
-from dromon import syncenv
+from dromon import cilog, syncenv
 from dromon import proposals as proposal_store
 from dromon.client import (
     REQUEST_TIMEOUT_SECONDS,
@@ -94,6 +94,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "role": "show, create, update or delete roles, read their journals, or give,"
     " vacate or ask to hand over one",
     "run": "show supervised runs, or clear a lost one after inspecting what is left",
+    "ci-log": "copy a GitHub Actions run's failed job log into a line's scratch",
     "budget": "list the providers' stated budgets, or state one",
     "reload": "read the project file again and apply its lines, limits and wake policy",
     "config": "check the project file and show what it declares",
@@ -1927,6 +1928,69 @@ def _run(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _ci_log(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Copy a GitHub Actions run's failed job log into a line's scratch. **Task of
+    2026-11-05, item 4.** It runs ``gh`` as the operator in the project root, shows
+    the run and asks before copying unless ``--yes`` is given, keeps the log's last
+    ``cilog.MAX_LOG_BYTES``, and has the daemon write it under the line's scratch,
+    as ``cilog`` says. Nothing is copied on a no, a ``gh`` failure or a refusal."""
+    line_id: str = arguments.line_id
+    job: str | None = arguments.job
+    try:
+        run_id = cilog.check_id("run", arguments.run)
+        job_id = None if job is None else cilog.check_id("job", job)
+    except cilog.CiLogRefused as error:
+        print(f"dromon ci-log: {error}", file=sys.stderr)
+        return exits.USAGE
+    found = land.run_command(
+        cilog.summary_argv(run_id), paths.root, timeout=cilog.GH_SECONDS
+    )
+    if found.code != 0:
+        reason = found.stderr.strip()[:500]
+        print(
+            f"dromon ci-log: gh could not show run {run_id}: {reason}", file=sys.stderr
+        )
+        return exits.FAILURE
+    try:
+        summary = cilog.parse_summary(found.stdout)
+    except cilog.CiLogRefused as error:
+        print(f"dromon ci-log: {error}", file=sys.stderr)
+        return exits.FAILURE
+    for line in cilog.describe(run_id, summary):
+        print(line)
+    target = cilog.scratch_path(run_id, job_id)
+    if not arguments.yes and not land.ask_terminal(
+        f"Copy its failed steps' log into line {line_id}'s scratch as {target}?"
+    ):
+        print("dromon ci-log: not copied", file=sys.stderr)
+        return exits.FAILURE
+    log = land.run_command(
+        cilog.log_argv(run_id, job_id), paths.root, timeout=cilog.GH_SECONDS
+    )
+    if log.code != 0:
+        print(
+            f"dromon ci-log: gh could not give the log: {log.stderr.strip()[:500]}",
+            file=sys.stderr,
+        )
+        return exits.FAILURE
+    kept, total = cilog.tail(log.stdout)
+    text = cilog.document(run_id, job_id, summary, kept, total, arguments.operator)
+    args: dict[str, object] = {
+        "line_id": line_id,
+        "path": target,
+        "text": text,
+        "operator": arguments.operator,
+    }
+    result = _call(paths, "ci-log", Operation.SCRATCH_PLACE, args)
+    if isinstance(result, int):
+        return result
+    print(
+        f"copied {result['bytes']} bytes to {result['absolute']}, and line {line_id}"
+        " was told"
+    )
+    return exits.OK
+
+
 def _run_status(paths: ProjectPaths, run_id: str | None) -> int:
     """Print every scope's recent runs, or one run with its whole receipt. Round
     14, item 11, since an operator otherwise read ``run_ended`` from the log."""
@@ -2000,6 +2064,13 @@ def _run_details(view: dict[str, object]) -> list[str]:
     note = view.get("note")
     if note:
         details.append(f"note: {note}")
+    tail = view.get("output_tail")
+    if isinstance(tail, str) and tail:
+        # Task of 2026-11-05, item 2. The command's own output, quoted line by line
+        # so it cannot pass for the client's text. The daemon kept printable
+        # characters only.
+        details.append("output tail, untrusted, the command's own last lines:")
+        details.extend(f"  | {line}" for line in tail.splitlines())
     cleared_at = view.get("cleared_at")
     if cleared_at is not None:
         by = view.get("cleared_by")
@@ -2925,6 +2996,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "teacher": _teacher,
     "role": _role,
     "run": _run,
+    "ci-log": _ci_log,
     "budget": _budget,
     "agent": _agent,
     "peer": _peer,
@@ -3540,6 +3612,20 @@ def build_parser() -> argparse.ArgumentParser:
                 "--operator",
                 default=default_operator(),
                 help="who clears it, default %(default)s",
+            )
+        if name == "ci-log":
+            command.add_argument("line_id", help="the line whose scratch receives it")
+            command.add_argument("run", help="the GitHub Actions run, as gh shows it")
+            command.add_argument("--job", help="one failed job of the run, by its id")
+            command.add_argument(
+                "--yes",
+                action="store_true",
+                help="copy without asking, after showing the run",
+            )
+            command.add_argument(
+                "--operator",
+                default=default_operator(),
+                help="who copies it, default %(default)s",
             )
         if name == "budget":
             command.add_argument(

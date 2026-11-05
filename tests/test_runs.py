@@ -299,8 +299,9 @@ def test_a_receipt_ends_the_run_as_it_says_with_the_outputs_digest(
     digest = write_output(tmp_path, run, b"passed\n")
     receipt = runs.Receipt(RunStatus.EXITED, 3, "")
     runs.write_receipt(runs.receipt_path(tmp_path, run.run_id), receipt)
+    # Task of 2026-11-05, item 2. The run failed, so its output's tail is kept.
     assert runs.reconcile([run], tmp_path, lambda pid: None) == [
-        runs.Finding("r-1", RunStatus.EXITED, 3, "", digest, 7)
+        runs.Finding("r-1", RunStatus.EXITED, 3, "", digest, 7, None, "passed")
     ]
 
 
@@ -484,6 +485,8 @@ def test_a_supervisor_runs_its_command_once_released_and_writes_a_receipt(
         "",
         hashlib.sha256(output).hexdigest(),
         len(output),
+        None,
+        "built",
     )
 
 
@@ -642,8 +645,12 @@ def project(tmp_path: Path) -> Generator[Path]:
 
 
 def wait_for_supervisor(scheduler: Scheduler, run_id: str) -> None:
+    """Wait for the run's supervisor, unless its end is recorded already, which the
+    watcher of the task of 2026-11-05, item 2, does once the supervisor exits."""
     children = scheduler._run_children  # pyright: ignore[reportPrivateUsage]
-    children[run_id].wait(timeout=WAIT_SECONDS)
+    child = children.get(run_id)
+    if child is not None:
+        child.wait(timeout=WAIT_SECONDS)
 
 
 def harness_notes(log: EventLog, line_id: str) -> list[str]:

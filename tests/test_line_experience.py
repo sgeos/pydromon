@@ -1070,14 +1070,18 @@ def test_check_disclosure_answers_pass_or_fail_with_a_count(
     listed(world, tmp_path)
     text, error = world.call("check_disclosure", {"text": "clean\nlines"})
     assert not error and text.startswith("pass, 0 lines hold a term")
+    assert "A check that passes spends nothing." in text
+    assert f"You have {MAX_DISCLOSURE_CHECKS} of" in text
     body = "the CODENAME\nclean\nCodename and a Second Term\n"
     text, error = world.call("check_disclosure", {"text": body})
     assert not error and text.startswith("fail, 2 lines hold a term")
+    assert "This failure counts against the limit." in text
     (world.root / "notes.md").write_text("one codename line\nclean\n")
     text, error = world.call("check_disclosure", {"path": "notes.md"})
     assert not error and text.startswith("fail, 1 line holds a term")
-    left = MAX_DISCLOSURE_CHECKS - 3
-    assert f"You have {left} of {MAX_DISCLOSURE_CHECKS} checks left" in text
+    # Task of 2026-11-05, item 1. Only the two failures spent the limit.
+    left = MAX_DISCLOSURE_CHECKS - 2
+    assert f"You have {left} of {MAX_DISCLOSURE_CHECKS} failing checks left" in text
     assert "codename" not in text.casefold() and "second term" not in text.casefold()
     recorded = checks(world)
     assert [event.matched_lines for event in recorded] == [0, 2, 1]
@@ -1119,17 +1123,36 @@ def test_check_disclosure_multi_file_call_spends_one_limit_entry(
     world: World, tmp_path: Path
 ) -> None:
     listed(world, tmp_path)
-    (world.root / "one.md").write_text("clean\n")
-    (world.root / "two.md").write_text("also clean\n")
+    (world.root / "one.md").write_text("codename\n")
+    (world.root / "two.md").write_text("codename too\n")
     for _ in range(MAX_DISCLOSURE_CHECKS - 1):
-        _, error = world.call("check_disclosure", {"text": "clean"})
+        _, error = world.call("check_disclosure", {"text": "codename"})
         assert not error
     text, error = world.call("check_disclosure", {"paths": ["one.md", "two.md"]})
     assert not error and f"You have 0 of {MAX_DISCLOSURE_CHECKS}" in text
     assert len(checks(world)) == MAX_DISCLOSURE_CHECKS
+    # Once the failures reach the limit, a text that would pass is refused unread
+    # too, since answering only passes would say which texts fail.
     text, error = world.call("check_disclosure", {"text": "clean"})
-    assert error and "limit of 10 checks" in text
+    assert error and "limit of 10 failing checks and refusals" in text
     assert len(checks(world)) == MAX_DISCLOSURE_CHECKS
+
+
+def test_a_check_that_passes_spends_nothing(world: World, tmp_path: Path) -> None:
+    """Task of 2026-11-05, item 1, the operator's decision. Passing checks are
+    recorded, and
+    only failing ones count against the limit."""
+    listed(world, tmp_path)
+    for _ in range(MAX_DISCLOSURE_CHECKS * 3):
+        text, error = world.call("check_disclosure", {"text": "clean"})
+        assert not error and f"You have {MAX_DISCLOSURE_CHECKS} of" in text
+    assert len(checks(world)) == MAX_DISCLOSURE_CHECKS * 3
+    text, error = world.call("check_disclosure", {"text": "codename"})
+    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 1} of" in text
+    # A send that passes after many free checks is still not refused or held.
+    text, error = world.call("send_message", {"to": "@ana", "body": "clean"})
+    assert not error and text.startswith("sent as")
+    assert world.log.state.lines["alpha"].held_by is None
 
 
 def test_check_disclosure_is_limited_per_line_across_a_restart(
@@ -1137,23 +1160,23 @@ def test_check_disclosure_is_limited_per_line_across_a_restart(
 ) -> None:
     listed(world, tmp_path)
     for _ in range(MAX_DISCLOSURE_CHECKS):
-        _, error = world.call("check_disclosure", {"text": "clean"})
+        _, error = world.call("check_disclosure", {"text": "codename"})
         assert not error
     world.clock.now += timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS - 1)
     world.log.close()
     world.log = EventLog(world.log_path)
     world.start()
     listed(world, tmp_path)
-    text, error = world.call("check_disclosure", {"text": "codename"})
-    assert error and "next is allowed at 2026-10-26T10:00:00Z" in text
+    text, error = world.call("check_disclosure", {"text": "clean"})
+    assert error and "next check is allowed at 2026-10-26T10:00:00Z" in text
     assert len(checks(world)) == MAX_DISCLOSURE_CHECKS
-    # The window slides, so each check made an hour ago frees one place.
+    # The window slides, so each failure made an hour ago frees one place, and a
+    # pass spends none of it.
     world.clock.now += timedelta(seconds=1)
     text, error = world.call("check_disclosure", {"text": "clean"})
+    assert not error and f"You have {MAX_DISCLOSURE_CHECKS} of" in text
+    text, error = world.call("check_disclosure", {"text": "codename"})
     assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 1} of" in text
-    world.clock.now += timedelta(seconds=1)
-    text, error = world.call("check_disclosure", {"text": "clean"})
-    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 2} of" in text
 
 
 def test_check_disclosure_refuses_without_a_list_or_one_input(
@@ -1289,7 +1312,7 @@ def test_a_refusal_for_disclosure_spends_a_check(
     )
     assert [event.matched_lines for event in checks(world)] == [1]
     text, error = world.call("check_disclosure", {"text": "clean"})
-    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 2} of" in text
+    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 1} of" in text
 
 
 def test_the_role_and_proposal_tools_spend_a_check_too(
@@ -1307,6 +1330,56 @@ def test_the_role_and_proposal_tools_spend_a_check_too(
         with pytest.raises(LineToolRefused, match="contains a term"):
             call()
     assert len(checks(world)) == len(calls)
+
+
+@pytest.mark.parametrize(
+    ("field", "values"),
+    [
+        ("task", ("a codename task", "", (), "")),
+        ("decisions", ("task", "a Codename call", (), "")),
+        ("next_action", ("task", "", (), "say codename")),
+        ("artifacts", ("task", "", ("docs/a.md", "codename.md"), "")),
+    ],
+)
+def test_a_refused_brief_names_the_one_field_that_matched(
+    world: World,
+    tmp_path: Path,
+    field: str,
+    values: tuple[str, str, tuple[str, ...], str],
+) -> None:
+    """Task of 2026-11-05, item 1, the operator's decision. A refused ``set_brief``
+    names the
+    one field that matched among its four, and never the term."""
+    listed(world, tmp_path)
+    task, decisions, artifacts, next_action = values
+    with pytest.raises(LineToolRefused) as refused:
+        world.scheduler.set_brief("alpha", task, decisions, artifacts, next_action)
+    assert str(refused.value) == disclosure.field_refusal((field,))
+    assert "codename" not in str(refused.value).casefold()
+    assert [event.matched_lines for event in checks(world)] == [1]
+
+
+def test_a_brief_matching_in_two_fields_names_neither(
+    world: World, tmp_path: Path
+) -> None:
+    """At most one field is ever named, so two matching fields get the generic
+    refusal."""
+    listed(world, tmp_path)
+    with pytest.raises(LineToolRefused) as refused:
+        world.scheduler.set_brief("alpha", "codename", "second term", (), "clean")
+    assert str(refused.value) == disclosure.REFUSAL
+
+
+def test_only_a_brief_names_one_field_among_several() -> None:
+    """Other tools that offer several fields keep the generic refusal."""
+    assert disclosure.refusal(("question",), 2) == disclosure.REFUSAL
+    assert disclosure.refusal(("question",), 2, name_single_match=True) == (
+        disclosure.field_refusal(("question",))
+    )
+    assert disclosure.refusal(("a", "b"), 2, name_single_match=True) == (
+        disclosure.REFUSAL
+    )
+    assert disclosure.refusal(("body",), 1) == disclosure.field_refusal(("body",))
 
 
 def test_a_text_that_passes_spends_no_check(world: World, tmp_path: Path) -> None:

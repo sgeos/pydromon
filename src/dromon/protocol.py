@@ -76,6 +76,10 @@ class Operation(StrEnum):
     """Operator only. Not offered to external agents or lines. Added in round 14."""
     RUN_CLEAR = "run_clear"
     """Operator only. Not offered to external agents or lines. Task of 2026-10-31."""
+    SCRATCH_PLACE = "scratch_place"
+    """Operator only. Not offered to external agents or lines. Writes a file the
+    operator gives into a line's scratch, for ``dromon ci-log``. Task of 2026-11-05,
+    item 4."""
     RUNS = "runs"
     """Read only. Not offered to external agents or lines. Added in round 14."""
     START_CONTEXT = "start_context"

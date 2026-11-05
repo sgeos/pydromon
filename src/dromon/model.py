@@ -844,11 +844,17 @@ class LineTurnEnded:
 
 
 MAX_DISCLOSURE_CHECKS: Final = 10
-"""The most ``check_disclosure`` calls one line may make within
-``DISCLOSURE_CHECK_WINDOW_SECONDS``, and the most check times the state keeps for a
-line. **Proposed for item B2 of 2026-10-28.** Each pass or fail answer says whether a
+"""The most failing ``check_disclosure`` calls and disclosure refusals one line may
+have within ``DISCLOSURE_CHECK_WINDOW_SECONDS``, and the most failure times the state
+keeps for a line. **Proposed for item B2 of 2026-10-28.** Each answer says whether a
 text holds a listed term, so an unbounded tool would let a line test candidate words
-one by one and recover the list."""
+one by one and recover the list. **Task of 2026-11-05, item 1, the operator's
+decision.** A
+check that passes spends nothing, as a tool's text that passes never did. **Residual
+risk.** A line may now test candidates for free until one fails, so each failure can
+confirm one term found by such a search, and the limit bounds the terms confirmed per
+hour, not the candidates tried. The disclosure guard was always against accidents and
+not against a line that tries to evade it, as ``dromon.disclosure`` says."""
 
 DISCLOSURE_CHECK_WINDOW_SECONDS: Final = 3600
 """The window ``MAX_DISCLOSURE_CHECKS`` applies to."""
@@ -2049,6 +2055,11 @@ MAX_RUN_ARGUMENTS: Final = 64
 MAX_RUN_ARGUMENT_BYTES: Final = 1024
 MAX_RUN_NOTE_BYTES: Final = 1024
 
+MAX_RUN_TAIL_BYTES: Final = 2048
+"""The most bytes of a failed run's output tail that ``run_ended`` keeps. **Task of
+2026-11-05, item 2.** Enough for a traceback's last frames or a gate's failing step,
+and small enough that a run that fails often does not swell the log."""
+
 
 class RunStatus(StrEnum):
     """How a supervised run ended. ``exited`` and ``stopped`` come from the receipt
@@ -2135,7 +2146,13 @@ class RunStarted:
 class RunEnded:
     """A supervised run ended, with its supervisor's receipt where one was found,
     the SHA-256 digest and size of its output file where the daemon could read it,
-    and a note on what was found. **Task of 2026-10-31.**"""
+    and a note on what was found. **Task of 2026-10-31.**
+
+    **Task of 2026-11-05, item 2.** ``output_tail`` is the last lines of a failed
+    run's output, as ``runs.failure_tail`` cuts them, so a failure keeps its reason
+    once the output file is gone or rewritten. It is the command's own output, which
+    a writing line can shape, so it is untrusted data wherever it is shown. Null for
+    a run that passed, for a lost run, and where the output could not be read."""
 
     run_id: str
     status: RunStatus
@@ -2144,9 +2161,19 @@ class RunEnded:
     output_bytes: int | None
     note: str
     ended_at: str
+    output_tail: str | None = None
 
     def __post_init__(self) -> None:
         check_id("run_id", self.run_id)
+        if self.output_tail is not None:
+            check_text("output_tail", self.output_tail, MAX_RUN_TAIL_BYTES)
+            if any(
+                not character.isprintable() and character != "\n"
+                for character in self.output_tail
+            ):
+                raise InvalidField(
+                    "output_tail holds only printable characters and newlines"
+                )
         check_member("status", self.status, RunStatus)
         code = self.exit_code
         if code is not None and (
@@ -3232,10 +3259,16 @@ class State:
                 records = self.task_records.get(event.line_id, ())
                 self.task_records[event.line_id] = (*records, event)[-MAX_TASK_RECORDS:]
             case DisclosureChecked():
-                times = self.disclosure_checks.get(event.line_id, ())
-                self.disclosure_checks[event.line_id] = (*times, event.checked_at)[
-                    -MAX_DISCLOSURE_CHECKS:
-                ]
+                # Task of 2026-11-05, item 1. Only a failure counts against the
+                # limit, so a check that passed is recorded and keeps no time here. A
+                # log from before that task replays with its passes no longer
+                # counted, which only widens the window.
+                if event.matched_lines > 0:
+                    times = self.disclosure_checks.get(event.line_id, ())
+                    self.disclosure_checks[event.line_id] = (
+                        *times,
+                        event.checked_at,
+                    )[-MAX_DISCLOSURE_CHECKS:]
             case WakeRequested():
                 self.wakes[event.wake_id] = Wake(
                     event.line_id, event.message_id, issued=False

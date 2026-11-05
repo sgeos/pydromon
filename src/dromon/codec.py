@@ -277,6 +277,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "output_bytes",
         "note",
         "ended_at",
+        "output_tail",
     ),
     "run_cleared": ("run_id", "cause", "operator_id", "cleared_at"),
     "commit_run_refused": (
@@ -402,6 +403,7 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "budget_stated": ("window",),
     "line_held": ("cause",),
     "run_started": ("commit", "checkout"),
+    "run_ended": ("output_tail",),
     "line_configured": ("sealed",),
 }
 """The fields left out of the wire when they are null, which a log written before
@@ -414,8 +416,11 @@ daemon that predates them still reads every run but a commit run. ``asks_reply``
 added to ``message_sent`` and ``reason`` to ``message_acknowledged`` in the round 14
 task of 2026-11-01, and ``sealed`` to ``line_configured`` in a task of the same day,
 so a daemon that predates it still reads every configuration without a literal
-value. **Porting hazard.** A port must omit these fields when null, not write them
-as null, so that its log stays readable by a daemon that predates them, and must
+value. ``output_tail`` was added to ``run_ended`` in the task of 2026-11-05, so a daemon
+that predates it still reads every run end without a tail, and refuses the log once
+a failed run's tail is recorded. **Porting hazard.** A port must omit these fields
+when null, not write them as null, so that its log stays readable by a daemon that
+predates them, and must
 read an absent one as null. A daemon predating ``window`` does not read an event
 that names one."""
 
@@ -775,6 +780,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "output_bytes": event.output_bytes,
                 "note": event.note,
                 "ended_at": event.ended_at,
+                "output_tail": event.output_tail,
             }
         case RunCleared():
             return "run_cleared", {
@@ -1127,6 +1133,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _optional_int(data, "output_bytes"),
                 _str(data, "note"),
                 _str(data, "ended_at"),
+                _optional_str(data, "output_tail"),
             )
         case "run_cleared":
             return RunCleared(
