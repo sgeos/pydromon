@@ -74,6 +74,7 @@ seats = ["core", "core-luna", "core-grok"]   # the order a failover follows
 handoff_seconds = 3600   # the default
 failover = "automatic"   # the default, or "ask"
 handoff_below_percent = 10   # the default, or 0 for never
+reviews = []   # the default, the roles whose work this role reviews
 
 [lines.core-grok]
 model = "grok-4.7"
@@ -696,6 +697,48 @@ an operator's statement, since the operator wants switching automatic, and the
 operator is told at once of each failover. **Superseded on 2026-10-27.** The earlier design
 had the harness move no role by budget, and ask the operator with the other seats as
 choices instead. That question is not built, and `ask` keeps the hold's question.
+
+## Review diversity
+
+**Round 15, item 5, approved by the operator in reply to q-cc52ba26bc44.** A review
+by a line on the same engine and model as the author of the work shares the author's
+blind spots, so the harness says so, and refuses nothing. **Fact.** The daemon had no
+notion of a review or of a work's author, since a review request is ordinary mail.
+
+**Design.** A role names the roles whose work it reviews, in `roles.ID.reviews` of the
+project file or with `dromon role create` and `dromon role update --reviews`, each
+recorded in `role_declared`. The operator asked for the commands too, since most roles
+here were made at run time. Each named role must exist when the list is written, and
+the role itself, or a role named twice, is refused. A pair is a reviewing role and a
+role it reviews, and it matches when both owners run one model. The engine is a
+function of the model, so one model is one engine and model.
+
+**Where it is said.**
+
+- `role_status` and `dromon role` give `reviews`, `reviewed_by` and `review_diversity`
+  for a role on either side of a pair, and `dromon role` prints each matching pair.
+- Every turn of the reviewing role's owner leads with `REVIEW DIVERSITY.` and the
+  pairs while a match holds, since a review brief may arrive in any turn. That turn
+  head is the review's brief in the sense of the task.
+- The notice that tells a new owner of an ownership change names each matching pair,
+  so a role moved onto the author's engine and model says so, on either side.
+
+**Failure modes and residuals.**
+
+- **Inference.** The author is taken to be the author role's current owner, since
+  the daemon records no author of a commit. Work written by an earlier owner on
+  another model is compared with the wrong seat.
+- A review asked of a line that is no seat of a reviewing role, or of a role that
+  names no reviewed role, is not seen. Nothing marks a message as a review request.
+- A pair either role of which is vacant is left out, since there is no owner to
+  compare.
+- Retiring a reviewed role leaves the reviewer's list as it was, since the model does
+  not require a named role to exist, and the pair is no longer shown. A project file
+  that still names a retired role is refused at the next start or reload until it is
+  changed, as any file whose roles cannot be recorded is.
+- **Rollback.** A daemon older than the field refuses a log with a `role_declared`
+  that names a reviewed role, as the rollback table in
+  [`EVENT_LOG.md`](../protocol/EVENT_LOG.md) records.
 
 ## Mapping the existing lines
 

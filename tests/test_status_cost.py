@@ -5,6 +5,7 @@ message. The reads of one call now share one copy, and every answer is unchanged
 import asyncio
 import json
 from collections.abc import Generator, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,15 @@ def no_engine(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
     raise AssertionError(f"no engine may start here, but {spec.line_id} did")
 
 
+NOW = datetime(2026, 11, 1, 9, 5, tzinfo=UTC)
+"""The scheduler's wall clock, fixed, as the log's clock is. An answer gives ages read
+from the wall clock, such as ``oldest_unread_age_seconds``, so a real clock that
+crossed a second between the two calls a test compares made them differ, and the test
+failed by chance. Inference, this is the count of 65 against 64 that runtime's gate
+reported on 2026-11-05, since it is the only number in the answer with lists that
+moves with the clock in seconds."""
+
+
 @pytest.fixture
 def scheduler(tmp_path: Path) -> Generator[Scheduler]:
     root = tmp_path.resolve() / "project"
@@ -45,6 +55,8 @@ def scheduler(tmp_path: Path) -> Generator[Scheduler]:
     found = Scheduler(
         log,
         no_engine,
+        clock=lambda: 1000.0,
+        wall_clock=lambda: NOW,
         tick_seconds=0,
         default_operator="ana",
         root=root,

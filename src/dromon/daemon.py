@@ -97,7 +97,17 @@ from dromon.driver import (
     DriverError,
     Strategy,
 )
-from dromon.eventlog import EventLog, LogError, read_entries, snapshot, utc_now
+from dromon.eventlog import (
+    EventLog,
+    LogError,
+    RestoreMismatch,
+    check_snapshot,
+    read_entries,
+    snapshot,
+    utc_now,
+    verify_restored,
+)
+from dromon.statesnapshot import snapshot_path
 from dromon.sealed import SealedStore, store_path
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
@@ -1997,6 +2007,66 @@ class Daemon:
             "its watch made every poll its wait allows without passing the deadline"
         )
 
+    async def verify_restore(self) -> tuple[RestoreMismatch, str | None] | None:
+        """Check a state this process restored from a snapshot against a full replay
+        of the log, off the event loop, and return the mismatch or ``None``. **Review
+        of 49236ad, item 1, required by the operator.** Nothing is checked when no
+        snapshot was used. On a mismatch every line is held in memory, the snapshot
+        is deleted, the daemon log and ``status`` name the mismatch by type, and only
+        a restart, which then replays the whole log, lifts the hold.
+
+        **Decided by core, for review.** The hold appends no event. An event is
+        checked against the state it is appended to, and this state is the one not
+        confirmed, so a ``line_held`` it accepted could be one the replayed state
+        refuses, and the log would then fail to replay at the next start.
+        **Re-review of 2cede6e, required by the operator.** No line starts a turn
+        until the check has ended, so no turn appends against the unconfirmed state
+        and none is running when the check fails. The wait is a copy and a full
+        replay of the log, which ``EVENT_LOG.md`` measures. **Residual.** The
+        events the daemon appends without a turn while the check runs, such as an
+        operator's command, mail from a peer, a scheduled wake that falls due, and the
+        recovery before the scheduler starts, were checked against the restored state
+        too. A stop waits for a running check, since a thread cannot be
+        interrupted."""
+        restored = self.log.restored
+        if restored is None:
+            return None
+        try:
+            scratch = check_scratch(self.paths)
+        except LogError as error:
+            mismatch: tuple[RestoreMismatch, str | None] | None = (
+                RestoreMismatch.CHECK_FAILED,
+                type(error).__name__,
+            )
+        else:
+            try:
+                mismatch = await asyncio.to_thread(
+                    verify_restored,
+                    self.log.path,
+                    scratch / self.log.path.name,
+                    restored,
+                )
+            finally:
+                await asyncio.to_thread(shutil.rmtree, scratch, True)
+        self.scheduler.restore_checked(mismatch)
+        if mismatch is None:
+            print(
+                f"dromond: the snapshot at event {restored.seq} agrees with a full"
+                " replay of the log",
+                file=sys.stderr,
+            )
+            return None
+        cause, kind = mismatch
+        print(
+            f"dromond: the snapshot at event {restored.seq} was not confirmed by a"
+            f" full replay of the log, mismatch {cause.value}"
+            + (f", class {kind}" if kind else "")
+            + ". Every line is held, the snapshot is deleted, and the daemon must be"
+            " restarted, which replays the whole log",
+            file=sys.stderr,
+        )
+        return mismatch
+
     def status(self) -> dict[str, object]:
         state = self.log.state
         open_questions = sum(
@@ -2206,10 +2276,11 @@ ROLE_CREATE_ARGS: Final = frozenset(
         "handoff_seconds",
         "failover",
         "handoff_below_percent",
+        "reviews",
     }
 )
 """What ``role_create`` takes. ``role_id``, ``operator``, ``workdir`` and ``seats``
-are required."""
+are required. ``reviews`` was added in round 15, item 5."""
 
 ROLE_UPDATE_ARGS: Final = ROLE_CREATE_ARGS | {"may_own"}
 """What ``role_update`` takes. Only ``role_id`` and ``operator`` are required, and
@@ -2326,6 +2397,10 @@ def role_wanted(
         ),
         order=order,
         seats=seats,
+        # Round 15, item 5. Given, it replaces the list, so an empty one clears it.
+        reviews=_names_arg(args, "reviews")
+        if "reviews" in args
+        else (() if role is None else role.reviews),
     )
 
 
@@ -2851,6 +2926,8 @@ async def serve(daemon: Daemon) -> None:
     relayer = daemon.operator_relayer()
     daemon.scheduler.recover()
     scheduling = asyncio.create_task(daemon.scheduler.run(daemon.stop_requested))
+    # Review of 49236ad, item 1. A restored state is checked while the daemon serves.
+    verifying = asyncio.create_task(daemon.verify_restore())
     forwarding = asyncio.create_task(forwarder.run(daemon.stop_requested))
     relaying = asyncio.create_task(relayer.run(daemon.stop_requested))
     scheduling.add_done_callback(watch_task("scheduler", daemon.stop_requested))
@@ -2864,6 +2941,13 @@ async def serve(daemon: Daemon) -> None:
     finally:
         daemon.stop_requested.set()
         await scheduling
+        try:
+            await verifying
+        except Exception as error:  # noqa: BLE001, a stop must still close the sockets
+            print(
+                f"dromond: the restore check ended with {type(error).__name__}",
+                file=sys.stderr,
+            )
         # Its watch has said how it ended, and an error here must not keep the
         # sockets open.
         with contextlib.suppress(Exception):
@@ -3634,6 +3718,34 @@ def report_unsealed(scheduler: Scheduler) -> None:
         )
 
 
+def report_start(log: EventLog, live_log: Path, check_only: bool) -> None:
+    """Tell the operator, at start, how the state was rebuilt. **Round 15, item 4.**
+    A start names whether it used the snapshot beside the log, or why it ignored one
+    and replayed the whole log, and how many events it replayed in how long. A check
+    opens its own copy of the log without the snapshot and compares the two later,
+    so it says only that."""
+    if check_only:
+        print(
+            "dromond: the check replays its copy of the log in full and compares the"
+            f" snapshot beside {live_log.name} with it",
+            file=sys.stderr,
+        )
+        return
+    start = log.start
+    milliseconds = round(start.seconds * 1000)
+    if start.snapshot == "used":
+        said = (
+            f"restored the state from the snapshot at event {start.snapshot_seq}"
+            f" and replayed {start.replayed} later events in {milliseconds} ms"
+        )
+    else:
+        said = (
+            f"replayed all {start.replayed} events in {milliseconds} ms, since the"
+            f" snapshot was ignored: {start.reason}"
+        )
+    print(f"dromond: {said}", file=sys.stderr)
+
+
 def private_dirs(paths: ProjectPaths) -> tuple[Path, ...]:
     """Every private directory Dromon owns under the project, which a start creates
     or checks. The peers' token store is checked by ``check_token_store``, and a
@@ -3889,11 +4001,14 @@ def run(
             snapshot(paths.event_log, log_path)
             if launch_checks:
                 launcher.configure(scratch / "left")
-        with EventLog(log_path) as log:
+        with EventLog(log_path, snapshots=not check_only) as log:
             # The dictionary is the daemon's own, which a reload updates in place.
+            # Set before ``report_start``, which may restore a snapshot, so that
+            # nothing is stored or restored without the scrub.
             log.secrets = lambda: credentials.environment_values(
                 line_secrets, os.environ
             )
+            report_start(log, paths.event_log, check_only)
             scheduler = Scheduler(
                 log,
                 engine_factory(
@@ -3981,6 +4096,12 @@ def run(
                 # start before any socket is made.
                 daemon.relay_routes(config)
                 if check_only:
+                    agrees, said = check_snapshot(
+                        snapshot_path(paths.event_log), log_path
+                    )
+                    print(f"dromond: {said}", file=sys.stderr)
+                    if not agrees:
+                        return exits.FAILURE
                     if launch_checks:
                         if scratch is None:
                             raise LogError("engine checks require a private directory")

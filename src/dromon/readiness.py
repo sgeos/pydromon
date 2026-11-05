@@ -14,6 +14,7 @@ the repository's own names and may hold any byte git allows, so they are shown a
 git prints them, bounded in count and length, and never interpreted.
 """
 
+import hashlib
 import os
 import subprocess
 from dataclasses import dataclass
@@ -81,6 +82,26 @@ def dirty_paths(worktree: Path) -> Dirty:
     """The dirty paths of ``worktree``. Raises ``ReadinessUnknown`` when git cannot
     start, runs too long or fails, since a report must not claim a clean tree it did
     not read. Blocking, so the scheduler runs it off its event loop."""
+    return parse_porcelain(_status(worktree))
+
+
+def dirty_digest(worktree: Path) -> tuple[str, int]:
+    """The SHA-256 of ``worktree``'s ``git status`` entries, each path with its two
+    status letters in git's own order, and how many entries there are. **Review of
+    49236ad, item 4.** A standing brief keeps the digest, so a later turn can tell
+    that the uncommitted state changed even where ``HEAD`` did not. The entries are
+    hashed whole, unbounded by ``MAX_READY_PATHS``, and the file contents are not
+    read, so an edit inside a path that was already dirty leaves the digest as it
+    was. Raises ``ReadinessUnknown`` as ``dirty_paths`` does. Blocking."""
+    output = _status(worktree)
+    return (
+        hashlib.sha256(output.encode("utf-8", "surrogateescape")).hexdigest(),
+        parse_porcelain(output).total,
+    )
+
+
+def _status(worktree: Path) -> str:
+    """The output of ``git status --porcelain=v1 -z`` in ``worktree``."""
     environment = {
         name: value for name, value in os.environ.items() if not name.startswith("GIT_")
     }
@@ -110,4 +131,4 @@ def dirty_paths(worktree: Path) -> Dirty:
         raise ReadinessUnknown(f"git could not start: {error}") from error
     if done.returncode != 0:
         raise ReadinessUnknown(f"git status failed with exit code {done.returncode}")
-    return parse_porcelain(done.stdout)
+    return done.stdout

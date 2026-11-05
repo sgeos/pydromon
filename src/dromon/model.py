@@ -24,7 +24,7 @@ import re
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Final, assert_never
+from typing import Final, assert_never, cast
 
 ID_PATTERN: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 """Identifiers. ASCII only, so every port compares them bytewise."""
@@ -104,6 +104,10 @@ never reveals the term."""
 DUE_PATTERN: Final = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
 )
+
+INSTANT_ECHO_CHARACTERS: Final = 40
+"""The most characters of a malformed time that its error repeats, twice the length of
+the form, so a near miss is shown whole and a long value is cut."""
 
 
 class InvalidField(ValueError):
@@ -392,6 +396,49 @@ class HoldCause(StrEnum):
     STOPPED = "stopped"
 
 
+class FailureCause(StrEnum):
+    """Why a turn failed, in one fixed word. **Round 15 follow-up of 2026-11-05.** A
+    turn that ended as failed had recorded nothing but the fact, so neither the
+    operator nor the line could say afterwards what had happened. The word is chosen
+    by the daemon from where the turn stood and from the daemon's own type for the
+    failure, never from an engine's text, which may carry anything.
+
+    ``NOT_STARTED``, a failure before the engine was given the prompt, as when the
+    prompt could not be composed or the engine could not be built. ``REFUSED``, a check
+    of the daemon or the driver refused the turn. ``ENGINE_ERROR``, the engine raised
+    during the turn. ``ENGINE_CLOSED``, the engine's process or connection ended before
+    the turn's result. ``ENGINE_REPORTED``, the engine reported the turn as ended
+    without success. ``LIMIT``, the engine reported a turn, token or budget limit of
+    its own. ``INTERRUPTED``, the engine reported or raised an interruption the driver
+    did not ask for, or a failure came while an operator stopped the turn.
+    ``UNKNOWN``, none of these, as a failure in the daemon after the engine returned.
+    A plan limit holds the line rather than failing it, so it has no word here."""
+
+    NOT_STARTED = "not_started"
+    REFUSED = "refused"
+    ENGINE_ERROR = "engine_error"
+    ENGINE_CLOSED = "engine_closed"
+    ENGINE_REPORTED = "engine_reported"
+    LIMIT = "limit"
+    INTERRUPTED = "interrupted"
+    UNKNOWN = "unknown"
+
+
+FAILURE_CLASS_PATTERN: Final = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
+"""A failure's class, the daemon's own exception type or a result subtype from the
+fixed table in ``dromon.scheduler``, at most 64 characters. Neither carries an
+engine's free text."""
+
+
+def check_failure_class(value: object) -> None:
+    """Refuse a failure class that is not a short identifier."""
+    if not isinstance(value, str) or FAILURE_CLASS_PATTERN.fullmatch(value) is None:
+        raise InvalidField(
+            "failure_class must be a letter and at most 63 more letters, digits or"
+            " underscores"
+        )
+
+
 class MessageKind(StrEnum):
     NOTE = "note"
     QUESTION = "question"
@@ -633,6 +680,45 @@ class LineCostMarked:
 
 
 @dataclass(frozen=True, slots=True)
+class LineCostRecorded:
+    """The cost of one turn of a line, or of one spend between its turns such as a
+    compaction, in whole millionths of a dollar, or ``None`` when it is unknown.
+    **Round 15, item 1, required by the operator.** The scheduler's cost since a
+    release is held in memory and reset by each release, so nothing kept a line's
+    whole cost or its turns across releases and restarts. ``State.line_costs`` sums
+    these events, which no release resets.
+
+    ``estimated`` is ``True`` when Dromon estimated the cost from the engine's token
+    counts and its price table, as ``dromon.prices`` gives it, and ``None`` when the
+    engine reported the cost or none is known. ``between`` is ``True`` for a spend
+    outside a turn of Dromon's, which is not counted as a turn, and ``None`` for a
+    turn. ``False`` is refused for both, so each fact has one encoding and the wire
+    omits it when null."""
+
+    line_id: str
+    cost_micro_usd: int | None
+    estimated: bool | None = None
+    between: bool | None = None
+
+    def __post_init__(self) -> None:
+        check_id("line_id", self.line_id)
+        cost = self.cost_micro_usd
+        if cost is not None and (
+            type(cost) is not int or not 0 <= cost <= MAX_COST_MICRO_USD
+        ):
+            raise InvalidField(
+                f"cost_micro_usd must be null or a whole number from 0 to"
+                f" {MAX_COST_MICRO_USD}"
+            )
+        if self.estimated is not None and self.estimated is not True:
+            raise InvalidField("estimated must be true or null")
+        if self.between is not None and self.between is not True:
+            raise InvalidField("between must be true or null")
+        if self.estimated is True and cost is None:
+            raise InvalidField("an estimated cost needs a cost")
+
+
+@dataclass(frozen=True, slots=True)
 class LineSessionCleared:
     """A line's next turn starts a new engine session, as an operator asked.
 
@@ -832,6 +918,16 @@ class LineTurnEnded:
     before the field. **Round 14 task of 2026-11-01.** ``False`` is refused, as for
     ``unreported``. **Rollback hazard.** A daemon older than the field refuses an
     event that gives it."""
+    failure: FailureCause | None = None
+    """Why the turn failed, given only with ``failed``. **Round 15 follow-up of
+    2026-11-05.** The scheduler gives it with every failed turn. ``None`` in a log
+    written before the field, whose failed turns read as of unknown cause.
+    **Rollback hazard.** A daemon older than the field refuses an event that gives
+    it."""
+    failure_class: str | None = None
+    """The daemon's exception type or the engine's result subtype behind
+    ``failure``, as ``check_failure_class`` bounds it, given only with ``failure``
+    and only where one exists."""
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
@@ -841,6 +937,15 @@ class LineTurnEnded:
             raise InvalidField("unreported must be true or null")
         if self.failed is not None and self.failed is not True:
             raise InvalidField("failed must be true or null")
+        if self.failure is not None:
+            if not isinstance(self.failure, FailureCause):  # pyright: ignore[reportUnnecessaryIsInstance]
+                raise InvalidField("failure must be a failure cause")
+            if self.failed is not True:
+                raise InvalidField("failure is given only with failed")
+        if self.failure_class is not None:
+            check_failure_class(self.failure_class)
+            if self.failure is None:
+                raise InvalidField("failure_class is given only with failure")
 
 
 MAX_DISCLOSURE_CHECKS: Final = 10
@@ -1531,6 +1636,9 @@ DEFAULT_HANDOFF_BELOW_PERCENT: Final = 10
 operator asked on 2026-10-27. **Assumption.** Ten percent is a starting value the
 operator may change per role. Zero turns the planned handoff by budget off."""
 MAX_ROLE_SEATS: Final = 16
+MAX_ROLE_REVIEWS: Final = 16
+"""The most roles one role may name as reviewed, a bound on the diversity check,
+which compares the owner of each pair. **Round 15, item 5.**"""
 """The most seats a role's declared order names, a bound on every walk of it."""
 MAX_ROLE_NOTE_BYTES: Final = 64 * 1024
 """The largest journal entry, which fits the handoff template with room to spare."""
@@ -1588,15 +1696,20 @@ class BudgetSource(StrEnum):
 def check_instant(name: str, value: object) -> None:
     """Raise ``InvalidField`` unless ``value`` is a time in the ``DUE_FORMAT`` form.
     The model never reads the log's own ``recorded_at``, so an event whose time
-    matters carries it."""
-    check_text(name, value, len("YYYY-MM-DDTHH:MM:SSZ"))
-    if not isinstance(value, str):  # Unreachable, since check_text refuses it.
-        raise InvalidField(f"{value!r} is not text")
+    matters carries it. Text of the wrong length, such as one with fractional seconds
+    or an offset, is refused with the same message as any other malformed time, so a
+    caller always learns the one form accepted. The value is echoed only up to a bound,
+    so a long one cannot make the error long."""
+    if not isinstance(value, str):
+        raise InvalidField(f"{name} is not text: {type(value).__name__}")
     try:
         parse_due(value)
     except InvalidField as error:
+        shown = value[:INSTANT_ECHO_CHARACTERS]
+        if len(value) > INSTANT_ECHO_CHARACTERS:
+            shown += "..."
         raise InvalidField(
-            f"{name} is not a valid time of the form YYYY-MM-DDTHH:MM:SSZ: {value!r}"
+            f"{name} is not a valid time of the form YYYY-MM-DDTHH:MM:SSZ: {shown!r}"
         ) from error
 
 
@@ -1625,6 +1738,26 @@ def check_commit(name: str, value: object) -> None:
         raise InvalidField(f"{name} is not a commit: {value!r}")
 
 
+def check_reviews(role_id: str, reviews: object) -> None:
+    """Refuse a ``reviews`` that is not a tuple of at most ``MAX_ROLE_REVIEWS``
+    distinct role identifiers other than ``role_id``. **Round 15, item 5.**"""
+    if type(reviews) is not tuple:
+        raise InvalidField(
+            f"reviews must be a list of at most {MAX_ROLE_REVIEWS} role identifiers"
+        )
+    names = cast(tuple[object, ...], reviews)
+    if len(names) > MAX_ROLE_REVIEWS:
+        raise InvalidField(
+            f"reviews must be a list of at most {MAX_ROLE_REVIEWS} role identifiers"
+        )
+    for name in names:
+        check_id("reviews", name)
+    if len(set(names)) != len(names):
+        raise InvalidField("reviews names a role twice")
+    if role_id in names:
+        raise InvalidField(f"role {role_id} cannot review itself")
+
+
 @dataclass(frozen=True, slots=True)
 class RoleDeclared:
     """A role and its worktree, relative to the project root, with how long a
@@ -1633,7 +1766,15 @@ class RoleDeclared:
     prepare a handoff. Declaring a role again changes these, and is refused when
     nothing changes or when the worktree would change while a seat owns it. The
     order may name a line before it is bound, since the seats are bound after the
-    role, and a failover skips any name that is not a seat of the role."""
+    role, and a failover skips any name that is not a seat of the role.
+
+    **Round 15, item 5.** ``reviews`` names the roles whose work this role reviews,
+    distinct, at most ``MAX_ROLE_REVIEWS``, and never the role itself. The model
+    does not require them to exist, since a role named here may be retired later
+    and the project file declares its roles in name order. The file and the role
+    commands require each to exist when it is written, which is where an operator
+    can correct it. It changes nothing the harness enforces. It tells a reviewer
+    that runs the same engine and model as an author's owner."""
 
     role_id: str
     workdir: str
@@ -1641,6 +1782,7 @@ class RoleDeclared:
     seats: tuple[str, ...] = ()
     failover: FailoverPolicy = FailoverPolicy.AUTOMATIC
     handoff_below_percent: int = DEFAULT_HANDOFF_BELOW_PERCENT
+    reviews: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         check_id("role_id", self.role_id)
@@ -1651,6 +1793,7 @@ class RoleDeclared:
             check_id("seats", seat)
         if len(set(self.seats)) != len(self.seats):
             raise InvalidField("seats names a line twice")
+        check_reviews(self.role_id, self.reviews)
         check_member("failover", self.failover, FailoverPolicy)
         percent = self.handoff_below_percent
         if type(percent) is not int or not 0 <= percent <= 100:
@@ -1892,9 +2035,19 @@ class BriefSet:
     workdir_commit: str
     daemon_commit: str
     set_at: str
+    workdir_dirty: str | None = None
+    """**Review of 49236ad, item 4.** The SHA-256 of the worktree's ``git status``
+    entries when the brief was set, each changed or untracked path with its status
+    letters, or ``None`` when they could not be read or the brief predates the
+    field. Edits inside a path already dirty do not change it."""
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
+        if (
+            self.workdir_dirty is not None
+            and DIGEST_PATTERN.fullmatch(self.workdir_dirty) is None
+        ):
+            raise InvalidField("workdir_dirty must be a SHA-256 digest in hex")
         for name, value in (
             ("task", self.task),
             ("decisions", self.decisions),
@@ -2260,6 +2413,7 @@ type Event = (
     | TaskRecorded
     | RestartNoted
     | LineCostMarked
+    | LineCostRecorded
     | ProcessesLeft
     | StopUnverified
     | WalkLimited
@@ -2334,6 +2488,13 @@ class Line:
     ``failed``, and cleared by one that does not, by a new message to the line, by
     ``line_released`` and by a restart note, the events at which the scheduler
     clears its own record, so a restarted daemon shows a failed line as failed."""
+    last_failure: FailureCause | None = None
+    """The cause of the line's latest failed turn, kept after ``failed`` clears so
+    an operator can still ask why. **Round 15 follow-up of 2026-11-05.** ``None``
+    when no turn failed, or when the latest failed one was logged before causes
+    were, which ``line_status`` reads as unknown with ``failed``."""
+    last_failure_class: str | None = None
+    """The class behind ``last_failure``, where one was recorded."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2398,6 +2559,20 @@ class Message:
     recipient's unanswered count, or ``None``."""
     closed_reason: str | None = None
     """The reason the recipient gave when it acknowledged the message, or ``None``."""
+    thread: str | None = None
+    """The identifier of the first message of the thread this one belongs to, its
+    own for a message that names no ``reply_to``, and its parent's thread otherwise.
+    ``None`` only for a message the model made itself, which no reply names, and
+    which ``thread_of`` reads as its own thread. **Round 15, item 2.**"""
+    answered_in_thread: str | None = None
+    """The recipient line's reply that closed this operator note by answering a
+    later note of the same operator in the same thread, or ``None``. **Round 15,
+    item 2.**"""
+
+
+def thread_of(message_id: str, message: Message) -> str:
+    """The thread ``message``, stored under ``message_id``, belongs to."""
+    return message_id if message.thread is None else message.thread
 
 
 def asks_reply_of(message: Message) -> bool:
@@ -2434,6 +2609,30 @@ class Correlation:
     unknown_cost_turns: int = 0
     """The turns whose engine reported no cost, which may still have cost
     something."""
+
+
+@dataclass(frozen=True, slots=True)
+class LineCost:
+    """A line's whole cost and turns, from every ``line_cost_recorded`` of the
+    line, which no release resets. **Round 15, item 1.** Each sum is held at
+    ``MAX_COST_MICRO_USD``."""
+
+    turns: int = 0
+    """The turns recorded, leaving out spends between turns."""
+    between: int = 0
+    """The spends between turns recorded, such as compactions outside a turn."""
+    reported_micro_usd: int = 0
+    """The sum of the costs the engine reported."""
+    estimated_micro_usd: int = 0
+    """The sum of the costs Dromon estimated from tokens."""
+    unknown: int = 0
+    """The turns and spends of unknown cost, which may still have cost something."""
+
+    @property
+    def total_micro_usd(self) -> int:
+        return min(
+            self.reported_micro_usd + self.estimated_micro_usd, MAX_COST_MICRO_USD
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2479,6 +2678,8 @@ class Role:
     """The declared order of the role's seats, which a failover follows."""
     failover: FailoverPolicy = FailoverPolicy.AUTOMATIC
     handoff_below_percent: int = DEFAULT_HANDOFF_BELOW_PERCENT
+    reviews: tuple[str, ...] = ()
+    """The roles whose work this role reviews. **Round 15, item 5.**"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2505,7 +2706,7 @@ class Run:
         return self.ended.status is RunStatus.LOST and self.cleared is None
 
 
-type RoleTerms = tuple[str, int, tuple[str, ...], FailoverPolicy, int]
+type RoleTerms = tuple[str, int, tuple[str, ...], FailoverPolicy, int, tuple[str, ...]]
 
 
 def role_terms(role: Role | RoleDeclared) -> RoleTerms:
@@ -2517,6 +2718,7 @@ def role_terms(role: Role | RoleDeclared) -> RoleTerms:
         role.seats,
         role.failover,
         role.handoff_below_percent,
+        role.reviews,
     )
 
 
@@ -2699,6 +2901,15 @@ class State:
     """Each line's questions to an operator still open, in the order asked, kept by
     ``_put_message`` as ``unread_mail`` is. A line with none has no entry. The inner
     maps are ordered sets. **Task of 2026-11-01.**"""
+    open_thread_notes: dict[str, dict[str, None]] = field(
+        default_factory=dict[str, dict[str, None]]
+    )
+    """Each operator's notes to a line that are not yet answered, by
+    ``_thread_key`` of line, operator and thread, in the order sent, kept by
+    ``_put_message`` as ``unread_mail`` is. **Round 15, item 2.** A reply by the
+    line to one of them closes the earlier ones of the same key, so the index lets
+    a reply find them without scanning every message. Bounded by the unanswered
+    operator notes."""
     retired_lines: dict[str, LineRetired] = field(
         default_factory=dict[str, LineRetired]
     )
@@ -2709,6 +2920,9 @@ class State:
     )
     """Each scope's latest refused commit run start, by ``run_scope``, bounded by
     the scopes. **Round 14, review of 1449c5c, C3.**"""
+    line_costs: dict[str, LineCost] = field(default_factory=dict[str, LineCost])
+    """Each line's whole cost and turns, from ``line_cost_recorded``, which no
+    release resets. Bounded by the lines ever created. **Round 15, item 1.**"""
 
     def holder_of(self, role_id: str) -> RoleHolder:
         """What decides ``role_id``'s terms and seats now."""
@@ -2789,8 +3003,10 @@ class State:
             dict(self.latest_runs),
             {line_id: dict(mail) for line_id, mail in self.unread_mail.items()},
             {line_id: dict(asked) for line_id, asked in self.open_asked.items()},
+            {key: dict(notes) for key, notes in self.open_thread_notes.items()},
             dict(self.retired_lines),
             dict(self.commit_refusals),
+            dict(self.line_costs),
         )
 
     def line_mail(self, line_id: str) -> LineMail:
@@ -2927,7 +3143,7 @@ class State:
                 self._check_task_noted(event)
             case RestartNoted():
                 self._check_noted(event.line_id, event.message_id)
-            case LineCostMarked():
+            case LineCostMarked() | LineCostRecorded():
                 self._line(event.line_id)
             case ProcessesLeft() | StopUnverified():
                 self._line(event.line_id)
@@ -3208,10 +3424,15 @@ class State:
             case LineTurnEnded():
                 self.last_turn_commits[event.line_id] = event.workdir_commit
                 line = self.lines[event.line_id]
-                if line.failed != (event.failed is True):
+                if event.failed is True:
                     self.lines[event.line_id] = replace(
-                        line, failed=event.failed is True
+                        line,
+                        failed=True,
+                        last_failure=event.failure,
+                        last_failure_class=event.failure_class,
                     )
+                elif line.failed:
+                    self.lines[event.line_id] = replace(line, failed=False)
                 if event.unreported is None:
                     self.reported_turn_ends[event.line_id] = (
                         self.reported_turn_ends.get(event.line_id, 0) + 1
@@ -3251,6 +3472,8 @@ class State:
             case WakeWithdrawn():
                 del self.scheduled[event.line_id]
                 self.withdrawn_wakes.add(event.message_id)
+            case LineCostRecorded():
+                self._total_cost(event)
             case LineCostMarked():
                 line = self.lines[event.line_id]
                 self.lines[event.line_id] = replace(
@@ -3316,6 +3539,7 @@ class State:
                         seats=event.seats,
                         failover=event.failover,
                         handoff_below_percent=event.handoff_below_percent,
+                        reviews=event.reviews,
                     )
                     if role is None
                     else replace(
@@ -3325,6 +3549,7 @@ class State:
                         seats=event.seats,
                         failover=event.failover,
                         handoff_below_percent=event.handoff_below_percent,
+                        reviews=event.reviews,
                     )
                 )
             case SeatBound():
@@ -3763,6 +3988,20 @@ class State:
         if message.delivered:
             raise EventRejected(f"message {event.message_id} was delivered")
 
+    def _total_cost(self, event: LineCostRecorded) -> None:
+        """Add one turn or spend to its line's whole cost."""
+        total = self.line_costs.get(event.line_id, LineCost())
+        known = event.cost_micro_usd
+        reported = known if known is not None and event.estimated is None else 0
+        estimated = known if known is not None and event.estimated is True else 0
+        self.line_costs[event.line_id] = LineCost(
+            total.turns + (0 if event.between else 1),
+            total.between + (1 if event.between else 0),
+            min(total.reported_micro_usd + reported, MAX_COST_MICRO_USD),
+            min(total.estimated_micro_usd + estimated, MAX_COST_MICRO_USD),
+            total.unknown + (1 if known is None else 0),
+        )
+
     def _total_correlated(self, event: TurnCorrelated) -> None:
         """Add a turn to each key it lists, moving each to the most recent end, and
         drop the keys used least recently beyond ``MAX_CORRELATIONS``."""
@@ -4055,6 +4294,12 @@ class State:
             None if previous is None else _asking_line(previous),
             _asking_line(message),
         )
+        _index_move(
+            self.open_thread_notes,
+            message_id,
+            None if previous is None else _thread_key(message_id, previous),
+            _thread_key(message_id, message),
+        )
         self.messages[message_id] = message
         if previous is None and isinstance(message.recipient, LineAddress):
             # Round 14. New mail to a line clears its failure, as the scheduler's
@@ -4062,6 +4307,31 @@ class State:
             line = self.lines.get(message.recipient.line_id)
             if line is not None and line.failed:
                 self.lines[message.recipient.line_id] = replace(line, failed=False)
+
+    def _thread_for(self, message_id: str, reply_to: str | None) -> str:
+        """The thread a new message joins, its parent's, or its own when it names
+        none or its parent is not held."""
+        parent = None if reply_to is None else self.messages.get(reply_to)
+        if reply_to is None or parent is None:
+            return message_id
+        return thread_of(reply_to, parent)
+
+    def _earlier_in_thread(self, message_id: str, message: Message) -> list[str]:
+        """The open notes ``open_thread_notes`` holds before ``message_id`` under its
+        key, those a reply to it closes. **Round 15, item 2, required by the
+        operator.** An operator note counts as answered once the line replies to a
+        later note from the same operator in the same thread. Bounded by the open
+        notes of one key, and stops at ``message_id`` itself."""
+        key = _thread_key(message_id, message)
+        if key is None:
+            return []
+        earlier: list[str] = []
+        for note_id in self.open_thread_notes.get(key, {}):
+            if note_id == message_id:
+                return earlier
+            earlier.append(note_id)
+        # The parent was not in its own key's index, which _put_message rules out.
+        return []
 
     def _apply_message_sent(self, event: MessageSent) -> None:
         if self._is_firing(event) and isinstance(event.sender, LineAddress):
@@ -4089,17 +4359,29 @@ class State:
                 event.reply_to,
                 status=status,
                 asks_reply=asks,
+                thread=self._thread_for(event.message_id, event.reply_to),
             ),
         )
         if event.reply_to is not None:
             parent = self.messages[event.reply_to]
             if event.sender == parent.recipient:
+                # Found before the parent leaves the index, since its place there
+                # is what makes the others earlier.
+                earlier = self._earlier_in_thread(event.reply_to, parent)
                 parent = replace(parent, replied=True)
                 if parent.status is QuestionStatus.OPEN:
                     parent = replace(
                         parent,
                         status=QuestionStatus.ANSWERED,
                         answered_by=event.message_id,
+                    )
+                for note_id in earlier:
+                    self._put_message(
+                        note_id,
+                        replace(
+                            self.messages[note_id],
+                            answered_in_thread=event.message_id,
+                        ),
                     )
             elif parent.corrected_by is None:
                 parent = replace(parent, corrected_by=event.message_id)
@@ -4157,6 +4439,7 @@ class State:
                 event.reply_to,
                 origin_id=event.origin_id,
                 priority_asked=event.priority_asked,
+                thread=self._thread_for(event.message_id, event.reply_to),
             ),
         )
         if event.reply_to is not None:
@@ -4214,6 +4497,26 @@ def _asking_line(message: Message) -> str | None:
     ):
         return None
     return sender.line_id
+
+
+def _thread_key(message_id: str, message: Message) -> str | None:
+    """The key under which ``open_thread_notes`` holds ``message``, or ``None``. An
+    operator's note to a line that is neither replied to, acknowledged, corrected
+    nor answered in its thread. Identifiers hold no ``/``, so the key is unique."""
+    sender = message.sender
+    recipient = message.recipient
+    if (
+        not isinstance(sender, OperatorAddress)
+        or not isinstance(recipient, LineAddress)
+        or message.kind is not MessageKind.NOTE
+        or message.replied
+        or message.acknowledged
+        or message.corrected_by is not None
+        or message.answered_in_thread is not None
+    ):
+        return None
+    thread = thread_of(message_id, message)
+    return f"{recipient.line_id}/{sender.operator_id}/{thread}"
 
 
 def _index_move(

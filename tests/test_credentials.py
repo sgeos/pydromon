@@ -249,6 +249,7 @@ def test_every_event_class_is_classified_as_scrubbed_or_without_free_text() -> N
         "LineAwakened": "an identifier",
         "LineConfigured": "sealed by the sealed store",
         "LineCostMarked": "an identifier",
+        "LineCostRecorded": "an identifier, a whole number and two flags",
         "LineCreated": "identifiers and enumerations",
         "LineHeld": "an identifier",
         "LineHibernated": "an identifier",
@@ -419,6 +420,45 @@ def test_a_failing_secret_source_refuses_an_event_with_text_and_stores_nothing(
         log.secrets = lambda: [value]
         log.append(MessageSent("m2", ANA, ALPHA, MessageKind.NOTE, f"is {value}"))
         assert log.state.messages["m2"].body == f"is {MASK}"
+
+
+def test_a_start_from_a_snapshot_stores_nothing_and_every_later_append_is_scrubbed(
+    tmp_path: Path,
+) -> None:
+    """Review of 7744806, for the merge of the state snapshot. The restore only reads
+    the log and the snapshot, which hold what ``append`` stored, so it cannot store an
+    unmasked event. The daemon sets ``secrets`` after the open, and the first append
+    after a restore is scrubbed and fails closed as any other."""
+    value = "plain-words-secret-value"
+    path = tmp_path / "events.sqlite"
+    with EventLog(path, snapshots=True) as log:
+        log.append(OperatorRegistered("ana"))
+        log.append(LineCreated("alpha", ENGINE, "subscription"))
+        log.secrets = lambda: [value]
+        log.append(MessageSent("m1", ANA, ALPHA, MessageKind.NOTE, f"is {value}"))
+    with EventLog(path, snapshots=True) as restored:
+        assert restored.start.snapshot == "used"
+        assert restored.secrets is None, "the open appended nothing, so none is needed"
+        assert restored.last_seq == restored.start.snapshot_seq
+        assert restored.state.messages["m1"].body == f"is {MASK}"
+        restored.secrets = lambda: [value]
+        restored.append(MessageSent("m2", ANA, ALPHA, MessageKind.NOTE, f"is {value}"))
+        assert restored.state.messages["m2"].body == f"is {MASK}"
+
+        def broken() -> list[str]:
+            raise RuntimeError("no source")
+
+        restored.secrets = broken
+        before = restored.last_seq
+        with pytest.raises(credentials.SecretsUnavailable):
+            restored.append(
+                MessageSent("m3", ANA, ALPHA, MessageKind.NOTE, f"is {value}")
+            )
+        assert restored.last_seq == before
+    stored = [path, path.with_name(path.name + ".snapshot")]
+    assert stored[1].exists(), "the snapshot was written, so it was read"
+    for file in stored:
+        assert value.encode() not in file.read_bytes(), file.name
 
 
 def test_the_secret_source_is_asked_only_for_an_event_with_text(

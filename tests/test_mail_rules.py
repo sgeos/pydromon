@@ -28,8 +28,10 @@ from dromon.mailbox import (
     replied_ids,
     sent,
     summary,
+    unanswered_reason,
 )
 from dromon.model import (
+    HARNESS,
     MAX_CLOSE_REASON_BYTES,
     Event,
     EventRejected,
@@ -595,3 +597,181 @@ def test_no_operator_at_all_says_there_are_none(tmp_path: Path) -> None:
             scheduler.send(ALPHA, OperatorAddress("operator"), "x")
     finally:
         log.close()
+
+
+# Round 15, item 2. What never counts, the thread rule and the listing's reasons.
+
+
+def test_wake_harness_and_role_notices_never_count(world: World) -> None:
+    """A line's note to itself, as a fired wake is, and any note from the harness,
+    which sends every role notice, are never counted, whatever they ask."""
+    world.deliver(world.scheduler.send(ALPHA, ALPHA, "wake", asks_reply=True))
+    world.log.append(
+        MessageSent("m-role", HARNESS, ALPHA, MessageKind.NOTE, "you own core")
+    )
+    world.deliver("m-role")
+    world.deliver(world.scheduler.send(ANA, ALPHA, "for the record", asks_reply=False))
+    assert world.unanswered() == 0
+    world.deliver(world.scheduler.send(ANA, ALPHA, "do the task"))
+    assert world.unanswered() == 1
+
+
+def asking_reply(world: World, operator: OperatorAddress, parent: str) -> str:
+    """An operator's note that replies within a thread and asks a reply."""
+    return world.deliver(
+        world.scheduler.send(operator, ALPHA, "and this too", parent, asks_reply=True)
+    )
+
+
+def test_a_reply_to_a_later_note_in_the_thread_answers_the_earlier(
+    world: World,
+) -> None:
+    task = world.deliver(world.scheduler.send(ANA, ALPHA, "do the task"))
+    report = world.deliver(world.scheduler.send(ALPHA, ANA, "done", task))
+    first = asking_reply(world, ANA, report)
+    second = asking_reply(world, ANA, report)
+    assert world.unanswered() == 2
+    reply = world.scheduler.send(ALPHA, ANA, "both done", second)
+    state = world.log.state
+    assert state.messages[first].answered_in_thread == reply
+    assert not state.messages[first].replied
+    assert state.messages[second].replied
+    assert world.unanswered() == 0
+    assert {state.messages[m].thread for m in (task, report, first, second)} == {task}
+
+
+def test_a_reply_to_an_earlier_note_leaves_the_later_one(world: World) -> None:
+    task = world.deliver(world.scheduler.send(ANA, ALPHA, "do the task"))
+    report = world.deliver(world.scheduler.send(ALPHA, ANA, "done", task))
+    first = asking_reply(world, ANA, report)
+    second = asking_reply(world, ANA, report)
+    world.scheduler.send(ALPHA, ANA, "first done", first)
+    page, _ = listing(world.log.state, ALPHA, unanswered_only=True)
+    assert [message_id for message_id, _ in page] == [second]
+
+
+def test_notes_that_each_start_a_thread_stay_apart(world: World) -> None:
+    first = world.deliver(world.scheduler.send(ANA, ALPHA, "task one"))
+    second = world.deliver(world.scheduler.send(ANA, ALPHA, "task two"))
+    world.scheduler.send(ALPHA, ANA, "two done", second)
+    page, _ = listing(world.log.state, ALPHA, unanswered_only=True)
+    assert [message_id for message_id, _ in page] == [first]
+    assert world.log.state.messages[first].answered_in_thread is None
+
+
+def test_another_operator_cannot_join_a_thread(world: World) -> None:
+    """A thread joins two parties only, since a reply goes back to the sender it
+    names and a correction comes from it. So the same operator in the same thread
+    is a fact of the thread, and a later note of another operator never answers
+    the first one's."""
+    world.scheduler.ensure_operator("bob")
+    task = world.deliver(world.scheduler.send(ANA, ALPHA, "do the task"))
+    report = world.deliver(world.scheduler.send(ALPHA, ANA, "done", task))
+    with pytest.raises(EventRejected, match="must go from @ana to alpha"):
+        world.scheduler.send(OperatorAddress("bob"), ALPHA, "me too", report)
+    assert world.unanswered() == 0
+
+
+def test_another_lines_notes_are_never_answered_in_thread(world: World) -> None:
+    """The rule is for an operator's notes. A line's reply to a later note of
+    another line answers only the note it names."""
+    task = world.deliver(world.scheduler.send(BETA, ALPHA, "check this"))
+    report = world.deliver(world.scheduler.send(ALPHA, BETA, "checked", task))
+    first = world.deliver(
+        world.scheduler.send(BETA, ALPHA, "and this", report, asks_reply=True)
+    )
+    second = world.deliver(
+        world.scheduler.send(BETA, ALPHA, "and that", report, asks_reply=True)
+    )
+    world.scheduler.send(ALPHA, BETA, "that done", second)
+    page, _ = listing(world.log.state, ALPHA, unanswered_only=True)
+    assert [message_id for message_id, _ in page] == [first]
+
+
+def test_the_thread_rule_keeps_the_times_and_the_index_exact(world: World) -> None:
+    task = world.deliver(world.scheduler.send(ANA, ALPHA, "do the task"))
+    report = world.deliver(world.scheduler.send(ALPHA, ANA, "done", task))
+    notes = [asking_reply(world, ANA, report) for _ in range(3)]
+    world.scheduler.send(ALPHA, ANA, "all done", notes[-1])
+    state = world.log.state
+    counted = {
+        message_id
+        for message_id, message in state.messages.items()
+        if counts_unanswered(state, message)
+    }
+    assert set(world.log.times.unanswered_recorded) == counted
+    assert not any(ALPHA.line_id in key for key in state.open_thread_notes)
+    world.restart()
+    assert world.log.state.messages[notes[0]].answered_in_thread is not None
+    assert set(world.log.times.unanswered_recorded) == counted
+
+
+def test_the_operator_sees_a_note_answered_in_its_thread(world: World) -> None:
+    task = world.deliver(world.scheduler.send(ANA, ALPHA, "do the task"))
+    report = world.deliver(world.scheduler.send(ALPHA, ANA, "done", task))
+    first = asking_reply(world, ANA, report)
+    second = asking_reply(world, ANA, report)
+    world.scheduler.send(ALPHA, ANA, "both done", second)
+    statuses, _ = sent(world.log.state, ANA)
+    outcomes = {status.message_id: status.outcome for status in statuses}
+    assert outcomes[first] == "answered in thread"
+    assert outcomes[second] == "replied"
+
+
+def test_line_status_lists_each_unanswered_message_with_its_reason(
+    world: World,
+) -> None:
+    task = world.deliver(world.scheduler.send(ANA, ALPHA, "secret body"))
+    asked = world.deliver(
+        world.scheduler.send(BETA, ALPHA, "a reply", None, asks_reply=True)
+    )
+    world.clock.advance(90)
+    status = world.scheduler.line_status("alpha", detail=False, lists=False)
+    listed = cast(list[dict[str, object]], status["unanswered_mail"])
+    assert [entry["message_id"] for entry in listed] == [task, asked]
+    assert status["unanswered_omitted"] == 0
+    first, second = listed
+    assert first["sender"] == "@ana" and first["kind"] == "note"
+    assert first["waited"] == "1m 30s"
+    assert "starts a thread" in cast(str, first["reason"])
+    assert "later note of its sender in its thread" in cast(str, first["reason"])
+    assert "sender asked a reply" in cast(str, second["reason"])
+    assert "later note" not in cast(str, second["reason"])
+    assert "secret body" not in str(status)
+
+
+def test_line_status_lists_a_bounded_number_and_counts_the_rest(
+    world: World,
+) -> None:
+    sent_ids = [
+        world.deliver(world.scheduler.send(ANA, ALPHA, f"task {number}"))
+        for number in range(scheduler_module.MAX_UNANSWERED_LISTED + 3)
+    ]
+    status = world.scheduler.line_status("alpha", detail=False, lists=False)
+    listed = cast(list[dict[str, object]], status["unanswered_mail"])
+    assert [entry["message_id"] for entry in listed] == sent_ids[
+        : scheduler_module.MAX_UNANSWERED_LISTED
+    ]
+    assert status["unanswered_omitted"] == 3
+    assert status["unanswered"] == len(sent_ids)
+    assert "status_truncated" not in status
+
+
+@pytest.mark.parametrize(
+    ("kind", "reply_to", "asks", "expected"),
+    [
+        (MessageKind.QUESTION, None, None, "a question, which always asks"),
+        (MessageKind.ISSUE, None, None, "an issue, which always asks"),
+        (MessageKind.NOTE, "m-0", True, "a reply that asks a reply"),
+        (MessageKind.NOTE, None, True, "a note whose sender asked a reply"),
+        (MessageKind.NOTE, None, None, "a note that starts a thread"),
+    ],
+)
+def test_each_reason_says_why_the_message_asks(
+    kind: MessageKind, reply_to: str | None, asks: bool | None, expected: str
+) -> None:
+    message = Message(BETA, ALPHA, kind, "body", (), reply_to, asks_reply=asks)
+    reason = unanswered_reason(message)
+    assert reason.startswith(expected)
+    assert reason.endswith("Reply to it or acknowledge it.")
+    assert "body" not in reason

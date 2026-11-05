@@ -28,6 +28,7 @@ from dromon.model import (
     MessageKind,
     MessageSent,
     OperatorAddress,
+    RoleDeclared,
     WakeScheduled,
 )
 
@@ -309,3 +310,29 @@ def test_an_oversized_payload_is_refused_before_parsing() -> None:
 def test_a_payload_with_a_lone_surrogate_is_refused() -> None:
     with pytest.raises(DecodeError, match="Unicode"):
         decode("\ud800")
+
+
+def test_reviews_are_left_out_when_empty_and_read_as_empty_when_absent() -> None:
+    """Round 15, item 5. A role that reviews nothing is written as before, so a
+    daemon that predates ``reviews`` reads it, and one that does is read back."""
+    plain = RoleDeclared("docs", "tmp/worktrees/docs")
+    assert "reviews" not in json.loads(encode(plain))["data"]
+    assert decode(encode(plain)) == plain
+    reviewing = RoleDeclared("docs", "tmp/worktrees/docs", reviews=("core",))
+    assert json.loads(encode(reviewing))["data"]["reviews"] == ["core"]
+    assert decode(encode(reviewing)) == reviewing
+
+
+@pytest.mark.parametrize(
+    ("reviews", "reason"),
+    [
+        ([], "reviews is not a non-empty array"),
+        (["docs"], "cannot review itself"),
+        (["core", "core"], "names a role twice"),
+        ("core", "reviews"),
+    ],
+)
+def test_a_malformed_reviews_is_refused(reviews: object, reason: str) -> None:
+    data = json.loads(encode(RoleDeclared("docs", "tmp/worktrees/docs")))["data"]
+    with pytest.raises(DecodeError, match=reason):
+        decode(wire("role_declared", {**data, "reviews": reviews}))
