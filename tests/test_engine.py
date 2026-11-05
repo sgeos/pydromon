@@ -1180,3 +1180,75 @@ def test_start_check_connects_sdk_without_sending_a_query() -> None:
     asyncio.run(line(session).check_start())
     assert len(session.options) == 1
     assert session.prompts == []
+
+
+@pytest.mark.parametrize(
+    ("version", "verbatim", "expected"),
+    [
+        ("2.2.0", False, ""),
+        ("1.0.0", False, "unsupported in the Agent SDK"),
+        ("2.1.0", True, "verbatim_prompts requires"),
+        ("unrecognized", True, ""),
+    ],
+)
+def test_sdk_version_probe_uses_one_synchronous_reaper(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    version: str,
+    verbatim: bool,
+    expected: str,
+) -> None:
+    import subprocess
+
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        assert kwargs == {
+            "capture_output": True,
+            "text": True,
+            "timeout": 2,
+            "check": False,
+        }
+        return subprocess.CompletedProcess(argv, 0, version, "")
+
+    monkeypatch.setattr(engine_module.subprocess, "run", run)
+    options = ClaudeAgentOptions(cli_path="scripted-cli", verbatim_prompts=verbatim)
+    transport = engine_module._SubprocessTransport(prompt="", options=options)  # pyright: ignore[reportPrivateUsage]
+    asyncio.run(transport._check_claude_version())  # pyright: ignore[reportPrivateUsage]
+    assert calls == [["scripted-cli", "-v"]]
+    if expected:
+        assert expected in caplog.text
+    else:
+        assert not caplog.records
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_sdk_version_probe_remains_advisory_on_start_or_timeout_errors(
+    monkeypatch: pytest.MonkeyPatch, timeout: bool
+) -> None:
+    import subprocess
+
+    def run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if timeout:
+            raise subprocess.TimeoutExpired("scripted-cli", 2)
+        raise FileNotFoundError("scripted-cli")
+
+    monkeypatch.setattr(engine_module.subprocess, "run", run)
+    transport = engine_module._SubprocessTransport(  # pyright: ignore[reportPrivateUsage]
+        prompt="", options=ClaudeAgentOptions(cli_path="scripted-cli")
+    )
+    asyncio.run(transport._check_claude_version())  # pyright: ignore[reportPrivateUsage]
+
+
+def test_sdk_explicit_transport_preserves_permission_control_channel() -> None:
+    async def allow(
+        tool_name: str, input_data: dict[str, Any], context: ToolPermissionContext
+    ) -> PermissionResultAllow:
+        return PermissionResultAllow()
+
+    original = ClaudeAgentOptions(cli_path="scripted-cli", can_use_tool=allow)
+    transport = engine_module._subprocess_transport(original)  # pyright: ignore[reportPrivateUsage]
+    assert isinstance(transport, engine_module._SubprocessTransport)  # pyright: ignore[reportPrivateUsage]
+    assert transport._options.permission_prompt_tool_name == "stdio"  # pyright: ignore[reportPrivateUsage]
+    assert original.permission_prompt_tool_name is None

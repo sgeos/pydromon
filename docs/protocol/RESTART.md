@@ -217,7 +217,9 @@ make.
 Fact. Restart preflight now includes `--check-engines`. An operator can run
 `dromond --check --check-engines` or `dromon check-engines` outside engine sandboxes.
 Plain `dromond --check` retains its static checks without launching engines.
-Each effective line in the copied state is built through the production factory,
+Hibernated and retired lines are skipped with an explicit note before their
+worktrees or engine configurations are opened. They cannot refuse a restart.
+Each remaining effective line in the copied state is built through the production factory,
 including lines recorded only in the event log and the current role access policy.
 The check reports each line and engine as passed or failed. Any failure refuses
 restart before the client sends its restart request.

@@ -1865,3 +1865,53 @@ def test_operator_engine_check_shows_per_line_results_and_returns_failure(
     )
     assert result == (exits.OK if code == 0 else exits.FAILURE)
     assert "line alpha engine codex" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("retired", [False, True])
+def test_inactive_line_does_not_build_an_engine_or_block_checks(
+    world: World,
+    paths: ProjectPaths,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    retired: bool,
+) -> None:
+    if retired:
+        world.scheduler.retire_line(ANA, "alpha")
+    else:
+        world.scheduler.hibernate("alpha")
+    built: list[str] = []
+
+    class Checked:
+        async def check_start(self) -> None:
+            return
+
+        async def run_turn(self, prompt: str) -> TurnReport:
+            raise AssertionError("no prompt")
+
+    def build(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> Checked:
+        assert spec.line_id != "alpha", "inactive worktree must not be opened"
+        built.append(spec.line_id)
+        return Checked()
+
+    class Server:
+        async def __aenter__(self) -> "Server":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return
+
+    socket_path = tmp_path / "inactive.sock"
+
+    async def start(*args: object, **kwargs: object) -> Server:
+        socket_path.touch()
+        return Server()
+
+    monkeypatch.setattr(world.scheduler, "_engine_factory", build)
+    monkeypatch.setattr(daemon.asyncio, "start_unix_server", start)
+    assert asyncio.run(
+        daemon.check_engine_launches(make_daemon(world, paths), socket_path)
+    )
+    assert built == ["beta"]
+    condition = "retired" if retired else "hibernated"
+    assert f"line alpha skipped because it is {condition}" in capsys.readouterr().err

@@ -3747,6 +3747,20 @@ async def check_engine_launches(daemon: Daemon, socket_path: Path) -> bool:
     try:
         async with server:
             for line_id in sorted(daemon.log.state.lines):
+                state = daemon.log.state
+                inactive = (
+                    "retired"
+                    if line_id in state.retired_lines
+                    else "hibernated"
+                    if state.lines[line_id].hibernated
+                    else None
+                )
+                if inactive is not None:
+                    print(
+                        f"dromond: line {line_id} skipped because it is {inactive}",
+                        file=sys.stderr,
+                    )
+                    continue
                 model = daemon.scheduler.model_of(line_id)
                 engine_name = ENGINE_OF[model]
                 diagnostics = evidence.StartupDiagnostics()

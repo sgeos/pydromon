@@ -5,3 +5,4 @@ Type: Fixed
 - Accept read-only Grok worktrees after the operator's reader-profile probe and replace a resumed session once when its model catalog omits the requested model.
 - Check effective line startups without prompts through adapter startup paths before restart and through explicit operator commands.
 - Preview generated Grok home changes and replace each file after confirmation with timestamped backups and documented interruption recovery.
+- Skip hibernated and retired lines during restart engine checks and give the Claude SDK version probe one synchronous subprocess reaper.

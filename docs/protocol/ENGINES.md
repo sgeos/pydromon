@@ -599,3 +599,16 @@ individual execution. Unexpected tools therefore still abort those turns.
 and headless modes do not establish their applicability to `agent stdio`. Advertisement
 filtering on that transport remains unverified. Dromon continues to reject unavailable
 `todo_write`, `spawn_subagent` and `web_fetch` calls through its permission policy.
+
+## Claude Code version child ownership
+
+Fact. The Agent SDK 0.2.174 version probe terminates an asynchronous child
+after reading its output. On macOS this can race the asyncio child watcher
+and produce an unknown child warning with return code 255. Dromon retains
+the SDK engine transport and overrides only its advisory version probe.
+A worker thread runs the version command with a two second timeout using
+a synchronous subprocess owner that also terminates and reaps it. The
+minimum version and verbatim prompt warnings remain. Probe failures remain
+advisory and actual startup handshake failures still refuse the line.
+This depends on the private SDK transport method and its version constants
+and must be checked on an SDK upgrade.
