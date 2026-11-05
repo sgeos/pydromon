@@ -8864,14 +8864,27 @@ class Scheduler:
                     cast(str, decisions),
                     tuple(cast(list[str], artifacts)),
                     cast(str, next_action),
-                    None if dirty is None else dirty[0],
+                    None if isinstance(dirty, readiness.ReadFailure) else dirty[0],
                 )
             except LineToolRefused as error:
                 return _tool_error(str(error))
+            # Operator task of 2026-11-05. A brief whose read failed has no digest,
+            # so no later turn can say its uncommitted state changed, and the line
+            # is told so once, here.
+            unread = (
+                ""
+                if not isinstance(dirty, readiness.ReadFailure)
+                else (
+                    " The daemon could not read git status in your worktree, for the"
+                    f" reason {dirty.value}, so later turns compare this brief's"
+                    " commit alone and will not say when your uncommitted changes"
+                    " differ."
+                )
+            )
             return _tool_text(
                 f"brief set at {brief.set_at}, stamped by the daemon with worktree"
                 f" commit {brief.workdir_commit[:12] or 'unknown'}. It replaces your"
-                " previous brief."
+                f" previous brief.{unread}"
             )
 
         return SdkMcpTool(
@@ -12296,15 +12309,19 @@ class Scheduler:
             " task changes."
         )
 
-    def dirty_state(self, line_id: str) -> tuple[str, int] | None:
+    def dirty_state(self, line_id: str) -> tuple[str, int] | readiness.ReadFailure:
         """The digest of ``line_id``'s worktree's ``git status`` entries with their
-        count, as ``readiness.dirty_digest`` gives them, or ``None`` when they cannot
-        be read. Blocking, so it runs off the event loop. **Review of 49236ad, item
-        4.**"""
+        count, as ``readiness.dirty_digest`` gives them, or the fixed word for why
+        they cannot be read. Blocking, so it runs off the event loop. **Review of
+        49236ad, item 4.** **Operator task of 2026-11-05.** A failed read had been
+        ``None`` with no reason kept, so a turn that could not compare said nothing,
+        which read as a current brief."""
         try:
             return readiness.dirty_digest(self._workdir_of(line_id))
-        except (LineToolRefused, readiness.ReadinessUnknown, UnicodeError):
-            return None
+        except LineToolRefused:
+            return readiness.ReadFailure.NO_WORKDIR
+        except readiness.ReadinessUnknown as error:
+            return error.cause
 
     async def _stale_brief_notice(self, line_id: str, led_brief: bool) -> str | None:
         """What a turn of ``line_id`` leads with while its standing brief is stale,
@@ -12315,7 +12332,15 @@ class Scheduler:
         brief, and not only the turn that leads with the brief. A turn whose lead
         already says the commit moved is not told twice. A line with a fresh
         session each turn is never led with its brief, so it is not told either.
-        Where either side cannot be read, that comparison is skipped.
+        Where the commit cannot be read, that comparison is skipped.
+
+        **Operator task of 2026-11-05.** Where the brief names a digest and the
+        worktree's ``git status`` cannot be read now, the notice says plainly that
+        the brief's currency is unknown, with the fixed word for why, since a turn
+        told nothing reads its brief as current. It heads every such turn, as the
+        stale notice does. A brief that names no digest, because it was recorded
+        before the field or its own read failed, compares the commit alone, and
+        ``set_brief`` says so when its read fails.
 
         **Decided by core, for review.** The digest covers which paths are dirty
         and how, and not their contents, so a line's edits inside a file already
@@ -12333,26 +12358,43 @@ class Scheduler:
             if brief.workdir_dirty is None
             else await asyncio.to_thread(self.dirty_state, line_id)
         )
-        changed = dirty is not None and dirty[0] != brief.workdir_dirty
-        if not (changed or (moved and not led_brief)):
-            return None
+        unread = dirty if isinstance(dirty, readiness.ReadFailure) else None
+        changed = isinstance(dirty, tuple) and dirty[0] != brief.workdir_dirty
         reasons: list[str] = []
         if moved and head is not None and not led_brief:
             reasons.append(
                 f"your worktree moved from commit {brief.workdir_commit[:12]} to"
                 f" {head[:12]}"
             )
-        if changed and dirty is not None:
+        if changed and isinstance(dirty, tuple):
             reasons.append(
                 "its uncommitted changes differ from those when the brief was set,"
                 f" with {dirty[1]} dirty {'path' if dirty[1] == 1 else 'paths'} now"
             )
-        return (
+        unknown = (
+            None
+            if unread is None
+            else (
+                "The daemon could not read git status in your worktree, for the"
+                f" reason {unread.value}, so whether your uncommitted changes differ"
+                " from those when the brief was set is unknown. Treat the brief as"
+                " possibly stale, and check it against git status yourself."
+            )
+        )
+        if not reasons:
+            if unknown is None:
+                return None
+            return (
+                f"BRIEF CURRENCY UNKNOWN. Your standing brief was set at"
+                f" {brief.set_at}. {unknown}"
+            )
+        stale = (
             f"STALE BRIEF. Your standing brief, set at {brief.set_at}, was set before"
             f" {' and '.join(reasons)}, so it may not describe your current task."
             " Check it against git log, git status and your mail before acting on"
             " it, and set it again with set_brief, which clears this notice."
         )
+        return stale if unknown is None else f"{stale} {unknown}"
 
     def _mail_since_brief(self, line_id: str, brief: BriefSet) -> str:
         """One sentence for the brief's lead when an operator mailed ``line_id``
