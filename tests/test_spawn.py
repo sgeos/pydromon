@@ -6,6 +6,7 @@ test can make the operating system stall a real one on demand."""
 
 import ast
 import asyncio
+import contextlib
 import io
 import os
 import signal
@@ -14,9 +15,9 @@ import sys
 import time
 import threading
 import tomllib
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING
 
 import pytest
 
@@ -846,8 +847,13 @@ def test_a_stuck_start_dumps_every_thread_past_its_bound(
     with pytest.raises(spawn.StartStalled):
         spawn.start(SLEEP)
     dump = wait_for_dump(path)
-    assert "dromon-spawn" in dump, "the stuck start's thread is in the dump"
+    # Found by CI on 2026-11-05. Python 3.12 prints no thread names, only newer
+    # versions do, so the stuck start is recognised by its frame, which every
+    # supported version prints.
     assert "(most recent call first)" in dump
+    assert 'spawn.py", line' in dump and "in target" in dump, (
+        "the stuck start's thread, in the frame that makes the child, is in the dump"
+    )
 
 
 def test_the_dump_waits_past_the_bound_and_the_margin(
@@ -1040,26 +1046,30 @@ def test_the_lock_is_released_after_a_fork_that_fails() -> None:
 def test_starts_from_many_threads_fork_one_at_a_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The call that forks is counted from inside the lock, and is never entered by
-    two threads at once."""
-    installed: Any = getattr(subprocess, "_fork_exec")  # noqa: B009
-    inner: Callable[..., Any] = getattr(installed, "__wrapped__")  # noqa: B009
+    """The lock is counted from inside, at its own entry and not at a standard library
+    function, since which function ``subprocess`` calls to fork differs by Python
+    version and platform. **Found by CI on 2026-11-05.** Python 3.15 on Linux starts
+    through ``os.posix_spawn``, not ``_fork_exec``. Every path takes this lock, so the
+    entries are never two at once and are at least one for each start."""
+    real = spawn.forking
     counts = {"now": 0, "most": 0, "calls": 0}
     guard = threading.Lock()
 
-    def counting(*args: object) -> object:
-        with guard:
-            counts["now"] += 1
-            counts["calls"] += 1
-            counts["most"] = max(counts["most"], counts["now"])
-        try:
-            time.sleep(0.01)
-            return inner(*args)
-        finally:
+    @contextlib.contextmanager
+    def counting() -> Generator[None]:
+        with real():
             with guard:
-                counts["now"] -= 1
+                counts["now"] += 1
+                counts["calls"] += 1
+                counts["most"] = max(counts["most"], counts["now"])
+            try:
+                time.sleep(0.01)
+                yield
+            finally:
+                with guard:
+                    counts["now"] -= 1
 
-    monkeypatch.setattr(subprocess, "_fork_exec", spawn._serialized(counting))  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType, reportAttributeAccessIssue]
+    monkeypatch.setattr(spawn, "forking", counting)
 
     def one() -> object:
         return spawn.start(["/bin/sh", "-c", "exit 0"]).wait()
@@ -1068,7 +1078,7 @@ def test_starts_from_many_threads_fork_one_at_a_time(
     for thread, _ in pool:
         thread.join(30)
     assert [outcome for _, outcome in pool] == [[0]] * 12
-    assert counts["calls"] == 12 and counts["most"] == 1
+    assert counts["calls"] >= 12 and counts["most"] == 1
 
 
 def test_the_watchdog_times_a_fork_that_does_not_return(
