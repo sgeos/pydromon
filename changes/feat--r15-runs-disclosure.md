@@ -18,3 +18,9 @@ Type: Changed
   configuration changed while it ran is not answered from memory and its pass is not
   remembered. A file `scratch_place` writes is never remembered as passed, so a listed
   term in a placed CI log is still found, as review C1 asked.
+- Round 15 re-review. A `write_scratch` the disclosure list screens is a check too, so
+  its text and path spend a pass, or a failure when refused, and their bytes, and once
+  either count is spent, or the bytes left are too few, the write is refused with the
+  `disclosure budget` rule before it is screened or written. The tests now pin that the
+  run parameter matcher kills its child at the default deadline of 2 seconds and when
+  a start is cancelled.

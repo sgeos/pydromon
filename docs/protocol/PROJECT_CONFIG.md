@@ -436,10 +436,19 @@ stops the start, or refuses the reload and keeps the previous list.
   have been answered from memory, and its pass is otherwise not remembered.
   **Round 15 review, C1.** A file the daemon writes without screening, as
   `scratch_place` writes an operator's CI log, is never remembered as passed, so a
-  listed term in it is still found. **Residual risk.** A tool's text that passes
-  the screen, such as a `write_scratch` text of up to 256 KiB, is still not counted,
-  as it never was, so a line can still test candidates through those tools at their
-  own sizes, and the guard remains against accidents, as the limits above say. A
+  listed term in it is still found. **Round 15 re-review.** A `write_scratch` call
+  that the list screens is a check too, since the audit wrote 100 clean texts of
+  256 KiB in two seconds and spent nothing. Its text and path spend one pass when
+  they pass, or one failure when refused, and their bytes in both cases. Once either
+  count is spent, or when they would pass the bytes left, the write is refused
+  before it is screened or written, without holding the line, as a spent
+  `check_disclosure` is. A screened write's pass is recorded before the file is
+  written, since a write refused afterwards still tells the line that the text
+  passed, and it counts even when its text is remembered, since the path is screened
+  too. **Residual risk.** A text that passes the screen of another tool, such as a
+  note or a brief, is still not counted, as it never was, so a line can still test
+  candidates through those tools at their sizes, which are far below a scratch
+  file's, and the guard remains against accidents, as the limits above say. A
   file is read as `write_scratch` writes, walked without following a link, and only
   when it is a regular file of the daemon's user with one name, outside every
   directory Dromon protects, and at most 16 MiB combined. A refusal, of a missing list, a limit

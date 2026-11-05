@@ -862,13 +862,17 @@ MAX_DISCLOSURE_PASSES: Final = 60
 line. **Round 15 review, D1, the operator's decision.** The audit measured about 1,300
 free passes of 16 MiB an hour on one daemon, about 130 times the candidates ten
 counted checks allowed, which put a short term within reach of a few failures. This
-limit bounds the candidate texts a line may try an hour. It counts only the
-``check_disclosure`` tool. Another tool's text that passes the screen is still free,
-as it always was, and each such text is at most what that tool accepts."""
+limit bounds the candidate texts a line may try an hour. It counts the
+``check_disclosure`` tool and, since the round 15 re-review, each ``write_scratch``
+whose text the list screens, since the audit screened 100 texts of 256 KiB in two
+seconds through it for nothing. Another tool's text that passes the screen is still
+free, as it always was, and each such text is at most what that tool accepts, which
+for a note or a brief is far less than a scratch file."""
 
 MAX_DISCLOSURE_BYTES: Final = 64 * 1024 * 1024
-"""The most bytes one line's ``check_disclosure`` calls may read and match within
-``DISCLOSURE_CHECK_WINDOW_SECONDS``, passes and failures together. **Round 15 review,
+"""The most bytes one line's ``check_disclosure`` calls and screened ``write_scratch``
+texts may read and match within ``DISCLOSURE_CHECK_WINDOW_SECONDS``, passes and
+failures together. **Round 15 review,
 D1.** It bounds the candidate bytes a line may test an hour, at less than the 160 MiB
 that ten counted checks of 16 MiB allowed before passes were free, and the daemon's
 time spent matching for one line. A check whose content would cross it is refused by
@@ -899,7 +903,9 @@ class DisclosureChecked:
     **Round 15 review, D1.** ``checked_bytes`` is how many bytes a
     ``check_disclosure`` call read and matched, so the hourly ceiling on bytes survives
     a restart too. It is null for a tool's refusal and in a record from before the
-    field, which count as no bytes. **Rollback hazard.** A daemon from before the field
+    field, which count as no bytes. **Round 15 re-review.** A ``write_scratch``
+    screening records its bytes too, both when the text passes and when it is
+    refused. **Rollback hazard.** A daemon from before the field
     refuses a log that holds it, as ``docs/protocol/EVENT_LOG.md`` records."""
 
     line_id: str

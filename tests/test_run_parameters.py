@@ -9,7 +9,8 @@ import time
 from collections.abc import Generator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from asyncio.subprocess import Process
+from typing import Any, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
@@ -216,6 +217,80 @@ def test_a_backtracking_match_is_refused_at_its_deadline_off_the_loop() -> None:
     assert time.monotonic() - started < 10
     # The loop ran while the child matched, so the ticks span the wait.
     assert len(ticks) > 10
+
+
+SLOW_MATCHER = "import time; time.sleep(30)"
+"""A matcher that answers far past any deadline, so a test can tell a killed child
+from one left to run or waited out."""
+
+
+def spawned_children(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Process, float]]:
+    """Record each child ``match`` starts, with the monotonic time it started."""
+    started: list[tuple[Process, float]] = []
+    real = cast(Any, asyncio.create_subprocess_exec)
+
+    async def recording(*args: object, **kwargs: object) -> Process:
+        child = cast(Process, await real(*args, **kwargs))
+        started.append((child, time.monotonic()))
+        return child
+
+    monkeypatch.setattr(runparams.asyncio, "create_subprocess_exec", recording)
+    return started
+
+
+def assert_killed(child: Process) -> None:
+    """The child was killed and reaped, so it no longer exists."""
+    assert child.returncode == -9, "the child was not killed"
+    with pytest.raises(ProcessLookupError):
+        os.kill(child.pid, 0)
+
+
+def test_the_child_is_killed_at_the_default_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 15 re-review. The audit found that removing the kill, or raising
+    ``MATCH_SECONDS`` to 200 seconds, survived the tests, which passed their own
+    deadline. This one uses the default deadline that ``Scheduler.start_run`` uses,
+    and a child that would sleep 30 seconds, so a child waited out or left running
+    fails it. The time is taken from the child's start, so a slow start under load
+    does not count against the deadline."""
+    monkeypatch.setattr(runparams, "MATCHER", SLOW_MATCHER)
+    started = spawned_children(monkeypatch)
+    prepared = runparams.prepare(
+        ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
+    )
+    with pytest.raises(ParameterRefused, match="took longer than 2 seconds"):
+        asyncio.run(runparams.match(prepared))
+    ended = time.monotonic()
+    [(child, began)] = started
+    assert runparams.MATCH_SECONDS <= ended - began < 10
+    assert_killed(child)
+
+
+def test_the_child_is_killed_when_the_start_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A start whose call is cancelled while the child matches, as when the line's
+    turn ends, kills and reaps the child before the cancellation goes on."""
+    monkeypatch.setattr(runparams, "MATCHER", SLOW_MATCHER)
+    started = spawned_children(monkeypatch)
+    prepared = runparams.prepare(
+        ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(runparams.match(prepared))
+        for _ in range(1000):
+            if started:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), 20))
+    [(child, _)] = started
+    assert_killed(child)
 
 
 def test_a_child_that_fails_refuses_the_start(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -464,3 +539,25 @@ def test_a_refused_argument_spends_no_run(project: Path) -> None:
                 scheduler.start_run("alpha", "one", "none", None, {"test": "x.py"})
             )
         assert log.state.runs == {}
+
+
+def test_a_start_whose_match_outlasts_the_deadline_is_refused_and_its_child_killed(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 15 re-review. The scheduler matches under the default deadline, so a
+    start that passed a longer one would be refused late or not at all."""
+    monkeypatch.setattr(runparams, "MATCHER", SLOW_MATCHER)
+    started = spawned_children(monkeypatch)
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        with pytest.raises(runs.RunRefused, match="took longer than 2 seconds"):
+            asyncio.run(
+                scheduler.start_run(
+                    "alpha", "one", "none", None, {"test": "tests/a.py"}
+                )
+            )
+        ended = time.monotonic()
+        assert log.state.runs == {}
+    [(child, began)] = started
+    assert ended - began < 10
+    assert_killed(child)

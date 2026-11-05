@@ -6832,8 +6832,9 @@ class Scheduler:
         Refused for an absolute path,
         ``..``, a path that resolves outside the area, a target that is a symbolic
         link or a directory, text over ``MAX_SCRATCH_BYTES``, text the disclosure
-        list covers, and ``reports`` when no report directory is declared. Every
-        other directory stays refused."""
+        list covers, a screening the line's disclosure budget has no room for, as
+        ``_screen_scratch`` says, and ``reports`` when no report directory is
+        declared. Every other directory stays refused."""
         if area not in (SCRATCH_AREA, REPORTS_AREA):
             raise _scratch_refused(
                 "area", f"area must be {SCRATCH_AREA} or {REPORTS_AREA}"
@@ -6850,16 +6851,8 @@ class Scheduler:
         data = text.encode("utf-8")
         if len(data) > MAX_SCRATCH_BYTES:
             raise _scratch_refused("size", f"text is over {MAX_SCRATCH_BYTES} bytes")
-        refusal = (
-            self.refuse_disclosed(line_id, ("text", text), ("path", path))
-            if check_disclosure
-            else None
-        )
-        if refusal is not None:
-            if refusal == DISCLOSURE_HELD:
-                # Alike for every tool, so a held line learns nothing from its form.
-                raise LineToolRefused(refusal)
-            raise _scratch_refused("disclosure list", refusal)
+        if check_disclosure:
+            self._screen_scratch(line_id, path, text, len(data) + len(path.encode()))
         workdir = self._workdir_of(line_id)
         scratch = self._area_parts(line_id, area)
         if (
@@ -6946,6 +6939,55 @@ class Scheduler:
         return ScratchWrite(
             str(relative), str(Path(os.path.realpath(workdir)) / relative), len(data)
         )
+
+    def _screen_scratch(self, line_id: str, path: str, text: str, size: int) -> None:
+        """Screen a ``write_scratch`` call's ``text`` and ``path`` against the
+        disclosure list, or raise ``LineToolRefused``. **Round 15 re-review.** The
+        audit wrote 100 clean texts of 256 KiB in two seconds and spent nothing,
+        which made the screen a free oracle on the list. So a screening is a check.
+        It is refused unread once the line's failure or pass limit is spent or when
+        ``size``, the bytes of the text and the path, would pass the hourly byte
+        ceiling, as ``check_disclosure`` is. A pass is recorded as a passing check
+        of ``size`` bytes, and a refusal as a failing one, through
+        ``refuse_disclosed``.
+
+        The pass is recorded before the file is written, since a write refused
+        afterwards, such as under ``read_only_paths``, still tells the line that
+        the text passed. A text already remembered as passed still counts, unlike
+        a remembered file in ``check_disclosure``, because the path is screened
+        too and is new each time. Without a list there is nothing to screen and
+        nothing is counted, and a line the state does not hold is screened and
+        counts nothing, as ``refuse_disclosed`` does. **Failure mode.** A line
+        that writes many scratch files spends its passes, which leaves fewer for
+        ``check_disclosure`` in the same hour."""
+        if line_id in self._disclosure_spent:
+            # Alike for every tool, so a held line learns nothing from its form.
+            raise LineToolRefused(DISCLOSURE_HELD)
+        if not self._disclosure:
+            return
+        known = line_id in self._state().lines
+        now = self._wall_clock()
+        if known:
+            spent = self._spent_budget(line_id, now)
+            if spent is not None:
+                raise _scratch_refused("disclosure budget", spent)
+            allowance = MAX_DISCLOSURE_BYTES - self._disclosure_bytes_used(line_id, now)
+            if size > allowance:
+                raise _scratch_refused(
+                    "disclosure budget",
+                    disclosurecheck.ceiling_refusal(
+                        allowance, MAX_DISCLOSURE_BYTES, DISCLOSURE_CHECK_WINDOW_SECONDS
+                    ),
+                )
+        refusal = self.refuse_disclosed(
+            line_id, ("text", text), ("path", path), checked_bytes=size
+        )
+        if refusal is not None:
+            if refusal == DISCLOSURE_HELD:
+                raise LineToolRefused(refusal)
+            raise _scratch_refused("disclosure list", refusal)
+        if known:
+            self._log.append(DisclosureChecked(line_id, format_due(now), 0, size))
 
     def _area_parts(self, line_id: str, area: str) -> tuple[str, ...]:
         """The components of the directory ``write_scratch`` writes under for
@@ -7248,6 +7290,7 @@ class Scheduler:
         line_id: str,
         *fields: tuple[str, str],
         name_single_match: bool = False,
+        checked_bytes: int | None = None,
     ) -> str | None:
         """**Decided by the operator on 2026-10-28.** The refusal a line tool gives
         for ``fields``, or None when it may proceed. A refusal for disclosure answers
@@ -7261,7 +7304,10 @@ class Scheduler:
         A text that passes is not counted, so the limit bounds only the failures.
         A line already held for another reason is not asked about twice, and its
         release clears this hold too. ``name_single_match`` names the one field that
-        matched among several offered, as ``disclosure.refusal`` says."""
+        matched among several offered, as ``disclosure.refusal`` says.
+        ``checked_bytes`` is recorded with a refusal, so a caller whose screening
+        counts against the byte ceiling, as ``write_scratch`` does, spends its bytes
+        whether the text passes or not."""
         if line_id in self._disclosure_spent:
             return DISCLOSURE_HELD
         texts = tuple(text for _, text in fields)
@@ -7292,6 +7338,7 @@ class Scheduler:
                     line_id,
                     format_due(now),
                     min(max(matched, 1), MAX_DISCLOSURE_MATCHES),
+                    checked_bytes,
                 )
             )
             return answer
@@ -9533,7 +9580,12 @@ class Scheduler:
                 " that already begins with that directory is not nested. Directories"
                 " below the area are created. The result gives the absolute path"
                 " written and the bytes written, and check_disclosure accepts that"
-                " path. A refusal names the rule that applied."
+                " path, answering it then without spending a check. Where the"
+                " project has a disclosure list, each write's text and path are"
+                " checked against it and spend one of check_disclosure's hourly"
+                " passes, or failures when refused, and their bytes, and once a"
+                " count is spent every write is refused. A refusal names the rule"
+                " that applied."
             ),
             input_schema=WRITE_SCRATCH_SCHEMA,
             handler=handler,

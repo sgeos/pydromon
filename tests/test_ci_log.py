@@ -223,7 +223,9 @@ def test_a_placed_file_is_never_answered_as_clean_from_memory(
         for entry in read_entries(tmp_path / "events.sqlite")
         if isinstance(entry.event, DisclosureChecked)
     ]
-    assert [event.matched_lines for event in recorded] == [1, 0]
+    # The write's screening, the placed term, the clean placed file, and nothing for
+    # either placement itself.
+    assert [event.matched_lines for event in recorded] == [0, 1, 0]
 
 
 @pytest.mark.parametrize(

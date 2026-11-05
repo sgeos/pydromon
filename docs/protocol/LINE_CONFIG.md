@@ -712,7 +712,7 @@ area, since `tmp/reports` is the owner's. **Interpretation.** The task named "th
 scratch path is already tmp/reports", which this reads as these two cases. The operator
 can narrow it to one. **Every refusal names its rule.** A refusal reads `write_scratch
 refused by the RULE rule: DETAIL`, with RULE one of `area`, `relative path`, `no parent
-component`, `size`, `disclosure list`, `read_only_paths`, `working directory`, `path
+component`, `size`, `disclosure budget`, `disclosure list`, `read_only_paths`, `working directory`, `path
 walk`, `reserved report directory`, `no overwrite of a link`, `file target`,
 `operating system`, `reports area is for the owner` and `reports area is declared`.
 The one exception is a line held for its disclosure limit, which every tool answers in
@@ -1283,7 +1283,9 @@ matched and gives the generic refusal when two or more did. No answer names the 
 or its position. The refusal records a disclosure check and counts against the same hourly limit as
 `check_disclosure`'s failing checks. A text that passes is not counted, unlike a
 passing `check_disclosure`, which since the round 15 review counts against its own
-limit of 60, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. A wake note
+limit of 60, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. `write_scratch`
+is the exception since the round 15 re-review. Its screening spends a pass or a
+failure and its bytes as a check does, and is refused once either count is spent. A wake note
 is checked again when it fires.
 
 **Request keys.** **Row 11 of the T3 Code review, 2026-10-27.** `send_message`,
