@@ -8,15 +8,21 @@ Type: Added
   run keeps the last 20 lines and at most 2,048 bytes of its output, printable
   characters only, in the new `run_ended` field `output_tail`, shown labelled untrusted
   and quoted in the `Run ended` note, in `run_status` for the latest run, in `dromon
-  run status RUN` and in the `runs` request. **Rollback hazard.** A daemon from before
-  this change refuses the log once a failed run's tail is recorded.
+  run status RUN` and in the `runs` request. The summary and tail are screened against
+  the disclosure list before the end is recorded, and withheld whole when either
+  holds a term, which counts as a failing check of the line that started the run.
+  **Rollback hazard.** A daemon from before this change refuses the log once a failed
+  run's tail is recorded.
 - Task of 2026-11-05, run parameters. A declared run command may hold whole-argument
   placeholders `{NAME}`, each declared with a pattern under
   `[runs.parameters.COMMAND.NAME]`, and `start_run` takes `arguments` with a value for
-  each. A value must match its pattern in full, be 1 to 256 printable bytes and never
-  begin with `-`, and replaces exactly its one argument without a shell, so a line can
-  rerun one suspect test outside its sandbox. `run_status` lists each parameter with
-  its pattern, and `RUNS.md` gives the trust argument.
+  each. A value must match its pattern in full, be 1 to 256 printable bytes, never
+  begin with `-` or `/` and hold no `..` step, and replaces exactly its one argument
+  without a shell, so a line can rerun one suspect test outside its sandbox. A pattern
+  that repeats a group is refused, and values are matched by a child process under a
+  deadline of two seconds, so a pattern that backtracks never holds the daemon.
+  `run_status` lists each parameter with its pattern, and `RUNS.md` gives the trust
+  argument.
 - Task of 2026-11-05, CI logs. `dromon ci-log LINE RUN [--job JOB] [--yes]` runs `gh`
   as the operator, shows the GitHub Actions run and asks before copying, then copies
   the last 200 KiB of its failed steps' log, printable text only and headed as

@@ -235,7 +235,7 @@ argument outside a tool's schema is refused.
 | `propose_change` | Records a proposed patch, file list and message for operator review; it does not change project files |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
 | `write_scratch` | Writes a file under the line's scratch in its working directory, `tmp/` or `tmp/lines/LINE`, as below. Its result gives the absolute path written and the bytes written |
-| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term, a file name or a line location. Files are checked independently, so a match cannot span files. A file is read in parts of at most 1 MiB cut after a newline and the counts are summed, a line may not exceed 1 MiB, and the combined content is at most 16 MiB. A path may be the absolute path `write_scratch` reported. One call, including a list, is one recorded check, and since the task of 2026-11-05 only a failing one spends the hourly limit, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
+| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term, a file name or a line location. Files are checked independently, so a match cannot span files. A file is read in parts of at most 1 MiB cut after a newline and the counts are summed, a line may not exceed 1 MiB, and the combined content is at most 16 MiB. A path may be the absolute path `write_scratch` reported. One call, including a list, is one recorded check. In any 3,600 seconds a line has 10 failing checks, which bound the terms it can confirm, 60 passing checks, which bound the candidate texts it can try, and 64 MiB read by its checks in all, which bounds the candidate bytes it can test and the daemon's time spent matching for it, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies since the round 15 review. Once either count is spent every check is refused, content past the bytes left is refused unread, and the answer says what is left of each. The check reads on a worker thread, off the daemon's event loop, and one runs at a time for each line. Added on 2026-10-28 |
 | `list_processes`, `stop_process` | List and stop the processes the line started, as below. Where the daemon cannot attribute processes to the line, `list_processes` says it is unavailable and why, and never returns an empty list. Changed in round 14 |
 | `worktree_status` | Gives the state of the line's own working directory, computed by the daemon outside the line's sandbox, as the processes section below specifies. Added in round 14, item 7 |
 
@@ -1237,7 +1237,9 @@ field. Calls offering several text fields receive a generic refusal, even if onl
 one matches, except `set_brief`, which since the task of 2026-11-05 names the one field that
 matched and gives the generic refusal when two or more did. No answer names the term
 or its position. The refusal records a disclosure check and counts against the same hourly limit as
-`check_disclosure`, whose passing checks spend nothing since the task of 2026-11-05, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. A wake note
+`check_disclosure`'s failing checks. A text that passes is not counted, unlike a
+passing `check_disclosure`, which since the round 15 review counts against its own
+limit of 60, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. A wake note
 is checked again when it fires.
 
 **Request keys.** **Row 11 of the T3 Code review, 2026-10-27.** `send_message`,

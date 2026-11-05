@@ -63,7 +63,23 @@ kept narrow by these rules, each of which a test checks.
   `..`, no slash outside `tests/`, no space and no other suffix.
 - **Rules the operator cannot widen.** A value is 1 to 256 bytes, holds only printable
   characters, and never begins with `-`, so it is never read as an option, such as
-  `--rootdir` or `-p` for pytest, whatever the pattern admits.
+  `--rootdir` or `-p` for pytest, whatever the pattern admits. **Round 15 review,
+  P2.** Nor may it begin with `/` or hold a `..` step between slashes, so a value
+  never names a path outside the working directory by itself. The audit's
+  `tests/[A-Za-z0-9_./]+` admitted `tests/../../etc/passwd`, which is now refused
+  before the pattern is matched. A name such as `a..b` is no step and is accepted.
+- **A pattern cannot hold the daemon.** **Round 15 review, P1.** Python's `re`
+  backtracks, and the audit measured `([a-z]+)+` holding the daemon's event loop for
+  59 seconds on a value of 30 characters. A pattern that repeats a group with `*`, `+`
+  or `{` is refused when it is declared, which a linear engine in a port would accept
+  and which removes the usual exponential forms. That alone is not enough, since a run
+  of optional items such as `a?a?a?aaa`, or of alternatives such as `(a|a)(a|a)`,
+  still backtracks exponentially. So the values are matched by a child Python process,
+  run with `-I`, under a deadline of two seconds, and a match that does not end in
+  time refuses the start and its child is killed and reaped. `re` holds the
+  interpreter lock while it matches, so a worker thread would not have freed the loop,
+  and a process does. A child that fails or answers anything but one result for each
+  value refuses the start, so a broken matcher lets nothing through.
 - **The record.** `run_started` records `argv` with the values in place, so the log
   and `run_status` show exactly what ran.
 - **Refused before anything else.** A value that is refused stops the start before the
@@ -75,12 +91,15 @@ named by a valid value runs with the daemon's authority, and a writing line can 
 that file, as it can write every script a declared command runs, which the trust
 section below already accepts for every command. The pattern only bounds which file.
 A commit command may declare parameters too, and then the file is the commit's, which
-no line can change after the ref has moved. **Porting hazard.** A pattern may not use
-`(?`, a backslash before a digit or a possessive quantifier, which a port's regular
-expressions may lack, so patterns stay portable. **Residual.** A pattern with nested
-quantifiers can take time exponential in the value's length to match. The value is
-bounded at 256 bytes and the pattern is the operator's, which the daemon trusts as it
-trusts the command.
+no line can change after the ref has moved. A value with no `..` step can still reach
+outside the worktree through a link the line planted in it, which the program
+follows, so a command that must stay in the worktree must refuse links itself.
+**Porting hazard.** A pattern may not use `(?`, a backslash before a digit or a
+possessive quantifier, which a port's regular expressions may lack, so patterns stay
+portable. A port with a linear engine needs neither the child nor the deadline, but
+must keep the refusal of a repeated group so the same declarations load. **Residual.**
+A start whose values match waits for the child, about 50 milliseconds on the machine
+the tests ran on, while other work on the loop goes on.
 
 The command runs in the line's working directory, resolved to its real path, with the
 daemon's `PATH`, `HOME`, `LANG`, `TERM` and `TMPDIR` and with `DROMON_RUN_ID`, the
@@ -301,6 +320,22 @@ note, in `run_status` for the scope's latest run, and in `dromon run status RUN`
 `runs` request gives it as `output_tail`. It discloses nothing a reader of the output
 file could not already read, since the file is in the scope's working directory.
 
+**Screening, round 15 review, R1, the operator's decision.** The tail and the test
+summary enter the event log and every copy of it, such as the one `dromond --check`
+makes, where a term of the disclosure list, a token in a URL or a value a traceback
+printed would stay in clear. So both are screened against the disclosure list before
+the end is recorded, and when either holds a term both are withheld, and the note says
+`The output's test summary and last lines are withheld from this record, since they
+hold a term from the project's disclosure list`. The output file is unchanged. A
+withholding is the same answer a check gives, so it counts as a failing check of the
+line that started the run, which a line printing candidates in its output could
+otherwise use to test them outside the check's limit. A line that has spent its failing
+checks has both withheld whatever they hold, with a note naming that reason, so the
+withholding tells it nothing. **Residual.** A tail that passes is not counted against
+the pass limit, as a tool's passing text is not, so a line can test a tail of up to
+2,048 bytes for each run it can start, at most one at a time in its scope. Text that is
+no listed term, such as a credential the list does not name, is kept as before.
+
 ## A lost run
 
 A lost run's supervisor is gone without a receipt, so its command may still run, in a
@@ -381,6 +416,8 @@ start another run. The rollback floor in [`EVENT_LOG.md`](../protocol/EVENT_LOG.
 names the commits of these and every other one-way change. **Task of 2026-11-05, item
 2.** `run_ended` gained `output_tail`, left out when null, so a daemon from before it
 reads every end without a tail and refuses the log once a failed run's tail is
+recorded. **Round 15 review.** `disclosure_checked` gained `checked_bytes` the same
+way, so a daemon from before it refuses the log once a `check_disclosure` call is
 recorded.
 
 ## Descendants in a session of their own

@@ -5,6 +5,7 @@ widen. ``docs/architecture/RUNS.md`` gives the trust argument."""
 import asyncio
 import os
 import sys
+import time
 from collections.abc import Generator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,6 +42,11 @@ COMMAND = ("uv", "run", "pytest", "{test}", "-q")
         ("a*+", "possessive"),
         ("a{2}+", "possessive"),
         ("[", "not valid"),
+        ("([a-z]+)+", "repeat a group"),
+        (r"(\w+\s?)*", "repeat a group"),
+        ("(ab){2,}", "repeat a group"),
+        ("x(a|b)+y", "repeat a group"),
+        ("((a))+", "repeat a group"),
     ],
 )
 def test_a_pattern_that_is_empty_unportable_or_invalid_is_refused(
@@ -48,6 +54,33 @@ def test_a_pattern_that_is_empty_unportable_or_invalid_is_refused(
 ) -> None:
     with pytest.raises(ParameterRefused, match=reason.replace("(", r"\(")):
         runparams.check_pattern(pattern)
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        r"tests/[a-z0-9_]+\.py",
+        r"tests/(unit|integration)/[a-z_]+\.py",
+        r"[a-z]+(::[A-Za-z_]+)?",
+        r"\)+",
+        "[)]+",
+        "[]a)]+",
+        "[^])]+",
+        r"[\])]+",
+    ],
+)
+def test_a_pattern_that_repeats_no_group_is_accepted(pattern: str) -> None:
+    """Round 15 review, P1. An escaped parenthesis, or one in a character class, is
+    no group, and a group that is not repeated, or only made optional, is
+    accepted."""
+    assert not runparams.repeats_group(pattern)
+    runparams.check_pattern(pattern)
+
+
+def test_the_group_scan_ends_on_a_trailing_escape() -> None:
+    assert not runparams.repeats_group("a\\")
+    assert runparams.repeats_group("[x](a)+")
+    assert not runparams.repeats_group("[(a)+]")
 
 
 def test_placeholders_are_whole_arguments_after_the_program() -> None:
@@ -92,7 +125,7 @@ def test_a_command_declares_at_most_eight_parameters() -> None:
         ("tests/a\x00.py", "printable"),
         ("-k", "begin with -"),
         ("--rootdir=/", "begin with -"),
-        ("tests/../secret.py", "does not match"),
+        ("tests/../secret.py", "a .. step"),
         ("tests/a.py extra", "does not match"),
         ("src/a.py", "does not match"),
     ],
@@ -101,21 +134,126 @@ def test_a_value_is_refused_by_the_fixed_rules_or_its_pattern(
     value: object, reason: str
 ) -> None:
     with pytest.raises(ParameterRefused, match=reason):
-        runparams.check_value(TEST_PATH, value)
+        substitute(("prog", "{test}"), {"test": TEST_PATH}, {"test": value})
+
+
+def substitute(
+    argv: Sequence[str],
+    declared: dict[str, RunParameter],
+    given: dict[str, object] | None,
+    seconds: float = runparams.MATCH_SECONDS,
+) -> tuple[str, ...]:
+    """Prepare and match as ``Scheduler.start_run`` does."""
+    return asyncio.run(
+        runparams.match(runparams.prepare(argv, declared, given), seconds)
+    )
 
 
 def test_a_dash_is_refused_even_where_the_pattern_allows_it() -> None:
     wide = RunParameter("any", ".+")
     with pytest.raises(ParameterRefused, match="begin with -"):
-        runparams.check_value(wide, "-x")
-    assert runparams.check_value(wide, "x-") == "x-"
+        runparams.check_fixed(wide, "-x")
+    assert runparams.check_fixed(wide, "x-") == "x-"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "tests/../../etc/passwd",
+        "..",
+        "../x",
+        "a/..",
+        "a/../b",
+        "/etc/passwd",
+        "/",
+    ],
+)
+def test_a_path_out_is_refused_whatever_the_pattern(value: str) -> None:
+    """Round 15 review, P2. The audit's ``tests/[A-Za-z0-9_./]+`` accepted
+    ``tests/../../etc/passwd``. A leading / or a .. step is refused before any
+    pattern is matched."""
+    wide = RunParameter("test", r"[A-Za-z0-9_./]+")
+    with pytest.raises(ParameterRefused, match=r"begin with / or hold a \.\. step"):
+        runparams.check_fixed(wide, value)
+
+
+@pytest.mark.parametrize("value", ["a..b", "tests/x..py", "...", "a/.../b", "./a"])
+def test_dots_that_are_no_step_up_are_accepted(value: str) -> None:
+    wide = RunParameter("test", r"[A-Za-z0-9_./]+")
+    assert runparams.check_fixed(wide, value) == value
+
+
+def test_a_backtracking_match_is_refused_at_its_deadline_off_the_loop() -> None:
+    """Round 15 review, P1. A pattern no group repeats can still backtrack
+    exponentially, as a run of optional items does. The child that matches it is
+    killed at the deadline, the value is refused, and the loop runs meanwhile."""
+    count = 40
+    slow = RunParameter("value", "a?" * count + "a" * count)
+    assert not runparams.repeats_group(slow.pattern)
+    prepared = runparams.prepare(
+        ("prog", "{value}"), {"value": slow}, {"value": "a" * count}
+    )
+    ticks: list[float] = []
+
+    async def scenario() -> str:
+        async def tick() -> None:
+            for _ in range(1000):
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.01)
+
+        ticking = asyncio.create_task(tick())
+        try:
+            await runparams.match(prepared, 0.5)
+        except ParameterRefused as error:
+            return str(error)
+        finally:
+            ticking.cancel()
+        return "matched"
+
+    started = time.monotonic()
+    refusal = asyncio.run(scenario())
+    assert "took longer than 0.5 seconds" in refusal
+    assert time.monotonic() - started < 10
+    # The loop ran while the child matched, so the ticks span the wait.
+    assert len(ticks) > 10
+
+
+def test_a_child_that_fails_refuses_the_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A child that exits with an error, or prints anything but one answer for each
+    value, refuses the start, so a broken matcher never lets a value through."""
+    prepared = runparams.prepare(
+        ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
+    )
+    for program in (
+        "import sys; sys.exit(3)",
+        "print('[true, true]')",
+        "print('[1]')",
+        "print('not json')",
+        "print('x' * 5000)",
+    ):
+        monkeypatch.setattr(runparams, "MATCHER", program)
+        with pytest.raises(ParameterRefused, match="could not be matched"):
+            asyncio.run(runparams.match(prepared))
+    monkeypatch.setattr(runparams, "MATCHER", "print('[false]')")
+    with pytest.raises(ParameterRefused, match="does not match its pattern"):
+        asyncio.run(runparams.match(prepared))
+
+
+def test_a_command_without_values_starts_no_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def never(*args: object, **kwargs: object) -> object:
+        raise AssertionError("a child was started")
+
+    monkeypatch.setattr(runparams.asyncio, "create_subprocess_exec", never)
+    assert substitute(("make",), {}, None) == ("make",)
 
 
 def test_values_replace_their_placeholders_as_whole_arguments() -> None:
     argv = ("uv", "run", "pytest", "{test}", "x{test}")
     declared = {"test": TEST_PATH}
     # x{test} is not a placeholder, so it is left as the operator wrote it.
-    assert runparams.substitute(argv[:4], declared, {"test": "tests/test_x.py"}) == (
+    assert substitute(argv[:4], declared, {"test": "tests/test_x.py"}) == (
         "uv",
         "run",
         "pytest",
@@ -136,14 +274,14 @@ def test_a_missing_or_extra_value_is_refused(
     given: dict[str, object] | None, reason: str
 ) -> None:
     with pytest.raises(ParameterRefused, match=reason):
-        runparams.substitute(COMMAND, {"test": TEST_PATH}, given)
+        runparams.prepare(COMMAND, {"test": TEST_PATH}, given)
 
 
 def test_a_command_without_parameters_takes_no_arguments() -> None:
-    assert runparams.substitute(("make",), {}, None) == ("make",)
-    assert runparams.substitute(("make",), {}, {}) == ("make",)
+    assert substitute(("make",), {}, None) == ("make",)
+    assert substitute(("make",), {}, {}) == ("make",)
     with pytest.raises(ParameterRefused, match="takes no arguments"):
-        runparams.substitute(("make",), {}, {"x": "y"})
+        runparams.prepare(("make",), {}, {"x": "y"})
 
 
 def test_describe_names_each_pattern() -> None:

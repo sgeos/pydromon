@@ -387,14 +387,26 @@ stops the start, or refuses the reload and keeps the previous list.
   have at most 10 failing checks in any 3,600 seconds, counted from the recorded times on the
   wall clock, so the limit survives a restart. Every answer says whether a text holds
   a term, so an unlimited check would let a line test candidate words one by one.
-  **Task of 2026-11-05, item 1, the operator's decision.** A check that passes is recorded and
-  spends nothing, as a tool's text that passes never did, and the answer says which
-  happened. Once the failures reach the limit, every check is refused unread, one that
-  would pass too, since answering only the passes would tell a line which texts fail.
-  **Residual risk.** A line may now test candidates without limit until one fails, so
-  the limit bounds the terms a line can confirm in an hour rather than the candidates
-  it tries. This was already true of the other tools, whose passing text was never
-  counted, and the guard is against accidents, as the limits above say. A
+  **Task of 2026-11-05, item 1, the operator's decision.** A check that passes spends
+  nothing of the failure limit, and the answer says which happened. **Round 15 review,
+  D1, the operator's decision.** Free passes let a line try about 130 times more
+  candidates an hour, so a short term fell to a few failures. So a line also has at
+  most 60 passing checks in the same window, and its checks may read at most 64 MiB in
+  all, passes and failures together. The failure limit bounds the terms a line can
+  confirm, the pass limit the candidate texts it can try, and the byte ceiling the
+  candidate bytes it can test and the daemon's time spent matching for it. 64 MiB is
+  less than the 160 MiB that ten checks of 16 MiB allowed before passes were free.
+  Once either count is spent, every check is refused unread, a would-be pass or
+  failure too, since answering only one kind would tell a line which texts are the
+  other. A text or file whose size would pass the bytes left is refused by its size
+  before it is read, and records nothing. **Round 15 review, D3.** A check reads and
+  matches on a worker thread, so it does not hold the daemon's event loop, and one
+  check runs at a time for each line. A tool's refusal may spend the last failure
+  while a check reads, so the limits are read again before the check is recorded, and
+  the check is then refused unanswered. **Residual risk.** A tool's text that passes
+  the screen, such as a `write_scratch` text of up to 256 KiB, is still not counted,
+  as it never was, so a line can still test candidates through those tools at their
+  own sizes, and the guard remains against accidents, as the limits above say. A
   file is read as `write_scratch` writes, walked without following a link, and only
   when it is a regular file of the daemon's user with one name, outside every
   directory Dromon protects, and at most 16 MiB combined. A refusal, of a missing list, a limit
@@ -413,7 +425,10 @@ stops the start, or refuses the reload and keeps the previous list.
   held for another reason is not asked about twice, and the release of that hold
   ends this one too. `check_disclosure` itself, when its limit is reached, still
   refuses with the time of its next check and does not hold the line, since that
-  refusal reveals nothing of the list. **Fact.** Each spent limit still yields one
+  refusal reveals nothing of the list. **Round 15 review, R1.** A run's output
+  summary and tail are screened the same way before its end is recorded, and
+  withheld whole when either holds a term, which counts as a failing check of the line
+  that started the run, as [`RUNS.md`](../architecture/RUNS.md) specifies. **Fact.** Each spent limit still yields one
   further answer, since the held reply differs from a sent one, so a line learns at
   most 11 answers per release.
 

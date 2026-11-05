@@ -351,6 +351,33 @@ def note_with_summary(note: str, summary: str | None) -> str:
     return text.encode()[:MAX_RUN_NOTE_BYTES].decode("utf-8", "ignore")
 
 
+OUTPUT_WITHHELD: Final = (
+    "The output's test summary and last lines are withheld from this record, since"
+    " they hold a term from the project's disclosure list. The output file is"
+    " unchanged"
+)
+"""What a run's end says in place of its summary and tail when either holds a listed
+term. **Round 15 review, R1.** Both come from the command's output and would enter
+the event log and every copy of it in clear, so they are screened before the end is
+recorded, as a line's own text is, and dropped whole when either matches."""
+
+OUTPUT_WITHHELD_SPENT: Final = (
+    "The output's test summary and last lines are withheld from this record, since"
+    " the line that started it has spent its disclosure checks. The output file is"
+    " unchanged"
+)
+"""What a run's end says in place of its summary and tail, whatever they hold, when
+the line that started it has no failing disclosure check left. **Round 15 review,
+R1.** Whether a tail was withheld says whether the output held a term, which is the
+answer the check limits, so a line that has spent them learns nothing from it."""
+
+
+def note_withheld(note: str, reason: str) -> str:
+    """The run's note with the reason its summary and tail are withheld after it."""
+    lead = f"{note}. " if note else ""
+    return f"{lead}{reason}".encode()[:MAX_RUN_NOTE_BYTES].decode("utf-8", "ignore")
+
+
 MAX_TAIL_LINES: Final = 20
 """The most lines of a failed run's output its end keeps. **Task of 2026-11-05, item
 2.**"""

@@ -114,7 +114,7 @@ import sys
 import traceback
 from datetime import UTC, datetime, timedelta
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import (
@@ -130,7 +130,7 @@ from typing import (
 from claude_agent_sdk import SdkMcpTool
 
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
-from dromon import disclosure
+from dromon import disclosure, disclosurecheck
 from dromon.overrides import (
     OverrideError,
     Scope,
@@ -363,8 +363,10 @@ from dromon.model import (
     LineTurnEnded,
     MAX_TURN_KEYS,
     DISCLOSURE_CHECK_WINDOW_SECONDS,
+    MAX_DISCLOSURE_BYTES,
     MAX_DISCLOSURE_CHECKS,
     MAX_DISCLOSURE_MATCHES,
+    MAX_DISCLOSURE_PASSES,
     DisclosureChecked,
     MAX_TASK_COMMAND_BYTES,
     MAX_TASK_PATH_BYTES,
@@ -761,7 +763,7 @@ MAX_CHECKED_BYTES: Final = 1024 * 1024
 """The largest text ``check_disclosure`` takes, and the size of one part of a file.
 **Round 14, item 3.** A file is checked in parts of at most this size, split after a
 newline, and the counts are summed, so a longer file costs one check and not several."""
-MAX_CHECKED_TOTAL_BYTES: Final = 16 * 1024 * 1024
+MAX_CHECKED_TOTAL_BYTES: Final = disclosurecheck.MAX_CHECKED_TOTAL_BYTES
 """The largest combined files ``check_disclosure`` reads in one check. A bound on
 memory and time, since the parts are held together before they are split."""
 MAX_CHECKED_PATHS: Final = 8
@@ -773,6 +775,34 @@ DISCLOSURE_HELD: Final = (
 )
 """The answer of every disclosure-checked line tool once the line spent its limit,
 whatever the text holds, so a held line learns nothing more of the list."""
+
+
+class CheckAnswer(NamedTuple):
+    """What one ``check_disclosure`` call answers. ``matched`` is the count of lines
+    holding a listed term, and the rest is what the line has left in the window.
+    **Round 15 review, D1.**"""
+
+    matched: int
+    failures_left: int
+    passes_left: int
+    bytes_left: int
+
+
+def check_answer_text(answer: CheckAnswer) -> str:
+    """The ``check_disclosure`` tool's answer, naming the limit the check spent and
+    what is left of each."""
+    matched = answer.matched
+    lines = "1 line holds" if matched == 1 else f"{matched} lines hold"
+    outcome = "pass" if matched == 0 else "fail"
+    spent = "This pass counts" if matched == 0 else "This failure counts"
+    return (
+        f"{outcome}, {lines} a term from the project's disclosure list. {spent}"
+        f" against its limit. In {DISCLOSURE_CHECK_WINDOW_SECONDS} seconds you have"
+        f" {answer.failures_left} of {MAX_DISCLOSURE_CHECKS} failing checks,"
+        f" {answer.passes_left} of {MAX_DISCLOSURE_PASSES} passing checks and"
+        f" {answer.bytes_left} of {MAX_DISCLOSURE_BYTES} bytes left."
+    )
+
 
 CHECK_DISCLOSURE_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
@@ -2283,6 +2313,10 @@ class Scheduler:
         self._quiet_tasks: dict[str, QuietTurn] = {}
         """What a silent turn left running, by line, for the next prompt. In memory,
         so a restart forgets it, as it ends the kept session whose tasks it names."""
+        self._disclosure_running: set[str] = set()
+        """Lines with a ``check_disclosure`` call on a worker thread. **Round 15
+        review, D3.** One runs at a time for each line, so concurrent calls cannot
+        each pass the budget before any is recorded."""
         self._disclosure_spent: set[str] = set()
         """Lines that spent their disclosure limit and are held for it. Every
         disclosure-checked tool answers ``DISCLOSURE_HELD`` for them until an
@@ -2892,28 +2926,6 @@ class Scheduler:
         except ValueError:
             relative = ""
         return self._disclosure_accepted.get(relative, ())
-
-    def _checked_matches(self, line_id: str, path: str | None, text: str) -> int:
-        return disclosure.matching_lines(
-            self._disclosure, text, self._accepted_lines(line_id, path)
-        )
-
-    def _checked_file_matches(self, line_id: str, path: str, data: bytes) -> int:
-        """The lines of a file's bytes that hold a listed term, counted in parts of
-        at most ``MAX_CHECKED_BYTES`` and summed. Refused when a line is longer than
-        a part, since a term could straddle a cut there. **Round 14, item 3.**"""
-        try:
-            return disclosure.matching_lines_in_parts(
-                self._disclosure,
-                data,
-                MAX_CHECKED_BYTES,
-                self._accepted_lines(line_id, path),
-            )
-        except disclosure.LineTooLong as error:
-            raise LineToolRefused(
-                f"the supplied file has a line longer than {MAX_CHECKED_BYTES} bytes,"
-                " which cannot be checked in parts without risking a term across a cut"
-            ) from error
 
     def _workdir_relative(self, line_id: str, path: str) -> str:
         """``path`` as a path relative to the line's working directory. A relative
@@ -4472,15 +4484,18 @@ class Scheduler:
         **Round 14, item 1.** With ``commit``, a commit command runs in a checkout of
         that commit the daemon makes, as ``commitruns`` says. **Task of 2026-11-05,
         item 3.** ``arguments`` gives a value for each parameter the command
-        declares, each checked as ``runparams.substitute`` says before anything else
+        declares, each checked as ``runparams.prepare`` says before anything else
         is, and the run records the command as it ran, with the values in place.
-        Raises ``runs.RunRefused``."""
+        **Round 15 review, P1.** The values are matched against their patterns by a
+        child process under a deadline, as ``runparams.match`` says, so a pattern
+        that backtracks never holds the loop. Raises ``runs.RunRefused``."""
         try:
-            argv = runparams.substitute(
+            prepared = runparams.prepare(
                 self._run_argv(command, commit),
                 self._run_parameters.get(command, {}),
                 arguments,
             )
+            argv = await runparams.match(prepared)
         except runparams.ParameterRefused as error:
             raise runs.RunRefused(str(error)) from error
         refusal = self._run_refusal(line_id, writes=commit is None)
@@ -4985,6 +5000,7 @@ class Scheduler:
         run = self._state().runs.get(finding.run_id)
         if run is None or run.ended is not None:
             return
+        note, tail = self._screened_output(run.started.line_id, finding)
         self._log.append(
             RunEnded(
                 finding.run_id,
@@ -4992,9 +5008,9 @@ class Scheduler:
                 finding.exit_code,
                 finding.output_digest,
                 finding.output_bytes,
-                runs.note_with_summary(finding.note, finding.summary),
+                note,
                 format_due(self._wall_clock()),
-                finding.tail,
+                tail,
             )
         )
         self._run_children.pop(finding.run_id, None)
@@ -5007,6 +5023,43 @@ class Scheduler:
         for line_id, wake_id in sorted(waiting.items()):
             if line_id != holder:
                 self._harness_note(LineAddress(line_id), text + _run_wake_text(wake_id))
+
+    def _screened_output(
+        self, line_id: str, finding: runs.Finding
+    ) -> tuple[str, str | None]:
+        """The note and tail a run's end records, with its output's summary and tail
+        screened against the disclosure list first. **Round 15 review, R1, the
+        operator's decision.** Either holding a term withholds both, and counts as a
+        failing check of ``line_id``, which started the run, as a tool's refusal
+        does, so a line cannot print candidates in a run's output to test them
+        outside the check's limit. A line that has spent its failing checks has both
+        withheld whatever they hold, so the withholding tells it nothing. A run of a
+        line no longer known is screened and nothing is counted."""
+        summary, tail = finding.summary, finding.tail
+        if summary is None and tail is None:
+            return finding.note, None
+        now = self._wall_clock()
+        known = line_id in self._state().lines
+        if known and (
+            line_id in self._disclosure_spent
+            or self._disclosure_reopens(line_id, now) is not None
+        ):
+            return runs.note_withheld(finding.note, runs.OUTPUT_WITHHELD_SPENT), None
+        texts = tuple(text for text in (summary, tail) if text is not None)
+        if not self.discloses(*texts):
+            return runs.note_with_summary(finding.note, summary), tail
+        if known:
+            matched = sum(
+                disclosure.matching_lines(self._disclosure, text) for text in texts
+            )
+            self._log.append(
+                DisclosureChecked(
+                    line_id,
+                    format_due(now),
+                    min(max(matched, 1), MAX_DISCLOSURE_MATCHES),
+                )
+            )
+        return runs.note_withheld(finding.note, runs.OUTPUT_WITHHELD), None
 
     def _withdraw_run_wakes(self, run_id: str) -> dict[str, str]:
         """Withdraw each pending wake that waits for the run ``run_id``, and return
@@ -6822,24 +6875,79 @@ class Scheduler:
         text: str | None,
         path: str | None,
         paths: Sequence[str] | None = None,
-    ) -> tuple[int, int]:
+    ) -> CheckAnswer:
         """**Item B2 of 2026-10-28.** Check ``text``, the file at ``path``, or the
         files at ``paths`` in the line's working directory, against the project's
         disclosure list, record
         ``disclosure_checked``, and return how many of its lines hold a listed term
-        and how many checks the line has left in the window. Never says which term.
+        and what the line has left in the window. Never says which term. The tool
+        runs the same steps with the reading on a worker thread, as
+        ``check_disclosure_off_loop`` says, and this form runs them in the caller.
 
         Refused when the project has no list, when the line had
-        ``MAX_DISCLOSURE_CHECKS`` failures within ``DISCLOSURE_CHECK_WINDOW_SECONDS``,
-        and for a text or file the check cannot read. **Task of 2026-11-05, item 1.**
-        A check
-        that passes is recorded and spends nothing. Once the limit is reached every
-        check is refused unread, a would-be pass too, since answering only the passes
+        ``MAX_DISCLOSURE_CHECKS`` failures or ``MAX_DISCLOSURE_PASSES`` passes within
+        ``DISCLOSURE_CHECK_WINDOW_SECONDS``, when the content would pass
+        ``MAX_DISCLOSURE_BYTES`` read in the window, and for a text or file the check
+        cannot read. **Task of 2026-11-05, item 1, and the round 15 review, D1.** A
+        failure counts against the failure limit and a pass against the larger pass
+        limit, and both count their bytes. Once either limit is reached every check
+        is refused unread, a would-be pass too, since answering only the passes
         would tell a line which texts fail. A refusal records nothing,
         since it reveals nothing of the list, so a spent limit refuses here without
         holding the line, unlike ``refuse_disclosed``. The window is read from the
         recorded times on the wall clock, so it survives a restart, and a clock set
         back lengthens it while one set forward shortens it."""
+        plan, now = self._plan_check(line_id, text, path, paths)
+        try:
+            matched, read = disclosurecheck.count(
+                plan, MAX_DISCLOSURE_BYTES, DISCLOSURE_CHECK_WINDOW_SECONDS
+            )
+        except disclosurecheck.CheckRefused as error:
+            raise LineToolRefused(str(error)) from error
+        return self._record_check(line_id, now, matched, read)
+
+    async def check_disclosure_off_loop(
+        self,
+        line_id: str,
+        text: str | None,
+        path: str | None,
+        paths: Sequence[str] | None = None,
+    ) -> CheckAnswer:
+        """``check_disclosure`` with its reading and matching on a worker thread.
+        **Round 15 review, D3, the operator's decision.** The plan is taken and the
+        answer recorded on the loop, and only the plan's plain data crosses to the
+        thread. One call runs at a time for each line, and a second is refused, so
+        concurrent calls cannot each pass the budget before any is recorded. The
+        budget is read again before recording, as ``_record_check`` says."""
+        if line_id in self._disclosure_running:
+            raise LineToolRefused(
+                "another check_disclosure call of this line is still running. Wait"
+                " for its answer, then check again"
+            )
+        plan, now = self._plan_check(line_id, text, path, paths)
+        self._disclosure_running.add(line_id)
+        try:
+            matched, read = await asyncio.to_thread(
+                disclosurecheck.count,
+                plan,
+                MAX_DISCLOSURE_BYTES,
+                DISCLOSURE_CHECK_WINDOW_SECONDS,
+            )
+        except disclosurecheck.CheckRefused as error:
+            raise LineToolRefused(str(error)) from error
+        finally:
+            self._disclosure_running.discard(line_id)
+        return self._record_check(line_id, now, matched, read)
+
+    def _plan_check(
+        self,
+        line_id: str,
+        text: str | None,
+        path: str | None,
+        paths: Sequence[str] | None,
+    ) -> tuple[disclosurecheck.CheckPlan, datetime]:
+        """Validate a check and take what it reads from the state, on the loop.
+        ``LineToolRefused`` when the check may not run, before anything is read."""
         if line_id in self._disclosure_spent:
             raise LineToolRefused(DISCLOSURE_HELD)
         offered = sum(value is not None for value in (text, path, paths))
@@ -6856,6 +6964,44 @@ class Scheduler:
                 " check cannot pass or fail without a list."
             )
         now = self._wall_clock()
+        self._refuse_spent_budget(line_id, now)
+        if text is not None and len(text.encode("utf-8")) > MAX_CHECKED_BYTES:
+            raise LineToolRefused(f"text is over {MAX_CHECKED_BYTES} bytes")
+        allowance = MAX_DISCLOSURE_BYTES - self._disclosure_bytes_used(line_id, now)
+        if allowance <= 0:
+            raise LineToolRefused(
+                disclosurecheck.ceiling_refusal(
+                    allowance, MAX_DISCLOSURE_BYTES, DISCLOSURE_CHECK_WINDOW_SECONDS
+                )
+            )
+        root: Path | None = None
+        files: list[tuple[str, tuple[str, ...]]] = []
+        if text is None:
+            for file_path in [path] if path is not None else list(paths or ()):
+                relative = self._workdir_relative(line_id, file_path)
+                files.append((relative, self._accepted_lines(line_id, relative)))
+            try:
+                root = Path(os.path.realpath(self._workdir_of(line_id)))
+            except LineToolRefused as error:
+                raise LineToolRefused("cannot resolve the working directory") from error
+        plan = disclosurecheck.CheckPlan(
+            terms=tuple(self._disclosure),
+            text=text,
+            root=root,
+            protected=tuple(
+                Path(os.path.realpath(directory)) for directory in self._protected
+            ),
+            files=tuple(files),
+            allowance=allowance,
+            total=MAX_CHECKED_TOTAL_BYTES,
+            part=MAX_CHECKED_BYTES,
+        )
+        return plan, now
+
+    def _refuse_spent_budget(self, line_id: str, now: datetime) -> None:
+        """``LineToolRefused`` naming the limit when the line has no failing or no
+        passing check left in the window, since either answer would then tell it
+        something the other limit withholds."""
         reopens = self._disclosure_reopens(line_id, now)
         if reopens is not None:
             raise LineToolRefused(
@@ -6863,33 +7009,51 @@ class Scheduler:
                 f" {DISCLOSURE_CHECK_WINDOW_SECONDS} seconds is reached, and the"
                 f" next check is allowed at {format_due(reopens)}"
             )
-        if text is not None and len(text.encode("utf-8")) > MAX_CHECKED_BYTES:
-            raise LineToolRefused(f"text is over {MAX_CHECKED_BYTES} bytes")
-        matched_lines = 0
-        if paths is not None:
-            total_bytes = 0
-            for file_path in paths:
-                relative = self._workdir_relative(line_id, file_path)
-                file_bytes = self._read_checked(
-                    line_id, relative, MAX_CHECKED_TOTAL_BYTES - total_bytes
-                )
-                total_bytes += len(file_bytes)
-                matched_lines += self._checked_file_matches(
-                    line_id, relative, file_bytes
-                )
-        elif path is not None:
-            relative = self._workdir_relative(line_id, path)
-            matched_lines = self._checked_file_matches(
-                line_id, relative, self._read_checked(line_id, relative)
+        passes = self._state().disclosure_passes.get(line_id, ())
+        if len(passes) >= MAX_DISCLOSURE_PASSES:
+            opens = parse_due(passes[-MAX_DISCLOSURE_PASSES]) + timedelta(
+                seconds=DISCLOSURE_CHECK_WINDOW_SECONDS
             )
-        else:
-            matched_lines = self._checked_matches(line_id, None, cast(str, text))
-        matched = min(matched_lines, MAX_DISCLOSURE_MATCHES)
-        self._log.append(DisclosureChecked(line_id, format_due(now), matched))
-        recent = self._state().disclosure_checks.get(line_id, ())
+            if now < opens:
+                raise LineToolRefused(
+                    f"the limit of {MAX_DISCLOSURE_PASSES} passing checks in"
+                    f" {DISCLOSURE_CHECK_WINDOW_SECONDS} seconds is reached, and the"
+                    f" next check is allowed at {format_due(opens)}"
+                )
+
+    def _in_window(self, times: Iterable[str], now: datetime) -> int:
+        """How many of ``times`` lie within the check window before ``now``."""
         window = timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS)
-        used = sum(1 for time in recent if now - parse_due(time) < window)
-        return matched, max(0, MAX_DISCLOSURE_CHECKS - used)
+        return sum(1 for time in times if now - parse_due(time) < window)
+
+    def _disclosure_bytes_used(self, line_id: str, now: datetime) -> int:
+        """The bytes the line's checks read within the window before ``now``."""
+        window = timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS)
+        return sum(
+            size
+            for time, size in self._state().disclosure_sizes.get(line_id, ())
+            if now - parse_due(time) < window
+        )
+
+    def _record_check(
+        self, line_id: str, now: datetime, matched_lines: int, read: int
+    ) -> CheckAnswer:
+        """Record a check that ran and give its answer. The budget is read again
+        first, since a tool's refusal on the loop may have spent the failure limit
+        while the check ran, and then nothing is recorded or answered, so the
+        limit holds."""
+        self._refuse_spent_budget(line_id, now)
+        matched = min(matched_lines, MAX_DISCLOSURE_MATCHES)
+        self._log.append(DisclosureChecked(line_id, format_due(now), matched, read))
+        state = self._state()
+        failures = self._in_window(state.disclosure_checks.get(line_id, ()), now)
+        passes = self._in_window(state.disclosure_passes.get(line_id, ()), now)
+        return CheckAnswer(
+            matched,
+            max(0, MAX_DISCLOSURE_CHECKS - failures),
+            max(0, MAX_DISCLOSURE_PASSES - passes),
+            max(0, MAX_DISCLOSURE_BYTES - self._disclosure_bytes_used(line_id, now)),
+        )
 
     def _disclosure_reopens(self, line_id: str, now: datetime) -> datetime | None:
         """When the line's window of disclosure checks and refusals next has room,
@@ -6964,79 +7128,6 @@ class Scheduler:
                 cause=HoldCause.DISCLOSURE_CHECKS,
             )
         return DISCLOSURE_HELD
-
-    def _read_checked(
-        self, line_id: str, path: str, max_bytes: int = MAX_CHECKED_TOTAL_BYTES
-    ) -> bytes:
-        """The contents of the file at ``path``, relative to the line's working
-        directory, for ``check_disclosure``. It is walked from the working
-        directory's descriptor one component at a time without following any link,
-        as ``write_scratch`` writes, and read only when it is a regular file of the
-        daemon's user with one name, outside every directory Dromon protects, and at
-        most ``max_bytes``. So a line cannot have the daemon test a file its own
-        sandbox denies or make a list exceed its aggregate bound. Bytes that are not
-        UTF-8 are replaced, which can only hide a term written in them."""
-        if not path or "\x00" in path or path.startswith(("/", "~")):
-            raise LineToolRefused(
-                "path must be a relative path in your working directory"
-            )
-        parts = Path(path).parts
-        if ".." in parts or not parts:
-            raise LineToolRefused("path may not contain ..")
-        try:
-            root = Path(os.path.realpath(self._workdir_of(line_id)))
-        except LineToolRefused as error:
-            raise LineToolRefused("cannot resolve the working directory") from error
-        candidate = root.joinpath(*parts)
-        for directory in self._protected:
-            guarded = Path(os.path.realpath(directory))
-            if candidate == guarded or guarded in candidate.parents:
-                raise LineToolRefused(
-                    "the supplied file is in a directory Dromon protects"
-                )
-        try:
-            parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-        except OSError as error:
-            raise LineToolRefused(
-                f"cannot open the working directory: {error.strerror}"
-            ) from error
-        try:
-            for name in parts[:-1]:
-                entered = os.open(
-                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
-                )
-                os.close(parent)
-                parent = entered
-            descriptor = os.open(
-                parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent
-            )
-        except OSError as error:
-            raise LineToolRefused(
-                "cannot read the supplied file: "
-                f"{error.strerror or type(error).__name__}"
-            ) from error
-        finally:
-            os.close(parent)
-        # Checked on the bare descriptor, since opening a directory as a file object
-        # raises before any check could refuse it.
-        facts = os.fstat(descriptor)
-        if not stat.S_ISREG(facts.st_mode):
-            os.close(descriptor)
-            raise LineToolRefused("the supplied file is not a regular file")
-        if facts.st_nlink != 1 or facts.st_uid != os.getuid():
-            os.close(descriptor)
-            raise LineToolRefused(
-                "the supplied file has more than one name or another owner"
-            )
-        with os.fdopen(descriptor, "rb") as handle:
-            raw = handle.read(max_bytes + 1)
-        if len(raw) > max_bytes:
-            raise LineToolRefused(
-                f"the checked files are over {MAX_CHECKED_TOTAL_BYTES} bytes combined"
-                if max_bytes < MAX_CHECKED_TOTAL_BYTES
-                else f"the supplied file is over {MAX_CHECKED_TOTAL_BYTES} bytes"
-            )
-        return raw
 
     def engine_config(self, line_id: str) -> LineConfig:
         """The configuration ``line_id``'s engine is built with, which is the
@@ -9290,23 +9381,12 @@ class Scheduler:
                     return _tool_error("paths must be a list of text")
                 paths = path_values
             try:
-                matched, left = self.check_disclosure(
+                answer = await self.check_disclosure_off_loop(
                     line_id, text, path, cast(list[str] | None, paths)
                 )
             except (LineToolRefused, EventRejected) as error:
                 return _tool_error(str(error))
-            lines = "1 line holds" if matched == 1 else f"{matched} lines hold"
-            outcome = "pass" if matched == 0 else "fail"
-            spent = (
-                "A check that passes spends nothing."
-                if matched == 0
-                else "This failure counts against the limit."
-            )
-            return _tool_text(
-                f"{outcome}, {lines} a term from the project's disclosure list."
-                f" {spent} You have {left} of {MAX_DISCLOSURE_CHECKS} failing checks"
-                f" left in {DISCLOSURE_CHECK_WINDOW_SECONDS} seconds."
-            )
+            return _tool_text(check_answer_text(answer))
 
         return SdkMcpTool(
             name=CHECK_DISCLOSURE_TOOL_NAME,
@@ -9322,9 +9402,12 @@ class Scheduler:
                 " you wrote and not a draft. Their combined content is at most 16 MiB,"
                 " a line may not exceed 1 MiB, and text is at most 1 MiB. A path may"
                 " be the absolute path write_scratch reported. Every check is"
-                " recorded. Only failing checks, with refusals for disclosure, are"
-                " limited per hour, and once the limit is reached every check is"
-                " refused."
+                f" recorded. In each hour a line has {MAX_DISCLOSURE_CHECKS} failing"
+                " checks, which refusals for disclosure share, and"
+                f" {MAX_DISCLOSURE_PASSES} passing checks, and its checks may read"
+                f" {MAX_DISCLOSURE_BYTES // (1024 * 1024)} MiB in all. Once either"
+                " count is spent every check is refused, and content that would pass"
+                " the bytes left is refused unread."
             ),
             input_schema=CHECK_DISCLOSURE_SCHEMA,
             handler=handler,

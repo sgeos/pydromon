@@ -42,7 +42,9 @@ from dromon.model import (
     HoldCause,
     HARNESS,
     DISCLOSURE_CHECK_WINDOW_SECONDS,
+    MAX_DISCLOSURE_BYTES,
     MAX_DISCLOSURE_CHECKS,
+    MAX_DISCLOSURE_PASSES,
     AgentAddress,
     DisclosureChecked,
     HarnessAddress,
@@ -69,6 +71,7 @@ from dromon.scheduler import (
     UNKNOWN_COST_RULE,
     UNREPORTED_ENGINE_NOTE,
     UNRELEASED_NOTE,
+    CheckAnswer,
     LineSpec,
     LineToolRefused,
     Scheduler,
@@ -1070,21 +1073,31 @@ def test_check_disclosure_answers_pass_or_fail_with_a_count(
     listed(world, tmp_path)
     text, error = world.call("check_disclosure", {"text": "clean\nlines"})
     assert not error and text.startswith("pass, 0 lines hold a term")
-    assert "A check that passes spends nothing." in text
-    assert f"You have {MAX_DISCLOSURE_CHECKS} of" in text
+    assert "This pass counts against its limit." in text
+    assert f"you have {MAX_DISCLOSURE_CHECKS} of" in text
+    assert f"{MAX_DISCLOSURE_PASSES - 1} of {MAX_DISCLOSURE_PASSES} passing" in text
     body = "the CODENAME\nclean\nCodename and a Second Term\n"
     text, error = world.call("check_disclosure", {"text": body})
     assert not error and text.startswith("fail, 2 lines hold a term")
-    assert "This failure counts against the limit." in text
+    assert "This failure counts against its limit." in text
     (world.root / "notes.md").write_text("one codename line\nclean\n")
     text, error = world.call("check_disclosure", {"path": "notes.md"})
     assert not error and text.startswith("fail, 1 line holds a term")
-    # Task of 2026-11-05, item 1. Only the two failures spent the limit.
+    # Task of 2026-11-05, item 1. The two failures spent the failure limit, and
+    # the round 15 review, D1, the one pass spent the pass limit.
     left = MAX_DISCLOSURE_CHECKS - 2
-    assert f"You have {left} of {MAX_DISCLOSURE_CHECKS} failing checks left" in text
+    assert f"you have {left} of {MAX_DISCLOSURE_CHECKS} failing checks," in text
+    assert f"{MAX_DISCLOSURE_PASSES - 1} of {MAX_DISCLOSURE_PASSES} passing" in text
+    read = len("clean\nlines") + len(body) + len("one codename line\nclean\n")
+    assert f"{MAX_DISCLOSURE_BYTES - read} of {MAX_DISCLOSURE_BYTES} bytes" in text
     assert "codename" not in text.casefold() and "second term" not in text.casefold()
     recorded = checks(world)
     assert [event.matched_lines for event in recorded] == [0, 2, 1]
+    assert [event.checked_bytes for event in recorded] == [
+        len("clean\nlines"),
+        len(body),
+        len("one codename line\nclean\n"),
+    ]
     assert {event.checked_at for event in recorded} == {"2026-10-26T09:00:00Z"}
 
 
@@ -1102,7 +1115,7 @@ def test_check_disclosure_checks_multiple_files_as_one_call(
     assert not error and text.startswith("fail, 3 lines hold a term")
     assert len(checks(world)) == 1
     assert checks(world)[0].matched_lines == 3
-    assert f"You have {MAX_DISCLOSURE_CHECKS - 1} of" in text
+    assert f"you have {MAX_DISCLOSURE_CHECKS - 1} of" in text
     assert "readme-a.md" not in text and "readme-b.md" not in text
     assert "review-a.md" not in text
     assert "codename" not in text.casefold()
@@ -1129,7 +1142,7 @@ def test_check_disclosure_multi_file_call_spends_one_limit_entry(
         _, error = world.call("check_disclosure", {"text": "codename"})
         assert not error
     text, error = world.call("check_disclosure", {"paths": ["one.md", "two.md"]})
-    assert not error and f"You have 0 of {MAX_DISCLOSURE_CHECKS}" in text
+    assert not error and f"you have 0 of {MAX_DISCLOSURE_CHECKS}" in text
     assert len(checks(world)) == MAX_DISCLOSURE_CHECKS
     # Once the failures reach the limit, a text that would pass is refused unread
     # too, since answering only passes would say which texts fail.
@@ -1138,21 +1151,191 @@ def test_check_disclosure_multi_file_call_spends_one_limit_entry(
     assert len(checks(world)) == MAX_DISCLOSURE_CHECKS
 
 
-def test_a_check_that_passes_spends_nothing(world: World, tmp_path: Path) -> None:
-    """Task of 2026-11-05, item 1, the operator's decision. Passing checks are
-    recorded, and
-    only failing ones count against the limit."""
+def test_passes_count_against_their_own_larger_limit(
+    world: World, tmp_path: Path
+) -> None:
+    """Round 15 review, D1, the operator's decision. A pass spends nothing of the
+    failure limit, and counts against the pass limit, which once spent refuses
+    every check unread, a would-be failure too."""
     listed(world, tmp_path)
-    for _ in range(MAX_DISCLOSURE_CHECKS * 3):
+    for index in range(MAX_DISCLOSURE_PASSES):
         text, error = world.call("check_disclosure", {"text": "clean"})
-        assert not error and f"You have {MAX_DISCLOSURE_CHECKS} of" in text
-    assert len(checks(world)) == MAX_DISCLOSURE_CHECKS * 3
-    text, error = world.call("check_disclosure", {"text": "codename"})
-    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 1} of" in text
-    # A send that passes after many free checks is still not refused or held.
+        assert not error and f"you have {MAX_DISCLOSURE_CHECKS} of" in text
+        left = MAX_DISCLOSURE_PASSES - index - 1
+        assert f"{left} of {MAX_DISCLOSURE_PASSES} passing checks" in text
+    assert len(checks(world)) == MAX_DISCLOSURE_PASSES
+    for probe in ("clean", "codename"):
+        text, error = world.call("check_disclosure", {"text": probe})
+        assert error and f"limit of {MAX_DISCLOSURE_PASSES} passing checks" in text
+        assert "next check is allowed at 2026-10-26T10:00:00Z" in text
+    assert len(checks(world)) == MAX_DISCLOSURE_PASSES
+    # A send that passes after the passes are spent is still not refused or held,
+    # since another tool's passing text is not a check.
     text, error = world.call("send_message", {"to": "@ana", "body": "clean"})
     assert not error and text.startswith("sent as")
     assert world.log.state.lines["alpha"].held_by is None
+    world.clock.now += timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS)
+    text, error = world.call("check_disclosure", {"text": "codename"})
+    assert not error and text.startswith("fail, 1 line holds")
+    assert f"{MAX_DISCLOSURE_PASSES} of {MAX_DISCLOSURE_PASSES} passing" in text
+
+
+def test_the_bytes_checked_an_hour_are_bounded(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 15 review, D1. Content that would pass the bytes left is refused by
+    its size before it is read, records nothing, and spends nothing, and the
+    ceiling survives a restart, since each check records its bytes."""
+    ceiling = 100
+    monkeypatch.setattr(scheduler_module, "MAX_DISCLOSURE_BYTES", ceiling)
+    listed(world, tmp_path)
+    text, error = world.call("check_disclosure", {"text": "a" * 60})
+    assert not error and f"{ceiling - 60} of {ceiling} bytes left" in text
+    (world.root / "big.md").write_text("b" * 41)
+    text, error = world.call("check_disclosure", {"path": "big.md"})
+    assert error and f"the ceiling of {ceiling} bytes" in text
+    assert "with 40 bytes left" in text and "before it was read" in text
+    text, error = world.call("check_disclosure", {"text": "c" * 41})
+    assert error and "with 40 bytes left" in text
+    assert len(checks(world)) == 1
+    (world.root / "fits.md").write_text("d" * 40)
+    text, error = world.call("check_disclosure", {"path": "fits.md"})
+    assert not error and f"0 of {ceiling} bytes left" in text
+    world.log.close()
+    world.log = EventLog(world.log_path)
+    world.start()
+    listed(world, tmp_path)
+    text, error = world.call("check_disclosure", {"text": "e"})
+    assert error and "with 0 bytes left" in text
+    world.clock.now += timedelta(seconds=DISCLOSURE_CHECK_WINDOW_SECONDS)
+    text, error = world.call("check_disclosure", {"text": "e"})
+    assert not error and f"{ceiling - 1} of {ceiling} bytes left" in text
+
+
+def test_a_file_past_the_ceiling_is_refused_unread(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 15 review, D1. The size is read before the content, so a file past
+    the bytes left is never read, which a handle that records its reads shows."""
+    import io
+
+    from dromon import disclosurecheck
+
+    monkeypatch.setattr(scheduler_module, "MAX_DISCLOSURE_BYTES", 10)
+    listed(world, tmp_path)
+    (world.root / "big.md").write_text("codename\n" * 4)
+    (world.root / "small.md").write_text("codename\n")
+    reads: list[int] = []
+    real_fdopen = os.fdopen
+
+    class Recording(io.BufferedReader):
+        def read(self, size: int | None = -1, /) -> bytes:
+            reads.append(-1 if size is None else size)
+            return super().read(size)
+
+    def fdopen(descriptor: int, mode: str) -> io.BufferedReader:
+        assert mode == "rb"
+        return Recording(real_fdopen(descriptor, "rb", buffering=0))
+
+    monkeypatch.setattr(disclosurecheck.os, "fdopen", fdopen)
+    text, error = world.call("check_disclosure", {"path": "big.md"})
+    assert error and "refused by its size before it was read" in text
+    assert reads == [] and checks(world) == []
+    text, error = world.call("check_disclosure", {"path": "small.md"})
+    assert not error and text.startswith("fail, 1 line holds")
+    assert reads == [11]
+
+
+def test_a_check_reads_off_the_loop_one_at_a_time_per_line(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 15 review, D3. A check reads on a worker thread, so the loop runs
+    other work meanwhile, and a second check of the same line while the first runs
+    is refused, so two cannot both pass the budget before either is recorded."""
+    import threading
+
+    from dromon import disclosurecheck
+
+    listed(world, tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+    real_count = disclosurecheck.count
+    workers: list[bool] = []
+
+    def slow(
+        plan: disclosurecheck.CheckPlan, ceiling: int, window: int
+    ) -> tuple[int, int]:
+        workers.append(threading.current_thread() is threading.main_thread())
+        started.set()
+        release.wait(10)
+        return real_count(plan, ceiling, window)
+
+    monkeypatch.setattr(disclosurecheck, "count", slow)
+
+    async def scenario() -> tuple[CheckAnswer, str]:
+        first = asyncio.create_task(
+            world.scheduler.check_disclosure_off_loop("alpha", "codename", None)
+        )
+        # The loop is free while the first check waits on its worker.
+        await asyncio.to_thread(started.wait, 10)
+        try:
+            await world.scheduler.check_disclosure_off_loop("alpha", "clean", None)
+            second = "answered"
+        except LineToolRefused as error:
+            second = str(error)
+        release.set()
+        return await first, second
+
+    answer, second = asyncio.run(scenario())
+    assert workers == [False]
+    assert "still running" in second
+    assert answer.matched == 1 and len(checks(world)) == 1
+    # Once the first has answered, the line may check again.
+    monkeypatch.setattr(disclosurecheck, "count", real_count)
+    assert world.scheduler.check_disclosure("alpha", "clean", None).matched == 0
+
+
+def test_a_refusal_during_a_check_withholds_its_answer(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 15 review, D3. A tool's refusal on the loop may spend the last failure
+    while a check reads, so the budget is read again before the check is recorded,
+    and the check is then refused and records nothing."""
+    from dromon import disclosurecheck
+
+    listed(world, tmp_path)
+    for _ in range(MAX_DISCLOSURE_CHECKS - 1):
+        assert world.scheduler.check_disclosure("alpha", "codename", None).matched
+    planned: list[int] = []
+    real_count = disclosurecheck.count
+
+    def count(
+        plan: disclosurecheck.CheckPlan, ceiling: int, window: int
+    ) -> tuple[int, int]:
+        planned.append(len(checks(world)))
+        return real_count(plan, ceiling, window)
+
+    monkeypatch.setattr(disclosurecheck, "count", count)
+
+    async def scenario() -> str:
+        check = asyncio.create_task(
+            world.scheduler.check_disclosure_off_loop("alpha", "clean", None)
+        )
+        # The task plans and hands its read to the worker at its first await.
+        await asyncio.sleep(0)
+        assert world.scheduler.refuse_disclosed("alpha", ("body", "codename"))
+        try:
+            await check
+        except LineToolRefused as error:
+            return str(error)
+        return "answered"
+
+    refusal = asyncio.run(scenario())
+    assert len(planned) == 1
+    assert f"limit of {MAX_DISCLOSURE_CHECKS} failing checks" in refusal
+    assert [event.matched_lines > 0 for event in checks(world)] == [True] * (
+        MAX_DISCLOSURE_CHECKS
+    )
 
 
 def test_check_disclosure_is_limited_per_line_across_a_restart(
@@ -1174,9 +1357,9 @@ def test_check_disclosure_is_limited_per_line_across_a_restart(
     # pass spends none of it.
     world.clock.now += timedelta(seconds=1)
     text, error = world.call("check_disclosure", {"text": "clean"})
-    assert not error and f"You have {MAX_DISCLOSURE_CHECKS} of" in text
+    assert not error and f"you have {MAX_DISCLOSURE_CHECKS} of" in text
     text, error = world.call("check_disclosure", {"text": "codename"})
-    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 1} of" in text
+    assert not error and f"you have {MAX_DISCLOSURE_CHECKS - 1} of" in text
 
 
 def test_check_disclosure_refuses_without_a_list_or_one_input(
@@ -1311,8 +1494,11 @@ def test_a_refusal_for_disclosure_spends_a_check(
         else f"the {field} field contains a term from the project's disclosure list"
     )
     assert [event.matched_lines for event in checks(world)] == [1]
+    # A refusal records no bytes, since a tool's text is not a check.
+    assert [event.checked_bytes for event in checks(world)] == [None]
     text, error = world.call("check_disclosure", {"text": "clean"})
-    assert not error and f"You have {MAX_DISCLOSURE_CHECKS - 1} of" in text
+    assert not error and f"you have {MAX_DISCLOSURE_CHECKS - 1} of" in text
+    assert f"{MAX_DISCLOSURE_BYTES - len('clean')} of" in text
 
 
 def test_the_role_and_proposal_tools_spend_a_check_too(

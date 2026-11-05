@@ -17,14 +17,18 @@ import pytest
 from claude_agent_sdk import SdkMcpTool
 
 from dromon import runs
+from dromon.codec import encode
+from dromon.disclosure import load_terms
 from dromon.driver import Strategy
-from dromon.eventlog import EventLog
+from dromon.eventlog import EventLog, read_entries
 from dromon.model import (
     HARNESS,
+    MAX_DISCLOSURE_CHECKS,
     MAX_RUN_TAIL_BYTES,
     InvalidField,
     LineAddress,
     RunEnded,
+    RunStarted,
     RunStatus,
 )
 from dromon.scheduler import (
@@ -82,6 +86,12 @@ FAILING = python_command(
     "sys.exit(1)"
 )
 
+LEAKING = python_command(
+    "import sys\nprint('collecting')\nprint('FAILED ' + 'code' + 'name')\nsys.exit(1)"
+)
+"""A failed run whose output holds the listed term ``codename``, which its command
+never spells out, so only the output could carry it into the log."""
+
 
 @pytest.fixture
 def project(tmp_path: Path) -> Generator[Path]:
@@ -104,6 +114,7 @@ def scheduler_on(log: EventLog, root: Path) -> Scheduler:
         {
             "gate": python_command("print('gate passed')"),
             "failing": FAILING,
+            "leaking": LEAKING,
             "wait": python_command("import time; time.sleep(60)"),
         }
     )
@@ -202,6 +213,80 @@ def test_a_failed_run_keeps_its_tail_and_a_passed_run_none(project: Path) -> Non
         assert runs.TAIL_LABEL not in scheduler.run_status("alpha")
         (view,) = scheduler.runs_view(failed.run_id)
         assert view["output_tail"] == log.state.runs[failed.run_id].ended.output_tail  # type: ignore[union-attr]
+
+
+def listed(scheduler: Scheduler, root: Path) -> None:
+    (root / "terms").write_text("codename\n")
+    scheduler.set_disclosure_terms(load_terms(root / "terms"))
+
+
+def end_of(
+    scheduler: Scheduler, log: EventLog, command: str, previous: str
+) -> RunEnded:
+    started = asyncio.run(scheduler.start_run("alpha", command, previous))
+    wait_for_supervisor(scheduler, started.run_id)
+    asyncio.run(scheduler.reconcile_runs())
+    ended = log.state.runs[started.run_id].ended
+    assert ended is not None
+    return ended
+
+
+def test_a_tail_holding_a_listed_term_is_withheld_and_counted(project: Path) -> None:
+    """Round 15 review, R1. A failed run's summary and tail are screened before the
+    end is recorded, so a listed term in the output never reaches the event log, and
+    the withholding counts as a failing check of the line that started the run."""
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        listed(scheduler, project)
+        ended = end_of(scheduler, log, "leaking", "none")
+        assert ended.exit_code == 1 and ended.output_tail is None
+        assert ended.note.endswith(runs.OUTPUT_WITHHELD)
+        assert len(log.state.disclosure_checks["alpha"]) == 1
+        (note,) = harness_notes(log, "alpha")
+        assert runs.OUTPUT_WITHHELD in note and runs.TAIL_LABEL not in note
+        assert "codename" not in scheduler.run_status("alpha").casefold()
+    encoded = [encode(entry.event) for entry in read_entries(project / "events.sqlite")]
+    assert encoded and not any("codename" in line.casefold() for line in encoded)
+    # The output file itself is unchanged, since only the record is screened.
+    assert "codename" in (project / ended_output(project)).read_text()
+
+
+def ended_output(project: Path) -> str:
+    (run,) = (
+        entry.event
+        for entry in read_entries(project / "events.sqlite")
+        if isinstance(entry.event, RunStarted)
+    )
+    return run.output_file
+
+
+def test_a_clean_tail_is_kept_and_counts_nothing(project: Path) -> None:
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        listed(scheduler, project)
+        ended = end_of(scheduler, log, "failing", "none")
+        assert ended.output_tail is not None and "FAILED" in ended.output_tail
+        assert runs.OUTPUT_WITHHELD not in ended.note
+        assert "alpha" not in log.state.disclosure_checks
+
+
+def test_a_line_with_its_checks_spent_has_every_tail_withheld(project: Path) -> None:
+    """Round 15 review, R1. Whether a tail is withheld says whether the output held a
+    term, so once the line has spent its failing checks every tail is withheld, a
+    clean one too, and nothing more is counted."""
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        listed(scheduler, project)
+        for _ in range(MAX_DISCLOSURE_CHECKS):
+            assert scheduler.check_disclosure("alpha", "codename", None).matched
+        ended = end_of(scheduler, log, "failing", "none")
+        assert ended.output_tail is None
+        assert ended.note.endswith(runs.OUTPUT_WITHHELD_SPENT)
+        assert len(log.state.disclosure_checks["alpha"]) == MAX_DISCLOSURE_CHECKS
+        passed = end_of(
+            scheduler, log, "gate", log.state.latest_runs[("line", "alpha")]
+        )
+        assert passed.output_tail is None
 
 
 # The end is recorded as soon as the output is complete.

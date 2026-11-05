@@ -184,6 +184,7 @@ SCENARIO: tuple[Event, ...] = (
     LineTurnEnded("beta", None, True),
     LineTurnEnded("beta", None, None, True),
     DisclosureChecked("beta", "2026-10-28T19:00:00Z", 2),
+    DisclosureChecked("beta", "2026-10-28T19:01:00Z", 0, 4096),
     MessageSent("m5", BETA, PROBE, NOTE, "to an agent", reply_to="m4"),
     AgentRegistered("guest", AgentAccess.OBSERVE, ""),
     AgentRevoked("guest"),

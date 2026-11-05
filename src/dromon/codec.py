@@ -159,7 +159,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "message_prioritized": ("message_id",),
     "message_correlated": ("message_id", "key"),
     "turn_correlated": ("line_id", "keys", "key_count", "cost_micro_usd"),
-    "disclosure_checked": ("line_id", "checked_at", "matched_lines"),
+    "disclosure_checked": ("line_id", "checked_at", "matched_lines", "checked_bytes"),
     "wake_requested": ("wake_id", "line_id", "message_id"),
     "wake_issued": ("wake_id",),
     "wake_scheduled": ("line_id", "message_id", "due", "note", "task_id", "request"),
@@ -405,6 +405,7 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "run_started": ("commit", "checkout"),
     "run_ended": ("output_tail",),
     "line_configured": ("sealed",),
+    "disclosure_checked": ("checked_bytes",),
 }
 """The fields left out of the wire when they are null, which a log written before
 them never held, so decoding reads an absent one as null. **Task of 2026-10-29,
@@ -418,11 +419,12 @@ task of 2026-11-01, and ``sealed`` to ``line_configured`` in a task of the same 
 so a daemon that predates it still reads every configuration without a literal
 value. ``output_tail`` was added to ``run_ended`` in the task of 2026-11-05, so a daemon
 that predates it still reads every run end without a tail, and refuses the log once
-a failed run's tail is recorded. **Porting hazard.** A port must omit these fields
-when null, not write them as null, so that its log stays readable by a daemon that
-predates them, and must
-read an absent one as null. A daemon predating ``window`` does not read an event
-that names one."""
+a failed run's tail is recorded. ``checked_bytes`` was added to ``disclosure_checked``
+in the round 15 review, so a daemon that predates it still reads every refusal, and
+refuses the log once a ``check_disclosure`` call is recorded. **Porting hazard.** A
+port must omit these fields when null, not write them as null, so that its log stays
+readable by a daemon that predates them, and must read an absent one as null. A
+daemon predating ``window`` does not read an event that names one."""
 
 
 def _without_nulls(kind: str, data: dict[str, object]) -> dict[str, object]:
@@ -583,6 +585,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "line_id": event.line_id,
                 "checked_at": event.checked_at,
                 "matched_lines": event.matched_lines,
+                "checked_bytes": event.checked_bytes,
             }
         case WakeRequested():
             return "wake_requested", {
@@ -946,6 +949,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "line_id"),
                 _str(data, "checked_at"),
                 _int(data, "matched_lines"),
+                _optional_int(data, "checked_bytes"),
             )
         case "wake_requested":
             return WakeRequested(
