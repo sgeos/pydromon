@@ -11,6 +11,7 @@ import asyncio
 import os
 import sqlite3
 import stat
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -19,8 +20,10 @@ import pytest
 from claude_agent_sdk import SdkMcpTool
 
 from dromon import cli, statesnapshot
+from dromon import daemon as daemon_module
 from dromon.daemon import Daemon
 from dromon.driver import Strategy
+from dromon.engine import TurnReport
 from dromon.eventlog import (
     VERIFY_FAILED,
     VERIFY_NONE,
@@ -285,14 +288,36 @@ def no_engine(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> LineEngine:
     raise AssertionError(f"no engine may start here, but {spec.line_id} did")
 
 
+def test_no_line_starts_a_turn_until_the_check_passes(path: Path) -> None:
+    seeded(path)
+    with EventLog(path, snapshots=True) as log:
+        scheduler = Scheduler(log, no_engine, tick_seconds=0)
+        scheduler.create_line("beta", HAIKU, Strategy.SUBSCRIPTION)
+        eligible = scheduler._eligible  # pyright: ignore[reportPrivateUsage]
+        # Re-review of 2cede6e. The check is pending, so neither line may start.
+        assert log.restore_unconfirmed and not log.restore_failed
+        assert not eligible("alpha") and not eligible("beta")
+        scheduler.restore_checked(None)
+        assert not log.restore_unconfirmed
+        assert eligible("alpha") and eligible("beta")
+
+
+def test_a_start_without_a_snapshot_waits_for_no_check(path: Path) -> None:
+    with EventLog(path) as log:
+        log.append(LineCreated("alpha", HAIKU, "subscription"))
+        scheduler = Scheduler(log, no_engine, tick_seconds=0)
+        assert not log.restore_unconfirmed
+        assert scheduler._eligible("alpha")  # pyright: ignore[reportPrivateUsage]
+
+
 def test_a_failed_check_holds_every_line_in_memory(path: Path) -> None:
     seeded(path)
     with EventLog(path, snapshots=True) as log:
         scheduler = Scheduler(log, no_engine, tick_seconds=0)
         scheduler.create_line("beta", HAIKU, Strategy.SUBSCRIPTION)
         eligible = scheduler._eligible  # pyright: ignore[reportPrivateUsage]
-        assert eligible("alpha") and eligible("beta")
-        log.restore_checked((RestoreMismatch.STATE_DIFFERS, None))
+        scheduler.restore_checked((RestoreMismatch.STATE_DIFFERS, None))
+        assert log.restore_unconfirmed and log.restore_failed
         assert not eligible("alpha") and not eligible("beta")
         # The hold is in memory alone, so no line is recorded as held.
         assert all(line.held_by is None for line in log.state.lines.values())
@@ -365,6 +390,79 @@ def test_the_daemon_fails_closed_when_it_cannot_make_its_scratch(
     assert found == (RestoreMismatch.CHECK_FAILED, "LogError")
     assert status["event_log"]["start"]["restart_required"] is True
     assert "mismatch check_failed, class LogError" in said
+
+
+class Recorder:
+    """An engine that records each prompt it is given and ends the turn at once."""
+
+    def __init__(self, spec: LineSpec, prompts: list[str]) -> None:
+        self.session_id = spec.session_id
+        self.prompts = prompts
+
+    async def run_turn(self, prompt: str) -> TurnReport:
+        self.prompts.append(prompt)
+        return TurnReport("success", 1, "ok", (), None, None, "session-1", None, 0.0)
+
+
+@pytest.mark.parametrize("forged", [False, True])
+def test_mail_waits_while_the_check_runs_and_a_turn_starts_only_after_it(
+    paths: ProjectPaths,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    forged: bool,
+) -> None:
+    """**Re-review of 2cede6e.** The check is held open in its thread while the
+    scheduler runs with mail waiting for ``alpha``, which is the window the
+    re-review found. No turn starts in it. After a pass the waiting turn starts, and
+    after a mismatch none ever does, so no turn is running when the check fails."""
+    seeded(paths.event_log)
+    if forged:
+        forge(paths.event_log, state=intruded(paths.event_log))
+    entered = threading.Event()
+    release = threading.Event()
+    real = daemon_module.verify_restored
+
+    def held(
+        log_path: Path, copy_path: Path, restored: Restored
+    ) -> tuple[RestoreMismatch, str | None] | None:
+        entered.set()
+        assert release.wait(10), "the test never released the check"
+        return real(log_path, copy_path, restored)
+
+    monkeypatch.setattr(daemon_module, "verify_restored", held)
+    prompts: list[str] = []
+
+    def build(spec: LineSpec, tools: Sequence[SdkMcpTool[Any]]) -> Recorder:
+        del tools
+        return Recorder(spec, prompts)
+
+    async def scenario(log: EventLog) -> tuple[list[str], bool]:
+        scheduler = Scheduler(log, build, tick_seconds=0)
+        daemon = Daemon(paths, log, "2026-11-05T00:00:00Z", scheduler)
+        stop = asyncio.Event()
+        running = asyncio.create_task(scheduler.run(stop))
+        checking = asyncio.create_task(daemon.verify_restore())
+        assert await asyncio.to_thread(entered.wait, 10)
+        # The scheduler has had many passes with the mail deliverable.
+        for _ in range(50):
+            await asyncio.sleep(0)
+        await scheduler.idle()
+        during = list(prompts)
+        waiting = bool(scheduler.deliverable("alpha"))
+        release.set()
+        await checking
+        await scheduler.idle()
+        stop.set()
+        await running
+        assert during == [] and waiting
+        return prompts, log.restore_failed
+
+    with EventLog(paths.event_log, snapshots=True) as log:
+        assert log.start.verified == VERIFY_PENDING
+        found, failed = asyncio.run(scenario(log))
+    capsys.readouterr()
+    assert failed is forged
+    assert len(found) == (0 if forged else 1)
 
 
 def test_the_daemon_checks_nothing_without_a_restored_snapshot(

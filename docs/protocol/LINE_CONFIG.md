@@ -554,7 +554,8 @@ written or `null`, as the bounded start of [`EVENT_LOG.md`](EVENT_LOG.md) descri
 **Review of `49236ad`, item 1.** `verified` is `none`, `pending`, `passed` or
 `failed`, for the full replay that checks a state restored from a snapshot, and
 `mismatch`, `mismatch_class` and `restart_required` say why it failed and that every
-line is held until a restart.
+line is held until a restart. **Re-review of `2cede6e`.** While it is `pending`, no
+line starts a turn, and mail waits for the check to end.
 The daemon's `status` carries the same fields in its `event_log`, as
 [`CLIENT.md`](CLIENT.md) specifies.
 

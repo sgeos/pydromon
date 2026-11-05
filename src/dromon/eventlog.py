@@ -232,6 +232,15 @@ class EventLog:
         replay, so no line may start a turn until a restart."""
         return self.start.verified == VERIFY_FAILED
 
+    @property
+    def restore_unconfirmed(self) -> bool:
+        """Whether the state this process restored awaits its check or failed it, so
+        that no line may start a turn. **Re-review of 2cede6e, required by the
+        operator.** A turn started while the check runs would append events checked
+        only against the restored state, and could still be running when the check
+        fails."""
+        return self.start.verified in (VERIFY_PENDING, VERIFY_FAILED)
+
     def restore_checked(
         self, mismatch: tuple[RestoreMismatch, str | None] | None
     ) -> None:

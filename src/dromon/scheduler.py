@@ -195,7 +195,7 @@ from dromon.engine import (
     instruction_sizes,
     resolve_plugin,
 )
-from dromon.eventlog import EventLog, read_entries
+from dromon.eventlog import EventLog, RestoreMismatch, read_entries
 from dromon.engine_environment import (
     ShellSelectionError,
     selected_claude_shell,
@@ -3430,6 +3430,15 @@ class Scheduler:
             return False
         self._log.append(LineHibernated(line_id))
         return True
+
+    def restore_checked(
+        self, mismatch: tuple[RestoreMismatch, str | None] | None
+    ) -> None:
+        """Record the end of the check of a restored state, as
+        ``EventLog.restore_checked`` does, and wake the loop, since mail that arrived
+        while no turn could start waits for the next tick. **Re-review of 2cede6e.**"""
+        self._log.restore_checked(mismatch)
+        self._work.set()
 
     def awaken(self, line_id: str) -> bool:
         """Awaken ``line_id``, and say whether it was hibernated. Its kept mail and any
@@ -10201,9 +10210,10 @@ class Scheduler:
             and not line.hibernated
             and line_id not in self._failed
             and self._restart is None
-            # Review of 49236ad, item 1. A restored state that a full replay did
-            # not confirm holds every line, in memory alone, until a restart.
-            and not self._log.restore_failed
+            # Review of 49236ad, item 1, and the re-review of 2cede6e. No line starts
+            # a turn until a full replay has confirmed a restored state, and one it
+            # did not confirm holds every line, in memory alone, until a restart.
+            and not self._log.restore_unconfirmed
             and not self._waits_for_writer(line_id)
             and not self.waits_unconfined(line_id)
             and self.beside_owner(line_id) is None

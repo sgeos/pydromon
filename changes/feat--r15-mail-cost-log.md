@@ -44,7 +44,8 @@ Type: Added
   `log_corrupt` or `check_failed` with the exception's type, holds every line in
   memory, deletes the snapshot, and is shown in the daemon log, in `event_log.start`
   and as a `RESTART REQUIRED.` row of `dromon status` until a restart. No snapshot is
-  written while the check is pending or after it failed.
+  written while the check is pending or after it failed, and no line starts a turn
+  until the check has ended.
 - The snapshot's directory is synchronized after the snapshot moves into place.
 - `STATE_VERSION` is 2, and `tests/test_state_version.py` pins each version with a
   digest of the codec's types and of a replayed history, so a change to either fails

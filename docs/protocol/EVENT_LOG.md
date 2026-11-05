@@ -652,11 +652,33 @@ resumes.
      snapshot can also alter the log. The check detects corruption, a forgotten state
      version, and a file changed by a process that could write the snapshot but not
      the log. It does not detect a determined owner of the files.
-   - **Residual.** Events appended between the start and the end of the check were
-     checked against the restored state, a turn already running when the check fails
-     runs to its end, and a stop waits for a running check. A state that decodes to the
-     replay but was not written in the canonical form also differs, which fails
-     closed.
+   - **No turn starts until the check ends.** **Re-review of `2cede6e`, required by
+     the operator.** A line could start a turn while the check ran and append events
+     checked only against the restored state, and a turn running when the check
+     failed was not cancelled. No line now starts a turn while the check is pending,
+     and mail that arrives meanwhile waits, so no turn appends against the
+     unconfirmed state and none is running when the check fails. The scheduler wakes
+     when the check ends, and a waiting turn starts at once after a pass.
+   - **What the wait costs.** **Fact, from runs on 2026-11-05 on the operator's
+     macOS machine, with this branch's uncommitted code.** The script
+     `tmp/r26/measure_check.py` in the core worktree, which is not tracked, restored
+     each synthetic log above from its snapshot and ran the check three times. The
+     check took 0.258 seconds at best and 0.700 at worst for the 3.3 MiB log of
+     10,779 events, and 2.438 and 3.518 seconds for the 33 MiB log of 106,729 events.
+     **Inference.** It costs about twice a full replay, since it copies the log
+     before replaying it, so a start from a snapshot is again slower to its first
+     turn than a start without one, though it serves clients sooner. This project's
+     log was about 4.4 MB on 2026-11-01, so its first turn waits about a third of a
+     second, and a log ten times larger waits about three seconds. The wait was not
+     measured on this project's own log, which `.dromon/` closes to lines.
+   - **Residual.** The events the daemon appends without a turn while the check runs
+     were checked against the restored state. They are the recovery before the
+     scheduler starts, an operator's command, mail from a peer and a scheduled wake
+     that falls due. A stop waits for a running check, since a thread cannot be
+     interrupted. A check that ended with an error outside its own handling would
+     leave every line waiting until a restart, which fails closed, and the daemon log
+     names it only at the stop. A state that decodes to the replay but was not written
+     in the canonical form also differs, which fails closed.
    - **The state version is pinned.** **Review of `49236ad`, item 3.** A change of
      meaning that keeps the shape and does not raise the state version is invisible to
      a start. `tests/test_state_version.py` pins each state version with the digest of

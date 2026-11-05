@@ -2018,10 +2018,15 @@ class Daemon:
         checked against the state it is appended to, and this state is the one not
         confirmed, so a ``line_held`` it accepted could be one the replayed state
         refuses, and the log would then fail to replay at the next start.
-        **Residual.** The events appended between the start and the end of the check
-        were checked against the restored state too, and a turn already running
-        when the check fails runs to its end. A stop waits for a running check,
-        since a thread cannot be interrupted."""
+        **Re-review of 2cede6e, required by the operator.** No line starts a turn
+        until the check has ended, so no turn appends against the unconfirmed state
+        and none is running when the check fails. The wait is a copy and a full
+        replay of the log, which ``EVENT_LOG.md`` measures. **Residual.** The
+        events the daemon appends without a turn while the check runs, such as an
+        operator's command, mail from a peer, a scheduled wake that falls due, and the
+        recovery before the scheduler starts, were checked against the restored state
+        too. A stop waits for a running check, since a thread cannot be
+        interrupted."""
         restored = self.log.restored
         if restored is None:
             return None
@@ -2042,7 +2047,7 @@ class Daemon:
                 )
             finally:
                 await asyncio.to_thread(shutil.rmtree, scratch, True)
-        self.log.restore_checked(mismatch)
+        self.scheduler.restore_checked(mismatch)
         if mismatch is None:
             print(
                 f"dromond: the snapshot at event {restored.seq} agrees with a full"
