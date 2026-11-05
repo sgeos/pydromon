@@ -222,14 +222,17 @@ COVERED: Final[dict[type, tuple[str, ...]]] = {
     model.BriefSet: ("task", "decisions", "artifacts", "next_action"),
     model.BudgetStated: ("note",),
     model.LeaseAcquired: ("note",),
-    model.RunEnded: ("note",),
+    model.RunEnded: ("note", "output_tail"),
     model.CommitRunRefused: ("reason",),
     model.RunStarted: ("argv",),
 }
 """The events with free text, and the fields of each that are scrubbed. **Round 15,
 review of 3344ca6.** ``RunStarted.argv`` is added. It is the project file's argument
 vector for a run, and the run is launched from the project file and never from the
-event, so masking the recorded copy changes only what a view shows.
+event, so masking the recorded copy changes only what a view shows. **Merge of the ops
+disclosure work.** ``RunEnded.output_tail`` is added. It is the last lines of a failed
+run's output, which the disclosure list screens and which could still hold a literal
+secret value the run printed, so it is scrubbed as the note is.
 
 Fields with text that are deliberately **not** scrubbed.
 - ``LineConfigured.config``, ``LineOverridden.overrides`` and

@@ -497,6 +497,10 @@ def test_each_kind_of_note_and_summary_is_masked_by_its_field() -> None:
             "body",
         ),
         (RunEnded("r1", RunStatus.EXITED, 0, None, None, f"s {token}", AT), "note"),
+        (
+            RunEnded("r1", RunStatus.EXITED, 1, None, None, "n", AT, f"E {token}\nx"),
+            "output_tail",
+        ),
     )
     for event, name in texts:
         found = scrub_event(event)

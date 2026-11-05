@@ -870,6 +870,7 @@ class Daemon:
                 | Operation.ROLE_DELETE
                 | Operation.RETIRE_LINE
                 | Operation.RUN_CLEAR
+                | Operation.SCRATCH_PLACE
                 | Operation.RUNS
                 | Operation.START_CONTEXT
                 | Operation.BUDGETS
@@ -1007,6 +1008,19 @@ class Daemon:
                         "run_id": run_id,
                         "operator": operator,
                         "cleared_at": cleared.cleared_at,
+                    }
+                case Operation.SCRATCH_PLACE:
+                    line_id, path, text, operator = _text_args(
+                        request.args, ("line_id", "path", "text", "operator")
+                    )
+                    written = self.scheduler.place_scratch(
+                        OperatorAddress(operator), line_id, path, text
+                    )
+                    result = {
+                        "line_id": line_id,
+                        "path": written.relative,
+                        "absolute": written.absolute,
+                        "bytes": written.size,
                     }
                 case Operation.RUNS:
                     names = ("run_id",) if "run_id" in request.args else ()
@@ -1725,7 +1739,10 @@ class Daemon:
         self.scheduler.set_disclosure_accepted(config.disclosure_accepted)
         self.scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
         self.scheduler.set_runs(
-            config.run_commands, config.run_commit_commands, config.run_commit_refs
+            config.run_commands,
+            config.run_commit_commands,
+            config.run_commit_refs,
+            config.run_parameters,
         )
         self.project = config
         self.project_file_present = present
@@ -4056,7 +4073,10 @@ def run(
             scheduler.set_git_ssh(line_git_ssh)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
             scheduler.set_runs(
-                config.run_commands, config.run_commit_commands, config.run_commit_refs
+                config.run_commands,
+                config.run_commit_commands,
+                config.run_commit_refs,
+                config.run_parameters,
             )
             check_lines_sandboxed(config, log, scheduler)
             check_roles(scheduler, log, config)

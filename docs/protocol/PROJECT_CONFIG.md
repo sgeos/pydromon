@@ -117,6 +117,7 @@ relay = "tail"          # the route of operator ana's mail
 | `leases.ttl_seconds` | integer in [60, 86400] | 10800 | How long an acquired lease lasts unless released first |
 | `runs.commands` | table of names to arrays of text | none | The commands lines may start as supervised runs, at most 64, each name an identifier and each command its program and at most 63 arguments, never a shell string, as [`RUNS.md`](../architecture/RUNS.md) specifies. A declared command runs with the daemon's authority, outside any line's sandbox. Added on 2026-10-31 |
 | `runs.commit_commands` | table of names to arrays of text | none | Commands a line, a line that only reads its working directory included, may start on a commit it names, in a checkout the daemon makes in its state directory, as the commit run section of [`RUNS.md`](../architecture/RUNS.md) specifies. Each as in `runs.commands`, and no name may be in both tables. Declaring one requires `runs.commit_refs.patterns`. Added in round 14 |
+| `runs.parameters.COMMAND.NAME` | table with `pattern` text and an optional `description` | none | A parameter of the declared command COMMAND, whose argument `{NAME}` a line's `start_run` replaces with a value it gives in `arguments`. `pattern` is a regular expression of at most 256 bytes without `(?`, backreferences or possessive quantifiers, which the whole value must match, and `description` printable text of at most 256 bytes. Every placeholder of a command must be declared and every declaration used, at most eight a command. A value is also 1 to 256 printable bytes and never begins with `-`, as the parameter section of [`RUNS.md`](../architecture/RUNS.md) specifies with its trust argument. Added in the task of 2026-11-05 |
 | `runs.commit_refs.patterns` | array of text | none | The ref patterns, 1 to 16, each beginning `refs/remotes/REMOTE/` with a remote named without wildcards, without spaces or `..`, as `git for-each-ref` reads them. A commit run's commit must be the tip of a ref matching one. A pattern under `refs/heads`, `refs/tags` or anywhere else outside `refs/remotes` is refused, since a line's sandbox may write those refs. Added in round 14, and narrowed to remote-tracking tips in its review of 1449c5c |
 | `limits.*` | as in `CLIENT.md` | 12, 2, 0 | The conversation limits of every line |
 | `wake.every_ticks` | integer in [1, 3600] | 1 | The wake policy of every line |
@@ -351,6 +352,12 @@ stops the start, or refuses the reload and keeps the previous list.
   or `note`, only when the call offered text in that one field. A call offering
   several fields receives a generic refusal even when only one matches. The round 4
   review F1 rule prevents learning more than one bit from each counted refusal.
+  **Task of 2026-11-05, item 1, the operator's decision.** `set_brief` is the exception. Its
+  refusal names the one field among `task`, `decisions`, `next_action` and
+  `artifacts` that matched, so a line knows what to reword, at a cost of at most two
+  bits a refusal. Two or more matching fields still get the generic refusal, so no
+  refusal names more than one field, and none names a term, a line or a position,
+  which the operator declined.
 - **Not checked.** Messages from operators, who hold authority, and the questions the
   daemon asks on a held line's behalf.
 - **Secrecy.** Terms are never logged, returned or stored. Errors about the file name
@@ -397,9 +404,52 @@ stops the start, or refuses the reload and keeps the previous list.
   including a list, is recorded as one
   `disclosure_checked` event, without the text or its name, as [`EVENT_LOG.md`](EVENT_LOG.md)
   specifies. **Proposed.** A line may
-  check at most 10 times in any 3,600 seconds, counted from the recorded times on the
+  have at most 10 failing checks in any 3,600 seconds, counted from the recorded times on the
   wall clock, so the limit survives a restart. Every answer says whether a text holds
-  a term, so an unlimited check would let a line test candidate words one by one. A
+  a term, so an unlimited check would let a line test candidate words one by one.
+  **Task of 2026-11-05, item 1, the operator's decision.** A check that passes spends
+  nothing of the failure limit, and the answer says which happened. **Round 15 review,
+  D1, the operator's decision.** Free passes let a line try about 130 times more
+  candidates an hour, so a short term fell to a few failures. So a line also has at
+  most 60 passing checks in the same window, and its checks may read at most 64 MiB in
+  all, passes and failures together. The failure limit bounds the terms a line can
+  confirm, the pass limit the candidate texts it can try, and the byte ceiling the
+  candidate bytes it can test and the daemon's time spent matching for it. 64 MiB is
+  less than the 160 MiB that ten checks of 16 MiB allowed before passes were free.
+  Once either count is spent, every check is refused unread, a would-be pass or
+  failure too, since answering only one kind would tell a line which texts are the
+  other. A text or file whose size would pass the bytes left is refused by its size
+  before it is read, and records nothing. **Round 15 review, D3.** A check reads and
+  matches on a worker thread, so it does not hold the daemon's event loop, and one
+  check runs at a time for each line. A tool's refusal may spend the last failure
+  while a check reads, so the limits are read again before the check is recorded, and
+  the check is then refused unanswered. **Round 15, item 4, merged with D1.** A check
+  of files whose exact bytes all already passed, as a checked text, as a checked file
+  of the same path, or as text `write_scratch` screened and wrote, is answered as a pass
+  from the daemon's memory of passes and spends nothing of any budget and records
+  nothing, even once a budget is spent, since it tells the line nothing it did not
+  learn when the bytes passed. A text check is never answered from memory. Once a
+  budget is spent, a file is read for the comparison only when its size equals that
+  of a remembered pass, and is never matched, so other content is still refused
+  unread. The memory holds 64 passes of a line in the daemon's process, and is
+  emptied by a restart, a replaced list and a changed configuration of the line. A
+  check whose list or configuration changed while it ran is refused when it would
+  have been answered from memory, and its pass is otherwise not remembered.
+  **Round 15 review, C1.** A file the daemon writes without screening, as
+  `scratch_place` writes an operator's CI log, is never remembered as passed, so a
+  listed term in it is still found. **Round 15 re-review.** A `write_scratch` call
+  that the list screens is a check too, since the audit wrote 100 clean texts of
+  256 KiB in two seconds and spent nothing. Its text and path spend one pass when
+  they pass, or one failure when refused, and their bytes in both cases. Once either
+  count is spent, or when they would pass the bytes left, the write is refused
+  before it is screened or written, without holding the line, as a spent
+  `check_disclosure` is. A screened write's pass is recorded before the file is
+  written, since a write refused afterwards still tells the line that the text
+  passed, and it counts even when its text is remembered, since the path is screened
+  too. **Residual risk.** A text that passes the screen of another tool, such as a
+  note or a brief, is still not counted, as it never was, so a line can still test
+  candidates through those tools at their sizes, which are far below a scratch
+  file's, and the guard remains against accidents, as the limits above say. A
   file is read as `write_scratch` writes, walked without following a link, and only
   when it is a regular file of the daemon's user with one name, outside every
   directory Dromon protects, and at most 16 MiB combined. A refusal, of a missing list, a limit
@@ -418,7 +468,10 @@ stops the start, or refuses the reload and keeps the previous list.
   held for another reason is not asked about twice, and the release of that hold
   ends this one too. `check_disclosure` itself, when its limit is reached, still
   refuses with the time of its next check and does not hold the line, since that
-  refusal reveals nothing of the list. **Fact.** Each spent limit still yields one
+  refusal reveals nothing of the list. **Round 15 review, R1.** A run's output
+  summary and tail are screened the same way before its end is recorded, and
+  withheld whole when either holds a term, which counts as a failing check of the line
+  that started the run, as [`RUNS.md`](../architecture/RUNS.md) specifies. **Fact.** Each spent limit still yields one
   further answer, since the held reply differs from a sent one, so a line learns at
   most 11 answers per release.
 

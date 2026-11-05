@@ -54,13 +54,15 @@ from dromon.model import Event, State
 FORMAT_VERSION: Final = 1
 """The version of the file's own layout."""
 
-STATE_VERSION: Final = 2
+STATE_VERSION: Final = 3
 """Raised by hand whenever applying an event comes to mean something else for a state
 of the same shape, since the shape digest cannot see that. **Review of 49236ad, item
 3.** ``tests/test_state_version.py`` fails when the types ``codec_digest`` covers, or
 the state a fixed history replays to, change while this stays the same, so a raise
 cannot be forgotten. Version 2 is the round 15 follow-up, whose events
-``line_turn_ended`` and ``brief_set`` gained fields."""
+``line_turn_ended`` and ``brief_set`` gained fields. Version 3 is the merge of
+``feat/r15-runs-disclosure``, where ``disclosure_checked`` gained ``checked_bytes`` and
+a pass is kept apart from a failure, and ``run_ended`` gained ``output_tail``."""
 
 SUFFIX: Final = ".snapshot"
 """The snapshot of ``events.sqlite`` is ``events.sqlite.snapshot``."""
