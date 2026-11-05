@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -522,3 +523,39 @@ def test_the_stuck_text_names_the_effect_and_no_program() -> None:
     text = spawn.stuck_text(4)
     assert "4 child process starts are stuck" in text
     assert "stop or a hold" in text and "restarts" in text
+
+
+# Test isolation. The autouse ``_isolated_spawn_state`` in ``tests/conftest.py`` gives
+# each test an empty list of stranded starts. The two tests below run in file order. The
+# first strands a live thread and leaves it, and the second finds the count at zero
+# while that thread is still alive, so the zero is the fixture's and not the thread's
+# end. Run in another order, the second skips and proves nothing.
+
+_LEFT: list[threading.Thread] = []
+_RELEASE = threading.Event()
+
+
+def test_a_stranded_start_left_by_one_test_is_counted_in_it() -> None:
+    thread = threading.Thread(target=_RELEASE.wait, daemon=True)
+    thread.start()
+    _LEFT.append(thread)
+    with spawn._stranded_lock:  # pyright: ignore[reportPrivateUsage]
+        spawn._stranded.append(thread)  # pyright: ignore[reportPrivateUsage]
+    assert spawn.stranded_count() == 1
+
+
+def test_the_next_test_starts_with_no_stranded_start() -> None:
+    try:
+        if not _LEFT:
+            pytest.skip("the test that strands a start did not run before this one")
+        assert _LEFT[0].is_alive(), "the left thread ended, so zero proves nothing"
+        assert spawn.stranded_count() == 0
+        # A start under the cap is allowed, so the earlier stall does not refuse it.
+        assert (
+            spawn.run(
+                ["/bin/echo", "ok"], timeout=10, capture_output=True, text=True
+            ).stdout
+            == "ok\n"
+        )
+    finally:
+        _RELEASE.set()
