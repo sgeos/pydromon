@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from dromon import spawn
 from dromon import workdir
 from dromon.model import COMMIT_PATTERN, ID_PATTERN
 from dromon.sandbox import SandboxError
@@ -167,7 +168,7 @@ def _git(
     Raises ``CommitRefused``."""
     argv = ["git", *GIT_CONFIG, *arguments]
     try:
-        process = subprocess.Popen(  # noqa: S603
+        process = spawn.start(
             argv,
             cwd=cwd,
             env=dict(environment),

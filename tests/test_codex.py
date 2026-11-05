@@ -20,7 +20,7 @@ import pytest
 from claude_agent_sdk import SdkMcpTool
 from imagesamples import png
 
-from dromon import codex as codex_module
+from dromon import codex as codex_module, spawn
 from dromon import evidence
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon.codex import (
@@ -1965,7 +1965,7 @@ def test_disabled_connector_does_not_need_a_name(
     def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(returncode=0, stdout=json.dumps([{"enabled": enabled}]))
 
-    monkeypatch.setattr(codex_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(spawn, "run", fake_run)
     if enabled is False:
         assert codex_module.list_servers({}) == []
     else:
@@ -2117,7 +2117,7 @@ def test_listing_preserves_transport_and_selects_valid_disabled_toml(
             returncode=0, stdout=json.dumps([{"name": "mail", "transport": transport}])
         )
 
-    monkeypatch.setattr(codex_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(spawn, "run", fake_run)
     listed = codex_module.list_servers({})
     arguments = server_arguments(listed, LineConfig())
     entry = next(value for value in arguments if value.startswith("mcp_servers.mail"))
@@ -2162,7 +2162,7 @@ def test_listing_refuses_malformed_transport_without_echoing_values(
             returncode=0, stdout=json.dumps([{"name": "mail", "transport": transport}])
         )
 
-    monkeypatch.setattr(codex_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(spawn, "run", fake_run)
     with pytest.raises(EngineRefused, match=r"\[0\].transport"):
         codex_module.list_servers({})
 

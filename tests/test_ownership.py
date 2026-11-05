@@ -5,7 +5,6 @@ turn. Roles step 2, ``docs/architecture/ROLES.md``."""
 
 import asyncio
 import os
-import subprocess
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,7 +13,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import scheduler as scheduler_module
+from dromon import scheduler as scheduler_module, spawn
 from dromon.capabilities import Known, TABLES
 from dromon.driver import Strategy
 from dromon.engine import EnginePlanLimit, TurnReport
@@ -51,6 +50,7 @@ from dromon.model import (
     TaskRecorded,
     format_due,
 )
+from dromon.processes import MARK_VARIABLE, ProcessInfo, ProcessRefused
 from dromon.roles import (
     CONFINING_ENGINES,
     RoleConflict,
@@ -1820,10 +1820,10 @@ def test_a_real_unreadable_directory_is_reported_unreadable(tmp_path: Path) -> N
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     git = ["git", "-C", str(checkout), "-c", "user.email=a@b", "-c", "user.name=a"]
-    subprocess.run([*git, "init", "-q"], check=True)  # noqa: S603
+    spawn.run([*git, "init", "-q"], check=True, timeout=60)  # noqa: S603
     (checkout / "a").write_text("a\n")
-    subprocess.run([*git, "add", "a"], check=True)  # noqa: S603
-    subprocess.run([*git, "commit", "-qm", "a"], check=True)  # noqa: S603
+    spawn.run([*git, "add", "a"], check=True, timeout=60)  # noqa: S603
+    spawn.run([*git, "commit", "-qm", "a"], check=True, timeout=60)  # noqa: S603
     closed = checkout / "closed"
     closed.mkdir()
     (closed / "b").write_text("b\n")
@@ -1834,3 +1834,225 @@ def test_a_real_unreadable_directory_is_reported_unreadable(tmp_path: Path) -> N
         closed.chmod(0o755)
     assert "closed" not in status
     assert unreadable == ("closed/",)
+
+
+# Round 15, item 4. Whether the former holder's processes are shown to have ended.
+
+
+class _Table:
+    """A process table the test writes. ``refuse`` makes every read fail."""
+
+    def __init__(self, marked: dict[int, str], refuse: bool = False) -> None:
+        self.marked = marked
+        self.refuse = refuse
+
+    def own_processes(self) -> Sequence[ProcessInfo]:
+        if self.refuse:
+            raise ProcessRefused("the table is closed")
+        return [ProcessInfo(pid, 1, "00:05", f"sleep {pid}") for pid in self.marked]
+
+    def has_variable(self, pid: int, assignment: str) -> bool:
+        return assignment in self.environments().get(pid, [])
+
+    def environments(self) -> dict[int, list[str]]:
+        if self.refuse:
+            raise ProcessRefused("the table is closed")
+        return {pid: [f"{MARK_VARIABLE}={mark}"] for pid, mark in self.marked.items()}
+
+    def send(self, pid: int, signal_number: int) -> None:
+        raise ProcessLookupError(pid)
+
+
+def observe(
+    world: World, table: _Table, *, identifiable: bool = True
+) -> dict[str, Any]:
+    scheduler = world.scheduler
+    scheduler._processes = table  # pyright: ignore[reportPrivateUsage]
+    scheduler._processes_identifiable = identifiable  # pyright: ignore[reportPrivateUsage]
+    asyncio.run(scheduler.observe_former_holder("core"))
+    view = cast("dict[str, Any] | None", scheduler.role_status("beta")["former_holder"])
+    assert view is not None
+    return view
+
+
+def test_a_role_that_never_changed_hands_has_no_former_holder(world: World) -> None:
+    assert world.scheduler.role_status("beta")["former_holder"] is None
+
+
+def test_a_change_not_yet_observed_says_unknown(world: World) -> None:
+    world.scheduler.relinquish_ownership("alpha", "over", "beta", None)
+    view = cast("dict[str, Any]", world.scheduler.role_status("beta")["former_holder"])
+    assert view["line_id"] == "alpha" and view["state"] == "unknown"
+    assert view["count"] is None and "not observed" in view["basis"]
+
+
+def test_no_marked_process_is_shown_as_ended_with_what_that_means(
+    world: World,
+) -> None:
+    world.scheduler.relinquish_ownership("alpha", "over", "beta", None)
+    view = observe(world, _Table({4001: "gamma.0123"}))
+    assert view["state"] == "ended" and view["count"] == 0
+    assert "every process of the daemon's user was read" in view["basis"]
+    assert view["observed_at"] is not None and view["unseen"] == 0
+
+
+class _Shaped:
+    """A table with parents and environments the test writes. ``env`` gives a pid its
+    entries, a pid in ``rows`` with no entry in ``env`` is unreadable. ``later`` is the
+    environment of the second reading, where it differs."""
+
+    def __init__(
+        self,
+        rows: dict[int, int],
+        env: dict[int, list[str]],
+        later: dict[int, list[str]] | None = None,
+        gone: frozenset[int] = frozenset(),
+    ) -> None:
+        self.rows = rows
+        self.env = env
+        self.later = later
+        self.gone = gone
+        self.reads = 0
+
+    def own_processes(self) -> Sequence[ProcessInfo]:
+        second = self.reads > 0
+        return [
+            ProcessInfo(pid, ppid, "00:05", f"cmd{pid}")
+            for pid, ppid in self.rows.items()
+            if not (second and pid in self.gone)
+        ]
+
+    def has_variable(self, pid: int, assignment: str) -> bool:
+        return assignment in self.environments().get(pid, [])
+
+    def environments(self) -> dict[int, list[str]]:
+        found = self.later if self.reads > 0 and self.later is not None else self.env
+        self.reads += 1
+        return dict(found)
+
+    def send(self, pid: int, signal_number: int) -> None:
+        raise ProcessLookupError(pid)
+
+
+def mark(line: str) -> list[str]:
+    return [f"{MARK_VARIABLE}={line}.0123"]
+
+
+def shaped(world: World, table: _Shaped) -> dict[str, Any]:
+    world.scheduler.relinquish_ownership("alpha", "over", "beta", None)
+    return observe(world, cast(_Table, table))
+
+
+def test_a_marked_engine_that_is_a_daemon_child_or_grandchild_is_seen_as_running(
+    world: World,
+) -> None:
+    # Review of 3344ca6. These were left out as the daemon's launchers and engines, and
+    # the count of zero was read as ended.
+    daemon = os.getpid()
+    rows = {daemon: 1, 5001: daemon, 5002: 5001, 5003: 5001}
+    env: dict[int, list[str]] = {
+        daemon: [],
+        5001: [],
+        5002: mark("alpha"),
+        5003: mark("gamma"),
+    }
+    view = shaped(world, _Shaped(rows, env))
+    assert view["state"] == "running" and view["count"] == 1
+
+
+def test_an_unreadable_process_makes_the_answer_unknown_not_ended(world: World) -> None:
+    daemon = os.getpid()
+    rows = {daemon: 1, 5001: daemon, 5002: 5001}
+    # 5002 is the engine of some line, a child of a launcher, and cannot be read.
+    env: dict[int, list[str]] = {daemon: [], 5001: mark("gamma")}
+    view = shaped(world, _Shaped(rows, env))
+    assert view["state"] == "unknown" and view["unseen"] == 1
+    assert "could not be read" in view["basis"] and view["count"] == 0
+
+
+def test_a_process_unreadable_once_and_readable_on_the_second_reading_is_judged(
+    world: World,
+) -> None:
+    daemon = os.getpid()
+    rows = {daemon: 1, 5002: 1}
+    env: dict[int, list[str]] = {daemon: []}
+    later: dict[int, list[str]] = {daemon: [], 5002: mark("alpha")}
+    view = shaped(world, _Shaped(rows, env, later))
+    assert view["state"] == "running" and view["count"] == 1 and view["unseen"] == 0
+
+
+def test_a_process_that_ended_between_the_readings_is_not_unseen(world: World) -> None:
+    daemon = os.getpid()
+    rows = {daemon: 1, 5002: 1}
+    view = shaped(
+        world, _Shaped(rows, {daemon: []}, {daemon: []}, gone=frozenset({5002}))
+    )
+    assert view["state"] == "ended" and view["unseen"] == 0
+
+
+def test_the_daemons_own_unreadable_environment_is_not_counted_as_unseen(
+    world: World,
+) -> None:
+    daemon = os.getpid()
+    view = shaped(world, _Shaped({daemon: 1, 5001: 1}, {5001: []}))
+    assert view["state"] == "ended"
+
+
+def test_a_process_with_the_former_holders_mark_is_shown_as_running(
+    world: World,
+) -> None:
+    world.scheduler.relinquish_ownership("alpha", "over", "beta", None)
+    view = observe(world, _Table({4001: "alpha.0123", 4002: "alpha.9999"}))
+    assert view["state"] == "running" and view["count"] == 2
+
+
+def test_a_table_that_cannot_be_read_is_unknown_never_ended(world: World) -> None:
+    world.scheduler.relinquish_ownership("alpha", "over", "beta", None)
+    view = observe(world, _Table({}, refuse=True))
+    assert view["state"] == "unknown" and view["count"] is None
+    assert "could not be read" in view["basis"]
+
+
+def test_a_platform_that_cannot_attribute_processes_is_unknown(world: World) -> None:
+    world.scheduler.relinquish_ownership("alpha", "over", "beta", None)
+    view = observe(world, _Table({}), identifiable=False)
+    assert view["state"] == "unknown"
+    assert view["basis"] == scheduler_module.UNIDENTIFIABLE
+
+
+def test_a_turn_in_flight_is_running_whatever_the_table_says(world: World) -> None:
+    world.scheduler.relinquish_ownership("alpha", "over", "beta", None)
+    observe(world, _Table({}))
+    world.scheduler._running["alpha"] = cast(  # pyright: ignore[reportPrivateUsage]
+        "asyncio.Task[None]", object()
+    )
+    try:
+        view = cast(
+            "dict[str, Any]", world.scheduler.role_status("beta")["former_holder"]
+        )
+    finally:
+        del world.scheduler._running["alpha"]  # pyright: ignore[reportPrivateUsage]
+    assert view["state"] == "running" and "in flight" in view["basis"]
+
+
+def test_a_later_change_does_not_inherit_the_earlier_observation(
+    world: World,
+) -> None:
+    world.scheduler.relinquish_ownership("alpha", "over", "beta", None)
+    observe(world, _Table({}))
+    world.scheduler.relinquish_ownership("beta", "back", "alpha", None)
+    view = cast("dict[str, Any]", world.scheduler.role_status("alpha")["former_holder"])
+    assert view["line_id"] == "beta" and view["state"] == "unknown"
+
+
+def test_the_role_status_tool_reads_the_table_before_it_answers(world: World) -> None:
+    world.scheduler.relinquish_ownership("alpha", "over", "beta", None)
+    world.scheduler._processes = _Table({})  # pyright: ignore[reportPrivateUsage]
+    world.scheduler._processes_identifiable = True  # pyright: ignore[reportPrivateUsage]
+    tool = world.scheduler.role_status_tool("beta")
+
+    async def invoke() -> dict[str, Any]:
+        return await tool.handler({})
+
+    text = str(asyncio.run(invoke())["content"][0]["text"])
+    assert '"state": "ended"' in text

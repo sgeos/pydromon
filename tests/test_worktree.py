@@ -14,7 +14,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import worktree
+from dromon import spawn, worktree
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
@@ -46,12 +46,13 @@ def git(directory: Path, *arguments: str) -> str:
         "GIT_COMMITTER_NAME": "t",
         "GIT_COMMITTER_EMAIL": "t@example.com",
     }
-    done = subprocess.run(  # noqa: S603
-        ["git", "-C", str(directory), *arguments],  # noqa: S607
+    done = spawn.run(
+        ["git", "-C", str(directory), *arguments],
         capture_output=True,
         text=True,
         check=True,
         env=environment,
+        timeout=60,
     )
     return done.stdout
 
@@ -314,14 +315,14 @@ def test_the_real_runner_reports_a_missing_git_and_a_timeout(
     def cannot(command: list[str], **_: object) -> object:
         raise FileNotFoundError("git")
 
-    monkeypatch.setattr(subprocess, "run", cannot)
+    monkeypatch.setattr(spawn, "run", cannot)
     found = run_git(tmp_path, ["status"])
     assert found.code == 127 and "git cannot be run" in found.stderr
 
     def slow(command: list[str], **_: object) -> object:
         raise subprocess.TimeoutExpired(command, 1)
 
-    monkeypatch.setattr(subprocess, "run", slow)
+    monkeypatch.setattr(spawn, "run", slow)
     found = run_git(tmp_path, ["status"])
     assert found.code == 124 and "did not finish" in found.stderr
 
@@ -331,15 +332,16 @@ def test_the_real_runner_turns_the_file_system_monitor_off(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     seen: list[list[str]] = []
-    real = subprocess.run
+    real = spawn.run
 
     def spy(
-        command: list[str], **keywords: object
+        command: list[str],
+        **keywords: Any,  # noqa: ANN401
     ) -> "subprocess.CompletedProcess[str]":
         seen.append(command)
-        return real(command, **keywords)  # type: ignore[call-overload,no-any-return]
+        return cast("subprocess.CompletedProcess[str]", real(command, **keywords))
 
-    monkeypatch.setattr(subprocess, "run", spy)
+    monkeypatch.setattr(spawn, "run", spy)
     run_git(tmp_path, ["--version"])
     assert seen[0][:5] == ["git", "-C", str(tmp_path), "-c", "core.fsmonitor=false"]
 
@@ -411,3 +413,33 @@ def test_the_tool_is_unavailable_where_the_directory_does_not_resolve(
 ) -> None:
     text, error = call(scheduler, {})
     assert error and text.startswith("worktree_status is unavailable: ")
+
+
+def test_a_git_whose_start_never_completes_is_reported_and_does_not_hold_the_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Round 15. The start of a git is bounded by dromon.spawn, which tests/test_spawn.py
+    # covers in full. Here the runner shows what a stalled start becomes: a failure
+    # to run with the reason, not a hang and not a clean tree.
+    def stalled(command: list[str], **_: object) -> object:
+        raise spawn.StartStalled("git did not start within 0.2s")
+
+    monkeypatch.setattr(spawn, "run", stalled)
+    ran = run_git(tmp_path, ["status"])
+    assert ran.code == 127 and "did not start within" in ran.stderr
+
+
+def test_a_git_that_cannot_be_started_and_one_that_overruns_are_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def missing(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError("no git")
+
+    monkeypatch.setattr(spawn, "run", missing)
+    assert worktree.run_git(tmp_path, ["status"]).code == 127
+
+    def slow(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired("git", 1.0)
+
+    monkeypatch.setattr(spawn, "run", slow)
+    assert worktree.run_git(tmp_path, ["status"]).code == 124

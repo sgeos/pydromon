@@ -1,13 +1,14 @@
 """The local teacher: its project table, and bringing it up and down against a fake
 Ollama, so no test starts a server, loads a model or signals a real process."""
 
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from dromon import cli, exits
+from dromon import cli, exits, spawn
 from dromon.daemon import release_teacher, start_teacher
 from dromon.projectconfig import ConfigFileError, parse
 from dromon.teacher import (
@@ -15,6 +16,7 @@ from dromon.teacher import (
     Teacher,
     TeacherConfig,
     TeacherError,
+    _command_name,  # pyright: ignore[reportPrivateUsage]
     parse_teacher,
 )
 
@@ -393,3 +395,35 @@ def test_dromon_config_reports_the_teacher(
         f"teacher: {MODEL} at http://127.0.0.1:11434, context 4096, keep alive 30m,"
         " autostart" in out
     )
+
+
+# Review of 151cbcd. A ps that cannot say is not the teacher.
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        spawn.StartStalled("ps did not start"),
+        subprocess.TimeoutExpired(["ps"], 10),
+        FileNotFoundError("ps"),
+    ],
+)
+def test_a_ps_that_stalls_or_fails_leaves_the_command_unknown_and_status_whole(
+    failure: BaseException, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def refuse(*args: object, **kwargs: object) -> object:
+        raise failure
+
+    monkeypatch.setattr(spawn, "run", refuse)
+    assert _command_name(4242) is None
+    fake = FakeOllama(running=False)
+    (tmp_path / PID_FILE).write_text("4242", encoding="ascii")
+    config = parse_teacher({"model": MODEL})
+    teacher = Teacher(
+        config,
+        tmp_path,
+        transport=fake.transport,
+        memory=lambda: PLENTY,
+    )
+    state = teacher.status()
+    assert state.started_by_dromon is False, "a pid ps cannot vouch for is not it"

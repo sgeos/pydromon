@@ -5,6 +5,7 @@ that starts a fresh session each turn."""
 
 import asyncio
 import json
+import os
 from collections.abc import Generator, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -12,6 +13,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import linetemp
 from dromon import scheduler as scheduler_module
 from dromon.driver import Strategy
 from dromon.engine import ClaudeCodeLine, TurnReport
@@ -113,9 +115,19 @@ def test_the_first_turn_states_the_facts_and_a_later_one_does_not(world: World) 
     assert "reaches only github.com, pypi.org." in first
     scratch = world.project / "tmp" / "lines" / "alpha"
     assert f"Scratch is {scratch}, which your shell may write." in first
+    shell = linetemp.claude_shell_tmpdir(os.getuid())
     assert (
-        f"TMPDIR is {world.temp.temp} and UV_CACHE_DIR is {world.temp.cache}" in first
+        "Claude Code sets TMPDIR in your shell to its own directory, observed as "
+        + shell
+        in first
     )
+    assert "shares, so do not treat it as private" in first
+    assert (
+        f"Dromon's directory for you is {world.temp.temp} and UV_CACHE_DIR is"
+        f" {world.temp.cache}" in first
+    )
+    # The shell's TMPDIR is not claimed to be Dromon's directory.
+    assert f"TMPDIR is {world.temp.temp}" not in first
     second = world.turn("again")
     assert "Your sandbox," not in second
 
@@ -241,3 +253,32 @@ def test_line_status_gives_the_facts_whole(world: World) -> None:
     assert cast(dict[str, object], facts["scratch"])["shell_may_write"] is True
     assert str(world.temp.temp) in text
     assert "not probes" in cast(str, facts["note"])
+
+
+def test_the_claude_code_shell_directory_is_named_for_the_user() -> None:
+    prefix = linetemp.CLAUDE_TMPDIR_PREFIX
+    assert linetemp.claude_shell_tmpdir(501) == f"{prefix}501"
+    assert linetemp.claude_shell_tmpdir(0) == f"{prefix}0"
+
+
+# Round 15, item 5.
+
+
+def test_a_turn_trims_the_line_directory_and_tells_the_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(linetemp, "MAX_TEMP_BYTES", 100_000)
+    project = tmp_path / "project"
+    project.mkdir()
+    world = World(tmp_path, project, None)
+    try:
+        world.temp.temp.mkdir(parents=True)
+        old = world.temp.temp / "old"
+        old.write_bytes(b"x" * 300_000)
+        os.utime(old, (1.0, 1.0))
+        said = world.turn()
+        assert "Dromon removed 1 oldest entries of tmp" in said
+        assert not (world.temp.temp / "old").exists()
+        assert "Dromon removed" not in world.turn("again")
+    finally:
+        world.log.close()

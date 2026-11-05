@@ -4,18 +4,18 @@ widen. ``docs/architecture/RUNS.md`` gives the trust argument."""
 
 import asyncio
 import os
+import subprocess
 import sys
 import time
 from collections.abc import Generator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from asyncio.subprocess import Process
 from typing import Any, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import runparams, runs
+from dromon import runparams, runs, spawn
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.projectconfig import ConfigFileError, parse
@@ -224,21 +224,24 @@ SLOW_MATCHER = "import time; time.sleep(30)"
 from one left to run or waited out."""
 
 
-def spawned_children(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Process, float]]:
-    """Record each child ``match`` starts, with the monotonic time it started."""
-    started: list[tuple[Process, float]] = []
-    real = cast(Any, asyncio.create_subprocess_exec)
+def spawned_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[subprocess.Popen[bytes], float]]:
+    """Record each child ``match`` starts through ``spawn``, with the monotonic time
+    it started."""
+    started: list[tuple[subprocess.Popen[bytes], float]] = []
+    real = cast(Any, spawn.start)
 
-    async def recording(*args: object, **kwargs: object) -> Process:
-        child = cast(Process, await real(*args, **kwargs))
+    def recording(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        child = cast(subprocess.Popen[bytes], real(*args, **kwargs))
         started.append((child, time.monotonic()))
         return child
 
-    monkeypatch.setattr(runparams.asyncio, "create_subprocess_exec", recording)
+    monkeypatch.setattr(runparams.spawn, "start", recording)
     return started
 
 
-def assert_killed(child: Process) -> None:
+def assert_killed(child: subprocess.Popen[bytes]) -> None:
     """The child was killed and reaped, so it no longer exists."""
     assert child.returncode == -9, "the child was not killed"
     with pytest.raises(ProcessLookupError):
@@ -314,13 +317,44 @@ def test_a_child_that_fails_refuses_the_start(monkeypatch: pytest.MonkeyPatch) -
         asyncio.run(runparams.match(prepared))
 
 
+def test_a_start_that_fails_or_stalls_refuses_and_goes_through_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The matching child is started by ``spawn.start``, so its start is bounded and
+    counted, and a start that fails or stalls refuses the values and never lets one
+    through. Merge of the ops work, which started it with asyncio."""
+    prepared = runparams.prepare(
+        ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
+    )
+    real = cast(Any, spawn.start)
+    for failure in (OSError("no exec"), spawn.StartStalled("stalled")):
+
+        def failing(
+            *args: object, error: Exception = failure, **kwargs: object
+        ) -> object:
+            raise error
+
+        monkeypatch.setattr(runparams.spawn, "start", failing)
+        with pytest.raises(ParameterRefused, match="could not be matched"):
+            asyncio.run(runparams.match(prepared))
+    calls: list[object] = []
+
+    def counting(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        calls.append(args)
+        return cast(subprocess.Popen[bytes], real(*args, **kwargs))
+
+    monkeypatch.setattr(runparams.spawn, "start", counting)
+    assert asyncio.run(runparams.match(prepared)) == ("prog", "tests/a.py")
+    assert len(calls) == 1
+
+
 def test_a_command_without_values_starts_no_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def never(*args: object, **kwargs: object) -> object:
+    def never(*args: object, **kwargs: object) -> object:
         raise AssertionError("a child was started")
 
-    monkeypatch.setattr(runparams.asyncio, "create_subprocess_exec", never)
+    monkeypatch.setattr(runparams.spawn, "start", never)
     assert substitute(("make",), {}, None) == ("make",)
 
 

@@ -15,7 +15,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import processes
+from dromon import processes, spawn
 from dromon.driver import Driver, Strategy
 from dromon.engine import ClaudeCodeLine
 from dromon.eventlog import EventLog
@@ -412,14 +412,14 @@ def test_the_system_table_lists_through_ps_and_fails_closed(
         calls.append(command)
         return Completed("  7  1  00:01 sleep 9\n")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(spawn, "run", fake_run)
     assert SystemProcesses().own_processes() == [ProcessInfo(7, 1, "00:01", "sleep 9")]
     assert calls[0][-1] == "pid=,ppid=,etime=,args="
 
     def broken(command: list[str], **_: object) -> Completed:
         raise OSError("ps is not available")
 
-    monkeypatch.setattr(subprocess, "run", broken)
+    monkeypatch.setattr(spawn, "run", broken)
     with pytest.raises(ProcessRefused, match="cannot list processes"):
         SystemProcesses().own_processes()
 
@@ -442,11 +442,11 @@ def test_the_environment_is_read_per_platform_and_none_means_not_the_lines(
         raise PermissionError(str(self))
 
     monkeypatch.setattr(processes.sys, "platform", "darwin")
-    monkeypatch.setattr(subprocess, "run", marked_ps)
+    monkeypatch.setattr(spawn, "run", marked_ps)
     assert read_environment(7) == ["sleep", "9", "PATH=/bin", f"{MARK_VARIABLE}={MARK}"]
     assert SystemProcesses().has_variable(7, f"{MARK_VARIABLE}={MARK}")
     assert not SystemProcesses().has_variable(7, f"{MARK_VARIABLE}={MARK[:-1]}")
-    monkeypatch.setattr(subprocess, "run", failed_ps)
+    monkeypatch.setattr(spawn, "run", failed_ps)
     assert read_environment(7) is None
     assert not SystemProcesses().has_variable(7, f"{MARK_VARIABLE}={MARK}")
     monkeypatch.setattr(processes.sys, "platform", "linux")
@@ -631,7 +631,7 @@ def test_strict_environment_reading_names_why_it_failed(
     def timed_out(command: list[str], **_: object) -> Completed:
         raise subprocess.TimeoutExpired(command, 10)
 
-    monkeypatch.setattr(subprocess, "run", timed_out)
+    monkeypatch.setattr(spawn, "run", timed_out)
     with pytest.raises(ProcessRefused):
         processes.read_environments(1, strict=True)
     assert processes.read_environments(1) == {}
@@ -642,14 +642,14 @@ def test_strict_environment_reading_names_why_it_failed(
         def cannot_run(command: list[str], **_: object) -> Completed:
             raise OSError("not permitted")
 
-        monkeypatch.setattr(subprocess, "run", cannot_run)
+        monkeypatch.setattr(spawn, "run", cannot_run)
         with pytest.raises(ProcessRefused, match="ps cannot be run: not permitted"):
             processes.read_environments(1, strict=True)
 
         def denied(command: list[str], **_: object) -> Completed:
             return Completed("", 2, "denied\n")
 
-        monkeypatch.setattr(subprocess, "run", denied)
+        monkeypatch.setattr(spawn, "run", denied)
         with pytest.raises(ProcessRefused, match="status 2 and said denied"):
             processes.read_environments(1, strict=True)
 
@@ -671,7 +671,7 @@ def test_the_system_table_environments_are_strict(
     def timed_out(command: list[str], **_: object) -> Completed:
         raise subprocess.TimeoutExpired(command, 10)
 
-    monkeypatch.setattr(subprocess, "run", timed_out)
+    monkeypatch.setattr(spawn, "run", timed_out)
     with pytest.raises(ProcessRefused):
         SystemProcesses().environments()
 
@@ -690,7 +690,7 @@ def test_all_environments_are_read_in_one_call_on_macos(
         )
 
     monkeypatch.setattr(processes.sys, "platform", "darwin")
-    monkeypatch.setattr(subprocess, "run", one_ps)
+    monkeypatch.setattr(spawn, "run", one_ps)
     found = processes.read_environments(501)
     assert len(calls) == 1 and "-U" in calls[0] and "501" in calls[0]
     assert found[7][-1] == f"{MARK_VARIABLE}={MARK}" and found[8] == [
@@ -702,7 +702,7 @@ def test_all_environments_are_read_in_one_call_on_macos(
     def broken(command: list[str], **_: object) -> Completed:
         raise OSError("no ps")
 
-    monkeypatch.setattr(subprocess, "run", broken)
+    monkeypatch.setattr(spawn, "run", broken)
     assert processes.read_environments(501) == {}
     monkeypatch.setattr(processes.sys, "platform", "sunos5")
     assert processes.read_environments(501) == {}
@@ -771,7 +771,7 @@ def probe(monkeypatch: pytest.MonkeyPatch) -> FakeChild:
         child.environment = environment
         return child
 
-    monkeypatch.setattr(processes.subprocess, "Popen", popen)
+    monkeypatch.setattr(spawn, "start", popen)
 
     def token_hex(size: int) -> str:
         return "t"
@@ -828,7 +828,7 @@ def test_a_child_that_cannot_start_fails_the_self_test(
     def refused(command: list[str], **_: object) -> FakeChild:
         raise OSError("no sleep")
 
-    monkeypatch.setattr(processes.subprocess, "Popen", refused)
+    monkeypatch.setattr(spawn, "start", refused)
     assert processes.environment_reading_works() is False
 
 
@@ -997,7 +997,7 @@ def test_the_default_identity_is_read_from_ps(monkeypatch: pytest.MonkeyPatch) -
         assert isinstance(env, dict) and env["LC_ALL"] == "C"
         return next(answers)
 
-    monkeypatch.setattr(processes.subprocess, "run", run)
+    monkeypatch.setattr(spawn, "run", run)
     assert identity_of(5) == (77, STARTED)
     assert identity_of(5) is None
     assert identity_of(5) is None
@@ -1009,18 +1009,21 @@ def test_an_unreadable_identity_is_none(monkeypatch: pytest.MonkeyPatch) -> None
     def broken(*arguments: object, **options: object) -> None:
         raise OSError("no ps")
 
-    monkeypatch.setattr(processes.subprocess, "run", broken)
+    monkeypatch.setattr(spawn, "run", broken)
     assert identity_of(5) is None
 
 
 def _ps_runs() -> bool:
     try:
-        found = subprocess.run(  # noqa: S603
+        found = spawn.run(
             ["/bin/ps", "-o", "pid=", "-p", str(os.getpid())],
             capture_output=True,
             timeout=10,
             check=False,
         )
+    except spawn.StartStalled:
+        # A stalled start is a failure to report, never a ps that is absent.
+        raise
     except OSError:
         return False
     return found.returncode == 0

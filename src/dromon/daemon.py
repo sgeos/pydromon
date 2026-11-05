@@ -55,7 +55,7 @@ from OpenSSL.SSL import Context as OpenSSLContext
 
 from dromon.scheduler import StartCheckEngine
 from dromon import __version__, exits, fleet, grok, peercred, registry, restart, runs
-from dromon import evidence
+from dromon import credentials, evidence
 from dromon import proposals as proposal_store
 from dromon.federation import (
     MAX_OPEN_REMOTE_PEERS,
@@ -4019,6 +4019,12 @@ def run(
             if launch_checks:
                 launcher.configure(scratch / "left")
         with EventLog(log_path, snapshots=not check_only) as log:
+            # The dictionary is the daemon's own, which a reload updates in place.
+            # Set before ``report_start``, which may restore a snapshot, so that
+            # nothing is stored or restored without the scrub.
+            log.secrets = lambda: credentials.environment_values(
+                line_secrets, os.environ
+            )
             report_start(log, paths.event_log, check_only)
             scheduler = Scheduler(
                 log,

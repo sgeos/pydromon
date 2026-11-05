@@ -13,18 +13,21 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import codetree
+from dromon import codetree, spawn
 from dromon.driver import Strategy
 from dromon.engine import TurnReport
 from dromon.eventlog import EventLog
 from dromon.limits import Limits
 from dromon.model import LineAddress, OperatorAddress
 from dromon.scheduler import LineSpec, Scheduler
+
+if TYPE_CHECKING:
+    from conftest import StalledStart
 
 HAIKU = "claude-haiku-5-5"
 ANA = OperatorAddress("ana")
@@ -48,12 +51,25 @@ STATUS_BOUND_SECONDS = 0.5
 """How long a status may take while git hangs, a tenth of ``GIT_SECONDS``."""
 
 
+def run_git(
+    command: list[str], environment: dict[str, str] | None
+) -> subprocess.CompletedProcess[str]:
+    """``command`` run to its end, through ``dromon.spawn``, which bounds the start as
+    well as the run. A stalled start raises ``StartStalled`` naming the program, and a
+    failed git raises ``CalledProcessError`` as ``subprocess.run`` does. **Round 15.**
+    The wait for the child to reach ``exec`` stopped a full gate for its five minutes on
+    2026-11-05 in this file's second test."""
+    return spawn.run(
+        command, capture_output=True, text=True, timeout=60, check=True, env=environment
+    )
+
+
 def git(directory: Path, *arguments: str) -> str:
     environment = {
         name: value for name, value in os.environ.items() if not name.startswith("GIT_")
     }
-    done = subprocess.run(  # noqa: S603
-        [  # noqa: S607
+    done = run_git(
+        [
             "git",
             "-C",
             str(directory),
@@ -67,11 +83,7 @@ def git(directory: Path, *arguments: str) -> str:
             "core.hooksPath=/dev/null",
             *arguments,
         ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=True,
-        env=environment,
+        environment,
     )
     return done.stdout.strip()
 
@@ -241,13 +253,7 @@ def test_git_variables_in_the_daemons_environment_do_not_change_an_answer(
     monkeypatch.setenv("GIT_INDEX_FILE", str(decoy.root / ".git" / "index"))
     # The variables take effect for a git that keeps them, so the test would see
     # the filter go.
-    unfiltered = subprocess.run(  # noqa: S603
-        ["git", "-C", str(root), "rev-parse", "HEAD"],  # noqa: S607
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=True,
-    )
+    unfiltered = run_git(["git", "-C", str(root), "rev-parse", "HEAD"], None)
     assert unfiltered.stdout.strip() == decoy.code != repository.code
     assert answers() == clean
 
@@ -582,3 +588,86 @@ def test_a_prompt_does_not_wait_for_git_and_tells_the_turn_after(
     asked(stale_world.trees, lambda: stale_world.scheduler.daemon_behind("alpha"))
     stale_world.run("two")
     assert told in stale_world.last_prompt()
+
+
+# The start of a git, which ``subprocess.run`` does not bound. Round 15. The bound is
+# ``dromon.spawn``'s, covered in ``tests/test_spawn.py``. Here a stalled start shows
+# what it becomes for the worker.
+
+
+@pytest.fixture
+def stalled(
+    stalled_start: "StalledStart", monkeypatch: pytest.MonkeyPatch
+) -> "StalledStart":
+    monkeypatch.setattr(spawn, "START_SECONDS", 0.2)
+    return stalled_start
+
+
+def test_a_git_that_does_not_start_ends_the_wait_and_is_counted(
+    repository: Repository, stalled: "StalledStart"
+) -> None:
+    began = time.monotonic()
+    with pytest.raises(codetree._Timeout):  # pyright: ignore[reportPrivateUsage]
+        codetree._git(repository.root, "rev-parse", "HEAD")  # pyright: ignore[reportPrivateUsage]
+    # Derived from the start bound, with a margin for a loaded runner.
+    assert time.monotonic() - began < 10 * spawn.START_SECONDS
+    assert spawn.stranded_count() == 1
+    stalled.stall = False
+    stalled.gate.set()
+    stalled.until_ended()
+    assert spawn.stranded_count() == 0
+
+
+def test_no_more_gits_start_while_the_most_allowed_are_stuck(
+    repository: Repository, stalled: "StalledStart", monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(spawn, "MAX_STRANDED", 2)
+    for _ in range(2):
+        with pytest.raises(codetree._Timeout):  # pyright: ignore[reportPrivateUsage]
+            codetree._git(repository.root, "rev-parse", "HEAD")  # pyright: ignore[reportPrivateUsage]
+    assert stalled.calls == 2
+    with pytest.raises(codetree._Timeout):  # pyright: ignore[reportPrivateUsage]
+        codetree._git(repository.root, "rev-parse", "HEAD")  # pyright: ignore[reportPrivateUsage]
+    assert stalled.calls == 2, "a third start was made past the bound"
+
+
+def test_a_stalled_start_does_not_wedge_the_worker(
+    repository: Repository, stalled: "StalledStart"
+) -> None:
+    """The worker ends on a stalled start, the question is unknown, and once git can
+    start the question is asked again and answered."""
+    now = [0.0]
+    trees = codetree.CodeTrees(clock=lambda: now[0])
+    package = repository.root / "src" / "dromon"
+    assert trees.package_path(package) is None
+    assert trees.settle(SETTLE_SECONDS), "the worker never ended on a stalled start"
+    assert trees.package_path(package) is None
+    stalled.stall = False
+    stalled.gate.set()
+    stalled.until_ended()
+    now[0] += codetree.RETRY_SECONDS + 1
+    assert asked(trees, lambda: trees.package_path(package)) == "src/dromon"
+
+
+def test_a_start_that_fails_is_unknown_and_a_timeout_is_a_timeout(
+    repository: Repository, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failure: list[BaseException] = []
+
+    def failing(command: list[str], **_: object) -> object:
+        raise failure[0]
+
+    monkeypatch.setattr(spawn, "run", failing)
+    failure[:] = [FileNotFoundError("git")]
+    assert codetree._git(repository.root, "rev-parse", "HEAD") is None  # pyright: ignore[reportPrivateUsage]
+    failure[:] = [subprocess.TimeoutExpired("git", 1)]
+    with pytest.raises(codetree._Timeout):  # pyright: ignore[reportPrivateUsage]
+        codetree._git(repository.root, "rev-parse", "HEAD")  # pyright: ignore[reportPrivateUsage]
+    failure[:] = [spawn.StartStalled("git did not start")]
+    with pytest.raises(codetree._Timeout):  # pyright: ignore[reportPrivateUsage]
+        codetree._git(repository.root, "rev-parse", "HEAD")  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.undo()
+    done = codetree._git(repository.root, "rev-parse", "HEAD")  # pyright: ignore[reportPrivateUsage]
+    assert done is not None
+    assert done.stdout.strip() == repository.code
+    assert spawn.stranded_count() == 0

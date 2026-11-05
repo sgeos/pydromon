@@ -4,13 +4,12 @@ replaced by a recording runner, and every other command runs for real."""
 
 import os
 import stat
-import subprocess
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
 
-from dromon import cli, exits, land
+from dromon import cli, exits, land, spawn
 from dromon.land import Completed, Lander, Request
 
 TERM = "zqxjvorbit"
@@ -20,8 +19,8 @@ PR_URL = "https://example.invalid/sgeos/demo/pull/7"
 
 
 def git(directory: Path, *args: str, check: bool = True) -> str:
-    done = subprocess.run(  # noqa: S603
-        ["git", "-C", str(directory), *args],  # noqa: S607
+    done = spawn.run(
+        ["git", "-C", str(directory), *args],
         capture_output=True,
         text=True,
         timeout=60,

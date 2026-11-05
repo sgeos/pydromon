@@ -41,10 +41,13 @@ declarations load.
 import asyncio
 import json
 import re
+import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, cast
+
+from dromon import spawn
 
 MAX_PARAMETERS: Final = 8
 """The most parameters one command declares."""
@@ -265,17 +268,29 @@ async def match(prepared: Prepared, seconds: float = MATCH_SECONDS) -> tuple[str
     payload = json.dumps(
         [[pattern, value] for _, pattern, value in prepared.checks]
     ).encode()
-    child = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-I",
-        "-c",
-        MATCHER,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
     try:
-        output, _ = await asyncio.wait_for(child.communicate(payload), seconds)
+        # Review of the merge of the ops work. ``asyncio.create_subprocess_exec`` runs
+        # ``Popen`` on the event loop's own thread, where a start that stalls in the
+        # exec-pipe read would stop the whole daemon. The start is made by
+        # ``spawn.start`` on a worker thread, which bounds it, and the loop stays free
+        # while the child matches.
+        child = await asyncio.to_thread(
+            spawn.start,
+            [sys.executable, "-I", "-c", MATCHER],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, TimeoutError) as error:
+        # A start that failed or stalled refuses, as a child that fails does, so a
+        # broken start never lets a value through.
+        raise ParameterRefused(
+            "the values could not be matched against their patterns"
+        ) from error
+    try:
+        output, _ = await asyncio.wait_for(
+            asyncio.to_thread(child.communicate, payload), seconds
+        )
     except TimeoutError as error:
         raise ParameterRefused(
             f"the values took longer than {seconds:g} seconds to match their"
@@ -283,9 +298,11 @@ async def match(prepared: Prepared, seconds: float = MATCH_SECONDS) -> tuple[str
             " alternatives in a row can take time exponential in a value's length"
         ) from error
     finally:
-        if child.returncode is None:
+        # The kill ends the worker thread's ``communicate`` too, since its pipes
+        # close, so no thread outlives the call by more than the reap.
+        if child.poll() is None:
             child.kill()
-            await child.wait()
+        await asyncio.to_thread(child.wait)
     _check_answers(prepared, output, child.returncode)
     return prepared.argv
 

@@ -21,16 +21,35 @@ without following a link, and refused unless the daemon's user owns it and no ot
 user can reach it. A directory that fails the check is not used, and the line's
 shell keeps the temporary directory it had, which the status says.
 
-Facts and hypotheses. **Fact**, seen in a round 14 session, Claude Code sets the
-shell's ``TMPDIR`` to a directory of its own under ``/tmp``, and its sandbox grants
-that directory. **Hypothesis**, not verified live, a ``TMPDIR`` that Dromon sets is
-overridden by Claude Code where it sets its own, in which case ``UV_CACHE_DIR`` and the
-write grant still stand and only the here-document case depends on Claude Code. The
+Facts and hypotheses. **Fact**, observed live on 2026-11-01 under Claude Code with
+Sonnet 5.5, the shell's ``TMPDIR`` is ``/tmp/claude-UID``, set by Claude Code and not
+the directory Dromon names, while ``UV_CACHE_DIR`` is Dromon's. A here-document to
+``$TMPDIR`` worked there. **Inference**, that directory is shared by every Claude Code
+line of the user, so lines may read each other's temporary files in it, which Dromon
+does not control. **Round 15, item 2.** The turn-start note therefore names both
+directories and says which one the shell has, through ``claude_shell_tmpdir``. The
 two directories survive the daemon, since removing them while a line's command runs
 would fail that command, and ``sweep`` removes only what has gone unchanged for a
 week. The sandbox also denies the line reads of the directory above its own, which
-holds the other lines' directories, and lifts that for its own. Hypothesis, not
-verified live, that ``allowRead`` lifts a ``denyRead`` of a directory above it.
+holds the other lines' directories, and lifts that for its own. **Fact**, observed
+live, the denial of another line's directory holds and ``allowRead`` lifts it for the
+line's own.
+
+**Round 15, item 5. A byte bound, applied between turns.** The sandbox has no quota,
+so the daemon measures each directory before a line's turn starts and, when it holds
+more than ``MAX_TEMP_BYTES`` or ``MAX_CACHE_BYTES``, removes whole top-level entries,
+oldest change first, until it holds at most half the bound. The line is told in that
+turn's prompt what was removed. The measure is allocated bytes with ``os.lstat`` and no
+following of links, at most ``MAX_WALK_ENTRIES`` entries. A walk cut short counts a
+lower bound, so removal starts only when that count already exceeds the bound, and a
+directory of more entries whose counted bytes are within it is reported as not measured
+in full and loses nothing, as ``trim`` says. **Residual.** A line can
+exceed the bound within a turn, as far as the disk allows, and the bound is checked
+only at a turn start. A file in use by a command that outlives the turn can be removed,
+which the line is told. Hard links to one file count once for each name. The bounds are
+constants, not a project setting. **Inference.** Removing the oldest entries is safe for
+a temporary directory and for a cache that can be rebuilt, and unsafe for a line that
+keeps state there on purpose, which the sandbox note does not promise to keep.
 
 Porting note. The directory is found with the operating system's temporary directory
 and checked with ``os.lstat``, which matches POSIX only.
@@ -57,6 +76,16 @@ CACHE_NAME: Final = "uv-cache"
 MAX_TEMP_AGE_SECONDS: Final = 7 * 24 * 3600
 """How long an entry in a known line's temporary directory may go unchanged before the
 start sweep removes it."""
+CLAUDE_TMPDIR_PREFIX: Final = "/tmp/claude-"  # noqa: S108
+MAX_TEMP_BYTES: Final = 2**30
+"""The most a line's ``tmp`` directory may hold at a turn start, one gibibyte."""
+MAX_CACHE_BYTES: Final = 4 * 2**30
+"""The most a line's package cache may hold at a turn start, four gibibytes."""
+MAX_WALK_ENTRIES: Final = 100_000
+"""The most entries one measure visits, so the work is bounded. A directory with more
+is counted as far as the limit and reported as not measured in full."""
+MAX_TOP_ENTRIES: Final = 10_000
+"""The most top-level entries one trim considers."""
 TEMP_VARIABLE: Final = "TMPDIR"
 CACHE_VARIABLE: Final = "UV_CACHE_DIR"
 
@@ -92,6 +121,15 @@ class LineTemp:
         """The sandbox ``allowRead`` entry that lifts the denial for the line's own
         directory, which its shell reads, as a here-document's file is."""
         return [str(self.root)]
+
+
+def claude_shell_tmpdir(user: int) -> str:
+    """The ``TMPDIR`` a Claude Code line's shell has, whatever Dromon sets, which
+    Claude Code replaces with a directory of its own for the user. **Fact**, observed
+    once, on 2026-11-01, so it is an observation of a Claude Code behaviour and not a
+    contract. The status says it is observed, and a Claude Code that changes it makes
+    the note wrong until this is updated."""
+    return f"{CLAUDE_TMPDIR_PREFIX}{user}"
 
 
 def base_directory() -> Path:
@@ -181,12 +219,11 @@ def sweep(
     **Residual.** A cache that a line only reads keeps its old modification times and
     is removed after a week, which costs its speed and nothing else.
 
-    **There is no byte bound, and none is possible here.** The sandbox grants write
-    access to a directory and has no quota, and the operating system gives an
-    unprivileged process none for a directory on a shared file system. What bounds the
-    growth is the age rule and this sweep at each start, and a line can still fill the
-    disk between starts. **Residual.** The daemon does not measure the size, since a
-    measure without an action would only report what a full disk reports already.
+    **Size is bounded by ``trim``, not here.** The sandbox grants write access to a
+    directory and has no quota, and the operating system gives an unprivileged process
+    none for a directory on a shared file system, so the bound is applied by the
+    daemon between turns, as ``trim`` says. What bounds the growth during a turn is
+    nothing, and this sweep still removes what has gone unchanged for a week.
 
     The model has no event that retires or deletes a line, so no removal happens at
     one. The parent and each entry are checked with ``os.lstat`` and removed without
@@ -283,3 +320,199 @@ def _remove(path: Path, user: int, removed: list[str], failed: list[str]) -> Non
         failed.append(f"{path}: {error.strerror or error}")
         return
     removed.append(str(path))
+
+
+@dataclass(frozen=True, slots=True)
+class Trimmed:
+    """What ``trim`` did to one directory. ``removed`` is the entries taken out and
+    ``freed`` the bytes they held, and ``incomplete`` says the walk limit was reached,
+    so the sizes are lower bounds."""
+
+    place: str
+    bound: int
+    removed: tuple[str, ...]
+    freed: int
+    incomplete: bool
+    failed: tuple[str, ...]
+
+
+def measure(directory: Path, limit: int | None = None) -> tuple[int, bool]:
+    """The allocated bytes under ``directory`` and whether the walk was complete.
+    Links are counted, not followed, and at most ``limit`` entries are visited. A
+    missing directory holds nothing, and an unreadable one is counted as it was read."""
+    bound = MAX_WALK_ENTRIES if limit is None else limit
+    total = 0
+    visited = 0
+    pending = [directory]
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    visited += 1
+                    if visited > bound:
+                        return total, False
+                    try:
+                        found = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    total += _allocated(found)
+                    if stat.S_ISDIR(found.st_mode):
+                        pending.append(Path(entry.path))
+        except OSError:
+            continue
+    return total, True
+
+
+def _allocated(found: os.stat_result) -> int:
+    blocks = getattr(found, "st_blocks", None)
+    return blocks * 512 if isinstance(blocks, int) else found.st_size
+
+
+def _newest_change(path: Path, budget: int) -> tuple[float, int]:
+    """The latest modification time of ``path`` and of what lies under it, found by a
+    walk of at most ``budget`` entries that follows no link, and the budget left. A
+    directory's own time changes only when its direct entries do, so a tree written
+    deep below would look old by it alone. A walk cut short by the budget gives the
+    latest time seen, which is never older than the entry's own."""
+    try:
+        newest = os.lstat(path).st_mtime
+    except OSError:
+        return 0.0, budget
+    pending = [path]
+    while pending and budget > 0:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    budget -= 1
+                    if budget < 0:
+                        return newest, 0
+                    try:
+                        found = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    newest = max(newest, found.st_mtime)
+                    if stat.S_ISDIR(found.st_mode):
+                        pending.append(Path(entry.path))
+        except OSError:
+            continue
+    return newest, max(budget, 0)
+
+
+def trim(place: Path, bound: int, user: int | None = None) -> Trimmed:
+    """Keep ``place`` within ``bound`` bytes by removing top-level entries, oldest
+    first, until it holds at most half of ``bound``.
+
+    **What proves a directory over its bound.** A walk that reaches its limit has
+    counted a lower bound of the bytes, never more than the directory holds. Removal
+    starts only when that count already exceeds ``bound``, whether or not the walk
+    finished, and continues only while the count exceeds half of ``bound``. A walk cut
+    short whose count is within ``bound`` proves nothing, so nothing is removed and
+    ``incomplete`` says the size is unknown. **Round 15, review of 3344ca6.** A
+    directory of many small entries was purged to its oldest ten thousand whatever its
+    size before this rule. The residual is that such a directory can stay over the
+    bound unseen, which the notice says.
+
+    **Age.** An entry's age is the latest modification time found in it by a walk
+    that shares one budget of ``MAX_WALK_ENTRIES`` entries between all entries, and
+    the entry's own time where the budget ran out, so a tree written deep below is not
+    mistaken for an old one, up to that budget.
+
+    **A writer racing the trim.** A command that outlives its turn can write into an
+    entry as it is removed. It may see its file vanish or a path missing, and may
+    recreate a directory that then stays. An entry whose removal fails because the
+    writer added to it is reported in ``failed`` and not counted as removed, and
+    ``freed`` is measured before removal, so it can differ from what the disk
+    returned. Links are unlinked, not followed, and an entry another user owns is left
+    and reported. Considers at most ``MAX_TOP_ENTRIES`` entries, which leaves a
+    directory with more of them over its bound, as the report says through
+    ``failed``."""
+    owner = os.getuid() if user is None else user
+    total, complete = measure(place)
+    if total <= bound:
+        return Trimmed(place.name, bound, (), 0, not complete, ())
+    try:
+        names = os.listdir(place)
+    except OSError as error:
+        return Trimmed(place.name, bound, (), 0, not complete, (f"{place}: {error}",))
+    failed: list[str] = []
+    if len(names) > MAX_TOP_ENTRIES:
+        failed.append(
+            f"{place}: more than {MAX_TOP_ENTRIES} entries, oldest considered"
+        )
+    dated: list[tuple[float, str]] = []
+    budget = MAX_WALK_ENTRIES
+    for name in names:
+        changed, budget = _newest_change(place / name, budget)
+        if changed == 0.0 and not os.path.lexists(place / name):
+            failed.append(f"{place / name}: vanished")
+            continue
+        dated.append((changed, name))
+    dated.sort()
+    removed: list[str] = []
+    freed = 0
+    target = bound // 2
+    since, batch = 0, 1
+    for _, name in dated[:MAX_TOP_ENTRIES]:
+        if total <= target:
+            break
+        path = place / name
+        size, _ = measure(path)
+        size += _entry_size(path)
+        done: list[str] = []
+        _remove(path, owner, done, failed)
+        if done:
+            removed.append(name)
+            freed += size
+            total = max(0, total - size)
+        since += 1
+        if not complete and since >= batch:
+            # Measured again after 1, 2, 4 and so on removals, so the walk limit
+            # bounds the work at a few measures and not one for each entry. Between
+            # two measures the count is a lower bound less a lower bound, so it can
+            # overshoot, by at most the entries of one batch.
+            total, complete = measure(place)
+            since, batch = 0, batch * 2
+    return Trimmed(
+        place.name, bound, tuple(removed), freed, not complete, tuple(failed)
+    )
+
+
+def _entry_size(path: Path) -> int:
+    try:
+        return _allocated(os.lstat(path))
+    except OSError:
+        return 0
+
+
+def trim_line(temp: LineTemp) -> tuple[Trimmed, Trimmed]:
+    """Trim the line's temporary directory and its package cache to their bounds."""
+    return trim(temp.temp, MAX_TEMP_BYTES), trim(temp.cache, MAX_CACHE_BYTES)
+
+
+def trim_notice(found: tuple[Trimmed, ...]) -> str | None:
+    """The sentence a turn's prompt carries when ``trim`` removed or failed to remove
+    something, or ``None`` when it did neither. It names no file, since a name is text
+    a command chose."""
+    parts: list[str] = []
+    for item in found:
+        if item.removed:
+            parts.append(
+                f"{len(item.removed)} oldest entries of {item.place}"
+                f" ({item.freed} bytes) because it held more than {item.bound} bytes"
+                + (
+                    ", counted as far as the walk limit allowed"
+                    if item.incomplete
+                    else ""
+                )
+            )
+        elif item.incomplete or item.failed:
+            parts.append(
+                f"nothing from {item.place}, which is over its bound of {item.bound}"
+                " bytes or could not be measured in full, and may fail your next"
+                " write"
+            )
+    if not parts:
+        return None
+    return "Dromon removed " + "; ".join(parts) + ", before this turn."

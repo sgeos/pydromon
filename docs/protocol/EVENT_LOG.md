@@ -538,6 +538,84 @@ the line they are configured for. A credential written into a server's `command`
 `args` or `url` is not sealed and still reaches the log, and older events keep their
 literals, both of which remain residuals as stated above.
 
+## Credential masking
+
+**Round 15, item 1.** Another project saw a temporary credential from a hosting service
+printed in tool output. Command lines were already masked by `dromon.redact`. The free
+text that enters the log is now masked as well, by `dromon.credentials`, in
+`EventLog.append`, which every event passes through. The text is masked before the
+model checks the event and before it is stored, so the stored event, the state and every
+view, status, export and backup built from either hold the masked text. A keyed call's
+request digest is taken over the arguments as given and is unchanged, so a retry is
+unaffected.
+
+- **Covered fields.** `body` of `message_sent`, `message_received`, `task_noted`,
+  `restart_noted` and `role_noted`, and `choices` of `message_sent`. `reason` of
+  `message_acknowledged` and `commit_run_refused`. `note` of `wake_scheduled`,
+  `stop_unverified`, `walk_limited`, `budget_stated`, `lease_acquired` and `run_ended`.
+  `task`, `decisions`, `artifacts` and `next_action` of `brief_set`. `command` of
+  `task_recorded`, `commands` of `processes_left` and, from the review of 3344ca6,
+  `argv` of `run_started`, a copy of the project file's argument vector, since the run is
+  launched from the project file and not from the event. A test fails when an event class is
+  neither covered nor listed as holding no free text, so a new event is classified when
+  it is added.
+- **What is masked, by pattern.** Values with a known prefix and length, namely GitHub,
+  GitLab, Slack, Stripe, SendGrid, npm, PyPI, Hugging Face, DigitalOcean, Google and
+  Anthropic or OpenAI keys, Amazon access key identifiers and the session token of an
+  Amazon temporary credential, JSON web tokens, and a private key block. The credential
+  after `Bearer` or `Basic`. The user and password of a URL, and from the review of
+  3344ca6 those before a host with no scheme, apart from an image digest. The value of a
+  `NAME=value` in any case, such as `github_token=...` or `--api-key=...`, whose name says token, secret, password, credential, access key, private
+  key, API key or session. The value of a JSON member whose name says the same.
+- **What is masked, by name.** The literal value of every environment variable that the
+  project grants a line in a `secrets` list, wherever it appears, when it has at least
+  eight characters. The daemon reads the values from its own environment at each append,
+  so a reload of the project file takes effect at once.
+- **Not covered, stated plainly.** The engine's own context, which Dromon does not hold,
+  so a line that reads a credential in its own tool output still holds it and may write
+  it into a file or a mail, where only the patterns above stand between it and the log.
+  The raw output file of a supervised run, files a line writes, the launcher's report
+  file and the engine's transcript, since Dromon does not author them and the log holds
+  only a digest of the first. A credential with no known prefix, no `NAME=value` shape and
+  no listed name. A listed secret shorter than eight characters. A value split across two
+  texts. **Left unmasked on purpose, review of 3344ca6.** `line_configured`,
+  `line_overridden` and `project_overridden` are canonical JSON that the daemon decodes
+  again to build an engine, so a mask inside would change the configuration a line runs
+  under, and the credentials a configuration carries in an MCP server's environment and
+  headers are sealed before the event is written. A credential written into another
+  part, such as the instructions, is recorded as written. `peer_declared.policy` never
+  holds a token, and the command names of `run_started` and `commit_run_refused` are
+  identifiers. **Choices.** A question whose choices differ only by a credential is
+  refused, not stored, since an answer names a choice by its text and two equal choices
+  cannot be told apart. The refusal says the text repeated once masked, and echoes no
+  value. The operator settings in `line_overridden` and `project_overridden`, and an
+  operator's own free text in a client, which is masked like any message body. A text
+  that really holds such a value as an example is masked too, which fails safe.
+- **Failure modes.** A secret source that raises fails closed. An event with a covered
+  text field is refused as rejected, naming the kind of failure and no value, and
+  nothing is stored, because pattern masking alone would record a literal value it
+  cannot know. An event with no covered field does not ask the source. A password with
+  `@` is masked whole, and in a URL one with `/`, and a scheme-less password with `/`
+  is not masked, since it cannot be told from a path. Masking is by pattern and is not
+  the disclosure scan.
+- **Callers that can meet the refusal. Review of 151cbcd.** A tool a line or an
+  operator calls returns the refusal as an error that names the kind of failure and
+  stores nothing. An event the daemon makes for itself, which is the walk gap, the
+  restart note, the engine stop note, a budget stated from an engine's report, the
+  compaction wake, a run's note to its holder and a task end's note, is dropped with a
+  line on the standard error that names what was lost and not its text, and the flow
+  it belonged to goes on. A task end is noted when it is reported again. Records that
+  already caught a rejection keep doing so. **Review of 7744806.** About seventy
+  appends in the scheduler can meet the refusal, so one guard stands at the tick. Each
+  due wake and each line's update is an action, and an action that meets the refusal
+  ends alone. Its event was never stored, so its state is as it was and it is tried
+  again at the next tick, the other actions of the tick go on, and the loop rests one
+  second, which is not a fault and is not doubled. The standard error says so once for
+  each episode, naming the action and never any text. An append made in a turn's own
+  task is not inside the guard, and still reaches the fault handler, which pauses and
+  tries again. The forwarder's outage note leaves its state unchanged, so it is tried
+  again as well.
+
 ## Bounded start
 
 **Required by the operator on 2026-11-01, measured and designed by core for review.
