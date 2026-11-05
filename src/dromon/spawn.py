@@ -182,6 +182,7 @@ another way, has no such read to bound, and the module reduces to its signatures
 import contextlib
 import faulthandler
 import os
+import resource
 import signal
 import subprocess
 import sys
@@ -484,6 +485,31 @@ def install_fork_lock() -> bool:
     return installed
 
 
+def disable_vfork(platform: str = sys.platform) -> bool:
+    """On Linux, stop ``subprocess`` from starting children with ``vfork`` or
+    ``posix_spawn``, so that every start forks. **Round 15, an experiment.** A CI run on
+    Linux stalled a start of ``git``, and reading ``/proc`` for the report then blocked
+    for the rest of five minutes, which fits a child that is in the middle of ``vfork``,
+    where the parent thread is suspended and the child shares its memory until it runs
+    its program. CPython on Linux uses ``vfork`` since 3.10 through
+    ``subprocess._USE_VFORK``, and ``glibc``'s ``posix_spawn``, which Python 3.15 uses
+    when it can, makes the same kind of child, so both are turned off. If Linux CI
+    then stops stalling, ``vfork`` is the cause and this is the fix. If it does not, it
+    is not, and it should be taken out, since a fork copies the page tables of the
+    whole daemon and is slower. **Not known.** Whether it helps. It is not applied
+    elsewhere. ``os.posix_spawn`` calls made directly by this repository are not
+    changed. Returns whether it changed anything. **Porting hazard.** It sets private
+    names in the standard library, which only Python allows."""
+    if not platform.startswith("linux"):
+        return False
+    changed = False
+    for name in ("_USE_VFORK", "_USE_POSIX_SPAWN"):
+        if hasattr(subprocess, name):
+            setattr(subprocess, name, False)
+            changed = True
+    return changed
+
+
 @dataclass(frozen=True)
 class _Child:
     """A child of this process, as the process table shows it. ``execed`` is whether
@@ -521,21 +547,35 @@ def _where(thread: threading.Thread) -> str:
     )
 
 
-def _proc_children(root: Path, parent: int) -> list[_Child]:
+def _proc_children(
+    root: Path,
+    parent: int,
+    at: list[str] | None = None,
+    found: list[_Child] | None = None,
+) -> list[_Child]:
     """The children of ``parent`` read from a Linux ``/proc`` at ``root``, without
     starting a process, which is what a stalled start may no longer be able to do. A
     child's program is its ``comm``, and it has executed when its ``exe`` differs from
-    this process's own. Reads at most ``MAX_PROC_ENTRIES`` entries."""
+    this process's own. Reads at most ``MAX_PROC_ENTRIES`` entries. Only ``stat``,
+    ``exe`` and ``wchan`` are read, never ``cmdline``, ``environ`` or ``maps``, which
+    need the memory of a process that may be in the middle of ``vfork``. **Round 15.**
+    A CI run on Linux hung five minutes inside the read of one of these files, so
+    ``at`` is set to the path about to be read and a child is added to ``found`` as
+    soon as its ``stat`` is read, for ``_proc_children_bounded`` to report when the
+    read does not return."""
+    seen = [] if found is None else found
+    here = [""] if at is None else at
+    here[0] = str(root / "self" / "exe")
     own = _read_link(root / "self" / "exe")
-    found: list[_Child] = []
     try:
         names = os.listdir(root)
     except OSError:
-        return found
+        return seen
     for name in names[:MAX_PROC_ENTRIES]:
         if not name.isdigit():
             continue
         try:
+            here[0] = str(root / name / "stat")
             stat = (root / name / "stat").read_text(errors="replace")
         except OSError:
             continue
@@ -546,20 +586,53 @@ def _proc_children(root: Path, parent: int) -> list[_Child]:
             continue
         if int(fields[1]) != parent:
             continue
+        program = stat[open_ + 1 : close]
+        seen.append(_Child(int(name), fields[0], program, None, None))
+        here[0] = str(root / name / "exe")
         exe = _read_link(root / name / "exe")
+        here[0] = str(root / name / "wchan")
         wait = _read_text(root / name / "wchan")
-        found.append(
-            _Child(
-                int(name),
-                fields[0],
-                stat[open_ + 1 : close],
-                None if own is None or exe is None else exe != own,
-                None if wait in (None, "", "0") else wait,
-            )
+        seen[-1] = _Child(
+            int(name),
+            fields[0],
+            program,
+            None if own is None or exe is None else exe != own,
+            None if wait in (None, "", "0") else wait,
         )
-        if len(found) >= MAX_CHILDREN_REPORTED:
+        if len(seen) >= MAX_CHILDREN_REPORTED:
             break
-    return found
+    return seen
+
+
+def _proc_children_bounded(root: Path, parent: int) -> list[_Child] | str:
+    """``_proc_children`` on a thread of its own, left behind after
+    ``DIAGNOSE_SECONDS`` where a read does not return, so the report never blocks. A
+    read can wait for ever on a child in the middle of ``vfork`` or ``exec``, and it
+    cannot be interrupted, so the thread is abandoned and is a daemon. The text then
+    names the file it was reading and the children found before it, which is itself
+    evidence of where the child is."""
+    at = [""]
+    found: list[_Child] = []
+    ended = threading.Event()
+
+    def read() -> None:
+        try:
+            _proc_children(root, parent, at, found)
+        except Exception:  # noqa: BLE001, S110
+            pass
+        finally:
+            ended.set()
+
+    reader = threading.Thread(target=read, name="dromon-spawn-report", daemon=True)
+    reader.start()
+    if ended.wait(DIAGNOSE_SECONDS):
+        return list(found)
+    where = Path(at[0])
+    shown = "/".join(where.parts[-2:]) if where.parts[-2:] else at[0]
+    return (
+        f"reading /proc/{_clean(shown, 40)} did not return within"
+        f" {DIAGNOSE_SECONDS:g}s, {_children_text(list(found))}"
+    )
 
 
 def _read_link(path: Path) -> str | None:
@@ -699,6 +772,22 @@ def _children_text(table: list[_Child] | str) -> str:
     return f"children of the daemon {shown}"
 
 
+def _descriptor_limit_text() -> str:
+    """The soft limit on open descriptors, since a child that closes every descriptor
+    up to it before its program runs takes time in proportion to it. **Round 15.**
+    Timed on macOS with the soft limit at 1,048,576 and at 256, idle and with twice
+    as many busy processes as cores, a start took about 20 milliseconds either way, so
+    that is not the cause there, and the report shows the limit to rule it in or out
+    where a stall is seen."""
+    try:
+        soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except (OSError, ValueError):
+        return "descriptor limit unknown"
+    if soft < 0 or soft == resource.RLIM_INFINITY:
+        return "descriptor limit unlimited"
+    return f"descriptor limit {soft}"
+
+
 def stall_report(
     thread: threading.Thread,
     handoff: _Handoff,
@@ -718,7 +807,7 @@ def stall_report(
         with _active_lock:
             now, most = len(_active), handoff.overlap
         if (proc / "self" / "stat").exists():
-            children: list[_Child] | str = _proc_children(proc, os.getpid())
+            children: list[_Child] | str = _proc_children_bounded(proc, os.getpid())
         else:
             children = libproc(os.getpid())
             if isinstance(children, str):
@@ -727,6 +816,7 @@ def stall_report(
             f"the start thread is at {_where(thread)}",
             f"{now} starts in flight now and {most} at most during this one",
             f"{threading.active_count()} threads alive",
+            _descriptor_limit_text(),
             _children_text(children),
         ]
         return _clean("; ".join(parts), MAX_REPORT_CHARS)
@@ -1097,3 +1187,4 @@ def run(
 
 
 install_fork_lock()
+disable_vfork()

@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import io
 import os
+import resource
 import signal
 import subprocess
 import sys
@@ -584,6 +585,10 @@ def test_a_stalled_start_reports_where_its_thread_is_and_what_was_in_flight(
     assert "the start thread is at" in report and "target" in report
     assert "1 starts in flight now and 1 at most during this one" in report
     assert "threads alive" in report and "of the daemon" in report
+    soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    assert (
+        f"descriptor limit {soft}" in report or "descriptor limit unlimited" in report
+    )
     assert "/bin/sleep" not in report, "the report must not name the command"
 
 
@@ -660,6 +665,134 @@ def test_proc_children_are_bounded_and_unreadable_entries_are_skipped(
     found = spawn._proc_children(tmp_path, 50)  # pyright: ignore[reportPrivateUsage]
     assert len(found) == spawn.MAX_CHILDREN_REPORTED
     assert spawn._proc_children(tmp_path / "missing", 50) == []  # pyright: ignore[reportPrivateUsage]
+
+
+def unblock(fifo: Path) -> None:
+    """Let a reader that waits in the ``open`` of ``fifo`` go, and wait for the
+    abandoned report thread to end, so that no test leaves one behind."""
+    with contextlib.suppress(OSError):
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and any(
+        t.name == "dromon-spawn-report" for t in threading.enumerate()
+    ):
+        time.sleep(0.02)
+
+
+def test_a_proc_read_that_blocks_ends_the_report_and_names_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**Found by CI on 2026-11-05.** A Linux run hung five minutes in a read of
+    ``/proc``. A named pipe stands for the file, since a read of it blocks the same
+    way and can be let go afterwards."""
+    monkeypatch.setattr(spawn, "DIAGNOSE_SECONDS", 0.3)
+    make_proc(tmp_path, {"100": ("git", "R 50", "/usr/bin/git", None)})
+    (tmp_path / "200").mkdir()
+    fifo = tmp_path / "200" / "stat"
+    os.mkfifo(fifo)
+    try:
+        began = time.monotonic()
+        result = spawn._proc_children_bounded(tmp_path, 50)  # pyright: ignore[reportPrivateUsage]
+        assert time.monotonic() - began < 5, "the read is left behind, not waited for"
+        assert isinstance(result, str)
+        assert "did not return within 0.3s" in result and "200/stat" in result
+    finally:
+        unblock(fifo)
+
+
+def test_the_stall_report_survives_a_proc_read_that_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(spawn, "DIAGNOSE_SECONDS", 0.3)
+    make_proc(tmp_path, {})
+    (tmp_path / "300").mkdir()
+    fifo = tmp_path / "300" / "stat"
+    os.mkfifo(fifo)
+    thread = threading.Thread(target=lambda: None)
+    thread.start()
+    thread.join()
+    try:
+        began = time.monotonic()
+        report = spawn.stall_report(thread, spawn._Handoff(), proc=tmp_path)  # pyright: ignore[reportPrivateUsage]
+        assert time.monotonic() - began < 5
+        assert "did not return" in report and "300/stat" in report
+        assert "threads alive" in report, "the rest of the report is still given"
+    finally:
+        unblock(fifo)
+
+
+def test_a_proc_read_never_opens_the_files_that_need_a_childs_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``cmdline``, ``environ`` and ``maps`` of a child in the middle of ``vfork``
+    can block, so they are named pipes here and the read must not touch them."""
+    monkeypatch.setattr(spawn, "DIAGNOSE_SECONDS", 2.0)
+    make_proc(tmp_path, {"100": ("git", "R 50", "/usr/bin/git", None)})
+    for name in ("cmdline", "environ", "maps", "mem"):
+        os.mkfifo(tmp_path / "100" / name)
+    result = spawn._proc_children_bounded(tmp_path, 50)  # pyright: ignore[reportPrivateUsage]
+    assert isinstance(result, list) and [child.pid for child in result] == [100]
+
+
+def test_a_child_is_kept_when_its_later_files_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The state of a child is reported even if its ``wchan`` cannot be read."""
+    monkeypatch.setattr(spawn, "DIAGNOSE_SECONDS", 0.3)
+    make_proc(tmp_path, {"100": ("git", "R 50", "/usr/bin/git", None)})
+    (tmp_path / "100" / "wchan").unlink(missing_ok=True)
+    fifo = tmp_path / "100" / "wchan"
+    os.mkfifo(fifo)
+    try:
+        result = spawn._proc_children_bounded(tmp_path, 50)  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(result, str)
+        assert "100/wchan" in result and "pid 100 state R program git" in result
+    finally:
+        unblock(fifo)
+
+
+def test_vfork_is_turned_off_on_linux_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(subprocess, "_USE_VFORK", True, raising=False)
+    monkeypatch.setattr(subprocess, "_USE_POSIX_SPAWN", True, raising=False)
+    assert spawn.disable_vfork("darwin") is False
+    assert getattr(subprocess, "_USE_VFORK") is True  # noqa: B009
+    assert getattr(subprocess, "_USE_POSIX_SPAWN") is True  # noqa: B009
+    assert spawn.disable_vfork("linux") is True
+    assert getattr(subprocess, "_USE_VFORK") is False  # noqa: B009
+    assert getattr(subprocess, "_USE_POSIX_SPAWN") is False  # noqa: B009
+
+
+def test_vfork_off_is_harmless_where_the_names_are_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(subprocess, "_USE_VFORK", raising=False)
+    monkeypatch.delattr(subprocess, "_USE_POSIX_SPAWN", raising=False)
+    assert spawn.disable_vfork("linux") is False
+
+
+def test_importing_the_module_turns_vfork_off_on_linux() -> None:
+    """In a fresh interpreter, so that an earlier import does not decide it."""
+    done = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            "import subprocess\n"
+            "was = getattr(subprocess, '_USE_VFORK', None)\n"
+            "import dromon.spawn\n"
+            "print(was, getattr(subprocess, '_USE_VFORK', None))",
+        ],
+        env={**os.environ, "PYTHONPATH": str(Path(spawn.__file__).parents[1])},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    was, now = done.stdout.split()
+    if sys.platform.startswith("linux") and was != "None":
+        assert now == "False"
+    else:
+        assert now == was, "nothing is changed where vfork is not used"
 
 
 PS_TABLE = """\
@@ -1091,3 +1224,23 @@ def test_the_watchdog_times_a_fork_that_does_not_return(
         dump = wait_for_dump(path)
         assert "(most recent call first)" in dump and "test_spawn.py" in dump
     assert spawn._armed is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_report_names_the_descriptor_limit_it_finds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+    limits: list[tuple[int, int]] = [(321, hard)]
+
+    def finds(_which: int) -> tuple[int, int]:
+        return limits[0]
+
+    def refuses(_which: int) -> tuple[int, int]:
+        raise ValueError("no such limit")
+
+    monkeypatch.setattr(resource, "getrlimit", finds)
+    assert spawn._descriptor_limit_text() == "descriptor limit 321"  # pyright: ignore[reportPrivateUsage]
+    limits[0] = (resource.RLIM_INFINITY, hard)
+    assert spawn._descriptor_limit_text() == "descriptor limit unlimited"  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(resource, "getrlimit", refuses)
+    assert spawn._descriptor_limit_text() == "descriptor limit unknown"  # pyright: ignore[reportPrivateUsage]
