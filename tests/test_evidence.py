@@ -748,7 +748,9 @@ def test_the_filled_tables_say_what_was_never_observed() -> None:
     assert codex_table.tested_on is not None and codex_table.minimum_version is None
     for table in (grok_table, antigravity_table):
         assert table.own_tools is Known.UNKNOWN
-        assert table.tested_on is None
+    assert grok_table.tested_on == "2026-11-05"
+    assert grok_table.read_only_workdir is Known.YES
+    assert antigravity_table.tested_on is None
     assert grok_table.deny_before_run is Known.UNKNOWN
     assert antigravity_table.deny_before_run is Known.NO
     for table in (codex_table, grok_table, antigravity_table):
@@ -816,7 +818,7 @@ def test_the_probe_reports_each_table_as_it_stands() -> None:
     assert claude[0] == "table claude-code, tested from 2.1.310 on 2026-10-26"
     assert "kept_session yes" in claude[1] and "sign_in_check unknown" in claude[1]
     assert len(claude) == 2
-    for engine in ("pi", "cursor-agent", "grok-build", "antigravity"):
+    for engine in ("pi", "cursor-agent", "antigravity"):
         assert report_lines(table_of(engine))[0] == (
             f"table {engine}, never run live, so no minimum version is enforced and"
             " any version the engine reports runs"
@@ -830,6 +832,10 @@ def test_the_probe_reports_each_table_as_it_stands() -> None:
         " version is enforced and any version the engine reports runs"
     )
     assert "deny_before_run yes" in codex_report[1]
+    assert report_lines(table_of("grok-build"))[0] == (
+        "table grok-build, run live on 2026-11-05, but no version is read, so no"
+        " minimum version is enforced and any version the engine reports runs"
+    )
     assert all(len(report_lines(table)) == 2 for table in TABLES.values())
 
 
@@ -1446,3 +1452,29 @@ def test_a_scrub_refuses_a_configuration_name_it_left(tmp_path: Path) -> None:
     )
     assert {"notes-keeper", "workbench-seven.lan", "agent-kestrel"} <= replaced
     assert evidence.leaks(json.dumps(recorded.frames), HOME, replaced) == []
+
+
+def test_startup_diagnostics_are_bounded_masked_and_drained_without_a_recording() -> (
+    None
+):
+    async def read() -> str:
+        stream = asyncio.StreamReader()
+        stream.feed_data(
+            b"unexpected argument --deny\nAuthorization: Bearer sk-invented-value\n"
+        )
+        stream.feed_data(b"x" * 10000)
+        stream.feed_eof()
+        diagnostics = evidence.StartupDiagnostics()
+        token = evidence.STARTUP_STDERR.set(diagnostics)
+        try:
+            await evidence.drain_stderr(stream, None)
+        finally:
+            evidence.STARTUP_STDERR.reset(token)
+        assert len(diagnostics.raw) == 8192
+        return diagnostics.text()
+
+    text = asyncio.run(read())
+    assert "unexpected argument --deny" in text
+    assert "sk-invented-value" not in text
+    assert "Authorization: ***" in text
+    assert "\n" not in text

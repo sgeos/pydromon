@@ -73,6 +73,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "create": "create a session line",
     "configure": "replace a session line's tools, MCP servers and tool policy",
     "stop": "stop the daemon",
+    "check-engines": "check configured engine startups without a model turn",
+    "grok-home": "preview or replace the generated Grok home files",
     "restart": "stop the daemon and start it again from the installed code",
     "status": "show the daemon and its session lines",
     "attach": "open an interactive client attached to one line",
@@ -347,7 +349,7 @@ def _preflight_argv(
     successor's own command, on the daemon's interpreter where the daemon names it
     and else on the one this client runs on, with the running daemon's options, and
     ``--check``, so the installed code runs its start checks against the project
-    file and a copy of the event log, and starts nothing."""
+    file and a copy of the event log, and checks engine startup without prompts."""
     return [
         interpreter or sys.executable,
         "-m",
@@ -358,7 +360,48 @@ def _preflight_argv(
         str(paths.runtime_dir),
         *options,
         "--check",
+        "--check-engines",
     ]
+
+
+def _check_engines(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    del arguments
+    # Run installed daemon code in a separate process outside engine sandboxes.
+    problem = _preflight(
+        _preflight_argv(paths, []), paths.runtime_dir, show_output=True
+    )
+    if problem is not None:
+        print(f"dromon check-engines: {problem}", file=sys.stderr)
+        return exits.FAILURE
+    print("dromon check-engines: all configured lines passed")
+    return exits.OK
+
+
+def _grok_home(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    del paths
+    home = Path.home() / grok.HOME_DIR
+    try:
+        changes = grok.home_changes(home)
+        if not changes:
+            print("Grok home already matches the generated files")
+            return exits.OK
+        print(grok.home_diff(changes), end="")
+        if not arguments.apply:
+            return exits.OK
+        if (
+            not arguments.yes
+            and input("Replace these files and keep backups? [y/N] ").strip().lower()
+            != "y"
+        ):
+            print("Grok home was not changed")
+            return exits.OK
+        for backup in grok.replace_home(home, changes):
+            print(f"Backup {backup}")
+        print("Grok home generated files replaced")
+        return exits.OK
+    except (EngineRefused, OSError, EOFError) as error:
+        print(f"dromon grok-home: {error}", file=sys.stderr)
+        return exits.FAILURE
 
 
 def _options_of(status: Mapping[str, object]) -> list[str]:
@@ -421,6 +464,8 @@ def _preflight(
     argv: Sequence[str],
     runtime_dir: Path | None = None,
     environment: Mapping[str, str] | None = None,
+    *,
+    show_output: bool = False,
 ) -> str | None:
     """Why the installed daemon would not start, or ``None``. A restart whose
     successor refuses to start leaves no daemon running, so this is checked before
@@ -445,6 +490,9 @@ def _preflight(
         return str(error)
     except OSError as error:
         return str(error)
+    if show_output:
+        print(done.stdout or "", end="")
+        print(done.stderr or "", end="", file=sys.stderr)
     if done.returncode == 0:
         return None
     lines = (done.stderr or done.stdout).strip().splitlines()
@@ -2901,6 +2949,8 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "status": _status,
     "stop": _stop,
     "restart": _restart,
+    "check-engines": _check_engines,
+    "grok-home": _grok_home,
     "probe": _probe,
     "create": _create,
     "configure": _configure,
@@ -3214,6 +3264,17 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     for name, help_text in SUBCOMMANDS.items():
         command = commands.add_parser(name, help=help_text, description=help_text)
+        if name == "grok-home":
+            command.add_argument(
+                "--apply",
+                action="store_true",
+                help="replace after preview and confirmation",
+            )
+            command.add_argument(
+                "--yes",
+                action="store_true",
+                help="confirm replacement without an interactive question",
+            )
         if name == "fleet":
             _add_fleet_commands(command)
         if name == "rebind":

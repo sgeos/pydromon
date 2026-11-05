@@ -52,10 +52,10 @@ CHECK_PREFIX: Final = "preflight-"
 """The prefix of the private directory a preflight copies the event log into, under
 the runtime directory."""
 
-CHECK_SECONDS: Final = 120.0
+CHECK_SECONDS: Final = 1800.0
 """How long a preflight may take before ``dromon restart`` ends it. It replays the
-whole event log, as a start does. A preflight directory older than this is left over
-from a check that was killed."""
+whole event log and checks configured engine startups without prompts. A preflight
+directory older than this is left over from a check that was killed."""
 
 MAX_SWEPT: Final = 1000
 """The most runtime-directory entries one sweep looks at, so it is bounded."""
