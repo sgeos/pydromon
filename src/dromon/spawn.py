@@ -36,15 +36,29 @@ way, and one that did not now fails with a message where it hung.
 
 **Limits.** At most ``MAX_STRANDED`` starts are left stuck at once. Past that no further
 child is started, and ``StartStalled`` is raised at once, since a host that cannot start
-processes is not helped by more of them. A stuck start keeps one blocked daemon thread,
-which never holds the interpreter open, and its pipe until the start ends or the
-process exits. A caller that closed a descriptor it passed to a start it was told
-stalled would leave the late start to fail with ``EBADF``, or in the worst case to
-pass a descriptor that another thread had reused, so a caller hands such descriptors
-over with ``close_after``, and spawn closes them once the start has ended. Children are
+processes is not helped by more of them. **Review of 151cbcd.** The count is of threads
+still alive, so a slot frees itself the moment its start returns or fails, and the
+scheduler tells the operator in a note, which holds no line, when the count reaches the
+bound. A start that never returns holds its slot until the daemon restarts, which the
+note says. A read that a stop or a hold depends on, the process table, is started with
+``essential``, which the bound does not refuse, so a daemon with stuck starts can still
+find and stop a process. It is refused only past ``MAX_STRANDED_ESSENTIAL`` stuck
+starts, a ceiling that keeps the threads bounded. A stuck start keeps one blocked
+daemon thread, which never holds the interpreter open, and its pipe until the start
+ends or the process exits. A caller that closed a descriptor it passed to a start it
+was told stalled would leave the late start to fail with ``EBADF``, or in the worst
+case to pass a descriptor that another thread had reused, so a caller hands such
+descriptors over with ``close_after``, and spawn closes them once the start has ended.
+Children are
 started from a thread other than the caller's. That matters for a parent death signal
 on Linux, which belongs to the thread that forked, so ``launcher.start_harness`` is
 exempt.
+
+**Exempt, and the path the first hypothesis names.** ``client.start_daemon`` starts the
+daemon with ``os.posix_spawn``, which has no pipe for an exec failure and so nothing to
+bound. It is also the call the first hypothesis names as the possible cause of the
+stall, and it stays outside this module, so that candidate is neither bounded nor
+excluded. A traceback of every thread at the next hang is what would settle it.
 
 **Not covered.** ``asyncio.create_subprocess_exec`` runs ``Popen`` on the event loop's
 own thread and cannot be moved to another, so its callers in the engine drivers are
@@ -61,6 +75,7 @@ another way, has no such read to bound, and the module reduces to its signatures
 
 import contextlib
 import os
+import signal
 import subprocess
 import threading
 from collections.abc import Mapping, Sequence
@@ -74,9 +89,30 @@ minutes after which pytest's faulthandler ends the whole test run."""
 MAX_STRANDED: Final = 4
 """The most starts left stuck at once. At the bound no further child is started."""
 
+MAX_STRANDED_ESSENTIAL: Final = 32
+"""The most stuck starts at which a start marked ``essential`` is still made. It is
+well above ``MAX_STRANDED`` and exists only to bound the threads a failing host can
+leave."""
+
+REAP_SECONDS: Final = 10.0
+"""How long ``_reap`` waits for a killed child to be reaped. A child that survives
+``SIGKILL``, as in an uninterruptible wait, is left to the interpreter's reaper, so the
+thread and its slot are not held for ever."""
+
+DRAIN_SECONDS: Final = 1.0
+"""How long ``run`` reads what a killed command left in its pipes. A descendant that
+holds a pipe open would otherwise hold the read."""
+
+TAIL_LIMIT: Final = 65536
+"""The most of a timed-out command's output kept for the caller, from its end, in bytes
+or characters."""
+
 EXEMPT: Final = {
     "launcher.py": "a parent death signal on Linux belongs to the thread that forked",
-    "client.py": "os.posix_spawn has no pipe to wait on for an exec failure",
+    "client.py": (
+        "os.posix_spawn has no pipe to wait on for an exec failure, and it is the call"
+        " the first hypothesis names"
+    ),
 }
 """The modules in ``src`` that start a child without this module, and why. A test holds
 this to the modules that really do."""
@@ -102,6 +138,20 @@ def stranded_count() -> int:
         return len(_stranded)
 
 
+def stuck_text(count: int) -> str:
+    """The note to the operator when ``count`` starts are stuck at the bound. It names
+    the effect and the remedy, and no program or argument."""
+    return (
+        f"{count} child process starts are stuck, the most dromond allows. It starts no"
+        " further child, apart from the reads of the process table that a stop or a"
+        " hold needs, so git status, runs and engine helpers are refused with a"
+        " message. A start that never returns frees its slot only when the daemon"
+        " restarts, and one that returns frees it at once. This is the intermittent"
+        " stall in dromon.spawn. Restart the daemon when it suits you, and keep a"
+        " traceback of every thread if you can."
+    )
+
+
 class _Handoff:
     """The place a start's outcome goes, for the thread that made it and the caller that
     waits. Under ``lock`` the outcome is set once, and ``abandoned`` is set once, and
@@ -114,12 +164,26 @@ class _Handoff:
         self.abandoned = False
 
 
-def _reap(process: subprocess.Popen[Any]) -> None:
-    """Kill and reap a child whose caller gave up on its start, and close its pipes,
-    without reading them, since a descendant could hold them open."""
+def _kill(process: subprocess.Popen[Any]) -> None:
+    """Send ``SIGKILL`` to a child that has not been reaped, and to its process group
+    when the child leads one of its own, as it does with ``start_new_session`` or
+    ``process_group``. **Review of 151cbcd.** The daemon's own group is never signalled.
+    The pid cannot have been reused, since the child is not reaped."""
+    with contextlib.suppress(OSError):
+        group = os.getpgid(process.pid)
+        if group == process.pid and group != os.getpgrp():
+            os.killpg(group, signal.SIGKILL)
     with contextlib.suppress(OSError):
         process.kill()
-    process.wait()
+
+
+def _reap(process: subprocess.Popen[Any]) -> None:
+    """Kill and reap a child whose caller gave up on its start, and close its pipes,
+    without reading them, since a descendant could hold them open. The wait is bounded
+    by ``REAP_SECONDS``."""
+    _kill(process)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(REAP_SECONDS)
     for stream in (process.stdin, process.stdout, process.stderr):
         if stream is not None:
             with contextlib.suppress(OSError):
@@ -137,16 +201,19 @@ def _begin(
     options: dict[str, Any],
     start_seconds: float | None,
     close_after: Sequence[int],
+    essential: bool,
 ) -> subprocess.Popen[Any]:
     bound = START_SECONDS if start_seconds is None else start_seconds
     name = os.fspath(argv[0]) if argv else "(no program)"
     if not bound > 0:
         _close_all(close_after)
         raise ValueError(f"the start bound must be above 0, not {bound:g}")
-    if stranded_count() >= MAX_STRANDED:
+    limit = MAX_STRANDED_ESSENTIAL if essential else MAX_STRANDED
+    if stranded_count() >= limit:
         _close_all(close_after)
         raise StartStalled(
-            f"{name} was not started: {MAX_STRANDED} earlier starts are still stuck"
+            f"{name} was not started: {limit} earlier starts are still stuck, and a"
+            " stuck start ends only when its thread does or the daemon restarts"
         )
     handoff = _Handoff()
 
@@ -215,6 +282,34 @@ def _options(
     }
 
 
+def _tail(value: object, text: bool) -> str | bytes | None:
+    """The last ``TAIL_LIMIT`` of a command's output, as text for a text command and
+    as bytes otherwise, or ``None`` when it wrote none."""
+    if value is None:
+        return None
+    if text and isinstance(value, bytes):
+        value = value.decode(errors="replace")
+    elif not text and isinstance(value, str):
+        value = value.encode(errors="replace")
+    return cast("str | bytes", value)[-TAIL_LIMIT:]
+
+
+def _drain(
+    process: subprocess.Popen[Any], expired: subprocess.TimeoutExpired, text: bool
+) -> tuple[str | bytes | None, str | bytes | None]:
+    """What a killed command wrote, bounded to its tail. It reads for at most
+    ``DRAIN_SECONDS`` and falls back to what the timeout had collected, since a
+    descendant that holds a pipe open would hold the read."""
+    out, err = expired.output, expired.stderr
+    try:
+        out, err = process.communicate(timeout=DRAIN_SECONDS)
+    except subprocess.TimeoutExpired as late:
+        out, err = late.output or out, late.stderr or err
+    except (OSError, ValueError):
+        pass
+    return _tail(out, text), _tail(err, text)
+
+
 @overload
 def start(
     argv: _Argv,
@@ -232,6 +327,7 @@ def start(
     pass_fds: Sequence[int] = (),
     close_after: Sequence[int] = (),
     start_seconds: float | None = None,
+    essential: bool = False,
 ) -> subprocess.Popen[str]: ...
 
 
@@ -252,6 +348,7 @@ def start(
     pass_fds: Sequence[int] = (),
     close_after: Sequence[int] = (),
     start_seconds: float | None = None,
+    essential: bool = False,
 ) -> subprocess.Popen[bytes]: ...
 
 
@@ -271,8 +368,11 @@ def start(
     pass_fds: Sequence[int] = (),
     close_after: Sequence[int] = (),
     start_seconds: float | None = None,
+    essential: bool = False,
 ) -> subprocess.Popen[Any]:
     """Start ``argv`` as ``subprocess.Popen`` does, with the start bounded.
+    ``essential`` marks a read that a stop or a hold depends on, which the bound on
+    stuck starts does not refuse, as the module says.
     ``close_after`` hands descriptors over that the child is given through ``stdin``,
     ``stdout``, ``stderr`` or ``pass_fds``. They are closed once the start has ended,
     or at once when no start is made, and the caller must not close them. Raises
@@ -297,6 +397,7 @@ def start(
         ),
         start_seconds,
         close_after,
+        essential,
     )
 
 
@@ -318,6 +419,7 @@ def run(
     errors: str | None = None,
     start_new_session: bool = False,
     start_seconds: float | None = None,
+    essential: bool = False,
 ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -339,6 +441,7 @@ def run(
     errors: None = None,
     start_new_session: bool = False,
     start_seconds: float | None = None,
+    essential: bool = False,
 ) -> subprocess.CompletedProcess[bytes]: ...
 
 
@@ -359,11 +462,13 @@ def run(
     errors: str | None = None,
     start_new_session: bool = False,
     start_seconds: float | None = None,
+    essential: bool = False,
 ) -> subprocess.CompletedProcess[Any]:
     """Run ``argv`` as ``subprocess.run`` does, with the start bounded by
     ``start_seconds`` and the run by ``timeout``. Unlike ``subprocess.run`` the timeout
     is required, so no command here waits for ever. A run past ``timeout`` kills the
-    child and raises ``subprocess.TimeoutExpired``, a start that stalls raises
+    child and its group, and raises ``subprocess.TimeoutExpired`` with the last
+    ``TAIL_LIMIT`` of what it wrote, a start that stalls raises
     ``StartStalled``, and ``check`` raises ``subprocess.CalledProcessError``. Raises
     ``ValueError`` when ``input`` is given with ``stdin``, or ``capture_output`` with
     ``stdout`` or ``stderr``."""
@@ -384,23 +489,27 @@ def run(
         errors=errors,
         start_new_session=start_new_session,
         start_seconds=start_seconds,
+        essential=essential,
     )
+    shown = [os.fspath(part) for part in argv]
     with process:
         try:
             out, err = cast(
                 "tuple[Any, Any]", process.communicate(cast("Any", input), timeout)
             )
-        except subprocess.TimeoutExpired:
-            process.kill()
+        except subprocess.TimeoutExpired as expired:
+            _kill(process)
+            kept_out, kept_err = _drain(process, expired, text)
             process.wait()
-            raise
+            raise subprocess.TimeoutExpired(
+                shown, timeout, output=kept_out, stderr=kept_err
+            ) from None
         except BaseException:
-            process.kill()
+            _kill(process)
             raise
         code = process.poll()
     if code is None:
         raise RuntimeError("a command that was waited for has no status")
-    shown = [os.fspath(part) for part in argv]
     if check and code != 0:
         raise subprocess.CalledProcessError(code, shown, out, err)
     return subprocess.CompletedProcess(shown, code, out, err)

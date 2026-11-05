@@ -70,6 +70,19 @@ stall there stops the daemon's loop, and the launcher's start is exempt because 
 death signal on Linux belongs to the thread that forked. A test pins both lists. See
 `src/dromon/spawn.py`.
 
+**Review of 151cbcd.** The count of stuck starts frees a slot as soon as the thread of
+its start ends, and the scheduler tells the default operator once, in a note that holds
+no line, when the count reaches the bound. A start that never returns holds its slot
+until the daemon restarts, and the note says so. The reads of the process table that a
+stop or a hold depends on are started as `essential`, which the bound does not refuse,
+up to a ceiling of 32 stuck starts that keeps the threads bounded. A late child is
+killed with its process group when it leads one, never the daemon's own group, and its
+reap waits at most ten seconds. A command past its timeout keeps the last 64 KiB of
+what it wrote on the `TimeoutExpired`. **Exempt and unbounded.** `client.start_daemon`
+starts the daemon with `os.posix_spawn`, which has no pipe to wait on, and it is the
+call the module's first hypothesis names, so that candidate is neither bounded nor
+excluded.
+
 ## Session lines and engines
 
 **Proposed.** Coordinate existing harnesses rather than replace them, so that each model

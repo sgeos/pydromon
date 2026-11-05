@@ -242,14 +242,21 @@ def _start_detached(
 
 
 def _command_name(pid: int) -> str | None:
-    """The executable name of process ``pid``, or ``None`` if there is none."""
-    completed = spawn.run(
-        ["/bin/ps", "-p", str(pid), "-o", "comm="],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
+    """The executable name of process ``pid``, or ``None`` if there is none or ``ps``
+    cannot say, including a start that stalled or ran past its bound. **Review of
+    151cbcd.** The caller reads ``None`` as not being the teacher, so it neither
+    signals nor reports a server it cannot see, and ``status`` never raises for it."""
+    try:
+        completed = spawn.run(
+            ["/bin/ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            essential=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
     name = completed.stdout.strip()
     return Path(name).name if completed.returncode == 0 and name else None
 

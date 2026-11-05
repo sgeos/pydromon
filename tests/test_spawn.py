@@ -362,3 +362,163 @@ def test_the_start_bound_ends_a_stall_well_before_the_test_run_is_ended() -> Non
     options = tomllib.loads((PROJECT / "pyproject.toml").read_text())
     timeout = options["tool"]["pytest"]["ini_options"]["faulthandler_timeout"]
     assert timeout > spawn.START_SECONDS * 2
+
+
+# Review of 151cbcd.
+
+
+def test_a_read_a_stop_depends_on_is_still_started_at_the_bound(
+    stalled: "StalledStart", monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(spawn, "MAX_STRANDED", 1)
+    with pytest.raises(spawn.StartStalled, match="did not start"):
+        spawn.start(SLEEP)
+    with pytest.raises(spawn.StartStalled, match="1 earlier starts are still stuck"):
+        spawn.run(["/bin/echo", "x"], timeout=5)
+    calls = stalled.calls
+    stalled.stall = False
+    done = spawn.run(
+        ["/bin/echo", "x"], timeout=5, text=True, capture_output=True, essential=True
+    )
+    assert done.stdout == "x\n" and stalled.calls == calls + 1
+    stalled.gate.set()
+    stalled.until_ended()
+
+
+def test_even_an_essential_start_is_refused_past_the_ceiling(
+    stalled: "StalledStart", monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(spawn, "MAX_STRANDED", 1)
+    monkeypatch.setattr(spawn, "MAX_STRANDED_ESSENTIAL", 2)
+    for _ in range(2):
+        with pytest.raises(spawn.StartStalled, match="did not start"):
+            spawn.run(["/bin/echo", "x"], timeout=5, essential=True)
+    with pytest.raises(spawn.StartStalled, match="2 earlier starts are still stuck"):
+        spawn.run(["/bin/echo", "x"], timeout=5, essential=True)
+    stalled.gate.set()
+    stalled.until_ended()
+
+
+def test_a_stuck_slot_frees_itself_when_its_thread_ends(
+    stalled: "StalledStart", monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(spawn, "MAX_STRANDED", 1)
+    with pytest.raises(spawn.StartStalled):
+        spawn.start(SLEEP)
+    assert spawn.stranded_count() == 1
+    stalled.stall = False
+    stalled.gate.set()
+    stalled.until_ended()
+    assert spawn.stranded_count() == 0
+    with spawn.start(["/bin/echo", "x"], stdout=subprocess.PIPE) as child:
+        assert child.communicate()[0] == b"x\n"
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_killing_a_child_that_leads_a_group_kills_the_group(tmp_path: Path) -> None:
+    marker = tmp_path / "grandchild"
+    child = spawn.start(
+        ["/bin/sh", "-c", f"sleep 60 & echo $! > {marker}; wait"],
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not (
+        marker.exists() and marker.read_text().strip()
+    ):
+        time.sleep(0.01)
+    grandchild = int(marker.read_text())
+    try:
+        assert alive(grandchild)
+        spawn._kill(child)  # pyright: ignore[reportPrivateUsage]
+        child.wait(10)
+        while alive(grandchild) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not alive(grandchild), "the grandchild outlived the group's kill"
+    finally:
+        if alive(grandchild):
+            os.kill(grandchild, signal.SIGKILL)
+
+
+def test_a_child_in_the_daemons_own_group_is_killed_alone() -> None:
+    assert os.getpgrp() != 0
+    child = spawn.start(SLEEP)
+    assert os.getpgid(child.pid) == os.getpgrp(), "the child shares the group"
+    spawn._kill(child)  # pyright: ignore[reportPrivateUsage]
+    assert child.wait(10) == -signal.SIGKILL
+    # This process, which shares the group, is still here to say so.
+    assert alive(os.getpid())
+
+
+def test_a_late_child_that_leads_a_group_is_reaped_with_its_group(
+    stalled: "StalledStart", tmp_path: Path
+) -> None:
+    marker = tmp_path / "grandchild"
+    script = f"sleep 60 & echo $! > {marker}; wait"
+    with pytest.raises(spawn.StartStalled):
+        spawn.start(["/bin/sh", "-c", script], start_new_session=True)
+    stalled.stall = False
+    stalled.gate.set()
+    child = stalled.until_reaped()
+    assert child.poll() is not None
+    if marker.exists() and marker.read_text().strip():
+        grandchild = int(marker.read_text())
+        deadline = time.monotonic() + 10
+        while alive(grandchild) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not alive(grandchild)
+
+
+def test_a_timed_out_command_keeps_the_tail_of_what_it_wrote() -> None:
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        spawn.run(
+            ["/bin/sh", "-c", "echo partial; echo problem >&2; sleep 60"],
+            timeout=1,
+            text=True,
+            capture_output=True,
+            start_new_session=True,
+        )
+    assert caught.value.output == "partial\n"
+    assert caught.value.stderr == "problem\n"
+    with pytest.raises(subprocess.TimeoutExpired) as raw:
+        spawn.run(
+            ["/bin/sh", "-c", "echo raw; sleep 60"],
+            timeout=1,
+            capture_output=True,
+            start_new_session=True,
+        )
+    assert raw.value.output == b"raw\n" and raw.value.stderr == b""
+
+
+def test_the_tail_of_a_timed_out_command_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(spawn, "TAIL_LIMIT", 4)
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        spawn.run(
+            ["/bin/sh", "-c", "printf abcdefghij; sleep 60"],
+            timeout=1,
+            text=True,
+            capture_output=True,
+            start_new_session=True,
+        )
+    assert caught.value.output == "ghij"
+    assert caught.value.stderr == ""
+
+
+def test_a_command_that_wrote_nothing_has_no_output_in_its_timeout() -> None:
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        spawn.run(SLEEP, timeout=0.3)
+    assert caught.value.output is None and caught.value.stderr is None
+
+
+def test_the_stuck_text_names_the_effect_and_no_program() -> None:
+    text = spawn.stuck_text(4)
+    assert "4 child process starts are stuck" in text
+    assert "stop or a hold" in text and "restarts" in text

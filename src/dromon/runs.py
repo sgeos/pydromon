@@ -430,6 +430,7 @@ def process_start(pid: int) -> str | None:
             env=PS_ENVIRONMENT,
             timeout=PS_TIMEOUT_SECONDS,
             check=False,
+            essential=True,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise TableUnreadable(f"ps cannot be run: {error}") from error
@@ -477,6 +478,7 @@ def process_groups() -> list[tuple[int, int]]:
             env=PS_ENVIRONMENT,
             timeout=PS_TIMEOUT_SECONDS,
             check=False,
+            essential=True,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise TableUnreadable(f"ps cannot be run: {error}") from error

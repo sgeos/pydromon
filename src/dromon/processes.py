@@ -319,6 +319,7 @@ def read_environments(uid: int, *, strict: bool = False) -> dict[int, list[str]]
                 text=True,
                 timeout=PS_TIMEOUT_SECONDS,
                 check=False,
+                essential=True,
             )
         except subprocess.TimeoutExpired as error:
             if strict:
@@ -387,6 +388,7 @@ def read_environment(pid: int) -> list[str] | None:
                 text=True,
                 timeout=PS_TIMEOUT_SECONDS,
                 check=False,
+                essential=True,
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
@@ -414,6 +416,7 @@ class SystemProcesses:
                 text=True,
                 timeout=PS_TIMEOUT_SECONDS,
                 check=False,
+                essential=True,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise ProcessRefused(f"cannot list processes: {error}") from error
@@ -566,6 +569,7 @@ def tree_or_reason(
             timeout=timeout,
             check=False,
             env=_ps_environment(),
+            essential=True,
         )
     except OSError as error:
         return TreeReadFailure(f"ps cannot be run: {error}")
@@ -670,6 +674,19 @@ def lstart_epoch(text: str) -> float | None:
         return None
 
 
+def runs_command(command: str, recorded: str) -> bool:
+    """Whether the process listing ``command`` runs the executable ``recorded``, by a
+    whole word and not a part of one. **Review of 151cbcd.** The program is the first
+    word of the listing, or the second when the first is the interpreter of a script, as
+    in ``node /path/claude``. A word matches when it is the recorded name or path, or
+    has the same final name, so ``claude`` matches ``/usr/local/bin/claude`` and never
+    ``claude-wrapper`` or ``vim notes.claude``."""
+    if not recorded:
+        return False
+    wanted = recorded.rsplit("/", 1)[-1]
+    return any(word.rsplit("/", 1)[-1] == wanted for word in command.split()[:2])
+
+
 def root_is_harness(rows: Sequence[TreeRow], harness: LaunchedHarness) -> bool:
     """Whether the process holding ``harness.pid`` in ``rows`` is the harness the launch
     record names, and not a process that was given its pid after the harness ended.
@@ -677,16 +694,16 @@ def root_is_harness(rows: Sequence[TreeRow], harness: LaunchedHarness) -> bool:
     **Round 15, re-review of 03ccbf3.** A record whose launcher died before it finished
     stays not done until the sweep removes it, and in that time its pid may be reused.
     The ledger takes the children of its root as the line's, so a reused root would
-    enter another process's children. The process must be there, not exited, with the
-    recorded executable in its command, and must have started no later than the
-    record was written, since the harness began before its launcher wrote the record
-    and a process that took the pid began after the harness ended. A record with no
-    time, or a start that cannot be read, is not accepted, since not knowing is not a
-    match."""
+    enter another process's children. The process must be there, not exited, running
+    the recorded executable by a whole word of its command, and must have started no
+    later than the record was written, since the harness began before its launcher
+    wrote the record and a process that took the pid began after the harness ended. A
+    record with no time, or a start that cannot be read, is not accepted, since not
+    knowing is not a match."""
     row = next((row for row in rows if row.pid == harness.pid), None)
     if row is None or "<defunct>" in row.command:
         return False
-    if not harness.command or harness.command not in row.command:
+    if not runs_command(row.command, harness.command):
         return False
     if harness.launched_ns is None:
         return False
@@ -963,6 +980,7 @@ def identity_of(pid: int, timeout: float = IDENTITY_SECONDS) -> tuple[int, str] 
             timeout=timeout,
             check=False,
             env=_ps_environment(),
+            essential=True,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None

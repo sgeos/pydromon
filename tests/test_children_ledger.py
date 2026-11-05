@@ -32,6 +32,7 @@ from dromon.processes import (
     ledger_listing,
     lstart_epoch,
     root_is_harness,
+    runs_command,
     stop_ledgered,
 )
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
@@ -599,3 +600,32 @@ def test_the_lstart_of_ps_reads_as_local_time() -> None:
     assert first is not None and second is not None and first < second
     assert lstart_epoch("") is None
     assert lstart_epoch("Sat Foo 99 07:23:05 2026") is None
+
+
+def test_a_command_matches_by_a_whole_word_and_not_a_part_of_one() -> None:
+    # Review of 151cbcd. A substring test let a common name pass.
+    assert runs_command("claude", "claude")
+    assert runs_command("/usr/local/bin/claude --print", "claude")
+    assert runs_command("claude --print", "/opt/bin/claude")
+    assert runs_command("node /opt/bin/claude --print", "claude"), "a script's program"
+    for other in (
+        "claude-wrapper --print",
+        "vim notes.claude",
+        "python -m claude_tools",
+        "node server.js claude",
+        "myclaude",
+        "",
+    ):
+        assert not runs_command(other, "claude"), other
+    assert not runs_command("claude", "")
+    assert not runs_command("python", "python3")
+
+
+def test_a_reused_pid_running_a_name_that_holds_the_recorded_one_is_not_a_root() -> (
+    None
+):
+    record = launched(HARNESS)
+    assert record is not None
+    assert not root_is_harness([row(HARNESS, 1, "claude-wrapper --x", FIRST)], record)
+    assert not root_is_harness([row(HARNESS, 1, "vim notes.claude", FIRST)], record)
+    assert root_is_harness([row(HARNESS, 1, "node /opt/bin/claude --x", FIRST)], record)

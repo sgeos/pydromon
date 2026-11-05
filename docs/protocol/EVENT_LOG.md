@@ -580,6 +580,16 @@ unaffected.
   `@` is masked whole, and in a URL one with `/`, and a scheme-less password with `/`
   is not masked, since it cannot be told from a path. Masking is by pattern and is not
   the disclosure scan.
+- **Callers that can meet the refusal. Review of 151cbcd.** A tool a line or an
+  operator calls returns the refusal as an error that names the kind of failure and
+  stores nothing. An event the daemon makes for itself, which is the walk gap, the
+  restart note, the engine stop note, a budget stated from an engine's report, the
+  compaction wake, a run's note to its holder and a task end's note, is dropped with a
+  line on the standard error that names what was lost and not its text, and the flow
+  it belonged to goes on. A task end is noted when it is reported again. Records that
+  already caught a rejection keep doing so. The delivery of an owed wake and the
+  forwarder's outage note leave their state unchanged, so the loop's fault handling
+  tries them again.
 
 ## Bounded start
 

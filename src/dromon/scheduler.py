@@ -152,7 +152,14 @@ from dromon.forwarder import PeerReport, check_outbound, outage_text
 from dromon.peering import PeerPriority, PeerTurns, Received, TurnCause, turn_cause
 from dromon import acp, antigravity, codex, cursor, grok, pi
 from dromon.agents import LineTokens
-from dromon import capabilities, launcher, linetemp, redact, sandboxprobe
+from dromon import (
+    capabilities,
+    credentials,
+    launcher,
+    linetemp,
+    redact,
+    sandboxprobe,
+)
 from dromon.linetemp import LineTemp
 from dromon.security_paths import project_secret_paths
 from dromon.handoff import Handoff
@@ -2469,6 +2476,8 @@ class Scheduler:
         self._sweep_failure: str | None = None
         """Why the last sweep could not read the process table, said once."""
         self._detached: dict[str, tuple[int, ...]] = {}
+        self._stuck_noted = False
+        """Whether the operator was told of the stuck starts now at the bound."""
         self._children = ChildLedger()
         """Round 15, item 3. The children seen below each line's engine."""
         self._tree_read: Callable[[], list[TreeRow] | TreeReadFailure] = lambda: (
@@ -2693,7 +2702,48 @@ class Scheduler:
         line. **Review F1.**"""
         text = note or ""
         if self._state().walk_limit != text:
-            self._log.append(WalkLimited(text))
+            self._append_or_say(WalkLimited(text), "the walk gap")
+
+    def _append_or_say(self, event: Event, what: str) -> bool:
+        """Append an event the daemon makes for itself, and say so on the standard error
+        and return ``False`` when the log refuses it because the literal secret values
+        could not be read, as ``credentials.SecretsUnavailable`` says. **Review of
+        151cbcd.** The daemon cannot ask anyone to try again, and an exception here
+        would cut a turn's end or the daemon's start short, so the event is dropped,
+        nothing unmasked is stored, and the message names what was lost and never its
+        text. A caller that has state to undo undoes it when this returns ``False``."""
+        try:
+            self._log.append(event)
+        except credentials.SecretsUnavailable:
+            print(
+                f"dromond: {what} was not recorded, because the literal secret values"
+                " could not be read",
+                file=sys.stderr,
+            )
+            return False
+        return True
+
+    def note_stuck_starts(self) -> None:
+        """Tell the default operator, once for each time the count of stuck starts
+        reaches ``spawn.MAX_STRANDED``, in a note from the harness that holds no line.
+        **Review of 151cbcd.** No further child is started at the bound except the
+        reads a stop depends on, and a start that never returns frees its slot only
+        when the daemon restarts, so the operator is told. The count is read at each
+        rest of the loop. A note that cannot be recorded is tried again at the next."""
+        stuck = spawn.stranded_count()
+        if stuck < spawn.MAX_STRANDED:
+            self._stuck_noted = False
+            return
+        if self._stuck_noted:
+            return
+        operator = self._default_operator
+        try:
+            self.ensure_operator(operator.operator_id)
+            self.send(HARNESS, operator, spawn.stuck_text(stuck))
+        except EventRejected as error:
+            print(f"dromond: stuck starts were not reported: {error}", file=sys.stderr)
+            return
+        self._stuck_noted = True
 
     def _schedule_survivor_scan(self) -> None:
         if not self._processes_identifiable:
@@ -3589,7 +3639,10 @@ class Scheduler:
         template = restart.NOTE if self._restart is not None else restart.ABANDONED_NOTE
         body = template.format(operator=self._restart_by)
         message_id = new_id("m")
-        self._log.append(RestartNoted(line_id, message_id, body))
+        if not self._append_or_say(
+            RestartNoted(line_id, message_id, body), f"the restart note of {line_id}"
+        ):
+            return
         self._sent.append(message_id)
         self._failed.discard(line_id)
         self._work.set()
@@ -4916,7 +4969,16 @@ class Scheduler:
             run.started.line_id if owner is None or owner.owner is None else owner.owner
         )
         if recipient in self._state().lines:
-            self._harness_note(LineAddress(recipient), text)
+            try:
+                self._harness_note(LineAddress(recipient), text)
+            except credentials.SecretsUnavailable:
+                # Review of 151cbcd. The run's end is recorded and this note is the
+                # only thing lost, so it is said and the sweep goes on.
+                print(
+                    f"dromond: the note of a run to {recipient} was not recorded,"
+                    " because the literal secret values could not be read",
+                    file=sys.stderr,
+                )
 
     def _run_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
         """The run tools, offered while the project declares a run command or the
@@ -5379,9 +5441,12 @@ class Scheduler:
         if self.discloses(note):
             note = WITHHELD_WAKE_NOTE
         message_id = new_id("m")
-        self._log.append(
-            WakeScheduled(line_id, message_id, format_due(self._wall_clock()), note)
-        )
+        if not self._append_or_say(
+            WakeScheduled(line_id, message_id, format_due(self._wall_clock()), note),
+            f"the compaction wake of {line_id}",
+        ):
+            self._context_compaction_wakes.discard(line_id)
+            return
         self._context_compaction_wake_ids[line_id] = message_id
         self._work.set()
 
@@ -8195,7 +8260,7 @@ class Scheduler:
                 resets_at = None
         # Four bytes is the most one character takes in UTF-8.
         note = str(error)[: MAX_BUDGET_NOTE_BYTES // 4]
-        self._log.append(
+        self._append_or_say(
             BudgetStated(
                 provider,
                 0,
@@ -8204,7 +8269,8 @@ class Scheduler:
                 note,
                 format_due(self._wall_clock()),
                 error.window,
-            )
+            ),
+            f"the budget of {provider}",
         )
 
     def credits_spent(self, line_id: str, note: str) -> None:
@@ -8229,7 +8295,8 @@ class Scheduler:
             note[: MAX_BUDGET_NOTE_BYTES // 4],
             format_due(now),
         )
-        self._log.append(budget)
+        if not self._append_or_say(budget, f"the budget of {provider}"):
+            return
         self.activity.record(line_id, ActivityKind.NOTICE, note)
         self._budget_followed(budget)
 
@@ -8280,7 +8347,8 @@ class Scheduler:
             format_due(now),
             window,
         )
-        self._log.append(budget)
+        if not self._append_or_say(budget, f"the budget of {provider}"):
+            return
         effective = self._state().effective_budget(provider, now)
         if effective is not None:
             self._budget_followed(effective)
@@ -10404,6 +10472,7 @@ class Scheduler:
                 # records of launchers that exited between turns. Review N1.
                 try:
                     self.collect_left()
+                    self.note_stuck_starts()
                 except Exception as error:  # noqa: BLE001
                     await self._fault_found(error, stop)
                     continue
@@ -10890,15 +10959,17 @@ class Scheduler:
         Delivery after the turn end keeps it owed until a later engine report,
         including across a restart or a failure before the next prompt arrives."""
         message_id = new_id("m")
-        self._log.append(
+        if not self._append_or_say(
             MessageSent(
                 message_id,
                 HARNESS,
                 LineAddress(line_id),
                 MessageKind.NOTE,
                 self._safe_stop_notice(cause),
-            )
-        )
+            ),
+            f"the engine stop note of {line_id}",
+        ):
+            return
         self._log.append(MessageDelivered(message_id))
 
     def _engine_stop_notice(self, line_id: str) -> str | None:
@@ -11859,15 +11930,23 @@ class Scheduler:
                 " the limit on such notes."
             )
         message_id = new_id("m")
-        self._log.append(
+        if not self._append_or_say(
             TaskNoted(
                 line_id,
                 message_id,
                 _cut(end.task_id, MAX_TASK_ID_BYTES),
                 _cut(end.status, MAX_TASK_STATUS_BYTES),
                 _cut(body, MAX_TASK_NOTE_BYTES),
-            )
-        )
+            ),
+            f"the task note of {line_id}",
+        ):
+            # Review of 151cbcd. The end is not noted, so a later report of it is
+            # noted, and the count of ends left unnoted is given back.
+            if end.task_id in noted:
+                noted.remove(end.task_id)
+            if unnoted:
+                self._unnoted_tasks[line_id] = unnoted
+            return None
         _bounded_put(self._task_detected, message_id, detected)
         if record_only:
             self._log.append(MessageDelivered(message_id))
