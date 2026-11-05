@@ -106,7 +106,7 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `message_correlated` | `message_id`, `key` identifier | The message exists, is a note from an external agent to a local line, is not delivered, and has no key. Gives it a correlation key, which names the agent's own task, as [`AGENTS.md`](AGENTS.md) specifies. The daemon appends it right after the note's `message_sent`. Added on 2026-10-28 |
 | `turn_correlated` | `line_id`, `keys` array of identifiers, `key_count` whole number, `cost_micro_usd` whole number from 0 to 10^15 or `null` | The line exists. `keys` holds from 1 to 64 distinct keys in sorted order, and `key_count` is at least their number, and equals it unless 64 are listed. Records that a turn of the line ended which delivered notes with these keys, however it ended, with the turn's cost in millionths of a dollar or `null` when the engine reported none. `key_count` is how many distinct keys the turn carried, so a reader sees that a turn counted under several keys cost its amount once. Applying it adds the turn to the totals of each listed key, the whole cost under each, and counts it as shared when `key_count` exceeds 1. The state keeps the totals of at most 4,096 keys, and drops the key used least recently to make room. Added on 2026-10-28 |
 | `task_recorded` | `line_id`, `task_id` of at most 128 bytes, `command` of at most 2,048 bytes, `status` of at most 32 bytes, `exit_code` 32-bit whole number or `null`, `output_file` of at most 1,024 bytes or `null`, `output_digest` SHA-256 in lowercase hexadecimal or `null`, `output_bytes` whole number or `null`, `workdir_commit` commit or empty, `ended_at` time | The line exists, and `output_digest` and `output_bytes` are both given or both `null`. Records that a background task of the line's engine ended between turns, for every end the engine reports, whether or not a `task_noted` wakes the line, and never wakes it. The command and output file name are recorded as the engine reported them, and `role_status` screens them against the disclosure list for every seat but the line itself. The digest covers the output the engine reported inline, or else the output file read as a task note reads it, up to 16 MiB. `workdir_commit` is `HEAD` where the line works, empty when none was read, and says nothing of uncommitted changes. Applying it keeps the line's latest 10 records, which `role_status` shows its role's seats. Added on 2026-10-28 |
-| `disclosure_checked` | `line_id`, `checked_at` time, `matched_lines` whole number from 0 to 1,000,000, `checked_bytes` whole number from 0 to 67,108,864 or left out when null | The line exists. Records that the line checked text, one file, or a list of files with `check_disclosure`, or that a line tool refused text for disclosure, or that a run's output was withheld for disclosure, and how many lines held a term of the project's disclosure list. The text, its name and any term are never recorded. Applying it keeps, for the limits [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, the line's latest 10 failure times when `matched_lines` is above 0, and its latest 60 pass times otherwise, and, when `checked_bytes` is given, its latest 70 check times with their bytes. A refusal is always recorded with at least 1 and no bytes. `checked_bytes` is how many bytes a `check_disclosure` call read, added in the round 15 review. A log from before the task of 2026-11-05 replays with its passes counted under the pass limit, and one from before `checked_bytes` with no bytes, which only widens the windows. **Rollback hazard.** A daemon from before `checked_bytes` refuses a log that gives one. Added on 2026-10-28 |
+| `disclosure_checked` | `line_id`, `checked_at` time, `matched_lines` whole number from 0 to 1,000,000, `checked_bytes` whole number from 0 to 67,108,864 or left out when null | The line exists. Records that the line checked text, one file, or a list of files with `check_disclosure`, or that a line tool refused text for disclosure, or that a run's output was withheld for disclosure, and how many lines held a term of the project's disclosure list. The text, its name and any term are never recorded. Applying it keeps, for the limits [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, the line's latest 10 failure times when `matched_lines` is above 0, and its latest 60 pass times otherwise, and, when `checked_bytes` is given, its latest 70 check times with their bytes. A refusal is always recorded with at least 1, and with no bytes except from `write_scratch`. `checked_bytes` is how many bytes a `check_disclosure` call read, added in the round 15 review, or since the round 15 re-review how many bytes of text and path a screened `write_scratch` gave, on a pass and on a refusal. A log from before the task of 2026-11-05 replays with its passes counted under the pass limit, and one from before `checked_bytes` with no bytes, which only widens the windows. **Rollback hazard.** A daemon from before `checked_bytes` refuses a log that gives one. Added on 2026-10-28 |
 | `message_delivered` | `message_id` | The message exists and was not delivered, returned or left unconfirmed. For a line, delivery is into a turn. For an operator, delivery is acceptance by the operator's relay or display in a client. For a party of a peer, it is the peer's `accepted`, and the message leaves the peer's outbox |
 | `message_returned` | `message_id`, `code` one of the codes of returned mail in [`FEDERATION.md`](../architecture/FEDERATION.md), `note_id` message identifier or `null` | The message exists, is to a party of a peer, and was not delivered, returned or left unconfirmed. When its sender is a line, `note_id` is a new identifier that no message, withdrawn wake or pending scheduled wake holds, and it is `null` otherwise. The message leaves its peer's outbox undelivered, and a line sender receives a note from itself under `note_id` whose text the model derives from the code. Added on 2026-10-28 |
 | `message_unconfirmed` | `message_id`, `note_id` message identifier or `null` | As for `message_returned`. The message expired after a copy of it may have reached the peer without an answer, so whether it was delivered is unknown, and a line sender's note says so. Added on 2026-10-28 |
@@ -117,14 +117,15 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `restart_noted` | `line_id`, `message_id`, `body` note of at most 2,048 bytes | Checked as `task_noted` is. Records a note from the line to itself, already sent, saying that a daemon restart ended its turn at a safe point, as [`RESTART.md`](RESTART.md) specifies, so the restarted daemon wakes the line. Only the daemon records it, as the turn ends. Decided by the operator on 2026-10-27 |
 | `task_noted` | `line_id`, `message_id`, `task_id` of at most 128 bytes, `status` of at most 32 bytes, `body` note of at most 8,192 bytes | The line exists, no message has the identifier, and the note identifier is not reserved by a scheduled wake. Records a note from the line to itself saying that a background task ended. If the line's pending scheduled wake names this `task_id`, the event atomically removes it, keeps its identifier among the withdrawn wakes, and its body names the cancelled wake and says the task ended the wait. This task note is not suppressed by the ordinary per-line task-note limit. An end between turns wakes the line, unless its engine has already begun an admitted turn on it, in which case that turn consumes the note. Ends during a turn or for a task the line stopped are recorded as delivered without a wake. Only the daemon records it, from the engine's own report |
 | `line_cost_marked` | `line_id`, `engine_session` of at most 256 bytes, `total_micro_usd` a whole number from 0 to 10^15 | The line exists and the session is not empty. Records the running cost total the line's engine reported for its session after a turn, in millionths of a dollar, as the line's cost mark, from which the next turn's cost is measured |
-| `line_turn_ended` | `line_id`, `workdir_commit` commit or `null`, `unreported`, present only as `true`, and `failed`, present only as `true`, from round 14, when the turn failed, which keeps the line failed in the state until a turn ends without it, new mail reaches the line, `line_released` or a restart note. **Rollback hazard.** A daemon older than `failed` refuses an event that gives it | The line exists. Records the commit checked out in its worktree as its latest turn ended, or `null` when it could not be read, so a moved-worktree notice can compare against the last turn after a daemon restart. Only the daemon records it, however the turn ended. `unreported` is `true` when the line's engine returned no report for the turn, as when its prompt could not be composed, a check before the engine failed, the engine raised or the turn was cancelled, and is omitted otherwise. Such a turn retires none of the line's own notes, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies, since its prompt may never have reached the engine. `false` is refused, and an absent field decodes as `null`, so a log written before the field reads every turn end as reported. **Rollback hazard.** A daemon that predates the field rejects an event that holds it, so once a turn has ended unreported, an older daemon cannot read the log, as for a request key above. `unreported` added on 2026-10-30 in the round 8 review |
+| `line_cost_recorded` | `line_id`, `cost_micro_usd` whole number from 0 to 10^15 or `null`, optional `estimated` `true`, optional `between` `true` | The line exists. `estimated` and `between` are `true` or absent, never `false`, and `estimated` needs a cost. Records the cost of one turn, or with `between` of one spend outside a turn such as a compaction, in millionths of a dollar, or `null` when unknown. `estimated` says Dromon estimated it from the engine's token counts and its price table. Applying it adds to the line's whole cost in `State.line_costs`, the reported and estimated sums apart, the turns and the spends between turns apart, and the records of unknown cost, each sum held at 10^15. No release resets it. **Rollback hazard.** A daemon older than the kind refuses a log that holds one. Added in round 15, item 1 |
+| `line_turn_ended` | `line_id`, `workdir_commit` commit or `null`, `unreported`, present only as `true`, and `failed`, present only as `true`, from round 14, when the turn failed, which keeps the line failed in the state until a turn ends without it, new mail reaches the line, `line_released` or a restart note. **Rollback hazard.** A daemon older than `failed` refuses an event that gives it | The line exists. Records the commit checked out in its worktree as its latest turn ended, or `null` when it could not be read, so a moved-worktree notice can compare against the last turn after a daemon restart. Only the daemon records it, however the turn ended. `unreported` is `true` when the line's engine returned no report for the turn, as when its prompt could not be composed, a check before the engine failed, the engine raised or the turn was cancelled, and is omitted otherwise. Such a turn retires none of the line's own notes, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies, since its prompt may never have reached the engine. `false` is refused, and an absent field decodes as `null`, so a log written before the field reads every turn end as reported. **Rollback hazard.** A daemon that predates the field rejects an event that holds it, so once a turn has ended unreported, an older daemon cannot read the log, as for a request key above. `unreported` added on 2026-10-30 in the round 8 review. `failure`, present only with `failed`, one fixed word for the cause as [`LINE_CONFIG.md`](LINE_CONFIG.md) lists them under `last_failure`, and `failure_class`, present only with `failure` and only where one exists, the daemon's own exception type or a listed result subtype, at most 64 characters, a letter then letters, digits or underscores, added in the round 15 follow-up of 2026-11-05. Neither carries an engine's text. A failed turn logged before them has neither, and reads as of unknown cause. **Rollback hazard.** A daemon older than `failure` refuses an event that gives it |
 | `processes_left` | `line_id`, `cause` one of `exited`, `stopped`, `orphaned`, `detached` and `swept`, `pids` an array of 1 to 64 whole numbers above 1 and below 2^31, `commands` an array of as many texts of at most 1,024 bytes, `more` a whole number from 0 to 1,000,000 | The line exists. Records processes the line's engine left running, with the pid and command of each and how many more were left than are named, as the line's latest record. The first three causes are those of a launcher under the `leave_background` stop policy, when the harness exited, was stopped or found the daemon gone. `detached` is for processes found by the line's mark after its engine ended. `swept` is for processes the daemon's sweep of a launcher that exited before it finished found still running. Each command is a summary, the executable's name without its directory and its arguments with credentials masked, as `dromon.redact` describes. A record written before 2026-10-27 may hold a whole command. The whole command is kept only in the launcher's report file, readable by its owner alone. Only the daemon records it, and it makes no process Dromon's to end. Added on 2026-10-26 |
 | `stop_unverified` | `line_id`, `note` of 1 to 1,024 bytes | The line exists. Records a stop of the line's engine that Dromon could not verify was complete, as the line's latest, which its status shows as `processes.stop_unverified`. Recorded when the launcher could not read the process table at its stop, or when it exited before it finished its stop and the daemon swept its harness's group. Only the daemon records it. Added on 2026-10-27 |
 | `walk_limited` | `note` of at most 1,024 bytes, possibly empty | Always applies. Records what the daemon's platform keeps the launcher's walk of the process table from reaching, which every line's status shows as `processes.walk_limit`, or with empty text that nothing is. Only the daemon records it, as it starts, and only when it differs from the latest, so a platform's gap is recorded once. Added on 2026-10-26 |
 | `question_withdrawn` | `message_id` | The message is a question and is open. Recorded by the asking line's own tool, by a start for a stale ceiling question, and, from the audit of round 14, by an operator's retirement of the asking line |
 | `question_superseded` | `message_id`, `superseded_by` | Both messages are open questions, they differ, and they come from the same line |
 | `context_handed_off` | `line_id`, `cause` of `rebound` or `cleared`, `outcome` of `given` or `opted_out`, `message_ids`, at most 64 identifiers, `chars`, a whole number from 0 to 1,048,576, and `sha256`, a lowercase hexadecimal SHA-256 digest when given and empty otherwise | The line exists and is owed a handoff for this cause, which `line_rebound` and `line_session_cleared` set, as their `rebound` and `cleared`. An `opted_out` handoff selects nothing, with no identifiers, zero `chars` and an empty digest. Ends the handoff. Only the daemon records it, once the engine ran the turn that carried it, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies. Added on 2026-10-27 |
-| `role_declared` | `role_id`, `workdir`, `handoff_seconds` a whole number from 60 to 86,400, `seats` an array of at most 16 distinct line identifiers, `failover` failover policy, `handoff_below_percent` a whole number from 0 to 100 | The role was never retired, and does not exist, or exists and this changes any of its fields, and its workdir changes only while no seat owns it. The handoff bound is how long an owner asked to hand the role over has before the operator is asked to recover it instead, an hour by default. `seats` is the declared order a failover follows, and may name a line before it is bound. `failover` says whether the harness passes the role on itself when its owner cannot act. The owner is asked to prepare a handoff when its provider's stated budget is above 0 and below `handoff_below_percent`, and never when it is 0. A record written before step 3 of roles has only the first three fields, and decodes with an empty order, `automatic` and 10. Added on 2026-10-27, and the last three fields the same day, before any release |
+| `role_declared` | `role_id`, `workdir`, `handoff_seconds` a whole number from 60 to 86,400, `seats` an array of at most 16 distinct line identifiers, `failover` failover policy, `handoff_below_percent` a whole number from 0 to 100, optional `reviews` a non-empty array of at most 16 distinct role identifiers other than `role_id` | The role was never retired, and does not exist, or exists and this changes any of its fields, and its workdir changes only while no seat owns it. The handoff bound is how long an owner asked to hand the role over has before the operator is asked to recover it instead, an hour by default. `seats` is the declared order a failover follows, and may name a line before it is bound. `failover` says whether the harness passes the role on itself when its owner cannot act. The owner is asked to prepare a handoff when its provider's stated budget is above 0 and below `handoff_below_percent`, and never when it is 0. A record written before step 3 of roles has only the first three fields, and decodes with an empty order, `automatic` and 10. `reviews` names the roles whose work the role reviews. It is left out when empty, never written as an empty array, and read as empty when absent. The model does not require the named roles to exist, since one may be retired later, and the file and the role commands check that each exists when they write it. **Rollback hazard.** A daemon older than the field refuses a `role_declared` that names one. Added on 2026-10-27, the last three fields the same day, before any release, and `reviews` in round 15, item 5 |
 | `seat_bound` | `line_id`, `role_id`, `may_own` boolean | The line and the role exist, the line is a seat of no other role, and this is a new seat or changes the seat's `may_own`. A seat whose `may_own` is false never owns its role, and an owner cannot be made one. Added on 2026-10-27 |
 | `seat_unbound` | `line_id`, `role_id` | The role exists, the line is its seat, and the line does not own it. Ends the binding, and the seat's place in the role's notice counts. The line stays a line with its configuration, mail, leases and state. Only an operator's `role_update` or `role_delete` records it, as [`CLIENT.md`](CLIENT.md) specifies. **Rollback hazard.** A daemon older than round 10 does not know the kind, so once one is recorded, it cannot read the log, as for `unreported` above. Added on 2026-10-31 in round 10 |
 | `role_retired` | `role_id`, `by` operator address, `retired_at` time | The role exists and is vacant, no line is its seat, and `by` is a registered operator. Removes the role, and its identifier is never declared again, since an identifier is never reused within its kind. Its journal entries stay. Only an operator's `role_delete` records it, after a `seat_unbound` for each seat. **Rollback hazard.** As for `seat_unbound`. Added on 2026-10-31 in round 10 |
@@ -132,7 +133,7 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `role_held` | `role_id`, `holder` of `file` or `operator`, `by` operator address, `held_at` time | The role exists, `by` is a registered operator, and this changes the role's holder. A role with none is held by the file. A role command records `operator`, and a start or a reload records `file`, by the project's operator, once the file's table agrees with the role, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. **Rollback hazard.** As for `seat_unbound`. Added on 2026-10-31 in round 10 |
 | `ownership_changed` | `role_id`, `owner` and `previous` line identifiers or `null`, `cause` ownership cause, `by` address, `entry_id` or `null`, `changed_at` time, `back_to` line identifier or `null` | See the ownership rules below. Added on 2026-10-27, and `back_to` the same day, before any release |
 | `role_noted` | `role_id`, `entry_id`, `line_id`, `kind` entry kind, `body` text of 1 to 65,536 bytes, `workdir_commit` and `daemon_commit` commits, `noted_at` time | No entry has the identifier, the role exists, so a retired role takes no entry, and the line is its seat. A `handoff` or `recovery` entry is by the role's current owner, and a `note` by any seat. The daemon stamps both commits itself from `HEAD`. Added on 2026-10-27 |
-| `brief_set` | `line_id`, `task` text of 1 to 4,096 bytes, `decisions` and `next_action` text of at most 4,096 bytes, `artifacts` an array of at most 32 paths, each of 1 to 1,024 bytes on one line, `workdir_commit` and `daemon_commit` commits, `set_at` time | The line exists. The text fields and paths together are at most 16,384 bytes. Replaces the line's previous standing brief, which only `set_brief` records, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies. The text is the line's own and untrusted. The daemon stamps both commits and the time itself, and leaves a commit empty when it cannot read it. Added on 2026-10-29 |
+| `brief_set` | `line_id`, `task` text of 1 to 4,096 bytes, `decisions` and `next_action` text of at most 4,096 bytes, `artifacts` an array of at most 32 paths, each of 1 to 1,024 bytes on one line, `workdir_commit` and `daemon_commit` commits, `set_at` time, `workdir_dirty` a SHA-256 in lowercase hex or `null`, omitted when `null` | The line exists. The text fields and paths together are at most 16,384 bytes. Replaces the line's previous standing brief, which only `set_brief` records, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies. The text is the line's own and untrusted. The daemon stamps both commits and the time itself, and leaves a commit empty when it cannot read it. `workdir_dirty` is the digest of the worktree's `git status` entries when the brief was set, which a turn compares to flag the brief as stale, and `null` where git could not read them or for a brief recorded before the field. Added on 2026-10-29, and `workdir_dirty` in the review of `49236ad`. **Rollback hazard.** A daemon older than the field refuses the event when it carries the field |
 | `budget_stated` | `provider` identifier, `remaining_percent` a whole number from 0 to 100 or `null`, `resets_at` time or `null`, not both `null`, `source` budget source, `note` text of at most 1,024 bytes, `stated_at` time, and from 2026-10-31 optional `window`, an identifier | Always. An event without `window` replaces the provider's earlier statement. An engine event with a window updates that window's snapshot; the state keeps the lowest remaining percentage among unexpired engine windows. Older window snapshots are discarded when their reset passes. It is a snapshot and later turns do not adjust it. **Rollback hazard.** A daemon predating `window` refuses a log after one is recorded. Added on 2026-10-27; `window` added on 2026-10-31 |
 | `budget_handoff_requested` | `provider` identifier, `role_id` identifier, `remaining_percent` a whole number from 1 to 100, `threshold` a whole number from 0 to 100, `requested_at` time | The role exists and has an owner, its threshold matches, its current provider budget matches `remaining_percent` and is below `threshold`, and this provider-role pair has not been asked since its budget last rose above the threshold. Records one planned handoff request, which is re-armed only above threshold. **Rollback hazard.** A daemon predating round 11 does not know this kind and cannot read a log after one is recorded, as for `seat_unbound` above. Added on 2026-10-31 |
 | `lease_acquired` | `name` and `line_id` identifiers, `acquired_at` and `expires` times, `expires` the later, and `note` text of at most 500 bytes, present only when given, from round 14. **Rollback hazard.** A daemon older than `note` refuses an event that gives it | The line exists, and no lease is recorded under the name or the recorded one's `expires` is not after this `acquired_at`. Records the line as the lease's holder until `expires`, replacing an expired one. See the lease rules below. **Rollback hazard.** A daemon older than 2026-10-31 does not know the kind, so once one is recorded, it cannot read the log. Added on 2026-10-31 |
@@ -235,9 +236,13 @@ branch's merge.
 | `line_retired` | `625f3de` | `8b2c508` | `feat/operator-r14`, #129 |
 | A commit run, a `run_started` with `commit` and `checkout` | `1449c5c` | `8b2c508` | `feat/operator-r14`, #129 |
 | `commit_run_refused` | `522c146` | `8b2c508` | `feat/operator-r14`, #129 |
-| `line_configured.sealed`, written when a configuration holds a literal value | `025149b` | Pending | `feat/eventlog-r14` |
-| `run_ended.output_tail`, written when a failed run's output has a tail | Pending | Pending | `feat/r15-runs-disclosure` |
-| `disclosure_checked.checked_bytes`, written with every `check_disclosure` call | Pending | Pending | `feat/r15-runs-disclosure` |
+| `line_configured.sealed`, written when a configuration holds a literal value | `025149b` | `8ca4ead` | `feat/eventlog-r14`, #134 |
+| `line_cost_recorded`, written after every turn and every spend between turns | `49236ad` | Pending | `feat/r15-mail-cost-log` |
+| `role_declared.reviews`, written when a role names a role it reviews | `49236ad` | Pending | `feat/r15-mail-cost-log` |
+| `line_turn_ended.failure` and `failure_class`, written with every failed turn | Uncommitted | Pending | `feat/r15-mail-cost-log` |
+| `brief_set.workdir_dirty`, written whenever git can read the worktree as a brief is set | Uncommitted | Pending | `feat/r15-mail-cost-log` |
+| `run_ended.output_tail`, written when a failed run's output has a tail | `172f9b9` | Pending | `feat/r15-runs-disclosure` |
+| `disclosure_checked.checked_bytes`, written with every `check_disclosure` call and screened `write_scratch` | `da29483` | Pending | `feat/r15-runs-disclosure` |
 
 **Fact, from the history.** The table was built from the history of `HEAD` on
 `feat/mail-and-roles` at `5a1603f`. A kind's first commit is the oldest whose
@@ -258,6 +263,16 @@ so #124 moves no floor. **Updated again on 2026-11-01, in the merge of `main` at
 #129, `feat/operator-r14`, changes `dromon.codec` or `dromon.model`, so its rows now
 have their floor and the others move none. Its `commit_run_refused`, first written in
 `522c146`, is added, and no enumeration of `dromon.model` gained a value in it.
+**Updated on 2026-11-05 on `feat/r15-mail-cost-log`, from main at `9296036`.**
+`feat/eventlog-r14` merged in `8ca4ead`, #134, which gives the sealed field its
+floor. **Fact, from `git log --first-parent`.** `de680f5`, #133, is the merge before
+it and does not contain `025149b`. `line_cost_recorded` is added as pending.
+**Inference.** It is written after every turn of every line, so the first turn a
+daemon from this branch runs passes its floor, and from then a rollback to older code
+refuses the log until the operator restores it from a copy taken before. The round's
+other changes, the thread rule for unanswered mail and the stale brief lead, add no
+kind, field or value, since each is derived as events apply or composed in the
+prompt.
 
 **Inference.** The search reads the codec and the model, not every rule of the
 applying code. A rule that a newer daemon applies and an older one refuses, such as a
@@ -415,7 +430,8 @@ this project's own log without writing it. The log was 4,390,912 bytes and held 
 messages. Importing the daemon's modules took 0.048 seconds, replaying the log took
 0.139 seconds, and the peak memory was 32.4 MiB. The measuring script was the core
 line's. The daemon commit was not recorded. One log is no curve, so the figures give no
-growth rate, and snapshots stay under "Not yet specified".
+growth rate. Bounded start below measures synthetic logs and the snapshot built for
+them in round 15.
 
 **Writers.** One process writes a log. Before each append, the writer checks inside an
 immediate transaction that the newest `seq` is the one it last read, and refuses to
@@ -525,7 +541,8 @@ literals, both of which remain residuals as stated above.
 ## Bounded start
 
 **Required by the operator on 2026-11-01, measured and designed by core for review.
-Not built.** A daemon opens its log by replaying every event into a state held in
+Built in round 15, item 4, in `dromon.statesnapshot` and `EventLog`.** A daemon opens
+its log by replaying every event into a state held in
 memory, so the time to start and the memory held both grow with the log.
 
 **Measurements. Fact, from runs on 2026-11-01 on the operator's macOS machine.** The
@@ -563,49 +580,164 @@ operator mail since its brief. Each costs about what the open costs, for each li
 holds the whole log in memory while it runs. They are debt that a bounded start must
 also remove, by a time index kept beside the state.
 
-**Design.** A snapshot of the state at a sequence number, from which replay resumes.
+**Design, as built.** A snapshot of the state at a sequence number, from which replay
+resumes.
 
-1. **The file.** `events.sqlite.snapshot` beside the log, owner only, replaced whole as
-   the sealed store is. It holds a format version, the log's schema version, a state
-   version that the code raises whenever the shape of the state or the meaning of
-   applying an event changes, the sequence number `N` it was taken at, the SHA-256 of
-   the stored rows 1 and `N`, each its `recorded_at` and `payload`, the state and the
-   recorded times encoded as canonical JSON, and the SHA-256 of all of the above.
-2. **Taking one.** The daemon writes a snapshot between turns once the log has grown by
-   a set number of events since the last, and at a clean stop. It encodes the state it
-   holds, which costs about what the state's size costs, and it never blocks an append
-   for longer than the encoding takes.
-3. **Starting.** The daemon reads the snapshot, checks its own digest and versions,
-   reads rows 1 and `N` from the log and checks their digests, decodes the state, and
-   applies the events from `N + 1` as replay does today. The log is append only, its
-   triggers refuse a change, and a log whose first and `N`th rows match is the log the
-   snapshot was taken from, short of a writer with access to the file, whom the trust
-   section below already places outside the model.
-4. **Falling back.** A snapshot that is missing, unreadable, of another version, whose
-   digest does not verify, whose `N` lies past the log's end, or whose rows 1 and `N`
-   differ is ignored, and the daemon replays the whole log, as it does today. The
-   reason is named on standard error and in the daemon status. A snapshot is a cache
-   and never the record, so ignoring one loses nothing.
-5. **Checking.** `dromond --check` replays its copy of the log in full and compares the
-   encoded state with the snapshot's state at `N`. A difference means the code applies
-   events differently from the code that took the snapshot without raising the state
-   version, and fails the check.
-6. **What it does not bound.** Memory. A snapshot bounds the start time by the events
+1. **The file.** `events.sqlite.snapshot` beside the log, owner only, mode 0600,
+   written to a file beside it and moved into place with one rename, so a reader sees
+   the old file or the new one whole. It is opened without following a link, and a
+   file that is not regular, that a group or other may read or write, or that is over
+   4 GiB is refused. After the move the directory is synchronized, so the new name is
+   durable. **Review of `49236ad`, item 2.** A crash before the move leaves the earlier
+   snapshot or none, and may leave the `.writing` file, which no start reads. A crash
+   after the move and before the directory is synchronized may lose the new name on
+   some file systems, which leaves the earlier snapshot or none. Either way a start
+   finds a whole snapshot of the state at its own `N`, or none, and replays the events
+   after it or the whole log. A directory that cannot be synchronized is recorded as a
+   failed write. It holds a format version, the log's schema version, a state
+   version that the code raises whenever the meaning of applying an event changes,
+   the SHA-256 of the shape of the state's types, the sequence number `N` it was taken
+   at, the SHA-256 of the stored rows 1 and `N`, each its `recorded_at` and `payload`,
+   the state and the recorded times as canonical JSON, and the SHA-256 of all of the
+   above.
+2. **The encoding.** Reflective over the frozen records of `dromon.model.State`. A
+   record is an object of its fields, a map is an array of pairs in its order, since
+   the order of several maps is meaningful, a set is a sorted array, and a value of a
+   union of records is tagged with the record's name. The shape digest is taken over
+   the tree of field names and types, so any change to a field of the state changes
+   it, and a snapshot of another shape is ignored without a version raised by hand.
+   The decoder is compiled once for each type and as strict as the event codec, so a
+   value of the wrong type is refused and not coerced.
+3. **Taking one.** The daemon writes one at a clean stop when the log grew since the
+   last, and within the append that brings the growth to `SNAPSHOT_EVERY`, 10,000
+   events. A snapshot that fails to write is recorded in the status and never raised,
+   since the append it follows is stored already. `dromond --check` never writes one.
+4. **Starting.** The daemon reads the snapshot inside one read transaction of the log,
+   checks the file, its digest, its versions and its shape, reads rows 1 and `N` and
+   checks their digests, decodes the state and the recorded times, and applies the
+   events from `N + 1` as replay does.
+5. **Falling back.** A snapshot that is missing, unreadable, refused as a file, of
+   another version or shape, whose digest does not verify, whose `N` lies past the
+   log's end, whose rows 1 and `N` differ, or that does not decode is ignored, and the
+   daemon replays the whole log. The reason is printed on standard error at the start
+   and given as `event_log.start` in the daemon status, with `snapshot` one of `used`,
+   `ignored` or `off`, `snapshot_seq`, `reason`, `replayed`, `open_milliseconds` and
+   `write_failure`. A snapshot is a cache and never the record, so ignoring one loses
+   nothing.
+6. **Checking.** `dromond --check` replays its copy of the log in full through `N`,
+   encodes that state and the recorded times, and compares them byte for byte with the
+   snapshot's. A difference means the code applies events differently from the code
+   that took the snapshot without a new state version, and fails the check. No
+   snapshot, or one a start would ignore, passes with its reason, since a start would
+   then replay the whole log.
+   - **After every start from a snapshot.** **Review of `49236ad`, item 1, required by
+     the operator.** A snapshot whose digests are valid and whose state is not a replay
+     of the log passed every check of item 4 and was restored. A start that restored
+     from a snapshot now copies the log in the bounded ranges a check's copy uses, off
+     the event loop, replays the copy through `N`, and compares the digest of that
+     state and those times with the digest the snapshot named. A match sets
+     `verified` to `passed`. A mismatch is named by one fixed word, `state_differs`,
+     `log_corrupt`, or `check_failed` with the exception's type, and never its text.
+     Every line is then held in memory, the snapshot is deleted, the daemon log says
+     so, `event_log.start` gives `verified` `failed`, `mismatch`, `mismatch_class` and
+     `restart_required` true, and `dromon status` prints a `RESTART REQUIRED.` row.
+     Only a restart lifts the hold, and it replays the whole log, since the snapshot is
+     gone. No snapshot is written while the check is pending or after it failed, so a
+     stop before the check ends leaves the earlier file, which the next start checks
+     again.
+   - **Decided by core, for review.** The hold appends no `line_held`. The state is the
+     one a replay did not confirm, so an event checked against it may be one the
+     replayed state refuses, and the log would then fail to replay at the next start.
+   - **Trust.** The snapshot sits in the state directory beside the log, which
+     `protected_dirs` denies to confined lines, so it is on the same protected boundary
+     as the log, and the mode check does not stop the owner. Whoever can forge the
+     snapshot can also alter the log. The check detects corruption, a forgotten state
+     version, and a file changed by a process that could write the snapshot but not
+     the log. It does not detect a determined owner of the files.
+   - **No turn starts until the check ends.** **Re-review of `2cede6e`, required by
+     the operator.** A line could start a turn while the check ran and append events
+     checked only against the restored state, and a turn running when the check
+     failed was not cancelled. No line now starts a turn while the check is pending,
+     and mail that arrives meanwhile waits, so no turn appends against the
+     unconfirmed state and none is running when the check fails. The scheduler wakes
+     when the check ends, and a waiting turn starts at once after a pass.
+   - **What the wait costs.** **Fact, from runs on 2026-11-05 on the operator's
+     macOS machine, with this branch's uncommitted code.** The script
+     `tmp/r26/measure_check.py` in the core worktree, which is not tracked, restored
+     each synthetic log above from its snapshot and ran the check three times. The
+     check took 0.258 seconds at best and 0.700 at worst for the 3.3 MiB log of
+     10,779 events, and 2.438 and 3.518 seconds for the 33 MiB log of 106,729 events.
+     **Inference.** It costs about twice a full replay, since it copies the log
+     before replaying it, so a start from a snapshot is again slower to its first
+     turn than a start without one, though it serves clients sooner. This project's
+     log was about 4.4 MB on 2026-11-01, so its first turn waits about a third of a
+     second, and a log ten times larger waits about three seconds. The wait was not
+     measured on this project's own log, which `.dromon/` closes to lines.
+   - **Residual.** The events the daemon appends without a turn while the check runs
+     were checked against the restored state. They are the recovery before the
+     scheduler starts, an operator's command, mail from a peer and a scheduled wake
+     that falls due. A stop waits for a running check, since a thread cannot be
+     interrupted. A check that ended with an error outside its own handling would
+     leave every line waiting until a restart, which fails closed, and the daemon log
+     names it only at the stop. A state that decodes to the replay but was not written
+     in the canonical form also differs, which fails closed.
+   - **The state version is pinned.** **Review of `49236ad`, item 3.** A change of
+     meaning that keeps the shape and does not raise the state version is invisible to
+     a start. `tests/test_state_version.py` pins each state version with the digest of
+     the types of the state and of every event, written the same way on each Python
+     version the gate runs, and with the digest of the state the codec scenario
+     replays to. A change to either fails the test until the version is raised and a
+     pin appended, and a pin under a version already pinned is refused. Version 2 is
+     the round 15 follow-up. Version 3 is the merge of `feat/r15-runs-disclosure`,
+     whose disclosure passes, bytes and run tails failed the pin of version 2. **Fact, observed on 2026-11-05.** The shape digest of item
+     2 differs between Python 3.12 and 3.15, since it uses Python's own text of a type,
+     which is why the pin uses another digest.
+7. **What it does not bound.** Memory. A snapshot bounds the start time by the events
    since `N`, but the state it restores is as large as the state replay builds.
    Bounding memory needs the state to keep only the bodies of messages still open, and
    to read the others from the log by sequence number when a view asks, which is a
    separate change. The log itself is never compacted, since it is the record.
-7. **Rollback and porting.** The snapshot is a cache beside the log, so an older daemon
-   ignores the file and no floor moves. A port need not read the snapshot format and
-   may rebuild from the log, as replay always can.
+8. **Rollback and porting.** The snapshot is a cache beside the log, so an older daemon
+   ignores the file and no floor moves. A daemon that returns to this code after an
+   older one appended finds the rows past `N` and replays them, and one whose row `N`
+   differs ignores the snapshot. A port need not read the snapshot format and may
+   rebuild from the log, as replay always can. **Porting hazard.** The encoding reads
+   the Python types of the state, so a port that wants to read the file must carry the
+   same field names and orders, and its own shape digest would differ in any case.
 
-**Decision. Inference, by core.** Not built in this round. The design needs a canonical
-encoding of the whole state, every map and index of `dromon.model.State` and the
-recorded times, with a decoder as strict as the event codec and tests for each field,
-which is larger than the time left for this round. The measurements also show no
-present need, since this project's log opens in a fraction of a second by the
-synthetic numbers, and a hundredfold growth opens in about 12 seconds. The two whole
-reads above are the nearer cost, and a time index removes them without a snapshot.
+**Measurements, before and after. Fact, from runs on 2026-11-05 on the operator's macOS
+machine, with this branch's uncommitted code.** The script `tmp/r25/measure_start.py`
+in the core worktree, which is not tracked, opened a copy of each synthetic log above
+three times without a snapshot, once to write one, and three times with it, and kept
+the best of each three. The 330 MiB log was not measured again.
+
+| Log | Without, seconds | First start, replay and write, seconds | With, seconds | Snapshot, bytes |
+|---|---|---|---|---|
+| 3.3 MiB, 10,779 events | 0.120 | 0.202 | 0.039 | 2,632,326 |
+| 33 MiB, 106,729 events | 1.226 | 1.987 | 0.402 | 26,046,124 |
+
+**Inference.** A start from a snapshot takes about a third of a full replay at both
+sizes, and still grows with the state, since decoding the state is linear in its size.
+Writing one took about 0.08 and 0.76 seconds, the difference between the first start
+and the replay, and an append that reaches `SNAPSHOT_EVERY` waits that long, about
+once in 10,000 events. A first decoder, which resolved the type hints at each value,
+restored more slowly than a full replay, 0.190 against 0.124 seconds at 3.3 MiB, which
+is why the decoder is compiled once for each type.
+
+**Residuals.**
+
+- The snapshot holds every message body the state holds, as the log does, so it is as
+  sensitive as the log and is kept owner only beside it.
+- An append that reaches `SNAPSHOT_EVERY` blocks for the encoding and the write, as
+  measured above, rather than writing between turns, which would need the scheduler
+  to ask for it. **Hypothesis.** At this project's rate of events this is rare enough
+  not to matter, and it is not measured under load.
+- A daemon killed between appends writes no snapshot at stop, so its next start
+  replays from the last snapshot taken, which is correct and slower.
+- The two whole reads above are not changed by the snapshot.
+- A reason for ignoring a snapshot names the type that failed to decode and never the
+  stored value, since the reason reaches the daemon status, which lines read, and a
+  stored value may be any text the log holds.
 
 ## Trust
 
@@ -622,6 +754,6 @@ with write access to the file, so the file's permissions are the security bounda
   client are recorded by `line_overridden` and `project_overridden`.
 - How a line chooses which operator to ask, which belongs to per-project configuration.
 - Retiring an operator or a line.
-- Compaction or snapshots for long logs. Bounded start above designs a snapshot, and
-  it is not built.
+- Compaction of long logs. Bounded start above builds a snapshot, which bounds the
+  start's replay and not the memory the state holds, and the log is never compacted.
 - Migration between schema versions. Version 1 refuses every other version.

@@ -254,7 +254,7 @@ argument outside a tool's schema is refused.
 | `list_leases` | From round 14. Lists every live lease, with its holder, both times and the holder's unverified note, and the declared leases no line holds. Read only, the same for every line, as below |
 | `start_run`, `run_status`, `stop_run` | Offered while the project declares a run command, or while the line's scope has a run to read. Start a declared command as a supervised run that outlives the turn, the seat and the daemon, show the scope's latest runs with their receipts, and stop its open run, as [`RUNS.md`](../architecture/RUNS.md) specifies. A seat must own its role, and every line needs write access to its working directory. A lost run blocks its scope until no process is left in its supervisor's group or session, or an operator clears it. Added on 2026-10-31, and the last two sentences in the review of that day. From round 14 they are also offered while the project declares a commit command, and `start_run` takes `commit`, the full commit a commit command runs on in a checkout the daemon makes, which a line that only reads its working directory may start and stop. From the task of 2026-11-05 `start_run` takes `arguments`, a value for each parameter a command declares, each matching its pattern, `run_status` reconciles an open run before it answers and shows a failed latest run's untrusted output tail, and `wake_after` may wait for an open run |
 | `line_status` | Shows a compact read-only status by default, with diagnostic detail and long lists available by argument, as below |
-| `role_status` | Offered only to a seat of a role. Shows the role's worktree, whether the project file or an operator holds it, its declared failover order, failover policy, handoff threshold, owner, the seat a failover would pass it to now and the latest change of owner, its seats in the failover order with whether each is usable for a failover, their condition, worktree access, whether each waits because its engine cannot confine it, model, provider and stated budget, each seat's latest three background task ends with the digest of their output, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27, the task ends on 2026-10-28, the holder and the order on 2026-10-31 in round 10, and whether the project file declares the role, how a role an operator holds differs from it, and the lines that wait beside the owner, in the round 10 review |
+| `role_status` | Offered only to a seat of a role. Shows the role's worktree, whether the project file or an operator holds it, its declared failover order, failover policy, handoff threshold, owner, the seat a failover would pass it to now and the latest change of owner, its seats in the failover order with whether each is usable for a failover, their condition, worktree access, whether each waits because its engine cannot confine it, model, provider and stated budget, each seat's latest three background task ends with the digest of their output, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27, the task ends on 2026-10-28, the holder and the order on 2026-10-31 in round 10, and whether the project file declares the role, how a role an operator holds differs from it, and the lines that wait beside the owner, in the round 10 review. **Round 15, item 5.** It also gives `reviews`, the roles this role reviews, `reviewed_by`, the roles that review it, and `review_diversity`, each pair of a reviewing role and a role it reviews, this role being either, whose owners run the same engine and model, with `reviewer`, `reviewer_owner`, `author`, `author_owner`, `model`, `provider` and `text`, a sentence that says so. A pair either role of which is vacant is left out. Nothing is refused for a pair |
 | `record_role_note` | Offered only to a seat. Records a journal entry of `kind` `note`, by any seat, or `recovery`, by the owner, which the daemon stamps with the role worktree's commit, its own commit and the time. A handoff entry is written only by `relinquish_ownership`. Added on 2026-10-27 |
 | `relinquish_ownership` | Offered only to a seat, and refused unless it owns its role. Records the handoff `note` as a handoff entry and gives the role to the seat `to`, or with no `to` to the seat the handoff that gave it the role named as `back_to`, or else leaves it vacant. A return to a seat that can no longer own the role leaves it vacant and says so. Called inside the owner's own turn, which is how a seat calls it, the request is checked at once and the change is made when that turn ends, with the entry stamped then, and the tool says so. A second call in the same turn is refused. A change that no longer applies when the turn ends is not made, and the operator is told. A successor is awakened and sent a note from the harness, `!dromon`, saying the former owner handed it the role, and the former owner's engine is dropped, so its next turn is built read only. `back_to`, which needs `to`, is the seat the role returns to when the successor next relinquishes without naming one. Added on 2026-10-27 |
 | `take_ownership` | Offered only to a seat that may own its role. Takes the role, with cause `recovery`, only on a ground the harness observes, which is a vacant role, an owner held at a plan limit its engine reported in this daemon run from a shape observed live or typed by the Agent SDK, never from inferred wording, or an owner whose provider budget is recorded as 0 percent with no reset time passed, and never while the owner has a turn in flight. The `reason` of 1 to 4,096 bytes and the ground are recorded as a note entry that the change rests on. Added on 2026-10-27 |
@@ -332,7 +332,9 @@ not know. `disclosure` says whether the project has a disclosure list, `list` be
 can neither pass nor fail without one. It names no path, term, count of terms or line
 number, which the operator has declined to give. `cost_usd` keeps its `estimate`,
 `unknown` when no turn since the release reported a cost and some reported none, and
-gains `unknown_turns`, `unknown_counts_as_usd` and `counting`. **How unknown cost
+gains `unknown_turns`, `unknown_counts_as_usd` and `counting`. **Round 15, item 1,
+required by the operator.** It also gives `estimated_turns` and `whole`, which the
+paragraph on estimated and whole cost below specifies. **How unknown cost
 counts against `max_cost_usd`.** A turn that reported no cost, or ended without a
 report, adds nothing to the estimate, so it counts as `0.0000` toward the limit, and
 the limit holds the line only on the costs reported. A line whose turns report none
@@ -354,6 +356,46 @@ made up for a spend it cannot see. The `flexible` strategy is allowed and shows
 gives one. The client protocol's
 `cost_estimate_usd` stays `null` for an unknown cost, as [`CLIENT.md`](CLIENT.md)
 specifies.
+
+**Round 15, item 1. Estimated and whole cost.** **Required by the operator.**
+
+- **Estimated from tokens.** For an engine that reports tokens and no cost, Dromon
+  estimates a turn's cost from the token counts and a price table in
+  `dromon.prices`, in whole millionths of a dollar per million tokens, rounded up.
+  **Fact, from the adapters.** Of the three engines that report no cost, only Codex
+  reports tokens, so `TOKEN_PRICED_ENGINES` holds Codex alone. Its `input_tokens`
+  include its `cached_input_tokens`, which are priced apart, and its `output_tokens`
+  include its reasoning. An estimated cost counts toward `max_cost_usd` as a reported
+  one does, so a Codex line on a priced model shows `limit_enforced` true and can be
+  held by it. Grok and Cursor Agent report neither, so their lines keep
+  `limit_enforced` false. A turn whose usage lacks either count, or whose model has no
+  price, stays of unknown cost. The engine's own cost is always preferred.
+- **Labelled.** `cost_usd` gives `estimated_turns`, the turns since the release whose
+  cost was estimated, and its `note` then says the cost was estimated from token
+  counts and a price table. The budget line at the head of each turn says the same
+  beside the figure. **Assumption, not verified.** The prices were not read from any
+  provider's price list. They are placeholders of a plausible order, chosen higher
+  where unsure so that an error holds a line early. `PRICES_VERIFIED` is false, and
+  every label says the prices are unverified until an operator replaces them.
+- **The `api` strategy** stays refused on Codex, Grok and Cursor Agent, since an
+  estimate at unverified prices is not a bound on money.
+- **Whole cost.** `line_cost_recorded` is written after every turn and every spend
+  between turns, as [`EVENT_LOG.md`](EVENT_LOG.md) specifies, and the state sums it
+  per line as `line_costs`. A release resets the window that `max_cost_usd` holds
+  and leaves the whole cost alone, and a restart rebuilds it from the log.
+  `cost_usd.whole` in `line_status`, `cost_whole` in each seat of `role_status`, and
+  `cost_whole` in each line of the client's `status` give `usd`, `reported_usd`,
+  `estimated_usd`, each decimal text of whole millionths of a dollar, `turns`,
+  `between_turns`, `unknown_cost`, and `since`, which says that turns before this
+  change were never recorded. `dromon status` prints it in each line's row, such as
+  `$1.250000 in 14 turns in all, $0.040000 of it estimated`.
+- **Rollback.** A daemon older than `line_cost_recorded` refuses a log that holds
+  one, as the rollback table in [`EVENT_LOG.md`](EVENT_LOG.md) records, and the event
+  is written at the first turn. A rollback past this change therefore needs a copy of
+  the log taken before it. A port reads the totals from the events alone.
+- **Failure modes.** A sum is held at 10^15 millionths. A turn whose engine raised
+  before a report is of unknown cost. The window since a release is still held in
+  memory, so a restart resets it, as before, while the whole cost survives.
 
 Set `detail` to true for diagnostic fields, including the resolved `workdir`,
 `engine_session`, kept-session state, process status, event-log status and full context
@@ -437,6 +479,38 @@ given exactly when the line is held.
   mail reaches it, and stays failed across a restart. **Residual.** A note the daemon records for the line without
   waking it clears the state's flag, while the daemon's memory keeps the line failed
   until a restart.
+- **`last_failure`, from the round 15 follow-up.** **Required by the operator on
+  2026-11-05.** A turn could end failed with no reason anywhere, since
+  `line_turn_ended` carried the fact alone. Every failed turn now records a cause in
+  `line_turn_ended.failure`, one of the fixed words below, and where one exists its
+  class in `failure_class`, which is the daemon's own exception type or a result
+  subtype from the fixed table in `dromon.scheduler`. Neither ever carries an
+  engine's text, and a subtype the table does not list is recorded as
+  `engine_reported` with no class. Both views of `line_status`, and each entry of the
+  daemon's `status` `lines`, give `last_failure` as `cause`, `error_class` and
+  `current`, whether the line still stands failed, or `null` when no turn of the line
+  has failed. It is kept after `failed` clears, until a later failure replaces it. A
+  failure logged before the field reads as `unknown` with no class. The daemon log
+  gives one line for each failed turn, `dromond: line ID turn ended as failed, cause
+  CAUSE`, with `, class CLASS` where there is one.
+
+  | Cause | When |
+  |---|---|
+  | `not_started` | A failure before the engine was given the prompt, such as a prompt that could not be composed or an engine that could not be built |
+  | `refused` | A check of the daemon or the driver refused the turn, before or during it, `EngineRefused` and its kinds other than a closed engine |
+  | `engine_error` | The engine raised during the turn |
+  | `engine_closed` | The engine's process or connection ended before the turn's result, `EngineClosed` |
+  | `engine_reported` | The engine reported the turn ended without success |
+  | `limit` | The engine reported a turn, token or budget limit of its own |
+  | `interrupted` | The engine reported an interruption its driver did not ask for, or a failure came while an operator stopped the turn |
+  | `unknown` | None of these, such as a failure in the daemon after the engine reported, or a failure no path named |
+
+  A plan limit holds the line rather than failing it, and a turn an operator stops
+  is cancelled rather than failed, so neither records a cause. **Inference.** The
+  subtype table is taken from each engine's documented types and the adapters' code,
+  and only `error_during_execution` has been seen in a live failure here.
+  **Porting hazard.** The class names a Python type, which a port may not have, so
+  the cause, and not the class, is the word to rely on.
 - **The cost.** **Decided by the operator on review r13, C1.** The state keeps each
   line's unread mail and its open questions to an operator as indexes, updated as
   events apply and rebuilt by replay, so a line's `condition`, its `unread` and its
@@ -498,8 +572,19 @@ gives `events_per_hour` and `bytes_per_hour`, each rounded to a whole number sin
 client protocol carries no floats, once the daemon has had the log for 60 seconds, and
 `null` before. A size that cannot be read is `null`, never zero, and so
 is any growth derived from it. `compaction` is `none`, since nothing compacts the log
-yet, so it only grows. The daemon's `status` carries the same fields in its
-`event_log`, as [`CLIENT.md`](CLIENT.md) specifies.
+yet, so it only grows. **Round 15, item 4.** `start` says how this daemon rebuilt
+its state when it opened the log, with `snapshot`, `used`, `ignored` or `off`,
+`snapshot_seq`, the snapshot used or last written or `null`, `reason`, why a snapshot
+was ignored or `null`, `replayed`, the events applied at the open, `open_milliseconds`,
+and `write_failure`, why the latest snapshot this daemon tried to write was not
+written or `null`, as the bounded start of [`EVENT_LOG.md`](EVENT_LOG.md) describes.
+**Review of `49236ad`, item 1.** `verified` is `none`, `pending`, `passed` or
+`failed`, for the full replay that checks a state restored from a snapshot, and
+`mismatch`, `mismatch_class` and `restart_required` say why it failed and that every
+line is held until a restart. **Re-review of `2cede6e`.** While it is `pending`, no
+line starts a turn, and mail waits for the check to end.
+The daemon's `status` carries the same fields in its `event_log`, as
+[`CLIENT.md`](CLIENT.md) specifies.
 
 **Row 8 of the T3 Code review, 2026-10-27.** `cost_usd` keeps an unknown cost apart
 from zero. It holds `estimate`, the sum of the costs turns reported as a decimal string,
@@ -629,6 +714,17 @@ is read.
   and not as code, unlike `stale`, and a move that touched only documents is warned of
   too. **Coverage gap.** The tests call the notice directly and do not compose a whole
   prompt.
+- **The daemon's warning, from round 15, item 3.** **Required by the operator.** The
+  daemon's `WARNING` is given in full the first time a line's turn sees the pair
+  differ, and again whenever the loaded commit or the checkout's commit changes.
+  While the pair stays as told, the turn names both commits and adds only `They
+  still differ, as told before.` A pair that agrees resets it, so a later difference
+  is told in full. Each line is told for itself. **Failure modes.** What was told is
+  held in memory, so a restart tells it in full again, which a restart that loads a
+  new commit would do in any case. A turn whose prompt was composed but never
+  reached its engine still counts as told, so the next turn may see only the short
+  form. The brief's pair keeps its full warning at every turn, since the stale brief
+  lead above covers a new session and the pair is one sentence.
 - **`cite`.** One sentence naming both full commits, such as `line core read its
   worktree at commit C, under the daemon at commit D.`, with the commit the daemon's
   own checkout has moved to when it is stale, and a clause saying that the daemon's code
@@ -1077,6 +1173,40 @@ during that turn.
     client still sends no `asks_reply`, so its notes take the default. Messages already in a log keep their old fields, so an old reply
     that asked nothing leaves the count at once, which shrinks it and hides nothing
     that asked a reply.
+- **Unanswered, from round 15, item 2.** **Required by the operator.**
+  - **What never counts.** A wake note, which the line sends itself, a harness
+    notice, which includes every role notice since the harness `!dromon` sends them,
+    and a note that asks nothing. The first two held before, and are now tested
+    together.
+  - **The thread rule.** A thread is the chain of `reply_to`. A message that names
+    none starts its own, and a reply or a correction joins its parent's. An operator's
+    note to a line leaves the count once the line replies to a later note of the same
+    operator in the same thread. `list_sent` and `dromon sent` show it as `answered in
+    thread`, and the state records the line's reply that closed it. A reply must go
+    back to the sender it names and a correction come from it, so a thread joins two
+    parties only, and another operator's note can never answer the first one's.
+  - **What it does not close.** Two task notes that each start a thread stay apart,
+    so replying to the second leaves the first counted. A reply to an earlier note
+    leaves a later one counted. A line's notes to another line are not covered, since
+    the requirement names an operator's notes. **Inference.** The unanswered mail in a
+    long-running line is mostly task notes that each started a thread and were
+    answered by a report naming a later one, which this rule does not close. Those
+    still need a reply or `acknowledge_mail`.
+  - **`line_status` lists them.** The compact answer and the detailed one give
+    `unanswered_mail`, the oldest unanswered messages, at most 8, each with
+    `message_id`, `sender`, `kind`, `waited`, as `list_mail` words an age, or `null`
+    when unknown, and `reason`, and `unanswered_omitted`, how many more there are.
+    `list_mail` with `unanswered_only` pages through them all. The reason is fixed
+    text that says why the message asks a reply and how it may close, such as `a
+    note that starts a thread, which asks a reply by default. Reply to it, or to a
+    later note of its sender in its thread, or acknowledge it.` No part of a body
+    reaches it.
+  - **Porting note and rollback.** No event changes. Each message's thread and the
+    reply that closed a note in its thread are derived as events apply, kept in the
+    state with an index, `open_thread_notes`, of each operator's open notes to a
+    line by line, operator and thread, so a reply finds the earlier notes without
+    scanning every message. A daemon rolled back to code before this change reads
+    the same log and counts those notes as unanswered again, which hides nothing.
 - **Own notes.** **Required by the operator on 2026-10-30, the rule decided by core
   for review.** A note from the line to itself, such as a fired wake, a task-end note
   or a compaction request, is never counted in `unread`, and is counted in
@@ -1423,9 +1553,41 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
   in which case the brief is repeated, which costs only its length. A compaction the
   engine makes by itself during a turn is told at the next turn, one turn late.
 - **What it says.** The lead gives the time the brief was set and the worktree's
-  commit then, says that it is the line's own earlier text and may be stale, and
+  commit then, says that it is the line's own earlier text, and
   delimits the brief between `BEGIN STANDING BRIEF DATA` and `END STANDING BRIEF DATA`
   as JSON.
+- **A stale brief, from round 15, item 3.** **Required by the operator.** A line
+  resumed a task from a brief whose branch had since been merged and moved on, since
+  the lead presented the brief first and its staleness only as a possibility. The lead
+  now reads the worktree's `HEAD` as it is composed and opens in one of three ways.
+  - **Stale.** The brief names a commit and the worktree is at another. The lead opens
+    with `STALE BRIEF.`, names both commits and the time the brief was set, says that
+    the brief describes an earlier state and is not the line's current task, gives the
+    `git log --oneline` range to read, and asks for a new brief. It never calls the
+    brief current.
+  - **Not comparable.** The brief names no commit, or the worktree's `HEAD` cannot be
+    read. The lead says the daemon could not compare them and asks the line to treat
+    the brief as possibly stale.
+  - **Current.** The brief names the worktree's commit. The lead says so, and that
+    mail may have changed the task since, which the sentence on mail below makes
+    specific.
+  - **Residual.** The lead reads only the commit, since composing a prompt runs no
+    git. A commit made and then undone back to the brief's commit reads as current.
+  - **On every turn, with the uncommitted state.** **Review of `49236ad`, item 4,
+    required by the operator.** `set_brief` records `workdir_dirty`, the digest of the
+    worktree's `git status` entries, read off the event loop. Each turn of a kept
+    session reads the same digest and `HEAD` before its engine runs, and while either
+    differs from the brief's it opens with a `STALE BRIEF.` notice that names the
+    commit move, the changed uncommitted state with the count of dirty paths, or both,
+    until the line sets the brief again. A turn whose lead already says the commit
+    moved is told only of the uncommitted state. A line with a fresh session each turn
+    is never led with its brief and is not told. A side that cannot be read is not
+    compared, and a brief recorded before the field compares the commit alone.
+  - **Decided by core, for review.** The digest covers which paths are dirty and how,
+    not their contents, so edits inside a file already dirty do not flag the brief,
+    while a new dirty path, a path made clean, or discarded work does. A line's own
+    new file flags its brief until it sets the brief again, which is the intended
+    prompt to keep the brief current.
 - **Mail since the brief.** **Required by the operator on 2026-10-30.** The review
   line's brief was stale after a compaction, since its task had changed in mail since
   the brief was set. When an operator has mailed the line since its latest
@@ -2511,6 +2673,30 @@ configurations [`CODEX.md`](CODEX.md), [`GROK.md`](GROK.md), [`PI.md`](PI.md) or
 configured. Pi lines take no built-in tool. Cursor and Antigravity lines are refused
 whatever their configuration, as [`CURSOR.md`](CURSOR.md) and
 [`ANTIGRAVITY.md`](ANTIGRAVITY.md) record.
+
+## Timestamps
+
+**Round 15, item 6.** Every time a record accepts, and every time Dromon shows a caller,
+has one form, `YYYY-MM-DDTHH:MM:SSZ`, such as `2026-11-05T03:00:00Z`. It is
+Coordinated Universal Time in whole seconds with a capital `Z`. A caller sees it in
+the `resets_at` of `dromon budget set --resets-at` and of a stated budget, and in
+`line_status`, `role_status`, `list_leases`, `wake_after` and `run_status`, which show
+due times, expiries and the times a statement was made.
+
+- **Refused.** Fractional seconds such as `2026-11-05T03:00:00.5Z`, an offset such as
+  `+00:00` in place of `Z`, a lowercase `z`, a space in place of `T`, and a calendar
+  date that does not exist, such as `2026-02-30T00:00:00Z`. The error names the field
+  and the form, as `resets_at is not a valid time of the form YYYY-MM-DDTHH:MM:SSZ`,
+  and the statement records nothing.
+- **Rationale.** One fixed form compares the same way as text and as an instant in every
+  port, and needs no time zone database. A looser parser would accept values that a
+  Rust or Keleusma port might read differently.
+- **A reset time an engine reports** in another form is dropped and left unknown, not
+  guessed at, because it is not a caller's input to correct.
+- **The log's own `recorded_at`** keeps the form the daemon's clock writes, which may
+  carry fractional seconds and an offset. No record accepts it as one of these times,
+  and the daemon converts it to this form, truncating to the second, before a caller
+  sees it.
 
 ## Storage
 

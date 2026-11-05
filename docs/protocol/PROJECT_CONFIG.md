@@ -143,6 +143,7 @@ relay = "tail"          # the route of operator ana's mail
 | `roles.ID.handoff_seconds` | integer in [60, 86400] | 3600 | How long a planned ownership handoff may take |
 | `roles.ID.failover` | `automatic` or `ask` | `automatic` | Whether the harness passes the role to the next usable seat itself when its owner cannot act, or leaves the change to an operator, as [`ROLES.md`](../architecture/ROLES.md) specifies |
 | `roles.ID.handoff_below_percent` | integer in [0, 100] | 10 | The stated budget of the owner's provider below which the owner is asked to prepare a handoff. 0 never asks |
+| `roles.ID.reviews` | list of at most 16 role identifiers | empty | The roles whose work this role reviews, distinct and never the role itself. Each must be a role this file declares or one the log holds, which is checked when the file's roles are planned, so a file naming any other is refused whole at a start or a reload. It refuses no review. `role_status` and the reviewing owner's turns say when the two owners run the same engine and model, as [`ROLES.md`](../architecture/ROLES.md) gives. Added in round 15, item 5 |
 | `lines.ID.session` | text | none | An existing engine session the line adopts when the daemon creates it, checked as `line_session` is in [`EVENT_LOG.md`](EVENT_LOG.md). Ignored for a line that exists |
 | `teacher` | table | none | The project's local teacher model, as [`TEACHER.md`](TEACHER.md) specifies |
 | `agents` | table | off | Which external agents may connect, and with what access, as [`AGENTS.md`](AGENTS.md) specifies |

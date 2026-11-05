@@ -590,3 +590,31 @@ returns the contested identifier is refused before prompting. Tests cover both
 paths. A disallowed dynamic tool completion without a matching denied request
 interrupts the turn, including when only the turn completion arrives. Notifications
 alone do not establish that execution required Dromon's response.
+
+## Round 15 transport-aware disabling
+
+**Fact.** Dromon retains each listing entry's name and whether its transport is
+usable. A reported `stdio` transport requires a nonempty command, and a reported
+`streamable_http` transport requires a nonempty URL. Unknown or malformed transports
+are refused with the entry index and field, without echoing transport values.
+A missing or null transport receives the inert disabled table with
+`command="/usr/bin/false"` and empty arguments. Existing transports receive only
+`enabled=false`. Conflicting duplicate names are refused. Transport addresses and
+credentials are not retained by the listing parser.
+
+**Inference.** This preserves URL transports while giving transport-less listing
+entries a syntactically complete disabled configuration. Parsed TOML tests cover
+both cases, malformed listings and conflicting duplicates. These tests model table
+merging and do not establish actual engine configuration merging. Post-start zero
+server-tool checks remain necessary. No live launch was performed in the sandbox.
+Official OpenAI documentation could not be fetched because its host did not resolve.
+
+
+## No prompt startup check
+
+Fact. `dromon check-engines` and restart preflight reuse the turn startup path,
+including server listing, generated launch arguments, initialization, account
+reading and fresh thread isolation checks. The connection closes before
+`turn/start`. The check therefore catches launch and configuration merge failures
+without a model query. It can create an unused thread record. It does not establish
+that post-prompt model behavior or resumed session recovery will succeed.

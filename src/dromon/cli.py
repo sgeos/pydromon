@@ -73,6 +73,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "create": "create a session line",
     "configure": "replace a session line's tools, MCP servers and tool policy",
     "stop": "stop the daemon",
+    "check-engines": "check configured engine startups without a model turn",
+    "grok-home": "preview or replace the generated Grok home files",
     "restart": "stop the daemon and start it again from the installed code",
     "status": "show the daemon and its session lines",
     "attach": "open an interactive client attached to one line",
@@ -164,6 +166,9 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             f" open questions {counts.get('open_questions')}"
         )
         print(_log_growth(counts))
+        restore = _restore_row(counts.get("start"))
+        if restore is not None:
+            print(restore)
     watch = result.get("scheduler")
     if isinstance(watch, dict):
         row = _scheduler_row(cast(Mapping[str, object], watch))
@@ -231,6 +236,24 @@ def _correlation_row(totals: Mapping[str, object]) -> str:
     )
 
 
+def _restore_row(start: object) -> str | None:
+    """The line of ``dromon status`` when a full replay did not confirm the state
+    the daemon restored from a snapshot, or ``None``. **Review of 49236ad, item
+    1.**"""
+    if not isinstance(start, dict):
+        return None
+    report = cast(Mapping[str, object], start)
+    if report.get("restart_required") is not True:
+        return None
+    kind = report.get("mismatch_class")
+    return (
+        f"RESTART REQUIRED. The snapshot at event {report.get('snapshot_seq')} was not"
+        f" confirmed by a full replay, mismatch {report.get('mismatch')}"
+        + (f", class {kind}" if isinstance(kind, str) else "")
+        + ". Every line is held until the daemon restarts."
+    )
+
+
 def _scheduler_row(watch: Mapping[str, object]) -> str | None:
     """The line of ``dromon status`` for a fault the scheduler's watch keeps, or
     ``None`` while there is none."""
@@ -285,6 +308,16 @@ def _line_row(line: Mapping[str, object]) -> str:
         parts.append("not in the project file")
     if line.get("held_by") is not None and line.get("condition") != "held":
         parts.append(f"held by {line.get('held_by')}")
+    whole = line.get("cost_whole")
+    if isinstance(whole, dict):
+        # Round 15, item 1. A daemon from before round 15 gives no whole cost.
+        cost = cast(Mapping[str, object], whole)
+        text = f"${cost.get('usd')} in {cost.get('turns')} turns in all"
+        if cost.get("estimated_usd") not in (None, "0.000000"):
+            text += f", ${cost.get('estimated_usd')} of it estimated"
+        if cost.get("unknown_cost") not in (None, 0):
+            text += f", {cost.get('unknown_cost')} of unknown cost"
+        parts.append(text)
     return ", ".join(parts)
 
 
@@ -348,7 +381,7 @@ def _preflight_argv(
     successor's own command, on the daemon's interpreter where the daemon names it
     and else on the one this client runs on, with the running daemon's options, and
     ``--check``, so the installed code runs its start checks against the project
-    file and a copy of the event log, and starts nothing."""
+    file and a copy of the event log, and checks engine startup without prompts."""
     return [
         interpreter or sys.executable,
         "-m",
@@ -359,7 +392,48 @@ def _preflight_argv(
         str(paths.runtime_dir),
         *options,
         "--check",
+        "--check-engines",
     ]
+
+
+def _check_engines(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    del arguments
+    # Run installed daemon code in a separate process outside engine sandboxes.
+    problem = _preflight(
+        _preflight_argv(paths, []), paths.runtime_dir, show_output=True
+    )
+    if problem is not None:
+        print(f"dromon check-engines: {problem}", file=sys.stderr)
+        return exits.FAILURE
+    print("dromon check-engines: all configured lines passed")
+    return exits.OK
+
+
+def _grok_home(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    del paths
+    home = Path.home() / grok.HOME_DIR
+    try:
+        changes = grok.home_changes(home)
+        if not changes:
+            print("Grok home already matches the generated files")
+            return exits.OK
+        print(grok.home_diff(changes), end="")
+        if not arguments.apply:
+            return exits.OK
+        if (
+            not arguments.yes
+            and input("Replace these files and keep backups? [y/N] ").strip().lower()
+            != "y"
+        ):
+            print("Grok home was not changed")
+            return exits.OK
+        for backup in grok.replace_home(home, changes):
+            print(f"Backup {backup}")
+        print("Grok home generated files replaced")
+        return exits.OK
+    except (EngineRefused, OSError, EOFError) as error:
+        print(f"dromon grok-home: {error}", file=sys.stderr)
+        return exits.FAILURE
 
 
 def _options_of(status: Mapping[str, object]) -> list[str]:
@@ -422,6 +496,8 @@ def _preflight(
     argv: Sequence[str],
     runtime_dir: Path | None = None,
     environment: Mapping[str, str] | None = None,
+    *,
+    show_output: bool = False,
 ) -> str | None:
     """Why the installed daemon would not start, or ``None``. A restart whose
     successor refuses to start leaves no daemon running, so this is checked before
@@ -446,6 +522,9 @@ def _preflight(
         return str(error)
     except OSError as error:
         return str(error)
+    if show_output:
+        print(done.stdout or "", end="")
+        print(done.stderr or "", end="", file=sys.stderr)
     if done.returncode == 0:
         return None
     lines = (done.stderr or done.stdout).strip().splitlines()
@@ -2167,6 +2246,7 @@ ROLE_TERMS: Final = (
     "handoff_seconds",
     "failover",
     "handoff_below_percent",
+    "reviews",
 )
 """Each term option of ``dromon role create`` and ``update``, whose attribute is
 also its argument of ``role_create`` and ``role_update``."""
@@ -2202,7 +2282,7 @@ def _role_change(
         value: object = getattr(arguments, key)
         if value is None:
             continue
-        if key == "seats":
+        if key in ("seats", "reviews"):
             value = [
                 part.strip() for part in cast(str, value).split(",") if part.strip()
             ]
@@ -2283,6 +2363,12 @@ def _print_role(role: Mapping[str, object]) -> None:
             f"  line {line_id} waits, since it could write the worktree and is not a"
             " seat"
         )
+    # Round 15, item 5. Read with get, since an older daemon sends neither.
+    reviews = cast(list[str], role.get("reviews", []))
+    if reviews:
+        print(f"  reviews {', '.join(reviews)}")
+    for pair in cast(list[Mapping[str, object]], role.get("review_diversity", [])):
+        print(f"  {pair['text']}")
 
 
 def _seat_budget_mark(budget: object) -> str:
@@ -2972,6 +3058,8 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "status": _status,
     "stop": _stop,
     "restart": _restart,
+    "check-engines": _check_engines,
+    "grok-home": _grok_home,
     "probe": _probe,
     "create": _create,
     "configure": _configure,
@@ -3286,6 +3374,17 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     for name, help_text in SUBCOMMANDS.items():
         command = commands.add_parser(name, help=help_text, description=help_text)
+        if name == "grok-home":
+            command.add_argument(
+                "--apply",
+                action="store_true",
+                help="replace after preview and confirmation",
+            )
+            command.add_argument(
+                "--yes",
+                action="store_true",
+                help="confirm replacement without an interactive question",
+            )
         if name == "fleet":
             _add_fleet_commands(command)
         if name == "rebind":
@@ -3560,6 +3659,14 @@ def build_parser() -> argparse.ArgumentParser:
                 help="for create and update, the seats in failover order, separated"
                 " by commas, each a line that exists. For update it replaces the"
                 " seats, so it adds, removes and reorders them",
+            )
+            command.add_argument(
+                "--reviews",
+                help="for create and update, the roles whose work this role reviews,"
+                " separated by commas, each a role that exists. For update it"
+                " replaces the list, and an empty value clears it. Nothing is"
+                " refused for it, and role_status says when a reviewer's owner runs"
+                " the same engine and model as an author's",
             )
             command.add_argument(
                 "--no-own",

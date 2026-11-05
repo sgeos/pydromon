@@ -90,10 +90,12 @@ from decimal import Decimal
 import hashlib
 import importlib.metadata
 import json
+import logging
 import math
 import os
 import re
 import sys
+import subprocess
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
@@ -140,7 +142,11 @@ from claude_agent_sdk import (
 
 from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk._internal.transport import Transport
-from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+from claude_agent_sdk._internal.transport.subprocess_cli import (
+    MINIMUM_CLAUDE_CODE_VERSION,
+    VERBATIM_PROMPTS_MINIMUM_CLAUDE_CODE_VERSION,
+    SubprocessCLITransport,
+)
 from claude_agent_sdk.types import SystemPromptPreset
 
 from dromon import evidence, gitssh, launcher, redact
@@ -299,6 +305,13 @@ NON_SUBSCRIPTION_ENVIRONMENT: Final = API_ENVIRONMENT + PROVIDER_ENVIRONMENT
 
 class EngineRefused(Exception):
     """The credential policy or the driver refused to run the turn."""
+
+
+class EngineClosed(EngineRefused):
+    """The engine's process or connection ended before the turn's result. **Round 15
+    follow-up of 2026-11-05.** A type of its own, so the scheduler records the cause
+    ``engine_closed`` from the type and never from the message. It stays an
+    ``EngineRefused``, so every handler that caught the plain refusal still does."""
 
 
 class ConfinementBreach(EngineRefused):
@@ -532,6 +545,8 @@ class _SdkClient:
         recording = evidence.RECORDING.get()
         if transport is None and recording is not None:
             options, transport = _recorded(options, recording)
+        if transport is None:
+            transport = _subprocess_transport(options)
         self._client = ClaudeSDKClient(options=options, transport=transport)
 
     async def __aenter__(self) -> "_SdkClient":
@@ -710,14 +725,73 @@ def _recorded(
             recording.stderr((line + "\n").encode())
 
         options = replace(options, stderr=keep)
+    return options, RecordedTransport(_subprocess_transport(options), recording)
+
+
+class _SubprocessTransport(SubprocessCLITransport):
+    """Keep the SDK transport but give its version child one synchronous reaper.
+
+    SDK 0.2.174 unconditionally terminates its asynchronous version child after
+    reading output. On macOS that can race the asyncio child watcher through
+    Popen.poll and replace a successful status with 255. This optional advisory
+    probe runs in a worker thread with subprocess.run owning termination and wait.
+    The engine process and its protocol still use the SDK unchanged. Porting
+    hazard follows the SDK private version method and its two version constants.
+    """
+
+    async def _check_claude_version(self) -> None:
+        cli = self._cli_path
+        if cli is None:
+            raise EngineRefused("the SDK has not resolved its CLI path")
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [cli, "-v"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            # Match the SDK's advisory policy. The actual handshake still fails
+            # closed on a command that cannot start or initialize.
+            return
+        match = re.match(r"([0-9]+\.[0-9]+\.[0-9]+)", result.stdout.strip())
+        if match is None:
+            return
+        version = match.group(1)
+        parts = tuple(int(part) for part in version.split("."))
+        logger = logging.getLogger(__name__)
+        minimum = tuple(int(part) for part in MINIMUM_CLAUDE_CODE_VERSION.split("."))
+        if parts < minimum:
+            logger.warning(
+                "Claude Code version %s at %s is unsupported in the Agent SDK. "
+                "Minimum required version is %s.",
+                version,
+                cli,
+                MINIMUM_CLAUDE_CODE_VERSION,
+            )
+        verbatim = tuple(
+            int(part)
+            for part in VERBATIM_PROMPTS_MINIMUM_CLAUDE_CODE_VERSION.split(".")
+        )
+        if self._options.verbatim_prompts and parts < verbatim:
+            logger.warning(
+                "verbatim_prompts requires Claude Code %s or later. "
+                "Version %s ignores it.",
+                VERBATIM_PROMPTS_MINIMUM_CLAUDE_CODE_VERSION,
+                version,
+            )
+
+
+def _subprocess_transport(options: ClaudeAgentOptions) -> Transport:
+    # Explicit transports do not receive the SDK's automatic permission channel.
     transported = (
         replace(options, permission_prompt_tool_name="stdio")
         if options.can_use_tool is not None
         else options
     )
-    return options, RecordedTransport(
-        SubprocessCLITransport(prompt=_no_prompt(), options=transported), recording
-    )
+    return _SubprocessTransport(prompt=_no_prompt(), options=transported)
 
 
 def _sdk_session(
@@ -2424,6 +2498,27 @@ class ClaudeCodeLine:
             return preset
         return appended or None
 
+    async def check_start(self) -> None:
+        """Connect and complete SDK initialization without sending a query.
+
+        The later system/init message requires a prompt and is deliberately not
+        awaited here. This checks launch and control initialization only.
+        """
+        check_environment(self._environment, self.driver.settings.strategy)
+        options = self.options()
+        diagnostics = evidence.STARTUP_STDERR.get()
+        if diagnostics is not None:
+
+            def stderr(line: str) -> None:
+                diagnostics.append((line + "\n").encode())
+
+            options = replace(options, stderr=stderr)
+        factory = (
+            self._kept_factory if self.config.keep_session else self._session_factory
+        )
+        async with AsyncExitStack() as stack:
+            await self._enter(stack, factory, options)
+
     async def run_turn(self, prompt: str) -> TurnReport:
         """Run one turn for ``prompt`` and return what happened. A check that
         refuses the turn also closes a kept connection, whose engine may already have
@@ -2621,7 +2716,7 @@ class ClaudeCodeLine:
         """The turn's report, with ``cost`` the turn's own, which ``_measure`` took
         from the engine's running total."""
         if result is None:
-            raise EngineRefused("the engine ended the turn without a result")
+            raise EngineClosed("the engine ended the turn without a result")
         self.session_id = result.session_id
         return TurnReport(
             subtype=result.subtype,
@@ -3219,7 +3314,7 @@ class ClaudeCodeLine:
         if error is None:
             try:
                 if result is None:
-                    raise EngineRefused(
+                    raise EngineClosed(
                         "the engine ended its self-started turn without a result"
                     )
                 self._refuse_missing_sign_in(result.result, turn)

@@ -24,3 +24,7 @@ Type: Changed
   `disclosure budget` rule before it is screened or written. The tests now pin that the
   run parameter matcher kills its child at the default deadline of 2 seconds and when
   a start is cancelled.
+- Merge of main at `b41fc7f`. `STATE_VERSION` is 3, since this branch's disclosure
+  passes and bytes and its run tails change the codec's types and the state the pinned
+  history replays to, so a snapshot of version 2 is not restored and the log is
+  replayed instead.
