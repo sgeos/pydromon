@@ -1369,18 +1369,24 @@ def test_a_refusal_during_a_check_withholds_its_answer(
     """Round 15 review, D3. A tool's refusal on the loop may spend the last failure
     while a check reads, so the budget is read again before the check is recorded,
     and the check is then refused and records nothing."""
+    import threading
+
     from dromon import disclosurecheck
 
     listed(world, tmp_path)
     for _ in range(MAX_DISCLOSURE_CHECKS - 1):
         assert world.scheduler.check_disclosure("alpha", "codename", None).matched
     planned: list[int] = []
+    started = threading.Event()
+    release = threading.Event()
     real_count = disclosurecheck.count
 
     def count(
         plan: disclosurecheck.CheckPlan, ceiling: int, window: int
     ) -> disclosurecheck.CheckResult:
         planned.append(len(checks(world)))
+        started.set()
+        assert release.wait(10), "the refusal was never made"
         return real_count(plan, ceiling, window)
 
     monkeypatch.setattr(disclosurecheck, "count", count)
@@ -1389,9 +1395,12 @@ def test_a_refusal_during_a_check_withholds_its_answer(
         check = asyncio.create_task(
             world.scheduler.check_disclosure_off_loop("alpha", "clean", None)
         )
-        # The task plans and hands its read to the worker at its first await.
-        await asyncio.sleep(0)
+        # The worker is held in its read until the refusal is made. A yield to the
+        # loop alone had let the check finish first on a fast worker, about once in
+        # twenty runs on Python 3.15, so the refusal came too late to be tested.
+        assert await asyncio.to_thread(started.wait, 10)
         assert world.scheduler.refuse_disclosed("alpha", ("body", "codename"))
+        release.set()
         try:
             await check
         except LineToolRefused as error:

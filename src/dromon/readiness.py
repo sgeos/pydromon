@@ -42,10 +42,11 @@ class ReadFailure(StrEnum):
     and may carry anything.
 
     ``TIMED_OUT``, git ran past ``GIT_STATUS_SECONDS``. ``NOT_STARTED``, git could not
-    be started. ``FAILED``, git exited with an error, as outside a repository.
-    ``MALFORMED``, git's output was not in the porcelain form. ``NOT_TEXT``, git's
-    output could not be decoded. ``NO_WORKDIR``, the line's working directory is not
-    known or not allowed, so git was not run."""
+    be started, or its start stalled past ``spawn.START_SECONDS``, since
+    ``spawn.StartStalled`` is an ``OSError``. ``FAILED``, git exited with an error, as
+    outside a repository. ``MALFORMED``, git's output was not in the porcelain form.
+    ``NOT_TEXT``, git's output could not be decoded. ``NO_WORKDIR``, the line's working
+    directory is not known or not allowed, so git was not run."""
 
     TIMED_OUT = "timed_out"
     NOT_STARTED = "not_started"

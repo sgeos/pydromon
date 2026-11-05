@@ -20,7 +20,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import readiness
+from dromon import readiness, spawn
 from dromon.driver import Strategy
 from dromon.engine import TurnReport
 from dromon.eventlog import EventLog
@@ -105,6 +105,7 @@ def test_a_directory_git_cannot_read_has_no_digest(tmp_path: Path) -> None:
     [
         (subprocess.TimeoutExpired("git", 1.0), readiness.ReadFailure.TIMED_OUT),
         (FileNotFoundError("git"), readiness.ReadFailure.NOT_STARTED),
+        (spawn.StartStalled("git did not start"), readiness.ReadFailure.NOT_STARTED),
         (
             UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
             readiness.ReadFailure.NOT_TEXT,
@@ -117,15 +118,21 @@ def test_each_failed_read_gives_its_fixed_word(
     error: Exception,
     cause: readiness.ReadFailure,
 ) -> None:
+    """Git is started through ``dromon.spawn``, so the failure is raised there. A
+    start that stalls is a start that failed, since ``StartStalled`` is an
+    ``OSError``."""
     worktree = repository(tmp_path / "w")
+    calls: list[object] = []
 
     def run(*arguments: object, **options: object) -> object:
-        del arguments, options
+        calls.append(arguments)
+        del options
         raise error
 
-    monkeypatch.setattr(readiness.subprocess, "run", run)
+    monkeypatch.setattr(spawn, "run", run)
     with pytest.raises(readiness.ReadinessUnknown) as raised:
         readiness.dirty_digest(worktree)
+    assert len(calls) == 1, "git status did not go through dromon.spawn"
     assert raised.value.cause is cause
     # The word is apart from the message, and the message never supplies it.
     assert cause.value not in str(raised.value)
