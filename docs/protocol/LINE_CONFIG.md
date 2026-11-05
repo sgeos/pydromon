@@ -135,6 +135,33 @@ they are, not what they contain. `test_a_complete_container_may_still_carry_arbi
 pins this, so a later change that refuses such files is deliberate. **Review of d00da44,
 I1.**
 
+**Round 15, item 6. Re-encoding or stripping the image was not done, and why.** The
+task asked to re-encode a viewed image's pixels, or to strip every non-pixel chunk,
+before it reaches the engine, if that needs no new dependency. **Fact, from the code.**
+Dromon does not hand the engine any bytes. `image_refusal` reads the file once to check
+it and returns only a refusal or `None`. The engine then opens the path itself, Claude
+Code's `Read`, Codex's `imageView` item and Grok's `read_file`. To sanitise, Dromon
+would have to make the engine open another file. **Codex and Grok.** Dromon sees the
+path in a notice after the engine chose it and can refuse it, not replace it, so no
+substitution is possible there. **Claude Code.** A `PreToolUse` hook could in principle
+return a replacement for `file_path`. **Hypothesis, not verified.** That the hook's
+output can rewrite the tool input in this SDK version, and that the engine would then
+read a copy placed where its confinement allows, which is the working directory, a new
+place for Dromon to write into a line's tree. Nothing in the code uses it. **So** a
+sanitiser could cover one of three engines on an unverified mechanism, which would read
+as a guarantee it is not. **What each technique would remove.** Stripping the non-pixel
+chunks, which the container walkers of `dromon.imageformat` could do with the standard
+library alone, removes png `tEXt`, `zTXt`, `iTXt` and other ancillary chunks, jpeg
+`APPn` and comment segments, gif comment and application extensions and webp
+metadata. It does not touch bytes inside the compressed or entropy-coded pixel data.
+Only a decode and re-encode would, and with the standard library alone that is
+possible for png at most, by `zlib`, filter reversal and handling of interlace,
+palette and bit depth, and not for jpeg or webp, which need a codec. **Left for a
+decision.** Whether to restrict `ViewImage` to png and add a png re-encoder, and
+whether to verify the Claude Code hook rewrite live. Neither stands alone, so neither
+was started. The pinned test `test_a_complete_container_may_still_carry_arbitrary_bytes`
+still holds, and nothing in the behaviour changed.
+
 [`ENGINES.md`](ENGINES.md) gives the rationale, the limits that only an engine holds,
 and the steps the operator runs before relying on it.
 
@@ -235,7 +262,7 @@ argument outside a tool's schema is refused.
 | `propose_change` | Records a proposed patch, file list and message for operator review; it does not change project files |
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
 | `write_scratch` | Writes a file under the line's scratch in its working directory, `tmp/` or `tmp/lines/LINE`, as below. Its result gives the absolute path written and the bytes written |
-| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term, a file name or a line location. Files are checked independently, so a match cannot span files. A file is read in parts of at most 1 MiB cut after a newline and the counts are summed, a line may not exceed 1 MiB, and the combined content is at most 16 MiB. A path may be the absolute path `write_scratch` reported. One call, including a list, is one recorded check. In any 3,600 seconds a line has 10 failing checks, which bound the terms it can confirm, 60 passing checks, which bound the candidate texts it can try, and 64 MiB read by its checks in all, which bounds the candidate bytes it can test and the daemon's time spent matching for it, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies since the round 15 review. Once either count is spent every check is refused, content past the bytes left is refused unread, and the answer says what is left of each. The check reads on a worker thread, off the daemon's event loop, and one runs at a time for each line. Added on 2026-10-28 |
+| `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term, a file name or a line location. Files are checked independently, so a match cannot span files. A file is read in parts of at most 1 MiB cut after a newline and the counts are summed, a line may not exceed 1 MiB, and the combined content is at most 16 MiB. A path may be the absolute path `write_scratch` reported. One call, including a list, is one recorded check. In any 3,600 seconds a line has 10 failing checks, which bound the terms it can confirm, 60 passing checks, which bound the candidate texts it can try, and 64 MiB read by its checks in all, which bounds the candidate bytes it can test and the daemon's time spent matching for it, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies since the round 15 review. Once either count is spent every check is refused, content past the bytes left is refused unread, and the answer says what is left of each. The check reads on a worker thread, off the daemon's event loop, and one runs at a time for each line. A file check whose files' bytes all already passed, as a checked text, as a checked file of the same path or as written by `write_scratch`, is answered as a pass from memory and spends nothing of any budget, even once a budget is spent, since it tells the line nothing it did not learn when the bytes passed. A file the daemon wrote without screening, as `scratch_place` writes an operator's CI log, is never remembered as passed. Once a budget is spent, a file is read for that comparison only when its size equals that of a remembered pass, and is never matched. Added on 2026-10-28, changed in round 15 |
 | `list_processes`, `stop_process` | List and stop the processes the line started, as below. Where the daemon cannot attribute processes to the line, `list_processes` says it is unavailable and why, and never returns an empty list. Changed in round 14 |
 | `worktree_status` | Gives the state of the line's own working directory, computed by the daemon outside the line's sandbox, as the processes section below specifies. Added in round 14, item 7 |
 
@@ -673,6 +700,23 @@ its report directory would be the owner's. **Residual.** The line then writes un
 its own scratch, and the operator moves the report. Every path outside the area stays
 refused, as the next sentences say, and `read_only_paths` bind the reports area as they
 bind the scratch.
+**Round 15, item 3. The reports area and the scratch name one place.** A line whose
+scratch is `tmp/` already reaches `tmp/reports`, so for such a line the reports area
+with no `report_directory` declared writes under `tmp/reports` and no longer refuses.
+It is accepted because it grants nothing the scratch area does not, the same path under
+`reports/` in the scratch area writing the same file. A path that already begins with
+the area's directory, such as `tmp/reports/r.md` for the area `tmp/reports`, is written
+there once and not nested below itself, and a path that only begins alike is a
+subdirectory. A line with a scratch of its own, `tmp/lines/LINE`, still has no reports
+area, since `tmp/reports` is the owner's. **Interpretation.** The task named "the
+scratch path is already tmp/reports", which this reads as these two cases. The operator
+can narrow it to one. **Every refusal names its rule.** A refusal reads `write_scratch
+refused by the RULE rule: DETAIL`, with RULE one of `area`, `relative path`, `no parent
+component`, `size`, `disclosure list`, `read_only_paths`, `working directory`, `path
+walk`, `reserved report directory`, `no overwrite of a link`, `file target`,
+`operating system`, `reports area is for the owner` and `reports area is declared`.
+The one exception is a line held for its disclosure limit, which every tool answers in
+the same words so that it learns nothing from their form.
 The daemon writes the file, so a line without `Write` can keep its own notes and
 reports. It creates `tmp/` and the directories under it. It refuses an absolute path,
 a path starting with `~`, any `..`, a target that is a symbolic link, which is never

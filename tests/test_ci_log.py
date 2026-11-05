@@ -192,6 +192,40 @@ def test_a_placement_is_not_checked_for_disclosure_and_spends_nothing(
     assert checked == []
 
 
+def test_a_placed_file_is_never_answered_as_clean_from_memory(
+    scheduler: Scheduler, tmp_path: Path
+) -> None:
+    """Round 15 review, C1. ``check_disclosure`` answers a file whose bytes already
+    passed from its memory, and ``write_scratch``'s screened text is remembered as
+    passed. A placement is written unscreened, so it must never be remembered, or a
+    placed log holding a listed term would be answered clean. Both changes are
+    present here, as the memory answering a written file shows."""
+    (tmp_path / "terms").write_text("codename\n")
+    scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
+    written = scheduler.write_scratch_file("alpha", "w.md", "screened\n")
+    answer = scheduler.check_disclosure("alpha", None, written.relative)
+    assert answer.cached and answer.matched == 0
+    placed = scheduler.place_scratch(
+        OperatorAddress("ana"), "alpha", "ci/a.log", "the codename\n"
+    )
+    answer = scheduler.check_disclosure("alpha", None, placed.relative)
+    assert not answer.cached and answer.matched == 1
+    clean = scheduler.place_scratch(
+        OperatorAddress("ana"), "alpha", "ci/b.log", "clean\n"
+    )
+    first = scheduler.check_disclosure("alpha", None, clean.relative)
+    assert not first.cached and first.matched == 0
+    # Once the daemon itself has matched the placed bytes, they passed, and only
+    # then is the file answered from memory.
+    assert scheduler.check_disclosure("alpha", None, clean.relative).cached
+    recorded = [
+        entry.event
+        for entry in read_entries(tmp_path / "events.sqlite")
+        if isinstance(entry.event, DisclosureChecked)
+    ]
+    assert [event.matched_lines for event in recorded] == [1, 0]
+
+
 @pytest.mark.parametrize(
     ("line_id", "path", "size", "reason"),
     [

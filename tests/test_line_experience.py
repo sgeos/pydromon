@@ -3,6 +3,7 @@ and wake notes, ``read_instructions``, ``write_scratch``, the daemon's commit an
 Codex cache default."""
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import os
@@ -47,6 +48,7 @@ from dromon.model import (
     MAX_DISCLOSURE_PASSES,
     AgentAddress,
     DisclosureChecked,
+    RestartNoted,
     HarnessAddress,
     LineAddress,
     LineCreated,
@@ -843,7 +845,10 @@ def test_write_scratch_refuses_large_or_disclosing_text_and_bad_arguments(
     world.scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
     text, error = world.call("write_scratch", {"path": "n", "text": "the Codename"})
     # Round 4 F1 uses a generic refusal when both path and text are offered.
-    assert (text, error) == (disclosure.REFUSAL, True)
+    assert (text, error) == (
+        f"write_scratch refused by the disclosure list rule: {disclosure.REFUSAL}",
+        True,
+    )
     assert not (world.root / "tmp" / "n").exists()
     text, error = world.call("write_scratch", {"path": 3, "text": "x"})
     assert error and "must be text" in text
@@ -1047,7 +1052,10 @@ def test_the_disclosure_check_covers_the_scratch_path(
     text, error = world.call(
         "write_scratch", {"path": "the-codename-notes.md", "text": "clean"}
     )
-    assert (text, error) == (disclosure.REFUSAL, True)
+    assert (text, error) == (
+        f"write_scratch refused by the disclosure list rule: {disclosure.REFUSAL}",
+        True,
+    )
     assert not (world.root / "tmp").exists()
 
 
@@ -1233,9 +1241,9 @@ def test_a_file_past_the_ceiling_is_refused_unread(
             reads.append(-1 if size is None else size)
             return super().read(size)
 
-    def fdopen(descriptor: int, mode: str) -> io.BufferedReader:
+    def fdopen(descriptor: int, mode: str, closefd: bool = True) -> io.BufferedReader:
         assert mode == "rb"
-        return Recording(real_fdopen(descriptor, "rb", buffering=0))
+        return Recording(real_fdopen(descriptor, "rb", buffering=0, closefd=closefd))
 
     monkeypatch.setattr(disclosurecheck.os, "fdopen", fdopen)
     text, error = world.call("check_disclosure", {"path": "big.md"})
@@ -1264,7 +1272,7 @@ def test_a_check_reads_off_the_loop_one_at_a_time_per_line(
 
     def slow(
         plan: disclosurecheck.CheckPlan, ceiling: int, window: int
-    ) -> tuple[int, int]:
+    ) -> disclosurecheck.CheckResult:
         workers.append(threading.current_thread() is threading.main_thread())
         started.set()
         release.wait(10)
@@ -1295,6 +1303,41 @@ def test_a_check_reads_off_the_loop_one_at_a_time_per_line(
     assert world.scheduler.check_disclosure("alpha", "clean", None).matched == 0
 
 
+def test_memory_taken_before_the_list_changed_is_not_used_or_extended(
+    world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 15, item 4, merged with review D3. A check carries the memory of passes
+    to its worker, so the list may be replaced while it runs. An answer from that
+    memory is then refused, and a pass made under the old list is answered but not
+    remembered, since neither tells what the new list holds."""
+    from dromon import disclosurecheck
+
+    as_writer(world)
+    listed(world, tmp_path)
+    world.call("write_scratch", {"path": "kept.md", "text": "kept\n"})
+    (world.root / "fresh.md").write_text("fresh\n")
+    real_count = disclosurecheck.count
+    replacements = iter(["other\n", "another\n"])
+
+    def replaced(
+        plan: disclosurecheck.CheckPlan, ceiling: int, window: int
+    ) -> disclosurecheck.CheckResult:
+        result = real_count(plan, ceiling, window)
+        (tmp_path / "terms").write_text(next(replacements))
+        world.scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
+        return result
+
+    monkeypatch.setattr(disclosurecheck, "count", replaced)
+    with pytest.raises(LineToolRefused, match="changed while the check ran"):
+        world.scheduler.check_disclosure("alpha", None, "tmp/kept.md")
+    assert checks(world) == []
+    answer = world.scheduler.check_disclosure("alpha", None, "fresh.md")
+    assert answer.matched == 0 and not answer.cached and len(checks(world)) == 1
+    monkeypatch.setattr(disclosurecheck, "count", real_count)
+    again = world.scheduler.check_disclosure("alpha", None, "fresh.md")
+    assert not again.cached, "a pass under the old list was remembered"
+
+
 def test_a_refusal_during_a_check_withholds_its_answer(
     world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1311,7 +1354,7 @@ def test_a_refusal_during_a_check_withholds_its_answer(
 
     def count(
         plan: disclosurecheck.CheckPlan, ceiling: int, window: int
-    ) -> tuple[int, int]:
+    ) -> disclosurecheck.CheckResult:
         planned.append(len(checks(world)))
         return real_count(plan, ceiling, window)
 
@@ -1489,7 +1532,7 @@ def test_a_refusal_for_disclosure_spends_a_check(
         "write_scratch": None,
     }[name]
     assert error and text == (
-        disclosure.REFUSAL
+        f"write_scratch refused by the disclosure list rule: {disclosure.REFUSAL}"
         if field is None
         else f"the {field} field contains a term from the project's disclosure list"
     )
@@ -2468,15 +2511,91 @@ def test_a_report_directory_beside_the_reserved_ones_still_writes(world: World) 
     assert not error, text
 
 
-def test_the_reports_area_is_refused_without_a_declared_directory(
+def test_the_reports_area_falls_back_to_tmp_reports_for_a_line_that_writes_tmp(
     world: World,
 ) -> None:
+    """Round 15, item 3. The line's scratch is ``tmp/``, which already holds
+    ``tmp/reports``, so the area names one place with the scratch path and is
+    accepted with no directory declared."""
     as_writer(world)
     text, error = world.call(
         "write_scratch", {"path": "r.md", "text": "x", "area": "reports"}
     )
-    assert error and "declares no report_directory" in text
+    written = world.root.resolve() / "tmp" / "reports" / "r.md"
+    assert (text, error) == (f"wrote 1 bytes to {written}", False)
+    # The same place the scratch area reaches with the directory in the path.
+    text, error = world.call("write_scratch", {"path": "reports/r.md", "text": "y"})
+    assert not error and written.read_text() == "y"
+
+
+def test_a_line_with_a_scratch_of_its_own_still_has_no_reports_area(
+    world: World,
+) -> None:
+    """A line that cannot write its working directory has ``tmp/lines/LINE``, and
+    ``tmp/reports`` is the owner's, so the refusal stands and names its rule."""
+    world.scheduler.configure_line("alpha", LineConfig(builtin_tools=()))
+    text, error = world.call(
+        "write_scratch", {"path": "r.md", "text": "x", "area": "reports"}
+    )
+    assert error and "reports area is declared rule" in text
+    assert "declares no report_directory" in text
     assert not (world.root / "tmp" / "reports").exists()
+
+
+def test_a_path_that_already_names_the_report_directory_is_not_nested(
+    world: World,
+) -> None:
+    world.scheduler.configure_line("alpha", REPORTING)
+    text, error = world.call(
+        "write_scratch",
+        {"path": "tmp/reports/review/r.md", "text": "x", "area": "reports"},
+    )
+    written = world.root.resolve() / "tmp" / "reports" / "review" / "r.md"
+    assert (text, error) == (f"wrote 1 bytes to {written}", False)
+    assert not (world.root / "tmp" / "reports" / "review" / "tmp").exists()
+    # A path that only begins alike is a subdirectory, not the area again.
+    text, error = world.call(
+        "write_scratch",
+        {"path": "tmp/reports/x.md", "text": "z", "area": "reports"},
+    )
+    assert not error
+    assert (world.root / "tmp/reports/review/tmp/reports/x.md").read_text() == "z"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "rule"),
+    [
+        ({"path": "r.md", "text": "x", "area": "elsewhere"}, "area rule"),
+        ({"path": "/etc/x", "text": "x"}, "relative path rule"),
+        ({"path": "a/../b", "text": "x"}, "no parent component rule"),
+        ({"path": "b", "text": "x" * (MAX_SCRATCH_BYTES + 1)}, "size rule"),
+    ],
+)
+def test_every_refusal_of_write_scratch_names_its_rule(
+    world: World, arguments: dict[str, object], rule: str
+) -> None:
+    as_writer(world)
+    text, error = world.call("write_scratch", arguments)
+    assert error and text.startswith(f"write_scratch refused by the {rule}: "), text
+
+
+def test_the_remaining_refusals_of_write_scratch_name_their_rules(
+    world: World,
+) -> None:
+    as_writer(world)
+    (world.root / "tmp").mkdir()
+    (world.root / "tmp" / "isdir").mkdir()
+    (world.root / "tmp" / "link").symlink_to(world.root / "elsewhere")
+    cases = {
+        "isdir": "file target rule",
+        "link": "no overwrite of a link rule",
+    }
+    for path, rule in cases.items():
+        text, error = world.call("write_scratch", {"path": path, "text": "x"})
+        assert error and f"refused by the {rule}: " in text, (path, text)
+    (world.root / "tmp" / "afile").write_text("f")
+    text, error = world.call("write_scratch", {"path": "afile/x", "text": "x"})
+    assert error and "refused by the path walk rule: " in text
 
 
 def test_every_other_path_stays_refused_in_the_reports_area(world: World) -> None:
@@ -2706,3 +2825,351 @@ def test_the_cost_refusal_names_each_engine_that_reports_no_cost() -> None:
         assert cost_bound_refusal(ENGINE_OF[model], Strategy.SUBSCRIPTION) is None
         assert cost_bound_refusal(ENGINE_OF[model], Strategy.FLEXIBLE) is None
     assert {"codex", "grok-build", "cursor-agent"} == COST_UNREPORTED_ENGINES
+
+
+# Round 15, item 4. A file already checked is not checked again.
+
+
+def spent(world: World) -> int:
+    return len(checks(world))
+
+
+def test_a_draft_checked_as_text_then_written_is_not_checked_again(
+    world: World, tmp_path: Path
+) -> None:
+    as_writer(world)
+    listed(world, tmp_path)
+    draft = "A clean report.\nSecond line.\n"
+    text, error = world.call("check_disclosure", {"text": draft})
+    assert not error and text.startswith("pass")
+    assert spent(world) == 1
+    written, error = world.call("write_scratch", {"path": "r.md", "text": draft})
+    assert not error
+    absolute = written.removeprefix("wrote ").split(" bytes to ", 1)[1]
+    text, error = world.call("check_disclosure", {"path": absolute})
+    assert not error and text.startswith("pass, 0 lines")
+    assert "spent no check" in text
+    # The text's pass spent one pass and its bytes, and the file spent nothing.
+    assert f"{MAX_DISCLOSURE_PASSES - 1} of {MAX_DISCLOSURE_PASSES} passing" in text
+    assert f"{MAX_DISCLOSURE_BYTES - len(draft)} of {MAX_DISCLOSURE_BYTES}" in text
+    assert spent(world) == 1, "the unchanged file spent a second check"
+
+
+def test_a_file_the_tool_wrote_is_checked_clean_without_a_prior_check(
+    world: World, tmp_path: Path
+) -> None:
+    """write_scratch checks the text against the list, so its own pass is remembered
+    for the file it wrote."""
+    as_writer(world)
+    listed(world, tmp_path)
+    world.call("write_scratch", {"path": "w.md", "text": "clean\n"})
+    text, error = world.call("check_disclosure", {"path": "tmp/w.md"})
+    assert not error and "spent no check" in text
+    assert spent(world) == 0
+
+
+def test_an_edited_file_is_checked_and_counted_again(
+    world: World, tmp_path: Path
+) -> None:
+    as_writer(world)
+    listed(world, tmp_path)
+    world.call("write_scratch", {"path": "e.md", "text": "clean\n"})
+    (world.root / "tmp" / "e.md").write_text("clean\nand the codename\n")
+    text, error = world.call("check_disclosure", {"path": "tmp/e.md"})
+    assert not error and text.startswith("fail, 1 line holds")
+    assert "spent no check" not in text and spent(world) == 1
+    # A failed file is never remembered as clean.
+    text, error = world.call("check_disclosure", {"path": "tmp/e.md"})
+    assert text.startswith("fail") and spent(world) == 2
+    # One byte of difference is a different digest.
+    (world.root / "tmp" / "e.md").write_text("clean\n ")
+    text, error = world.call("check_disclosure", {"path": "tmp/e.md"})
+    assert text.startswith("pass") and "spent no check" not in text
+    assert spent(world) == 3
+    text, error = world.call("check_disclosure", {"path": "tmp/e.md"})
+    assert "spent no check" in text and spent(world) == 3
+
+
+def test_a_text_check_is_never_answered_from_memory(
+    world: World, tmp_path: Path
+) -> None:
+    listed(world, tmp_path)
+    for expected in (1, 2):
+        text, error = world.call("check_disclosure", {"text": "same"})
+        assert not error and "spent no check" not in text
+        assert spent(world) == expected
+
+
+@pytest.mark.parametrize(
+    ("filler", "limit", "left"),
+    [
+        ("codename {number}", MAX_DISCLOSURE_CHECKS, "you have 0 of"),
+        (
+            "filler {number}",
+            MAX_DISCLOSURE_PASSES,
+            f"0 of {MAX_DISCLOSURE_PASSES} pass",
+        ),
+    ],
+    ids=["failures", "passes"],
+)
+def test_a_remembered_file_is_answered_at_the_limit_and_an_edited_one_is_not(
+    world: World,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filler: str,
+    limit: int,
+    left: str,
+) -> None:
+    """Merged with review D1. A remembered file is answered once either count is
+    spent. Another file is refused unread unless its size is a remembered one, and
+    one of that size but other bytes is read to compare and still never matched or
+    recorded."""
+    import io
+
+    from dromon import disclosurecheck
+
+    as_writer(world)
+    listed(world, tmp_path)
+    world.call("write_scratch", {"path": "k.md", "text": "kept\n"})
+    for number in range(limit):
+        world.call("check_disclosure", {"text": filler.format(number=number)})
+    assert spent(world) == limit
+    reads: list[int] = []
+    real_fdopen = os.fdopen
+
+    class Recording(io.BufferedReader):
+        def read(self, size: int | None = -1, /) -> bytes:
+            reads.append(-1 if size is None else size)
+            return super().read(size)
+
+    def fdopen(descriptor: int, mode: str, closefd: bool = True) -> io.BufferedReader:
+        assert mode == "rb"
+        return Recording(real_fdopen(descriptor, "rb", buffering=0, closefd=closefd))
+
+    monkeypatch.setattr(disclosurecheck.os, "fdopen", fdopen)
+    text, error = world.call("check_disclosure", {"path": "tmp/k.md"})
+    assert not error and "spent no check" in text and left in text
+    assert spent(world) == limit and reads == [len("kept\n") + 1]
+    reads.clear()
+    # Of a size no remembered pass has, neither the file nor any filler text.
+    (world.root / "tmp" / "k.md").write_text("a changed file\n")
+    text, error = world.call("check_disclosure", {"path": "tmp/k.md"})
+    assert error and "limit of" in text
+    assert reads == [], "a file of no remembered size was read"
+    (world.root / "tmp" / "k.md").write_text("kapt\n")
+    text, error = world.call("check_disclosure", {"path": "tmp/k.md"})
+    assert error and "limit of" in text
+    assert reads == [len("kept\n") + 1] and spent(world) == limit
+
+
+def test_a_list_of_files_spends_nothing_only_when_every_file_is_remembered(
+    world: World, tmp_path: Path
+) -> None:
+    as_writer(world)
+    listed(world, tmp_path)
+    world.call("write_scratch", {"path": "a.md", "text": "one\n"})
+    world.call("write_scratch", {"path": "b.md", "text": "two\n"})
+    text, error = world.call("check_disclosure", {"paths": ["tmp/a.md", "tmp/b.md"]})
+    assert not error and "spent no check" in text and spent(world) == 0
+    (world.root / "tmp" / "c.md").write_text("three\n")
+    text, error = world.call(
+        "check_disclosure", {"paths": ["tmp/a.md", "tmp/b.md", "tmp/c.md"]}
+    )
+    assert not error and "spent no check" not in text and spent(world) == 1
+    # The whole call passed, so each file is remembered now.
+    text, error = world.call(
+        "check_disclosure", {"paths": ["tmp/a.md", "tmp/b.md", "tmp/c.md"]}
+    )
+    assert "spent no check" in text and spent(world) == 1
+
+
+def test_replacing_the_list_forgets_what_passed(world: World, tmp_path: Path) -> None:
+    as_writer(world)
+    listed(world, tmp_path)
+    world.call("write_scratch", {"path": "f.md", "text": "plain\n"})
+    (tmp_path / "terms").write_text("plain\n")
+    world.scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
+    text, _ = world.call("check_disclosure", {"path": "tmp/f.md"})
+    assert text.startswith("fail") and spent(world) == 1
+
+
+def test_a_change_of_working_directory_forgets_what_passed(
+    world: World, tmp_path: Path
+) -> None:
+    """Review G1. A pass is bound to a path relative to the working directory, and
+    the operator's accepted lines to the project path it resolves to. The same
+    relative name and bytes in another directory must be checked again."""
+    (world.root / "one").mkdir()
+    (world.root / "two").mkdir()
+    one = LineConfig(workdir="one", builtin_tools=WRITING.builtin_tools)
+    world.scheduler.configure_line("alpha", one)
+    listed(world, tmp_path)
+    world.call("write_scratch", {"path": "same.md", "text": "plain\n"})
+    text, error = world.call("check_disclosure", {"path": "tmp/same.md"})
+    assert not error and "spent no check" in text and spent(world) == 0
+    # The same configuration again keeps the memory.
+    world.scheduler.configure_line("alpha", one)
+    text, _ = world.call("check_disclosure", {"path": "tmp/same.md"})
+    assert "spent no check" in text and spent(world) == 0
+    # Another directory holding a file of the same name and bytes is checked.
+    world.scheduler.configure_line(
+        "alpha", LineConfig(workdir="two", builtin_tools=WRITING.builtin_tools)
+    )
+    (world.root / "two" / "tmp").mkdir()
+    (world.root / "two" / "tmp" / "same.md").write_text("plain\n")
+    text, error = world.call("check_disclosure", {"path": "tmp/same.md"})
+    assert not error and text.startswith("pass")
+    assert "spent no check" not in text and spent(world) == 1
+    text, _ = world.call("check_disclosure", {"path": "tmp/same.md"})
+    assert "spent no check" in text and spent(world) == 1
+
+
+def test_an_override_of_the_line_forgets_what_passed(
+    world: World, tmp_path: Path
+) -> None:
+    """Any change of the effective configuration forgets the memory, not only the
+    working directory, which costs at most one more check."""
+    as_writer(world)
+    listed(world, tmp_path)
+    world.call("write_scratch", {"path": "o.md", "text": "plain\n"})
+    text, _ = world.call("check_disclosure", {"path": "tmp/o.md"})
+    assert "spent no check" in text
+    world.scheduler.configure_line(
+        "alpha",
+        LineConfig(builtin_tools=WRITING.builtin_tools, instructions=("changed.md",)),
+    )
+    text, _ = world.call("check_disclosure", {"path": "tmp/o.md"})
+    assert "spent no check" not in text and spent(world) == 1
+
+
+def test_nothing_is_remembered_while_no_list_is_configured(world: World) -> None:
+    as_writer(world)
+    world.call("write_scratch", {"path": "n.md", "text": "plain\n"})
+    text, error = world.call("check_disclosure", {"path": "tmp/n.md"})
+    assert error and "no disclosure list is configured" in text
+
+
+def test_the_memory_of_passes_is_bounded(world: World, tmp_path: Path) -> None:
+    from dromon.scheduler import MAX_CLEAN_CHECKED
+
+    as_writer(world)
+    listed(world, tmp_path)
+    for number in range(MAX_CLEAN_CHECKED + 1):
+        world.call("write_scratch", {"path": f"m{number}.md", "text": f"t{number}\n"})
+    text, _ = world.call("check_disclosure", {"path": f"tmp/m{MAX_CLEAN_CHECKED}.md"})
+    assert "spent no check" in text
+    text, _ = world.call("check_disclosure", {"path": "tmp/m0.md"})
+    assert text.startswith("pass") and "spent no check" not in text
+    assert spent(world) == 1
+
+
+def test_a_held_line_gets_no_remembered_answer(world: World, tmp_path: Path) -> None:
+    as_writer(world)
+    listed(world, tmp_path)
+    world.call("write_scratch", {"path": "h.md", "text": "plain\n"})
+    world.scheduler._disclosure_spent.add("alpha")  # pyright: ignore[reportPrivateUsage]
+    text, error = world.call("check_disclosure", {"path": "tmp/h.md"})
+    assert error and text == DISCLOSURE_HELD
+
+
+# Round 15, item 5. A turn that would only repeat an answer already given.
+
+
+def drain(world: World) -> None:
+    async def go() -> None:
+        stop = asyncio.Event()
+        loop = asyncio.create_task(world.scheduler.run(stop))
+        await asyncio.sleep(0)
+        await world.scheduler.idle()
+        stop.set()
+        await loop
+
+    asyncio.run(go())
+
+
+def alpha_turns(world: World) -> int:
+    engine = world.engines.get("alpha")
+    return 0 if engine is None else len(engine.prompts)
+
+
+def reply_to(world: World, message_id: str) -> None:
+    """The line answers a message it has not been shown, by its identifier."""
+    text, error = world.call(
+        "send_message", {"to": "@ana", "body": "done", "reply_to": message_id}
+    )
+    assert not error, text
+
+
+def test_mail_the_line_already_answered_does_not_start_a_turn(world: World) -> None:
+    sent = world.scheduler.send(ANA, LineAddress("alpha"), "please report")
+    reply_to(world, sent)
+    drain(world)
+    assert alpha_turns(world) == 0
+    assert world.log.state.messages[sent].delivered
+    assert world.scheduler.deliverable("alpha") == []
+
+
+def test_unanswered_mail_still_starts_a_turn_beside_answered_mail(
+    world: World,
+) -> None:
+    answered = world.scheduler.send(ANA, LineAddress("alpha"), "first")
+    reply_to(world, answered)
+    second = world.scheduler.send(ANA, LineAddress("alpha"), "second")
+    drain(world)
+    assert alpha_turns(world) == 1
+    assert second in world.engines["alpha"].prompts[0]
+
+
+def test_unanswered_mail_alone_starts_a_turn_as_before(world: World) -> None:
+    world.scheduler.send(ANA, LineAddress("alpha"), "plain")
+    drain(world)
+    assert alpha_turns(world) == 1
+
+
+def test_a_released_line_does_not_run_a_turn_for_mail_it_answered(
+    world: World,
+) -> None:
+    """The resume. The line is held, answers its waiting mail through its tool while
+    the operator is away, and a release then starts no turn for it."""
+    world.scheduler.hold("alpha", "for the test", cause=HoldCause.COST)
+    sent = world.scheduler.send(ANA, LineAddress("alpha"), "resume")
+    reply_to(world, sent)
+    world.scheduler.release("alpha")
+    drain(world)
+    assert alpha_turns(world) == 0
+    assert world.scheduler.deliverable("alpha") == []
+
+
+def test_a_released_line_still_runs_a_turn_for_mail_it_did_not_answer(
+    world: World,
+) -> None:
+    world.scheduler.hold("alpha", "for the test", cause=HoldCause.COST)
+    world.scheduler.send(ANA, LineAddress("alpha"), "resume")
+    world.scheduler.release("alpha")
+    drain(world)
+    assert alpha_turns(world) == 1
+
+
+def test_a_compaction_wake_starts_its_turn_even_when_answered(world: World) -> None:
+    """The wake is an instruction to compact, and its turn is how the compaction
+    runs, so an answer to its note does not cancel it."""
+    sent = world.scheduler.send(ANA, LineAddress("alpha"), "compact")
+    reply_to(world, sent)
+    world.scheduler._compact_wake["alpha"] = sent  # pyright: ignore[reportPrivateUsage]
+    messages = world.scheduler.pending("alpha")
+    assert world.scheduler._nothing_new("alpha", messages) is False  # pyright: ignore[reportPrivateUsage]
+    del world.scheduler._compact_wake["alpha"]  # pyright: ignore[reportPrivateUsage]
+    assert world.scheduler._nothing_new("alpha", messages) is True  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_restart_note_starts_its_turn_even_when_answered(world: World) -> None:
+    """Review G3. A restart note wakes a line to carry on its work, so an answer
+    does not cancel it, and only the note's own mark makes the difference."""
+    world.log.append(RestartNoted("alpha", "rn-1", "A restart ended your turn."))
+    ((message_id, note),) = world.scheduler.pending("alpha")
+    assert note.restart_note
+    answered = dataclasses.replace(note, replied=True)
+    scheduler = world.scheduler
+    assert scheduler._nothing_new("alpha", [(message_id, answered)]) is False  # pyright: ignore[reportPrivateUsage]
+    ordinary = dataclasses.replace(answered, restart_note=False)
+    assert scheduler._nothing_new("alpha", [(message_id, ordinary)]) is True  # pyright: ignore[reportPrivateUsage]
