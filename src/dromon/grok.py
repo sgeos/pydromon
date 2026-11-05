@@ -429,7 +429,8 @@ HOME_CONFIG: Final = (
     "hooks = false\n"
     "\n"
     "[[hooks.PreToolUse]]\n"
-    'matcher = "todo_write|spawn_subagent"\n'
+    'matcher = "todo_write|spawn_subagent|scheduler_create|scheduler_delete|'
+    'scheduler_list|monitor|update_goal|enter_plan_mode|exit_plan_mode"\n'
     'hooks = [{ type = "command", command = '
     + json.dumps(str(HOOK_PROGRAM))
     + ', args = ["%s\\n", '
@@ -1384,6 +1385,10 @@ def grok_arguments(
     ]
 
 
+class _MissingResumedModel(EngineRefused):
+    """A resumed session has a stale model catalog. No turn has started."""
+
+
 class GrokLine:
     """One session line on the Grok Build engine, with its driver."""
 
@@ -1435,6 +1440,7 @@ class GrokLine:
         self._client: acp.Client | None = None
         self.session_id_in_use: str | None = None
         self.protocol_version: int | None = None
+        self._model_replaced = False
 
     async def run_turn(self, prompt: str) -> TurnReport:
         """Run one turn for ``prompt`` and return what happened."""
@@ -2099,6 +2105,20 @@ class GrokLine:
         return credential
 
     async def _open_session(self, turn: _Turn) -> str:
+        try:
+            return await self._open_session_once(turn)
+        except _MissingResumedModel:
+            previous = self.session_id_in_use
+            self.session_id = None
+            self._model_replaced = True
+            turn.pending_model_refusal = None
+            turn.servers_reported = False
+            replacement = await self._open_session_once(turn)
+            if turn.refusal is None and replacement == previous:
+                turn.refusal = "Grok returned the old identifier for a fresh session"
+            return replacement
+
+    async def _open_session_once(self, turn: _Turn) -> str:
         meta: dict[str, object] = {"yoloMode": False, "autoMode": False}
         instructions = read_instructions(self.config.instructions, self.cwd)
         self._rules_digest = session_digest(self.config, instructions, self.own_tools)
@@ -2167,46 +2187,48 @@ class GrokLine:
             return session_id
         model_result: Mapping[str, Any] = result
         needs_pin = model != expected_model
-        if needs_pin:
-            listed: list[str] = []
-            options = result.get("configOptions")
-            for raw_option in (
-                cast(list[object], options) if isinstance(options, list) else []
+        listed: list[str] = []
+        options = result.get("configOptions")
+        for raw_option in (
+            cast(list[object], options) if isinstance(options, list) else []
+        ):
+            if not isinstance(raw_option, dict):
+                continue
+            option = cast(dict[str, Any], raw_option)
+            if (option.get("id") or option.get("configId")) != "model":
+                continue
+            choices = option.get("options")
+            for raw_choice in (
+                cast(list[object], choices) if isinstance(choices, list) else []
             ):
-                if not isinstance(raw_option, dict):
+                if not isinstance(raw_choice, dict):
                     continue
-                option = cast(dict[str, Any], raw_option)
-                if (option.get("id") or option.get("configId")) != "model":
-                    continue
-                choices = option.get("options")
-                for raw_choice in (
-                    cast(list[object], choices) if isinstance(choices, list) else []
-                ):
-                    if not isinstance(raw_choice, dict):
-                        continue
-                    choice = cast(dict[str, Any], raw_choice)
-                    value = choice.get("value")
-                    if isinstance(value, str):
-                        listed.append(value)
-                    else:
-                        nested_options = choice.get("options")
-                        for raw_nested in (
-                            cast(list[object], nested_options)
-                            if isinstance(nested_options, list)
-                            else []
-                        ):
-                            if not isinstance(raw_nested, dict):
-                                continue
-                            nested = cast(dict[str, Any], raw_nested)
-                            nested_value = nested.get("value")
-                            if isinstance(nested_value, str):
-                                listed.append(nested_value)
-            if expected_model not in listed:
-                turn.refusal = (
-                    f"Grok reported model {model!r} and does not list requested model"
-                    f" {expected_model!r}; listed values are {listed!r}"
-                )
-                return session_id
+                choice = cast(dict[str, Any], raw_choice)
+                value = choice.get("value")
+                if isinstance(value, str):
+                    listed.append(value)
+                else:
+                    nested_options = choice.get("options")
+                    for raw_nested in (
+                        cast(list[object], nested_options)
+                        if isinstance(nested_options, list)
+                        else []
+                    ):
+                        if not isinstance(raw_nested, dict):
+                            continue
+                        nested = cast(dict[str, Any], raw_nested)
+                        nested_value = nested.get("value")
+                        if isinstance(nested_value, str):
+                            listed.append(nested_value)
+        if expected_model not in listed:
+            if resumable is not None:
+                raise _MissingResumedModel("the resumed model catalog is stale")
+            turn.refusal = (
+                f"Grok reported model {model!r} and does not list requested model"
+                f" {expected_model!r}; listed values are {listed!r}"
+            )
+            return session_id
+        if needs_pin:
             try:
                 model_result = await self._rpc().call(
                     "session/set_config_option",
@@ -2249,6 +2271,13 @@ class GrokLine:
         return session_id
 
     async def _prompt(self, session_id: str, prompt: str, turn: _Turn) -> str:
+        if self._model_replaced:
+            prompt = (
+                "Dromon started a fresh Grok session because the resumed session"
+                " did not list the requested model. Your mailbox, brief and files"
+                " are retained. Earlier session context is unavailable.\n\n" + prompt
+            )
+            self._model_replaced = False
         if self._rules_replaced:
             prompt = (
                 "Dromon replaced your Grok session because its stored rules or tool"

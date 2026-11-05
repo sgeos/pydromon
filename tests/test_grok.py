@@ -426,7 +426,12 @@ def test_a_read_only_grok_line_is_refused_until_the_capability_is_known(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reader = LineConfig(builtin_tools=("Bash",), workdir_access=WorkdirAccess.READ)
-    assert grok_module.GROK_CAPABILITIES.read_only_workdir is not Known.YES
+    assert grok_module.GROK_CAPABILITIES.read_only_workdir is Known.YES
+    assert unsupported(reader) is None
+    unconfirmed = dataclasses.replace(
+        grok_module.GROK_CAPABILITIES, read_only_workdir=Known.UNKNOWN
+    )
+    monkeypatch.setattr(grok_module, "GROK_CAPABILITIES", unconfirmed)
     assert "read-only working directory" in (unsupported(reader) or "")
     assert unsupported(LineConfig(builtin_tools=("Bash",))) is None
     confirmed = dataclasses.replace(
@@ -438,7 +443,15 @@ def test_a_read_only_grok_line_is_refused_until_the_capability_is_known(
 
 def test_a_read_only_grok_line_refuses_the_turn_before_grok_starts(
     project: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        grok_module,
+        "GROK_CAPABILITIES",
+        dataclasses.replace(
+            grok_module.GROK_CAPABILITIES, read_only_workdir=Known.UNKNOWN
+        ),
+    )
     server = probed_grok()
     reader = LineConfig(workdir_access=WorkdirAccess.READ)
     with pytest.raises(EngineRefused, match="read-only working directory"):
@@ -3592,6 +3605,7 @@ def test_requested_model_must_be_listed(
     ):
         run(target)
     assert "session/load" in server.methods()
+    assert server.methods().count("session/new") == 1
     assert "session/set_config_option" not in server.methods()
     assert "session/prompt" not in server.methods()
 
@@ -3655,7 +3669,21 @@ def test_advertised_tool_change_replaces_resumed_session(
     assert server.environment["GROK_WEB_FETCH"] == "0"
 
 
-@pytest.mark.parametrize("name", ["todo_write", "spawn_subagent", "web_fetch"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "todo_write",
+        "spawn_subagent",
+        "web_fetch",
+        "scheduler_create",
+        "scheduler_delete",
+        "scheduler_list",
+        "monitor",
+        "update_goal",
+        "enter_plan_mode",
+        "exit_plan_mode",
+    ],
+)
 @pytest.mark.parametrize("not_run", [True, False])
 def test_unavailable_advertised_tool_is_denied_individually(
     project: tuple[Path, Path, Path], name: str, not_run: bool
@@ -3695,7 +3723,21 @@ def test_unavailable_advertised_tool_is_denied_individually(
     assert rejected["result"]["outcome"]["optionId"] == expected
 
 
-@pytest.mark.parametrize("name", ["todo_write", "spawn_subagent", "web_fetch"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "todo_write",
+        "spawn_subagent",
+        "web_fetch",
+        "scheduler_create",
+        "scheduler_delete",
+        "scheduler_list",
+        "monitor",
+        "update_goal",
+        "enter_plan_mode",
+        "exit_plan_mode",
+    ],
+)
 def test_rejection_without_later_update_holds_and_names_tool(
     project: tuple[Path, Path, Path], name: str
 ) -> None:
@@ -3830,7 +3872,17 @@ def test_generated_hook_runs_a_fixed_system_program_without_shell_input(
     workspace, _, _ = project
     parsed = tomllib.loads(HOME_CONFIG)
     group = parsed["hooks"]["PreToolUse"][0]
-    assert group["matcher"].split("|") == ["todo_write", "spawn_subagent"]
+    assert group["matcher"].split("|") == [
+        "todo_write",
+        "spawn_subagent",
+        "scheduler_create",
+        "scheduler_delete",
+        "scheduler_list",
+        "monitor",
+        "update_goal",
+        "enter_plan_mode",
+        "exit_plan_mode",
+    ]
     handler = group["hooks"][0]
     assert handler["command"] == str(grok_module.HOOK_PROGRAM)
     assert Path(handler["command"]).is_absolute()
@@ -3967,3 +4019,59 @@ def test_server_tool_controls_replace_inherited_values(
     assert tomllib.loads(grok_module.HOME_REQUIREMENTS) == {
         "features": {"image_edit": False}
     }
+
+
+@pytest.mark.parametrize("fresh_valid", [True, False])
+@pytest.mark.parametrize("fresh_identifier", ["fresh", "old"])
+def test_stale_resumed_model_catalog_gets_one_fresh_attempt(
+    project: tuple[Path, Path, Path],
+    fresh_valid: bool,
+    fresh_identifier: str,
+) -> None:
+    class CatalogGrok(FakeGrok):
+        async def send(self, message: Mapping[str, object]) -> None:
+            method = message.get("method")
+            if method == "session/load" or (
+                method == "session/new" and not fresh_valid
+            ):
+                self.model = "grok-4.6"
+                option = model_option("grok-4.6")
+                option["options"] = [{"value": "grok-4.6"}, {"value": "grok-4.5"}]
+                self.extra = {"configOptions": [option]}
+            elif method == "session/new":
+                self.model = GROK
+                self.extra = {}
+            await super().send(message)
+            if method == "session/new":
+                self.queue[-1]["result"]["sessionId"] = fresh_identifier
+
+    server = CatalogGrok()
+    target = line(
+        server, project, session_id="old:rules-" + stored_digest(LineConfig(), "")
+    )
+    if fresh_valid and fresh_identifier != "old":
+        report = run(target)
+        assert report.session_id == "fresh:rules-" + stored_digest(LineConfig(), "")
+        prompt = str(server.params("session/prompt"))
+        assert "did not list the requested model" in prompt
+        assert "Earlier session context is unavailable" in prompt
+    else:
+        message = "old identifier" if fresh_valid else "does not list requested model"
+        with pytest.raises(EngineRefused, match=message):
+            run(target)
+        assert "session/prompt" not in server.methods()
+    assert server.methods().count("session/load") == 1
+    assert server.methods().count("session/new") == 1
+
+
+def test_a_read_only_grok_line_can_start_with_checked_reader_profile(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok()
+    assert (
+        run(
+            line(server, project, config=LineConfig(workdir_access=WorkdirAccess.READ))
+        ).text
+        == "done"
+    )
+    assert server.environment["GROK_SANDBOX"] == READER_PROFILE

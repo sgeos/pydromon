@@ -558,8 +558,19 @@ def split_session(session: str | None) -> tuple[str | None, str | None]:
     return thread, fingerprint
 
 
+@dataclass(frozen=True, slots=True)
+class ListedServer:
+    """Listing identity and whether Codex already has a usable transport.
+
+    Transport addresses and credentials are deliberately not retained.
+    """
+
+    name: str
+    has_transport: bool
+
+
 def server_arguments(
-    servers: Sequence[str],
+    servers: Sequence[str | ListedServer],
     config: LineConfig,
     protected: Sequence[Path] = (),
     mark: str | None = None,
@@ -591,20 +602,32 @@ def server_arguments(
             "-c",
             f"shell_environment_policy.set.{name}={_toml_string(value)}",
         ]
-    for name in sorted(set(servers)):
+    listed: dict[str, bool] = {}
+    for server in servers:
+        name = server if isinstance(server, str) else server.name
+        present = True if isinstance(server, str) else server.has_transport
+        if name in listed and listed[name] != present:
+            raise EngineRefused(
+                "codex mcp list repeats a server with conflicting transport"
+            )
+        listed[name] = present
+    for name, present in sorted(listed.items()):
         # Codex's -c parser takes bare dotted keys only, and rejects a quoted one.
         if BARE_KEY.fullmatch(name) is None:
             raise EngineRefused(
                 f"the MCP server name {name!r} cannot be disabled by a Codex override,"
                 " so the line cannot be isolated"
             )
-        # Fact, 2026-11-01, Codex 0.166.0: a whole inline table with a command,
-        # merged over a server the operator defines by url, gave "url is not
-        # supported for stdio", and Codex fell back to defaults and failed
-        # account/read, so every Codex line failed. The sparse override disables a
-        # configured server whatever its transport. A listed server absent from the
-        # local configuration, which another project reported, is not handled.
-        arguments += ["-c", f"mcp_servers.{name}.enabled=false"]
+        # Preserve existing transports. Adding command to a URL table broke
+        # account/read on Codex 0.166.0. Only transport-less entries need a full
+        # inert table so their disabled override remains valid TOML configuration.
+        value = (
+            "enabled=false"
+            if present
+            else '={enabled=false,command="/usr/bin/false",args=[]}'
+        )
+        key = f"mcp_servers.{name}." if present else f"mcp_servers.{name}"
+        arguments += ["-c", key + value]
     for feature in DISABLED_FEATURES:
         arguments += ["--disable", feature]
     image = "enable" if VIEW_IMAGE in config.builtin_tools else "disable"
@@ -658,7 +681,7 @@ class Connection(Protocol):
 type ConnectionFactory = Callable[
     [list[str], Path, Mapping[str, str]], AbstractAsyncContextManager[Connection]
 ]
-type ServerLister = Callable[[Mapping[str, str]], Sequence[str]]
+type ServerLister = Callable[[Mapping[str, str]], Sequence[str | ListedServer]]
 
 
 class _Process:
@@ -731,7 +754,7 @@ async def _app_server(
         await evidence.stop_draining(draining)
 
 
-def list_servers(environment: Mapping[str, str]) -> Sequence[str]:
+def list_servers(environment: Mapping[str, str]) -> Sequence[ListedServer]:
     """The names of every MCP server Codex would load, from ``codex mcp list``."""
     completed = subprocess.run(  # noqa: S603
         [codex_path(), "mcp", "list", "--json"],
@@ -746,7 +769,7 @@ def list_servers(environment: Mapping[str, str]) -> Sequence[str]:
     decoded: object = json.loads(completed.stdout)
     if not isinstance(decoded, list):
         raise EngineRefused("codex mcp list returned something other than a list")
-    names: list[str] = []
+    names: list[ListedServer] = []
     for index, entry in enumerate(cast(list[object], decoded)):
         fields = cast(dict[str, object], entry) if isinstance(entry, dict) else {}
         name = (
@@ -760,7 +783,27 @@ def list_servers(environment: Mapping[str, str]) -> Sequence[str]:
                 # entries still get an explicit override even when disabled.
                 continue
             raise EngineRefused(f"codex mcp list field [{index}].name must be text")
-        names.append(name)
+        transport = fields.get("transport")
+        present = False
+        if transport is not None:
+            if not isinstance(transport, dict):
+                raise EngineRefused(
+                    f"codex mcp list field [{index}].transport must be a table"
+                )
+            details = cast(dict[str, object], transport)
+            kind = details.get("type")
+            endpoint = details.get("command" if kind == "stdio" else "url")
+            if (
+                kind not in ("stdio", "streamable_http")
+                or not isinstance(endpoint, str)
+                or not endpoint
+            ):
+                raise EngineRefused(
+                    f"codex mcp list field [{index}].transport "
+                    "is unsupported or incomplete"
+                )
+            present = True
+        names.append(ListedServer(name, present))
     return names
 
 

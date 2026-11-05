@@ -748,7 +748,9 @@ def test_the_filled_tables_say_what_was_never_observed() -> None:
     assert codex_table.tested_on is not None and codex_table.minimum_version is None
     for table in (grok_table, antigravity_table):
         assert table.own_tools is Known.UNKNOWN
-        assert table.tested_on is None
+    assert grok_table.tested_on == "2026-11-05"
+    assert grok_table.read_only_workdir is Known.YES
+    assert antigravity_table.tested_on is None
     assert grok_table.deny_before_run is Known.UNKNOWN
     assert antigravity_table.deny_before_run is Known.NO
     for table in (codex_table, grok_table, antigravity_table):
@@ -816,7 +818,7 @@ def test_the_probe_reports_each_table_as_it_stands() -> None:
     assert claude[0] == "table claude-code, tested from 2.1.310 on 2026-10-26"
     assert "kept_session yes" in claude[1] and "sign_in_check unknown" in claude[1]
     assert len(claude) == 2
-    for engine in ("pi", "cursor-agent", "grok-build", "antigravity"):
+    for engine in ("pi", "cursor-agent", "antigravity"):
         assert report_lines(table_of(engine))[0] == (
             f"table {engine}, never run live, so no minimum version is enforced and"
             " any version the engine reports runs"
@@ -830,6 +832,10 @@ def test_the_probe_reports_each_table_as_it_stands() -> None:
         " version is enforced and any version the engine reports runs"
     )
     assert "deny_before_run yes" in codex_report[1]
+    assert report_lines(table_of("grok-build"))[0] == (
+        "table grok-build, run live on 2026-11-05, but no version is read, so no"
+        " minimum version is enforced and any version the engine reports runs"
+    )
     assert all(len(report_lines(table)) == 2 for table in TABLES.values())
 
 
