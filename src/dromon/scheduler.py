@@ -4924,6 +4924,14 @@ class Scheduler:
         line_id, command, argv = start.line_id, start.command, start.argv
         latest_id, run_id, directory = start.latest_id, start.run_id, start.directory
         workdir, environment = start.workdir, start.environment
+        interpreter: dict[str, str] = {}
+        if commit is not None:
+            try:
+                interpreter = commitruns.interpreter_environment(
+                    commitruns.daemon_interpreter()
+                )
+            except commitruns.CommitRefused as error:
+                raise runs.RunRefused(str(error)) from error
         checkout = (
             None
             if commit is None
@@ -4933,8 +4941,10 @@ class Scheduler:
         if checkout is not None:
             # A fresh private home, so the commit's code finds none of the
             # operator's settings, credentials or caches by its home. It is not a
-            # confinement, since the command runs outside every sandbox.
-            environment = {**environment, "HOME": str(checkout.home)}
+            # confinement, since the command runs outside every sandbox. uv is named
+            # the daemon's interpreter, which the fresh home would hide, as
+            # ``commitruns.daemon_interpreter`` explains.
+            environment = {**environment, "HOME": str(checkout.home), **interpreter}
         try:
             launched = await self._process_worker.run(
                 lambda: runs.launch(

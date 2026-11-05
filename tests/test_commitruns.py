@@ -8,6 +8,7 @@ and system configuration left out, so the operator's own settings change nothing
 import asyncio
 import contextlib
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -1071,6 +1072,129 @@ def test_a_commit_run_has_a_fresh_private_home_removed_with_its_checkout(
         output = (Path(run.workdir) / run.output_file).read_text()
         assert output == f"{home} 0o700 []\n"
         assert not home.exists()
+
+
+# Fix of 2026-11-05. A commit run's fresh home hid uv's managed interpreters, so the
+# gate in the checkout ran under another Python on the search path. A commit run now
+# names the daemon's own base interpreter to uv.
+
+UV_SOURCE = (
+    "import os; print(os.environ.get('UV_PYTHON'),"
+    " os.environ.get('UV_PYTHON_DOWNLOADS'))"
+)
+
+
+def test_the_daemon_interpreter_is_the_one_this_environment_runs_on() -> None:
+    """Both sides are derived. The test runs in the project's environment, as the
+    daemon does, and the interpreter its executable resolves to is the one found
+    from the base prefix."""
+    assert commitruns.daemon_interpreter().samefile(os.path.realpath(sys.executable))
+
+
+def test_an_interpreter_that_is_not_there_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(commitruns.CommitRefused, match="is not at"):
+        commitruns.daemon_interpreter(str(tmp_path), (3, 12))
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "python3.12").write_text("")
+    with pytest.raises(commitruns.CommitRefused, match="is not at"):
+        commitruns.daemon_interpreter(str(tmp_path), (3, 12))
+    (tmp_path / "bin" / "python3.12").chmod(0o700)
+    assert commitruns.daemon_interpreter(str(tmp_path), (3, 12)) == (
+        tmp_path / "bin" / "python3.12"
+    )
+
+
+def test_a_commit_run_names_the_daemon_interpreter_and_no_downloads(
+    repo: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    repository, main, _ = repo
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = commit_scheduler(log, repository, tmp_path)
+        scheduler.set_runs({}, {"review": (sys.executable, "-c", UV_SOURCE)}, MAIN)
+        run = asyncio.run(scheduler.start_run("alpha", "review", "none", main))
+        wait_for_supervisor(scheduler, run.run_id)
+        check(scheduler)
+        output = (Path(run.workdir) / run.output_file).read_text()
+        assert output == f"{commitruns.daemon_interpreter()} never\n"
+
+
+def test_an_ordinary_run_is_not_given_the_interpreter(tmp_path: Path) -> None:
+    """Only a commit run's fresh home hides the operator's interpreters, so an
+    ordinary run keeps the daemon's environment as before."""
+    repository, _, _ = repository_with_side_branch(tmp_path)
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = commit_scheduler(log, repository, tmp_path)
+        scheduler.configure_line("alpha", LineConfig())
+        scheduler.set_runs({"gate": (sys.executable, "-c", UV_SOURCE)}, {}, MAIN)
+        run = asyncio.run(scheduler.start_run("alpha", "gate", "none"))
+        wait_for_supervisor(scheduler, run.run_id)
+        check(scheduler)
+        output = (Path(run.workdir) / run.output_file).read_text()
+        assert output == "None None\n"
+
+
+def test_a_commit_run_without_the_interpreter_is_refused_before_a_checkout(
+    repo: tuple[Path, str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, main, _ = repo
+    real = commitruns.daemon_interpreter
+
+    def missing(
+        prefix: str | None = None, version: tuple[int, int] | None = None
+    ) -> Path:
+        del prefix, version
+        return real(str(tmp_path / "gone"), (3, 12))
+
+    monkeypatch.setattr(commitruns, "daemon_interpreter", missing)
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = commit_scheduler(log, repository, tmp_path)
+        with pytest.raises(runs.RunRefused, match="the daemon's interpreter is not"):
+            asyncio.run(scheduler.start_run("alpha", "review", "none", main))
+        assert log.state.runs == {}
+        assert log.state.commit_refusals == {}
+        base = tmp_path / "state" / "commit-runs"
+        assert not base.exists() or list(base.iterdir()) == []
+
+
+UV = shutil.which("uv")
+
+
+@pytest.mark.skipif(UV is None, reason="uv is not on the search path")
+def test_uv_in_a_commit_run_finds_the_interpreter_the_gate_uses(
+    repo: tuple[Path, str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shaped as the run of 2026-11-05 that failed. uv makes a virtual environment in
+    the checkout with the fresh home, choosing its interpreter as the gate's
+    ``uv sync`` does, and must choose the one this environment, the gate's, runs on.
+    ``uv python find`` would not do, since it ignores ``UV_PYTHON``. Every virtual
+    environment's directory is taken out of the search path, where ``uv run`` puts
+    this one first and uv would find it without the fix. **Fact, observed on
+    2026-11-05.** With the fix removed, this test fails on the operator's machine."""
+    assert UV is not None
+    kept = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
+    monkeypatch.setenv(
+        "PATH",
+        os.pathsep.join(
+            part for part in kept if not (Path(part).parent / "pyvenv.cfg").exists()
+        ),
+    )
+    source = (
+        "import os, subprocess;"
+        f" subprocess.run([{UV!r}, 'venv', '--quiet', '.venv'], check=True);"
+        " print(os.path.realpath(os.path.join('.venv', 'bin', 'python')))"
+    )
+    repository, main, _ = repo
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = commit_scheduler(log, repository, tmp_path)
+        scheduler.set_runs({}, {"review": (sys.executable, "-c", source)}, MAIN)
+        run = asyncio.run(scheduler.start_run("alpha", "review", "none", main))
+        wait_for_supervisor(scheduler, run.run_id)
+        check(scheduler)
+        ended = log.state.runs[run.run_id].ended
+        output = (Path(run.workdir) / run.output_file).read_text()
+        assert ended is not None and ended.exit_code == 0, output
+        found = Path(output.strip().splitlines()[-1])
+        assert found.samefile(os.path.realpath(sys.executable)), output
 
 
 # Task of 2026-11-05, item 5. The flow a review line uses, end to end. The project
