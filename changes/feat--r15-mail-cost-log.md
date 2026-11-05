@@ -32,3 +32,23 @@ Type: Added
 - `docs/protocol/LINE_CONFIG.md` states the one timestamp form records accept, whole
   seconds in Coordinated Universal Time with a `Z`, and where callers see it. A near
   miss of it is refused naming the form.
+- Every failed turn records its cause in `line_turn_ended`, one fixed word from
+  `not_started`, `refused`, `engine_error`, `engine_closed`, `engine_reported`,
+  `limit`, `interrupted` and `unknown`, with the daemon's exception type or a listed
+  result subtype as its class where one exists and never an engine's text.
+  `line_status` and the daemon's `status` give it as `last_failure`, and the daemon
+  log gives one line for each failed turn. A closed engine raises the new
+  `EngineClosed`, a kind of `EngineRefused`.
+- A start that restored the state from a snapshot now checks it against a full
+  replay of a copy of the log, off the event loop. A mismatch, named `state_differs`,
+  `log_corrupt` or `check_failed` with the exception's type, holds every line in
+  memory, deletes the snapshot, and is shown in the daemon log, in `event_log.start`
+  and as a `RESTART REQUIRED.` row of `dromon status` until a restart. No snapshot is
+  written while the check is pending or after it failed.
+- The snapshot's directory is synchronized after the snapshot moves into place.
+- `STATE_VERSION` is 2, and `tests/test_state_version.py` pins each version with a
+  digest of the codec's types and of a replayed history, so a change to either fails
+  until the version is raised.
+- `brief_set` gains `workdir_dirty`, the digest of the worktree's `git status`
+  entries, and each turn of a kept session opens with `STALE BRIEF.` while the commit
+  or the uncommitted state differs from the brief's, until the line sets it again.

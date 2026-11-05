@@ -396,6 +396,49 @@ class HoldCause(StrEnum):
     STOPPED = "stopped"
 
 
+class FailureCause(StrEnum):
+    """Why a turn failed, in one fixed word. **Round 15 follow-up of 2026-11-05.** A
+    turn that ended as failed had recorded nothing but the fact, so neither the
+    operator nor the line could say afterwards what had happened. The word is chosen
+    by the daemon from where the turn stood and from the daemon's own type for the
+    failure, never from an engine's text, which may carry anything.
+
+    ``NOT_STARTED``, a failure before the engine was given the prompt, as when the
+    prompt could not be composed or the engine could not be built. ``REFUSED``, a check
+    of the daemon or the driver refused the turn. ``ENGINE_ERROR``, the engine raised
+    during the turn. ``ENGINE_CLOSED``, the engine's process or connection ended before
+    the turn's result. ``ENGINE_REPORTED``, the engine reported the turn as ended
+    without success. ``LIMIT``, the engine reported a turn, token or budget limit of
+    its own. ``INTERRUPTED``, the engine reported or raised an interruption the driver
+    did not ask for, or a failure came while an operator stopped the turn.
+    ``UNKNOWN``, none of these, as a failure in the daemon after the engine returned.
+    A plan limit holds the line rather than failing it, so it has no word here."""
+
+    NOT_STARTED = "not_started"
+    REFUSED = "refused"
+    ENGINE_ERROR = "engine_error"
+    ENGINE_CLOSED = "engine_closed"
+    ENGINE_REPORTED = "engine_reported"
+    LIMIT = "limit"
+    INTERRUPTED = "interrupted"
+    UNKNOWN = "unknown"
+
+
+FAILURE_CLASS_PATTERN: Final = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
+"""A failure's class, the daemon's own exception type or a result subtype from the
+fixed table in ``dromon.scheduler``, at most 64 characters. Neither carries an
+engine's free text."""
+
+
+def check_failure_class(value: object) -> None:
+    """Refuse a failure class that is not a short identifier."""
+    if not isinstance(value, str) or FAILURE_CLASS_PATTERN.fullmatch(value) is None:
+        raise InvalidField(
+            "failure_class must be a letter and at most 63 more letters, digits or"
+            " underscores"
+        )
+
+
 class MessageKind(StrEnum):
     NOTE = "note"
     QUESTION = "question"
@@ -875,6 +918,16 @@ class LineTurnEnded:
     before the field. **Round 14 task of 2026-11-01.** ``False`` is refused, as for
     ``unreported``. **Rollback hazard.** A daemon older than the field refuses an
     event that gives it."""
+    failure: FailureCause | None = None
+    """Why the turn failed, given only with ``failed``. **Round 15 follow-up of
+    2026-11-05.** The scheduler gives it with every failed turn. ``None`` in a log
+    written before the field, whose failed turns read as of unknown cause.
+    **Rollback hazard.** A daemon older than the field refuses an event that gives
+    it."""
+    failure_class: str | None = None
+    """The daemon's exception type or the engine's result subtype behind
+    ``failure``, as ``check_failure_class`` bounds it, given only with ``failure``
+    and only where one exists."""
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
@@ -884,6 +937,15 @@ class LineTurnEnded:
             raise InvalidField("unreported must be true or null")
         if self.failed is not None and self.failed is not True:
             raise InvalidField("failed must be true or null")
+        if self.failure is not None:
+            if not isinstance(self.failure, FailureCause):  # pyright: ignore[reportUnnecessaryIsInstance]
+                raise InvalidField("failure must be a failure cause")
+            if self.failed is not True:
+                raise InvalidField("failure is given only with failed")
+        if self.failure_class is not None:
+            check_failure_class(self.failure_class)
+            if self.failure is None:
+                raise InvalidField("failure_class is given only with failure")
 
 
 MAX_DISCLOSURE_CHECKS: Final = 10
@@ -1973,9 +2035,19 @@ class BriefSet:
     workdir_commit: str
     daemon_commit: str
     set_at: str
+    workdir_dirty: str | None = None
+    """**Review of 49236ad, item 4.** The SHA-256 of the worktree's ``git status``
+    entries when the brief was set, each changed or untracked path with its status
+    letters, or ``None`` when they could not be read or the brief predates the
+    field. Edits inside a path already dirty do not change it."""
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
+        if (
+            self.workdir_dirty is not None
+            and DIGEST_PATTERN.fullmatch(self.workdir_dirty) is None
+        ):
+            raise InvalidField("workdir_dirty must be a SHA-256 digest in hex")
         for name, value in (
             ("task", self.task),
             ("decisions", self.decisions),
@@ -2416,6 +2488,13 @@ class Line:
     ``failed``, and cleared by one that does not, by a new message to the line, by
     ``line_released`` and by a restart note, the events at which the scheduler
     clears its own record, so a restarted daemon shows a failed line as failed."""
+    last_failure: FailureCause | None = None
+    """The cause of the line's latest failed turn, kept after ``failed`` clears so
+    an operator can still ask why. **Round 15 follow-up of 2026-11-05.** ``None``
+    when no turn failed, or when the latest failed one was logged before causes
+    were, which ``line_status`` reads as unknown with ``failed``."""
+    last_failure_class: str | None = None
+    """The class behind ``last_failure``, where one was recorded."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -3345,10 +3424,15 @@ class State:
             case LineTurnEnded():
                 self.last_turn_commits[event.line_id] = event.workdir_commit
                 line = self.lines[event.line_id]
-                if line.failed != (event.failed is True):
+                if event.failed is True:
                     self.lines[event.line_id] = replace(
-                        line, failed=event.failed is True
+                        line,
+                        failed=True,
+                        last_failure=event.failure,
+                        last_failure_class=event.failure_class,
                     )
+                elif line.failed:
+                    self.lines[event.line_id] = replace(line, failed=False)
                 if event.unreported is None:
                     self.reported_turn_ends[event.line_id] = (
                         self.reported_turn_ends.get(event.line_id, 0) + 1

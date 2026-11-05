@@ -97,6 +97,7 @@ from dromon.engine import (
     no_context_line,
     INTERRUPT_TIMEOUT_SECONDS,
     KEEP_POLL_SECONDS,
+    EngineClosed,
     EngineRefused,
     TurnReport,
     closed_note,
@@ -1444,7 +1445,7 @@ class CodexLine:
     async def _receive(self) -> dict[str, Any]:
         message = await self._open().receive()
         if message is None:
-            raise EngineRefused("the engine closed its connection during the turn")
+            raise EngineClosed("the engine closed its connection during the turn")
         return message
 
     async def _call(

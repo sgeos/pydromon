@@ -26,7 +26,9 @@ run on the snapshot as on an event.
 name and each field's name and type. A change to the state's shape changes it, so a
 snapshot from code of another shape is ignored without anyone raising a version.
 ``STATE_VERSION`` must still be raised by hand when the meaning of applying an event
-changes and the shape does not, which ``dromond --check`` finds when it is forgotten.
+changes and the shape does not. A test pins it with the codec's types and a replay, as
+``codec_digest`` describes, and ``dromond --check`` and the check after every start
+from a snapshot find a difference the pin did not.
 
 **Porting hazard.** The reflection is Python's. A port writes the same encoding with
 explicit code for each record, or ignores the file and replays the log, which is
@@ -47,14 +49,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Final, cast
 
-from dromon.model import State
+from dromon.model import Event, State
 
 FORMAT_VERSION: Final = 1
 """The version of the file's own layout."""
 
-STATE_VERSION: Final = 1
+STATE_VERSION: Final = 2
 """Raised by hand whenever applying an event comes to mean something else for a state
-of the same shape, since the shape digest cannot see that."""
+of the same shape, since the shape digest cannot see that. **Review of 49236ad, item
+3.** ``tests/test_state_version.py`` fails when the types ``codec_digest`` covers, or
+the state a fixed history replays to, change while this stays the same, so a raise
+cannot be forgotten. Version 2 is the round 15 follow-up, whose events
+``line_turn_ended`` and ``brief_set`` gained fields."""
 
 SUFFIX: Final = ".snapshot"
 """The snapshot of ``events.sqlite`` is ``events.sqlite.snapshot``."""
@@ -424,6 +430,76 @@ def shape_digest() -> str:
     return hashlib.sha256("\n".join(sorted(lines)).encode("utf-8")).hexdigest()
 
 
+def hint_text(hint: object) -> str:
+    """``hint`` written the same way on every Python version, a record or an
+    enumeration by its name, a generic as its origin's name and its arguments, a
+    union as its members' texts sorted, and a literal as its values. **Review of
+    49236ad, item 3.** ``shape_digest`` uses Python's own text of a hint, which the
+    pin of ``codec_digest`` cannot, since the gate runs on 3.12 and 3.15. Raises
+    ``TypeError`` for a hint no state or event uses. Recursion is bounded by how
+    deeply the model's types nest."""
+    hint = _resolve(hint)
+    if hint is type(None):
+        return "None"
+    if _is_union(hint):
+        return " | ".join(sorted(hint_text(arg) for arg in typing.get_args(hint)))
+    origin = typing.get_origin(hint)
+    args: tuple[object, ...] = typing.get_args(hint)
+    if origin is typing.Literal:
+        return f"Literal[{', '.join(repr(arg) for arg in args)}]"
+    if origin is not None:
+        named = getattr(origin, "__name__", None)
+        if not isinstance(named, str):
+            raise TypeError(f"no text for the generic {hint!r}")
+        written = ", ".join(
+            "..." if arg is Ellipsis else hint_text(arg) for arg in args
+        )
+        return f"{named}[{written}]"
+    if isinstance(hint, type):
+        return hint.__name__
+    raise TypeError(f"no text for {hint!r}")
+
+
+def codec_digest() -> str:
+    """The SHA-256 of the types of the state and of every event the codec writes,
+    as ``type_lines`` writes them. **Review of 49236ad, item 3.** A change of meaning
+    that keeps the state's shape is invisible to a start, so
+    ``tests/test_state_version.py`` pins this digest with ``STATE_VERSION`` and a
+    replay of a fixed history, and fails when either changes without a new version.
+    Changing an event's fields is taken as a possible change of meaning."""
+    return hashlib.sha256(
+        "\n".join(type_lines((State, Event))).encode("utf-8")
+    ).hexdigest()
+
+
+def type_lines(roots: tuple[object, ...]) -> list[str]:
+    """Each record reachable from ``roots`` with each field's name and type as
+    ``hint_text`` writes it, and each enumeration with its values, sorted."""
+    lines: set[str] = set()
+    seen: set[object] = set()
+    pending: list[object] = list(roots)
+    for _ in range(8192):
+        if not pending:
+            break
+        hint = _resolve(pending.pop())
+        if hint in seen:
+            continue
+        seen.add(hint)
+        if isinstance(hint, type) and is_dataclass(hint):
+            hints = _hints(hint)
+            for field in fields(hint):
+                written = hint_text(hints[field.name])
+                lines.add(f"{hint.__name__}.{field.name}: {written}")
+                pending.append(hints[field.name])
+        elif isinstance(hint, type) and issubclass(hint, enum.Enum):
+            lines.add(f"{hint.__name__} = {[member.value for member in hint]!r}")
+        elif typing.get_origin(hint) is not typing.Literal:
+            pending.extend(arg for arg in typing.get_args(hint) if arg is not Ellipsis)
+    else:
+        raise TypeError("the type tree is larger than the bound")
+    return sorted(lines)
+
+
 def canonical(data: Json) -> bytes:
     """``data`` as canonical JSON, sorted keys and no spaces, in UTF-8."""
     return json.dumps(
@@ -456,6 +532,8 @@ class Loaded:
     nth_row: str
     state: State
     times: dict[str, dict[str, str]]
+    digest: str
+    """The digest the file names, which it was checked against."""
 
 
 def snapshot_path(log_path: Path) -> Path:
@@ -474,17 +552,24 @@ def write(
 ) -> None:
     """Write a snapshot to ``path``, owner only, replacing any earlier one whole. The
     file is written beside it under another name and moved into place, so a reader
-    finds either the old snapshot or the new one, never a part."""
-    body: dict[str, Json] = {
-        "format": FORMAT_VERSION,
-        "schema": schema_version,
-        "state_version": STATE_VERSION,
-        "shape": shape_digest(),
-        "seq": seq,
-        "first_row": first_row,
-        "nth_row": nth_row,
-        **cast(dict[str, Json], encode_state(state, times)),
-    }
+    finds either the old snapshot or the new one, never a part.
+
+    **Review of 49236ad, item 2.** The directory is synchronized after the move, so
+    the new name is durable once this returns. A crash before the move leaves the
+    earlier snapshot or none, and may leave the ``.writing`` file, which no start
+    reads. A crash after the move and before the directory is synchronized may lose
+    the new name on some file systems, which leaves the earlier snapshot or none.
+    Either way a start finds a whole snapshot that was the state at its own ``seq``,
+    or none, and replays the events after it, or the whole log. A directory that
+    cannot be synchronized raises ``OSError``, and the caller records it."""
+    body = _body(
+        schema_version=schema_version,
+        seq=seq,
+        first_row=first_row,
+        nth_row=nth_row,
+        state=state,
+        times=times,
+    )
     body["digest"] = hashlib.sha256(canonical(body)).hexdigest()
     temporary = path.with_name(path.name + ".writing")
     descriptor = os.open(
@@ -502,6 +587,67 @@ def write(
         raise
     os.chmod(temporary, 0o600)
     os.replace(temporary, path)
+    sync_directory(path.parent)
+
+
+def sync_directory(directory: Path) -> None:
+    """Synchronize ``directory``'s entries to the disk, so a name moved into it
+    survives a crash. Raises ``OSError``. **Porting note.** Opening a directory to
+    synchronize it is the POSIX form, which Linux and macOS, the platforms the gate
+    runs on, both allow. A port to a platform without it says what it does instead."""
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _body(
+    *,
+    schema_version: int,
+    seq: int,
+    first_row: str,
+    nth_row: str,
+    state: State,
+    times: Mapping[str, Mapping[str, str]],
+) -> dict[str, Json]:
+    """The snapshot's object without its digest, as ``write`` stores it."""
+    return {
+        "format": FORMAT_VERSION,
+        "schema": schema_version,
+        "state_version": STATE_VERSION,
+        "shape": shape_digest(),
+        "seq": seq,
+        "first_row": first_row,
+        "nth_row": nth_row,
+        **cast(dict[str, Json], encode_state(state, times)),
+    }
+
+
+def body_digest(
+    *,
+    schema_version: int,
+    seq: int,
+    first_row: str,
+    nth_row: str,
+    state: State,
+    times: Mapping[str, Mapping[str, str]],
+) -> str:
+    """The digest ``write`` would store for this state and these times. **Review of
+    49236ad, item 1.** A start that restored from a snapshot compares it with the
+    digest of a full replay, so the restored file need not be kept or read again."""
+    return hashlib.sha256(
+        canonical(
+            _body(
+                schema_version=schema_version,
+                seq=seq,
+                first_row=first_row,
+                nth_row=nth_row,
+                state=state,
+                times=times,
+            )
+        )
+    ).hexdigest()
 
 
 def read(
@@ -548,11 +694,7 @@ def read(
     state = decode_value(data.get("state"), State)
     times = _decode_times(data.get("times"))
     return Loaded(
-        seq,
-        first_row,
-        nth_row,
-        cast(State, state),
-        times,
+        seq, first_row, nth_row, cast(State, state), times, cast(str, claimed)
     )
 
 

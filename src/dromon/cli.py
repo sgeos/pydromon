@@ -163,6 +163,9 @@ def _status(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             f" open questions {counts.get('open_questions')}"
         )
         print(_log_growth(counts))
+        restore = _restore_row(counts.get("start"))
+        if restore is not None:
+            print(restore)
     watch = result.get("scheduler")
     if isinstance(watch, dict):
         row = _scheduler_row(cast(Mapping[str, object], watch))
@@ -227,6 +230,24 @@ def _correlation_row(totals: Mapping[str, object]) -> str:
         f" shared with other keys {totals.get('shared_turns')},"
         f" known cost ${totals.get('cost_usd')}"
         + (f", turns of unknown cost {unknown}" if unknown else "")
+    )
+
+
+def _restore_row(start: object) -> str | None:
+    """The line of ``dromon status`` when a full replay did not confirm the state
+    the daemon restored from a snapshot, or ``None``. **Review of 49236ad, item
+    1.**"""
+    if not isinstance(start, dict):
+        return None
+    report = cast(Mapping[str, object], start)
+    if report.get("restart_required") is not True:
+        return None
+    kind = report.get("mismatch_class")
+    return (
+        f"RESTART REQUIRED. The snapshot at event {report.get('snapshot_seq')} was not"
+        f" confirmed by a full replay, mismatch {report.get('mismatch')}"
+        + (f", class {kind}" if isinstance(kind, str) else "")
+        + ". Every line is held until the daemon restarts."
     )
 
 

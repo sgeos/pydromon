@@ -23,6 +23,7 @@ from dromon.model import (
     AgentRegistered,
     AgentRevoked,
     Event,
+    FailureCause,
     HoldCause,
     InvalidField,
     LineConfigured,
@@ -165,7 +166,14 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     "wake_issued": ("wake_id",),
     "wake_scheduled": ("line_id", "message_id", "due", "note", "task_id", "request"),
     "wake_withdrawn": ("line_id", "message_id"),
-    "line_turn_ended": ("line_id", "workdir_commit", "unreported", "failed"),
+    "line_turn_ended": (
+        "line_id",
+        "workdir_commit",
+        "unreported",
+        "failed",
+        "failure",
+        "failure_class",
+    ),
     "task_noted": ("line_id", "message_id", "task_id", "status", "body"),
     "task_recorded": (
         "line_id",
@@ -238,6 +246,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "workdir_commit",
         "daemon_commit",
         "set_at",
+        "workdir_dirty",
     ),
     "budget_stated": (
         "provider",
@@ -400,7 +409,8 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "message_sent": ("request", "asks_reply"),
     "message_acknowledged": ("reason",),
     "wake_scheduled": ("request",),
-    "line_turn_ended": ("unreported", "failed"),
+    "line_turn_ended": ("unreported", "failed", "failure", "failure_class"),
+    "brief_set": ("workdir_dirty",),
     "lease_acquired": ("note",),
     "budget_stated": ("window",),
     "line_held": ("cause",),
@@ -424,7 +434,9 @@ as null, so that its log stays readable by a daemon that predates them, and must
 read an absent one as null. A daemon predating ``window`` does not read an event
 that names one. ``reviews`` was added to ``role_declared`` in round 15, item 5, and
 is left out when empty, as ``sealed`` is, so a daemon that predates it still reads
-every role that reviews nothing."""
+every role that reviews nothing. ``failure`` and ``failure_class`` were added to
+``line_turn_ended`` in the round 15 follow-up of 2026-11-05, so a daemon that
+predates them still reads every turn that did not fail."""
 
 
 def _without_nulls(kind: str, data: dict[str, object]) -> dict[str, object]:
@@ -566,6 +578,8 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "workdir_commit": event.workdir_commit,
                 "unreported": event.unreported,
                 "failed": event.failed,
+                "failure": None if event.failure is None else event.failure.value,
+                "failure_class": event.failure_class,
             }
         case TaskRecorded():
             return "task_recorded", {
@@ -734,6 +748,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "workdir_commit": event.workdir_commit,
                 "daemon_commit": event.daemon_commit,
                 "set_at": event.set_at,
+                "workdir_dirty": event.workdir_dirty,
             }
         case BudgetStated():
             return "budget_stated", {
@@ -938,6 +953,10 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _optional_str(data, "workdir_commit"),
                 _optional_bool(data, "unreported"),
                 _optional_bool(data, "failed"),
+                None
+                if data["failure"] is None
+                else _member(data, "failure", FailureCause),
+                _optional_str(data, "failure_class"),
             )
         case "task_recorded":
             return TaskRecorded(
@@ -1094,6 +1113,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "workdir_commit"),
                 _str(data, "daemon_commit"),
                 _str(data, "set_at"),
+                _optional_str(data, "workdir_dirty"),
             )
         case "budget_stated":
             return BudgetStated(
@@ -1333,6 +1353,7 @@ def _member[
         LeaseEnd,
         RunStatus,
         RunClearance,
+        FailureCause,
     )
 ](data: dict[str, object], name: str, kind: type[T]) -> T:
     value = _str(data, name)

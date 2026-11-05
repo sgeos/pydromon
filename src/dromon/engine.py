@@ -301,6 +301,13 @@ class EngineRefused(Exception):
     """The credential policy or the driver refused to run the turn."""
 
 
+class EngineClosed(EngineRefused):
+    """The engine's process or connection ended before the turn's result. **Round 15
+    follow-up of 2026-11-05.** A type of its own, so the scheduler records the cause
+    ``engine_closed`` from the type and never from the message. It stays an
+    ``EngineRefused``, so every handler that caught the plain refusal still does."""
+
+
 class ConfinementBreach(EngineRefused):
     """A call escaped the confinement Dromon gave the line, as a ``Read`` that
     completed on a view-only line with no ViewImage hook call. **Round 15, review
@@ -2621,7 +2628,7 @@ class ClaudeCodeLine:
         """The turn's report, with ``cost`` the turn's own, which ``_measure`` took
         from the engine's running total."""
         if result is None:
-            raise EngineRefused("the engine ended the turn without a result")
+            raise EngineClosed("the engine ended the turn without a result")
         self.session_id = result.session_id
         return TurnReport(
             subtype=result.subtype,
@@ -3219,7 +3226,7 @@ class ClaudeCodeLine:
         if error is None:
             try:
                 if result is None:
-                    raise EngineRefused(
+                    raise EngineClosed(
                         "the engine ended its self-started turn without a result"
                     )
                 self._refuse_missing_sign_in(result.result, turn)

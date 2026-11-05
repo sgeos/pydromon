@@ -99,10 +99,12 @@ from dromon.driver import (
 from dromon.eventlog import (
     EventLog,
     LogError,
+    RestoreMismatch,
     check_snapshot,
     read_entries,
     snapshot,
     utc_now,
+    verify_restored,
 )
 from dromon.statesnapshot import snapshot_path
 from dromon.sealed import SealedStore, store_path
@@ -2004,6 +2006,61 @@ class Daemon:
             "its watch made every poll its wait allows without passing the deadline"
         )
 
+    async def verify_restore(self) -> tuple[RestoreMismatch, str | None] | None:
+        """Check a state this process restored from a snapshot against a full replay
+        of the log, off the event loop, and return the mismatch or ``None``. **Review
+        of 49236ad, item 1, required by the operator.** Nothing is checked when no
+        snapshot was used. On a mismatch every line is held in memory, the snapshot
+        is deleted, the daemon log and ``status`` name the mismatch by type, and only
+        a restart, which then replays the whole log, lifts the hold.
+
+        **Decided by core, for review.** The hold appends no event. An event is
+        checked against the state it is appended to, and this state is the one not
+        confirmed, so a ``line_held`` it accepted could be one the replayed state
+        refuses, and the log would then fail to replay at the next start.
+        **Residual.** The events appended between the start and the end of the check
+        were checked against the restored state too, and a turn already running
+        when the check fails runs to its end. A stop waits for a running check,
+        since a thread cannot be interrupted."""
+        restored = self.log.restored
+        if restored is None:
+            return None
+        try:
+            scratch = check_scratch(self.paths)
+        except LogError as error:
+            mismatch: tuple[RestoreMismatch, str | None] | None = (
+                RestoreMismatch.CHECK_FAILED,
+                type(error).__name__,
+            )
+        else:
+            try:
+                mismatch = await asyncio.to_thread(
+                    verify_restored,
+                    self.log.path,
+                    scratch / self.log.path.name,
+                    restored,
+                )
+            finally:
+                await asyncio.to_thread(shutil.rmtree, scratch, True)
+        self.log.restore_checked(mismatch)
+        if mismatch is None:
+            print(
+                f"dromond: the snapshot at event {restored.seq} agrees with a full"
+                " replay of the log",
+                file=sys.stderr,
+            )
+            return None
+        cause, kind = mismatch
+        print(
+            f"dromond: the snapshot at event {restored.seq} was not confirmed by a"
+            f" full replay of the log, mismatch {cause.value}"
+            + (f", class {kind}" if kind else "")
+            + ". Every line is held, the snapshot is deleted, and the daemon must be"
+            " restarted, which replays the whole log",
+            file=sys.stderr,
+        )
+        return mismatch
+
     def status(self) -> dict[str, object]:
         state = self.log.state
         open_questions = sum(
@@ -2863,6 +2920,8 @@ async def serve(daemon: Daemon) -> None:
     relayer = daemon.operator_relayer()
     daemon.scheduler.recover()
     scheduling = asyncio.create_task(daemon.scheduler.run(daemon.stop_requested))
+    # Review of 49236ad, item 1. A restored state is checked while the daemon serves.
+    verifying = asyncio.create_task(daemon.verify_restore())
     forwarding = asyncio.create_task(forwarder.run(daemon.stop_requested))
     relaying = asyncio.create_task(relayer.run(daemon.stop_requested))
     scheduling.add_done_callback(watch_task("scheduler", daemon.stop_requested))
@@ -2876,6 +2935,13 @@ async def serve(daemon: Daemon) -> None:
     finally:
         daemon.stop_requested.set()
         await scheduling
+        try:
+            await verifying
+        except Exception as error:  # noqa: BLE001, a stop must still close the sockets
+            print(
+                f"dromond: the restore check ended with {type(error).__name__}",
+                file=sys.stderr,
+            )
         # Its watch has said how it ended, and an error here must not keep the
         # sockets open.
         with contextlib.suppress(Exception):

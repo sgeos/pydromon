@@ -187,6 +187,7 @@ from dromon.engine import (
     SelfStartedFinish,
     ClaudeCodeLine,
     ConfinementBreach,
+    EngineClosed,
     EnginePlanLimit,
     EngineRefused,
     TurnReport,
@@ -328,6 +329,8 @@ from dromon.model import (
     InvalidField,
     LineAddress,
     HoldCause,
+    FAILURE_CLASS_PATTERN,
+    FailureCause,
     Line,
     LineConfigured,
     LineCreated,
@@ -1098,6 +1101,79 @@ INTERRUPTED: Final = "interrupted"
 engine reported success, reported anything else, or was interrupted by its driver.
 A turn an operator stopped, or one cancelled at shutdown, produces no report. A line's
 condition in ``line_status`` keeps running, held, failed, waiting and idle apart."""
+
+RESULT_FAILURES: Final[Mapping[str, FailureCause]] = {
+    "error_during_execution": FailureCause.ENGINE_REPORTED,
+    "error_max_turns": FailureCause.LIMIT,
+    "error_max_budget_usd": FailureCause.LIMIT,
+    "error_max_structured_output_retries": FailureCause.LIMIT,
+    "error": FailureCause.ENGINE_REPORTED,
+    "failed": FailureCause.ENGINE_REPORTED,
+    "interrupted": FailureCause.INTERRUPTED,
+    "cancelled": FailureCause.INTERRUPTED,
+    "aborted": FailureCause.INTERRUPTED,
+    "max_tokens": FailureCause.LIMIT,
+    "max_turn_requests": FailureCause.LIMIT,
+    "length": FailureCause.LIMIT,
+    "refusal": FailureCause.REFUSED,
+}
+"""**Round 15 follow-up of 2026-11-05.** The result subtypes a failed turn is known
+to report, each with its cause. The subtype is an engine's own word, so only one
+listed here is recorded, as the failure's class, and any other is recorded as
+``engine_reported`` with no class, which keeps an engine's free text out of the log.
+The Claude Code words are the Agent SDK's result subtypes, and ``error`` is what the
+Cursor, Antigravity and Pi adapters write for a failure. ``failed`` and
+``interrupted`` are Codex turn states, which the Pi adapter also writes for an
+aborted turn. ``cancelled``, ``max_tokens``, ``max_turn_requests`` and ``refusal``
+are the Agent Client Protocol's stop reasons, and ``length`` and ``aborted`` Pi's.
+**Inference.** These are taken from each engine's documented types and the adapters'
+code, and only ``error_during_execution`` has been seen in a live failure here. A
+subtype that reads ``interrupted`` while the driver asked no interruption is a turn
+the engine ended on its own, so it is a failure of cause ``interrupted``."""
+
+
+def reported_failure(subtype: str) -> tuple[FailureCause, str | None]:
+    """The cause and class of a turn whose engine reported ``subtype``, other than
+    success, as ``RESULT_FAILURES`` gives them."""
+    cause = RESULT_FAILURES.get(subtype)
+    if cause is None:
+        return FailureCause.ENGINE_REPORTED, None
+    return cause, subtype
+
+
+def raised_failure(
+    error: BaseException, *, started: bool, returned: bool, interrupted: bool
+) -> tuple[FailureCause, str | None]:
+    """The cause and class of a turn that raised ``error``. ``started`` says the
+    engine was given the prompt, ``returned`` that it had given its report when the
+    error came, and ``interrupted`` that an operator was stopping the turn. The class
+    is the error's own type, the daemon's or the runtime's and never the engine's
+    text, left out if it is not a short identifier. **Porting hazard.** A port names
+    its own error variants, so a class recorded by this prototype may have no
+    counterpart there, which is why the cause, and not the class, is the fixed
+    word."""
+    name = type(error).__name__
+    error_class = name if FAILURE_CLASS_PATTERN.fullmatch(name) is not None else None
+    if interrupted:
+        cause = FailureCause.INTERRUPTED
+    elif returned:
+        cause = FailureCause.UNKNOWN
+    elif isinstance(error, EngineClosed):
+        cause = FailureCause.ENGINE_CLOSED
+    elif isinstance(error, EngineRefused):
+        cause = FailureCause.REFUSED
+    elif not started:
+        cause = FailureCause.NOT_STARTED
+    else:
+        cause = FailureCause.ENGINE_ERROR
+    return cause, error_class
+
+
+def failure_text(failure: tuple[FailureCause, str | None]) -> str:
+    """A failure as the daemon log gives it, its cause and its class if any."""
+    cause, error_class = failure
+    return cause.value if error_class is None else f"{cause.value}, class {error_class}"
+
 
 RECENT_TURN_COSTS: Final = 10
 
@@ -5740,6 +5816,7 @@ class Scheduler:
             "background_ends": self.background_ends(line_id),
             "held_by": line.held_by,
             "hibernated": line.hibernated,
+            "last_failure": failure_view(line),
             "autonomous_turns": {
                 "used": self._autonomous.get(line_id, 0),
                 "allowed": limits.max_autonomous_turns,
@@ -7680,11 +7757,13 @@ class Scheduler:
         decisions: str = "",
         artifacts: tuple[str, ...] = (),
         next_action: str = "",
+        workdir_dirty: str | None = None,
     ) -> BriefSet:
         """Record ``line_id``'s standing brief, stamped by the daemon, replacing its
         previous one. The bounds are checked before the disclosure list, so an
         oversized brief is refused without spending a disclosure check. Raises
-        ``LineToolRefused``."""
+        ``LineToolRefused``. ``workdir_dirty`` is the digest ``dirty_state`` read,
+        which the tool reads off the event loop before it calls this."""
         stamp = self._stamp(line_id)
         try:
             event = BriefSet(
@@ -7696,6 +7775,7 @@ class Scheduler:
                 stamp.workdir_commit,
                 stamp.daemon_commit,
                 stamp.at,
+                workdir_dirty,
             )
         except InvalidField as error:
             raise LineToolRefused(str(error)) from error
@@ -7733,6 +7813,7 @@ class Scheduler:
                 isinstance(path, str) for path in cast(list[object], artifacts)
             ):
                 return _tool_error("artifacts must be a list of paths")
+            dirty = await asyncio.to_thread(self.dirty_state, line_id)
             try:
                 brief = self.set_brief(
                     line_id,
@@ -7740,6 +7821,7 @@ class Scheduler:
                     cast(str, decisions),
                     tuple(cast(list[str], artifacts)),
                     cast(str, next_action),
+                    None if dirty is None else dirty[0],
                 )
             except LineToolRefused as error:
                 return _tool_error(str(error))
@@ -10119,6 +10201,9 @@ class Scheduler:
             and not line.hibernated
             and line_id not in self._failed
             and self._restart is None
+            # Review of 49236ad, item 1. A restored state that a full replay did
+            # not confirm holds every line, in memory alone, until a restart.
+            and not self._log.restore_failed
             and not self._waits_for_writer(line_id)
             and not self.waits_unconfined(line_id)
             and self.beside_owner(line_id) is None
@@ -10556,6 +10641,8 @@ class Scheduler:
         breached = False
         stop_cause: str | None = None
         engine: LineEngine | None = None
+        started = False
+        failure: tuple[FailureCause, str | None] | None = None
         mailed = self._operator_mail(line_id)
         sent = self._line_mail(line_id)
         self.activity.record(line_id, ActivityKind.TURN_STARTED, prompt)
@@ -10570,6 +10657,9 @@ class Scheduler:
                 line_id, facts, fresh=compaction is not None
             ):
                 prompt = f"{facts}\n\n{prompt}"
+            stale = await self._stale_brief_notice(line_id, led_brief)
+            if stale is not None:
+                prompt = f"{stale}\n\n{prompt}"
             self._start_token(line_id, engine)
             if compaction is not None:
                 if isinstance(engine, CompactingEngine):
@@ -10582,6 +10672,7 @@ class Scheduler:
                     # engine cannot make, so it is given here instead.
                     warning = self._context_warning(line_id)
                     prompt = f"{warning}\n\n{prompt}" if warning else prompt
+            started = True
             report = await engine.run_turn(prompt)
             if owed is not None:
                 self._handed_off(line_id, *owed)
@@ -10603,6 +10694,7 @@ class Scheduler:
                 ending += f", interrupted by its driver: {report.interrupted_for}"
             elif turn_outcome(report) == FAILED:
                 ending = f"failed: the engine ended the turn as {report.subtype}"
+                failure = reported_failure(report.subtype)
                 # Follow-up of 2026-11-01. A failure the engine reports without
                 # raising marks the line failed, as one it raises does here and as
                 # either does in a self-started turn. Unmarked, a line that mailed an
@@ -10643,6 +10735,12 @@ class Scheduler:
                 stop_cause = str(error)
             ending = f"failed: {error}"
             failed = True
+            failure = raised_failure(
+                error,
+                started=started,
+                returned=report is not None,
+                interrupted=line_id in self._interrupted,
+            )
             breached = isinstance(error, ConfinementBreach)
             print(f"dromond: line {line_id} turn failed: {error}", file=sys.stderr)
         finally:
@@ -10675,14 +10773,7 @@ class Scheduler:
                 # Round 8 review, ON1. With no report the prompt may never have
                 # reached the engine, as when it could not be composed, so the turn
                 # retires none of the notes delivered into it.
-                self._log.append(
-                    LineTurnEnded(
-                        line_id,
-                        self._workdir_commit(line_id),
-                        True if report is None else None,
-                        True if line_id in self._failed else None,
-                    )
-                )
+                self._end_turn(line_id, report, failure)
             if stop_cause is not None and line is not None:
                 self._note_engine_stop(line_id, stop_cause)
             # A handoff asked for in the turn takes effect now that it has ended,
@@ -10699,6 +10790,36 @@ class Scheduler:
         if failed and (breached or self._operator_mail(line_id) == mailed):
             self._hold_failed(line_id, ending, breached)
         self.fail_over_if_unable(line_id)
+
+    def _end_turn(
+        self,
+        line_id: str,
+        report: TurnReport | None,
+        failure: tuple[FailureCause, str | None] | None,
+    ) -> None:
+        """Record ``line_turn_ended`` for a turn of ``line_id``, with the cause of its
+        failure if it failed, and write that cause to the daemon log. **Round 15
+        follow-up of 2026-11-05.** A turn marked failed for which no path named a
+        cause records ``unknown``, so no failed turn is recorded without one."""
+        failed = line_id in self._failed
+        if failed and failure is None:
+            failure = (FailureCause.UNKNOWN, None)
+        self._log.append(
+            LineTurnEnded(
+                line_id,
+                self._workdir_commit(line_id),
+                True if report is None else None,
+                True if failed else None,
+                failure[0] if failed and failure is not None else None,
+                failure[1] if failed and failure is not None else None,
+            )
+        )
+        if failed and failure is not None:
+            print(
+                f"dromond: line {line_id} turn ended as failed, cause"
+                f" {failure_text(failure)}",
+                file=sys.stderr,
+            )
 
     def _handoff(
         self, line_id: str, messages: list[tuple[str, Message]]
@@ -11008,10 +11129,10 @@ class Scheduler:
         operator.** A brief set before the worktree's last change is flagged as stale
         at the head of the turn and never presented as current, since a line resumed
         a task from a brief whose branch had been merged and moved on. The change
-        read is the commit at ``HEAD``. **Residual.** Uncommitted changes are not
-        read, so a brief set before the line's own later edits at the same commit
-        is presented as current, which those edits, being the line's own, need not
-        undo."""
+        read is the commit at ``HEAD``. Uncommitted changes are not read here, since
+        composing a prompt runs no git. **Review of 49236ad, item 4.** The turn reads
+        them off the event loop, and ``_stale_brief_notice`` heads it when they
+        changed since the brief was set, on every turn of a kept session."""
         head = self._workdir_commit(line_id)
         named = brief.workdir_commit
         if named and head is not None and named != head:
@@ -11037,6 +11158,64 @@ class Scheduler:
             f" current commit {named[:12]}. It is your own earlier text, and mail may"
             " have changed the task since. Set it again with set_brief when your"
             " task changes."
+        )
+
+    def dirty_state(self, line_id: str) -> tuple[str, int] | None:
+        """The digest of ``line_id``'s worktree's ``git status`` entries with their
+        count, as ``readiness.dirty_digest`` gives them, or ``None`` when they cannot
+        be read. Blocking, so it runs off the event loop. **Review of 49236ad, item
+        4.**"""
+        try:
+            return readiness.dirty_digest(self._workdir_of(line_id))
+        except (LineToolRefused, readiness.ReadinessUnknown, UnicodeError):
+            return None
+
+    async def _stale_brief_notice(self, line_id: str, led_brief: bool) -> str | None:
+        """What a turn of ``line_id`` leads with while its standing brief is stale,
+        or ``None``. **Review of 49236ad, item 4, required by the operator.** The
+        brief is stale when the worktree's ``HEAD`` moved from the commit it names,
+        or its uncommitted state changed from the digest it names. The notice heads
+        every turn of a kept session while either holds, until the line sets a new
+        brief, and not only the turn that leads with the brief. A turn whose lead
+        already says the commit moved is not told twice. A line with a fresh
+        session each turn is never led with its brief, so it is not told either.
+        Where either side cannot be read, that comparison is skipped.
+
+        **Decided by core, for review.** The digest covers which paths are dirty
+        and how, and not their contents, so a line's edits inside a file already
+        dirty do not flag the brief, while a new dirty path, a path made clean, or
+        work discarded does. A line whose own work flagged it clears the flag by
+        setting the brief again."""
+        brief = self._state().briefs.get(line_id)
+        if brief is None or self.effective_config(line_id).fresh_session_each_turn:
+            return None
+        head = self._workdir_commit(line_id)
+        moved = bool(brief.workdir_commit) and head is not None
+        moved = moved and brief.workdir_commit != head
+        dirty = (
+            None
+            if brief.workdir_dirty is None
+            else await asyncio.to_thread(self.dirty_state, line_id)
+        )
+        changed = dirty is not None and dirty[0] != brief.workdir_dirty
+        if not (changed or (moved and not led_brief)):
+            return None
+        reasons: list[str] = []
+        if moved and head is not None and not led_brief:
+            reasons.append(
+                f"your worktree moved from commit {brief.workdir_commit[:12]} to"
+                f" {head[:12]}"
+            )
+        if changed and dirty is not None:
+            reasons.append(
+                "its uncommitted changes differ from those when the brief was set,"
+                f" with {dirty[1]} dirty {'path' if dirty[1] == 1 else 'paths'} now"
+            )
+        return (
+            f"STALE BRIEF. Your standing brief, set at {brief.set_at}, was set before"
+            f" {' and '.join(reasons)}, so it may not describe your current task."
+            " Check it against git log, git status and your mail before acting on"
+            " it, and set it again with set_brief, which clears this notice."
         )
 
     def _mail_since_brief(self, line_id: str, brief: BriefSet) -> str:
@@ -11882,6 +12061,7 @@ class Scheduler:
         error: Exception | None = None
         ending = "cancelled"
         failed = False
+        failure: tuple[FailureCause, str | None] | None = None
         engine = self._engines.get(line_id)
         try:
             report, error = await asyncio.shield(completion)
@@ -11903,6 +12083,12 @@ class Scheduler:
                     self._failed.add(line_id)
                     failed = True
                     ending = f"failed: {error}"
+                    failure = raised_failure(
+                        error,
+                        started=True,
+                        returned=False,
+                        interrupted=line_id in self._interrupted,
+                    )
                     print(
                         f"dromond: line {line_id} self-started turn failed: {error}",
                         file=sys.stderr,
@@ -11925,6 +12111,7 @@ class Scheduler:
                     ending += f", interrupted by its driver: {report.interrupted_for}"
                 elif turn_outcome(report) == FAILED:
                     ending = f"failed: the engine ended the turn as {report.subtype}"
+                    failure = reported_failure(report.subtype)
                     self._failed.add(line_id)
                     failed = True
         except asyncio.CancelledError:
@@ -11944,6 +12131,12 @@ class Scheduler:
             self._failed.add(line_id)
             failed = True
             ending = f"failed: {unexpected}"
+            failure = raised_failure(
+                unexpected,
+                started=True,
+                returned=True,
+                interrupted=line_id in self._interrupted,
+            )
             print(
                 f"dromond: line {line_id} self-started turn failed: {unexpected}",
                 file=sys.stderr,
@@ -11968,14 +12161,7 @@ class Scheduler:
             if line is not None:
                 # Round 8 review, ON1, as in ``_turn``. An engine turn that failed or
                 # was cancelled before it reported retires none of its task notes.
-                self._log.append(
-                    LineTurnEnded(
-                        line_id,
-                        self._workdir_commit(line_id),
-                        True if report is None else None,
-                        True if line_id in self._failed else None,
-                    )
-                )
+                self._end_turn(line_id, report, failure)
             self._settle_relinquish(line_id)
             self._work.set()
         self._apply_limits(line_id, TurnCause.AUTONOMOUS, True, report)
@@ -12384,6 +12570,7 @@ class Scheduler:
                 "condition": self.condition(line_id),
                 "background_jobs": self.background_jobs(line_id),
                 "hibernated": line.hibernated,
+                "last_failure": failure_view(line),
                 "pending": len(self.pending(line_id)),
                 "turns": self._turns.get(line_id, 0),
                 "autonomous_turns": self._autonomous.get(line_id, 0),
@@ -12710,6 +12897,20 @@ def _hold_cause(line: Line) -> str | None:
     return line.hold_cause.value
 
 
+def failure_view(line: Line) -> dict[str, object] | None:
+    """``line``'s latest failed turn as ``line_status`` gives it, or ``None`` when no
+    turn of it has failed. **Round 15 follow-up of 2026-11-05.** ``current`` says
+    the line still stands failed. A failure logged before causes were reads as
+    ``unknown``, with no class."""
+    if line.last_failure is None and not line.failed:
+        return None
+    return {
+        "cause": (line.last_failure or FailureCause.UNKNOWN).value,
+        "error_class": line.last_failure_class,
+        "current": line.failed,
+    }
+
+
 def _lease_live(lease: LeaseAcquired, now: datetime) -> bool:
     """Whether ``lease`` is still held at ``now``, by its expiry."""
     return parse_due(lease.expires) > now
@@ -12805,6 +13006,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         "state": full["state"],
         "condition": full["condition"],
         "held_by": full["held_by"],
+        "last_failure": full["last_failure"],
         "autonomous_turns": {
             "used": autonomous["used"],
             "allowed": autonomous["allowed"],

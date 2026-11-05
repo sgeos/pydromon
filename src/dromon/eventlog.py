@@ -30,6 +30,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 from typing import Final, Self, cast
@@ -54,6 +55,7 @@ from dromon.model import (
     MessageReceived,
     MessageSent,
     State,
+    check_failure_class,
 )
 
 SCHEMA_VERSION: Final = 1
@@ -99,6 +101,39 @@ class Entry:
     event: Event
 
 
+class RestoreMismatch(StrEnum):
+    """Why a state restored from a snapshot was not confirmed by a full replay of the
+    log, in fixed words. **Review of 49236ad, item 1.**
+
+    ``state_differs`` means the replay's state or recorded times encode to another
+    digest than the snapshot's. ``log_corrupt`` means the log could not be replayed
+    through the snapshot's ``seq``. ``check_failed`` means the check itself could not
+    run, as when the copy of the log cannot be written, and names the exception's
+    type. Each is treated alike, since a state that was not confirmed is not
+    trusted."""
+
+    STATE_DIFFERS = "state_differs"
+    LOG_CORRUPT = "log_corrupt"
+    CHECK_FAILED = "check_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class Restored:
+    """What a start that restored from a snapshot keeps to check it later."""
+
+    seq: int
+    first_row: str
+    nth_row: str
+    digest: str
+
+
+VERIFY_NONE: Final = "none"
+"""No snapshot was used, so nothing is checked."""
+VERIFY_PENDING: Final = "pending"
+VERIFY_PASSED: Final = "passed"
+VERIFY_FAILED: Final = "failed"
+
+
 class EventLog:
     """An open event log and the state its events build.
 
@@ -121,6 +156,8 @@ class EventLog:
         self.path = path
         self._times = RecordedTimes()
         self._snapshots = snapshots
+        self.restored: Restored | None = None
+        """The snapshot this process restored from, until its check ends."""
         started = time.monotonic()
         try:
             _initialize(self._connection)
@@ -178,12 +215,59 @@ class EventLog:
         self._state, self._last_seq = _replay(
             self._connection, self._times, loaded.state, loaded.seq
         )
-        return StartReport("used", loaded.seq, None, self._last_seq - loaded.seq)
+        self.restored = Restored(
+            loaded.seq, loaded.first_row, loaded.nth_row, loaded.digest
+        )
+        return StartReport(
+            "used",
+            loaded.seq,
+            None,
+            self._last_seq - loaded.seq,
+            verified=VERIFY_PENDING,
+        )
+
+    @property
+    def restore_failed(self) -> bool:
+        """Whether the state this process restored was not confirmed by a full
+        replay, so no line may start a turn until a restart."""
+        return self.start.verified == VERIFY_FAILED
+
+    def restore_checked(
+        self, mismatch: tuple[RestoreMismatch, str | None] | None
+    ) -> None:
+        """Record the end of the check of the restored state. **Review of 49236ad,
+        item 1.** A pass lets snapshots be written again. A mismatch deletes the
+        snapshot, so the next start replays the whole log, and writes none for the
+        rest of this process, whose state is not trusted. A snapshot that cannot be
+        deleted is recorded in ``write_failure``, and the next start's own check
+        then finds it again."""
+        if self.start.verified != VERIFY_PENDING:
+            raise ValueError("no check of a restored state is pending")
+        self.restored = None
+        if mismatch is None:
+            self.start.verified = VERIFY_PASSED
+            return
+        self.start.verified = VERIFY_FAILED
+        self.start.mismatch, self.start.mismatch_class = mismatch
+        self._snapshots = False
+        try:
+            statesnapshot.snapshot_path(self.path).unlink(missing_ok=True)
+        except OSError as error:
+            self.start.write_failure = (
+                f"the snapshot could not be deleted: {type(error).__name__}"
+            )
 
     def write_snapshot(self) -> None:
         """Write a snapshot of the state at the newest event. A failure is recorded
-        in ``start.write_failure`` and never raised, since a snapshot is a cache."""
-        if self._last_seq < 1:
+        in ``start.write_failure`` and never raised, since a snapshot is a cache.
+        **Review of 49236ad, item 1.** None is written while a restored state awaits
+        its check, or after it failed, since the state written would be the one not
+        yet confirmed. A stop before the check ends leaves the earlier snapshot, which
+        the next start checks again."""
+        if self._last_seq < 1 or self.start.verified in (
+            VERIFY_PENDING,
+            VERIFY_FAILED,
+        ):
             return
         try:
             with _transaction(self._connection, "BEGIN") as reading:
@@ -301,6 +385,13 @@ class StartReport:
     seconds: float = 0.0
     write_failure: str | None = None
     """Why the latest snapshot this process tried to write was not written."""
+    verified: str = VERIFY_NONE
+    """Whether a full replay confirmed a restored state, ``none`` when none was
+    restored, then ``pending``, ``passed`` or ``failed``. **Review of 49236ad, item
+    1.**"""
+    mismatch: RestoreMismatch | None = None
+    mismatch_class: str | None = None
+    """The exception's type for ``check_failed``, an identifier and never its text."""
 
     def wire(self) -> dict[str, object]:
         """The report as a status gives it. Whole milliseconds, since the client
@@ -312,6 +403,10 @@ class StartReport:
             "replayed": self.replayed,
             "open_milliseconds": round(self.seconds * 1000),
             "write_failure": self.write_failure,
+            "verified": self.verified,
+            "mismatch": None if self.mismatch is None else self.mismatch.value,
+            "mismatch_class": self.mismatch_class,
+            "restart_required": self.verified == VERIFY_FAILED,
         }
 
 
@@ -476,6 +571,59 @@ def check_snapshot(snapshot_file: Path, log_copy: Path) -> tuple[bool, str]:
             " it without a new state version"
         )
     return True, f"the snapshot at event {loaded.seq} agrees with a full replay"
+
+
+def verify_restored(
+    log_path: Path, copy_path: Path, restored: Restored
+) -> tuple[RestoreMismatch, str | None] | None:
+    """Whether a full replay of the log at ``log_path`` through ``restored.seq``
+    gives the state and times the restored snapshot held, ``None`` when it does, or
+    the mismatch. **Review of 49236ad, item 1, required by the operator.** A start
+    that restored from a snapshot runs this off the event loop, so a snapshot whose
+    digests are valid but whose state is not the replay is caught, which before only
+    ``dromond --check`` did.
+
+    The log is first copied to ``copy_path``, which must not exist, in the bounded
+    ranges ``snapshot`` uses, so the replay holds no lock on the live log and the
+    daemon's commits wait at most for one range. The copy's events through ``seq``
+    are replayed, and the digest ``statesnapshot.body_digest`` gives for their state
+    and times is compared with the digest the restored file named, which ``read``
+    verified. A file whose state decodes to the replay but was not written in the
+    canonical form this code writes also differs, which fails closed. Blocking.
+
+    **Trust.** The snapshot sits beside the log, on the same protected boundary,
+    since ``protected_dirs`` holds the state directory. Whoever can forge the
+    snapshot can also alter the log, so this check detects corruption, a forgotten
+    ``STATE_VERSION`` and a file changed by a process that could write it but not
+    the log, and never a determined owner of the files."""
+    try:
+        snapshot(log_path, copy_path)
+        state, times = replay_through(copy_path, restored.seq)
+        replayed = statesnapshot.body_digest(
+            schema_version=SCHEMA_VERSION,
+            seq=restored.seq,
+            first_row=restored.first_row,
+            nth_row=restored.nth_row,
+            state=state,
+            times=times,
+        )
+    except LogCorrupt:
+        return RestoreMismatch.LOG_CORRUPT, None
+    except Exception as error:  # noqa: BLE001, any failure leaves the state unconfirmed
+        return RestoreMismatch.CHECK_FAILED, _error_class(error)
+    if replayed != restored.digest:
+        return RestoreMismatch.STATE_DIFFERS, None
+    return None
+
+
+def _error_class(error: BaseException) -> str | None:
+    """``error``'s type name when it is a bounded identifier, or ``None``."""
+    name = type(error).__name__
+    try:
+        check_failure_class(name)
+    except ValueError:
+        return None
+    return name
 
 
 def read_entries(path: Path) -> list[Entry]:

@@ -452,6 +452,38 @@ given exactly when the line is held.
   mail reaches it, and stays failed across a restart. **Residual.** A note the daemon records for the line without
   waking it clears the state's flag, while the daemon's memory keeps the line failed
   until a restart.
+- **`last_failure`, from the round 15 follow-up.** **Required by the operator on
+  2026-11-05.** A turn could end failed with no reason anywhere, since
+  `line_turn_ended` carried the fact alone. Every failed turn now records a cause in
+  `line_turn_ended.failure`, one of the fixed words below, and where one exists its
+  class in `failure_class`, which is the daemon's own exception type or a result
+  subtype from the fixed table in `dromon.scheduler`. Neither ever carries an
+  engine's text, and a subtype the table does not list is recorded as
+  `engine_reported` with no class. Both views of `line_status`, and each entry of the
+  daemon's `status` `lines`, give `last_failure` as `cause`, `error_class` and
+  `current`, whether the line still stands failed, or `null` when no turn of the line
+  has failed. It is kept after `failed` clears, until a later failure replaces it. A
+  failure logged before the field reads as `unknown` with no class. The daemon log
+  gives one line for each failed turn, `dromond: line ID turn ended as failed, cause
+  CAUSE`, with `, class CLASS` where there is one.
+
+  | Cause | When |
+  |---|---|
+  | `not_started` | A failure before the engine was given the prompt, such as a prompt that could not be composed or an engine that could not be built |
+  | `refused` | A check of the daemon or the driver refused the turn, before or during it, `EngineRefused` and its kinds other than a closed engine |
+  | `engine_error` | The engine raised during the turn |
+  | `engine_closed` | The engine's process or connection ended before the turn's result, `EngineClosed` |
+  | `engine_reported` | The engine reported the turn ended without success |
+  | `limit` | The engine reported a turn, token or budget limit of its own |
+  | `interrupted` | The engine reported an interruption its driver did not ask for, or a failure came while an operator stopped the turn |
+  | `unknown` | None of these, such as a failure in the daemon after the engine reported, or a failure no path named |
+
+  A plan limit holds the line rather than failing it, and a turn an operator stops
+  is cancelled rather than failed, so neither records a cause. **Inference.** The
+  subtype table is taken from each engine's documented types and the adapters' code,
+  and only `error_during_execution` has been seen in a live failure here.
+  **Porting hazard.** The class names a Python type, which a port may not have, so
+  the cause, and not the class, is the word to rely on.
 - **The cost.** **Decided by the operator on review r13, C1.** The state keeps each
   line's unread mail and its open questions to an operator as indexes, updated as
   events apply and rebuilt by replay, so a line's `condition`, its `unread` and its
@@ -519,6 +551,10 @@ its state when it opened the log, with `snapshot`, `used`, `ignored` or `off`,
 was ignored or `null`, `replayed`, the events applied at the open, `open_milliseconds`,
 and `write_failure`, why the latest snapshot this daemon tried to write was not
 written or `null`, as the bounded start of [`EVENT_LOG.md`](EVENT_LOG.md) describes.
+**Review of `49236ad`, item 1.** `verified` is `none`, `pending`, `passed` or
+`failed`, for the full replay that checks a state restored from a snapshot, and
+`mismatch`, `mismatch_class` and `restart_required` say why it failed and that every
+line is held until a restart.
 The daemon's `status` carries the same fields in its `event_log`, as
 [`CLIENT.md`](CLIENT.md) specifies.
 
@@ -1478,9 +1514,23 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
   - **Current.** The brief names the worktree's commit. The lead says so, and that
     mail may have changed the task since, which the sentence on mail below makes
     specific.
-  - **Residual.** Only the commit is read, so a brief set before the line's own
-    uncommitted edits at the same commit is presented as current. A commit made and
-    then undone back to the brief's commit reads as current too.
+  - **Residual.** The lead reads only the commit, since composing a prompt runs no
+    git. A commit made and then undone back to the brief's commit reads as current.
+  - **On every turn, with the uncommitted state.** **Review of `49236ad`, item 4,
+    required by the operator.** `set_brief` records `workdir_dirty`, the digest of the
+    worktree's `git status` entries, read off the event loop. Each turn of a kept
+    session reads the same digest and `HEAD` before its engine runs, and while either
+    differs from the brief's it opens with a `STALE BRIEF.` notice that names the
+    commit move, the changed uncommitted state with the count of dirty paths, or both,
+    until the line sets the brief again. A turn whose lead already says the commit
+    moved is told only of the uncommitted state. A line with a fresh session each turn
+    is never led with its brief and is not told. A side that cannot be read is not
+    compared, and a brief recorded before the field compares the commit alone.
+  - **Decided by core, for review.** The digest covers which paths are dirty and how,
+    not their contents, so edits inside a file already dirty do not flag the brief,
+    while a new dirty path, a path made clean, or discarded work does. A line's own
+    new file flags its brief until it sets the brief again, which is the intended
+    prompt to keep the brief current.
 - **Mail since the brief.** **Required by the operator on 2026-10-30.** The review
   line's brief was stale after a compaction, since its task had changed in mail since
   the brief was set. When an operator has mailed the line since its latest
