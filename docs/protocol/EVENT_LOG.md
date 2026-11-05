@@ -587,9 +587,16 @@ unaffected.
   compaction wake, a run's note to its holder and a task end's note, is dropped with a
   line on the standard error that names what was lost and not its text, and the flow
   it belonged to goes on. A task end is noted when it is reported again. Records that
-  already caught a rejection keep doing so. The delivery of an owed wake and the
-  forwarder's outage note leave their state unchanged, so the loop's fault handling
-  tries them again.
+  already caught a rejection keep doing so. **Review of 7744806.** About seventy
+  appends in the scheduler can meet the refusal, so one guard stands at the tick. Each
+  due wake and each line's update is an action, and an action that meets the refusal
+  ends alone. Its event was never stored, so its state is as it was and it is tried
+  again at the next tick, the other actions of the tick go on, and the loop rests one
+  second, which is not a fault and is not doubled. The standard error says so once for
+  each episode, naming the action and never any text. An append made in a turn's own
+  task is not inside the guard, and still reaches the fault handler, which pauses and
+  tries again. The forwarder's outage note leaves its state unchanged, so it is tried
+  again as well.
 
 ## Bounded start
 

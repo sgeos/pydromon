@@ -1853,7 +1853,7 @@ def test_operator_engine_check_shows_per_line_results_and_returns_failure(
             argv, code, "", f"dromond: line alpha engine codex {result}\n"
         )
 
-    monkeypatch.setattr(cli.subprocess, "run", execute)
+    monkeypatch.setattr(spawn, "run", execute)
     result = cli.main(
         [
             "--project",

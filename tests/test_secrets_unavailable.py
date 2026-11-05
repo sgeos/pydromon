@@ -15,13 +15,21 @@ The callers fall in three kinds, and each is held to its kind here.
 - Reads that already caught ``EventRejected`` keep doing so, as ``_record_task``,
   ``_record_unverified``, ``_record_left`` and ``_record_commit_refusal`` do.
 
-Left to the loop's fault handling, which pauses and tries again, and not tested here,
-are the delivery of an owed wake and the forwarder's outage note. Both retry, since
-their state is unchanged by a refusal.
+Review of 7744806. About seventy appends in the scheduler can meet the refusal, and one
+guard, ``Scheduler._refusing_on_secrets``, stands at the tick. Each due wake and each
+line's update is an action that ends alone when the log refuses it. The other actions
+of the tick go on, the loop does not pause as for a fault, and the refused action is
+tried again. The tests below drive an ordinary tick and the run loop through it.
+
+Not covered by the guard are the tools and operator requests, which meet the refusal
+in their own task and return it as an error, and an event appended in a turn's own
+task. The forwarder's outage note is the forwarder's own. All of them keep their state
+unchanged by a refusal, so each tries again.
 """
 
 import asyncio
 from collections.abc import Generator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -29,10 +37,11 @@ from typing import Any, cast
 import pytest
 
 from dromon import credentials, spawn
+from dromon import scheduler as scheduler_module
 from dromon.driver import Strategy
-from dromon.engine import BackgroundEnd
-from dromon.eventlog import EventLog
-from dromon.model import HARNESS, LineAddress
+from dromon.engine import BackgroundEnd, TurnReport
+from dromon.eventlog import EventLog, read_entries
+from dromon.model import HARNESS, LineAddress, MessageSent, WakeRequested
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
 
 HAIKU = "claude-haiku-5-5"
@@ -233,3 +242,140 @@ def test_the_exception_is_an_event_rejected() -> None:
     from dromon.model import EventRejected
 
     assert issubclass(credentials.SecretsUnavailable, EventRejected)
+
+
+# Review of 7744806. The tick.
+
+
+class Quiet:
+    """A line engine whose turn ends at once with nothing to say."""
+
+    def __init__(self) -> None:
+        self.session_id: str | None = None
+
+    async def run_turn(self, prompt: str) -> TurnReport:
+        self.session_id = "session-1"
+        return TurnReport("success", 1, "ok", (), None, None, "session-1", None, None)
+
+
+NOW = datetime(2026, 11, 5, 12, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def clock() -> list[datetime]:
+    return [NOW]
+
+
+def due(scheduler: Scheduler, clock: list[datetime], note: str) -> None:
+    """Schedule alpha's wake and let the clock pass its due time."""
+    scheduler.schedule_wake("alpha", 0, note, minimum=0)
+    clock[0] += timedelta(seconds=5)
+
+
+@pytest.fixture
+def ticking(tmp_path: Path, clock: list[datetime]) -> Generator[Scheduler]:
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = Scheduler(
+            log,
+            lambda spec, tools: Quiet(),
+            tick_seconds=0.01,
+            wall_clock=lambda: clock[0],
+        )
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        scheduler.create_line("beta", HAIKU, Strategy.SUBSCRIPTION)
+        scheduler.ensure_operator(scheduler._default_operator.operator_id)  # pyright: ignore[reportPrivateUsage]
+        yield scheduler
+
+
+def recorded(scheduler: Scheduler, kind: type) -> list[Any]:
+    return [
+        entry.event
+        for entry in read_entries(scheduler._log.path)  # pyright: ignore[reportPrivateUsage]
+        if isinstance(entry.event, kind)
+    ]
+
+
+def test_a_refused_wake_ends_alone_and_the_other_line_still_starts_its_turn(
+    ticking: Scheduler, clock: list[datetime], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The wake of alpha has text, so it cannot be recorded. Beta's mail was recorded
+    earlier, and delivering it has none, so beta's turn begins in the same tick."""
+    ticking.send(LineAddress("alpha"), LineAddress("beta"), "hello")
+    due(ticking, clock, "later")
+    failing(ticking)
+
+    async def scenario() -> None:
+        ticking.step()
+        ticking.step()
+        await asyncio.gather(*ticking._running.values())  # pyright: ignore[reportPrivateUsage]
+
+    asyncio.run(scenario())
+    assert ticking.fault is None and ticking.faults == 0, "a refusal is not a fault"
+    assert ticking.secret_refusals == 2
+    assert [w.line_id for w in recorded(ticking, WakeRequested)] == ["beta"]
+    assert "alpha" in ticking._state().scheduled, "the wake stays owed"  # pyright: ignore[reportPrivateUsage]
+    shown = capsys.readouterr().err
+    assert shown.count("was refused, because the literal secret values") == 1
+    assert "the wake of line alpha" in shown and "later" not in shown
+
+
+def test_the_refused_wake_fires_at_a_later_tick_once_the_source_recovers(
+    ticking: Scheduler, clock: list[datetime], capsys: pytest.CaptureFixture[str]
+) -> None:
+    def owed() -> dict[str, Any]:
+        return dict(ticking._state().scheduled)  # pyright: ignore[reportPrivateUsage]
+
+    async def scenario() -> None:
+        due(ticking, clock, "later")
+        failing(ticking)
+        ticking.step()
+        assert "alpha" in owed()
+        ticking._log.secrets = lambda: []  # pyright: ignore[reportPrivateUsage]
+        ticking.step()
+        assert "alpha" not in owed(), "the wake fired"
+        await asyncio.gather(*ticking._running.values())  # pyright: ignore[reportPrivateUsage]
+        # The episode is over, so a later one is said again.
+        due(ticking, clock, "again")
+        failing(ticking)
+        ticking.step()
+
+    asyncio.run(scenario())
+    assert [m.body for m in recorded(ticking, MessageSent)] == ["later"]
+    assert capsys.readouterr().err.count("was refused") == 2
+
+
+def test_the_loop_rests_and_goes_on_without_a_fault_while_the_source_fails(
+    ticking: Scheduler, clock: list[datetime], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scheduler_module, "SECRETS_RETRY_SECONDS", 0.01)
+    due(ticking, clock, "later")
+    failing(ticking)
+
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        task = asyncio.create_task(ticking.run(stop))
+        await asyncio.sleep(0.3)
+        refused = ticking.secret_refusals
+        ticking._log.secrets = lambda: []  # pyright: ignore[reportPrivateUsage]
+        await asyncio.sleep(0.3)
+        stop.set()
+        await task
+        assert refused >= 2, "the wake was tried again, and not once"
+
+    asyncio.run(scenario())
+    assert ticking.faults == 0 and ticking.fault is None
+    assert [m.body for m in recorded(ticking, MessageSent)] == ["later"]
+
+
+def test_another_exception_in_an_action_is_still_a_fault(
+    ticking: Scheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard names one failure and hides no other."""
+
+    def broken_update(line_id: str) -> None:
+        raise RuntimeError("a bug")
+
+    monkeypatch.setattr(ticking, "_update_line", broken_update)
+    with pytest.raises(RuntimeError, match="a bug"):
+        ticking.step()
+    assert ticking.secret_refusals == 0

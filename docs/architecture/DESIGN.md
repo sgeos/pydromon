@@ -77,8 +77,14 @@ until the daemon restarts, and the note says so. The reads of the process table 
 stop or a hold depends on are started as `essential`, which the bound does not refuse,
 up to a ceiling of 32 stuck starts that keeps the threads bounded. A late child is
 killed with its process group when it leads one, never the daemon's own group, and its
-reap waits at most ten seconds. A command past its timeout keeps the last 64 KiB of
-what it wrote on the `TimeoutExpired`. **Exempt and unbounded.** `client.start_daemon`
+reap waits at most ten seconds. The group kill covers only a child that leads its own
+group, as one started with a new session or its own process group does. A child that
+shares the daemon's group is killed alone, and its descendants are not reached, since
+signalling the group would kill the daemon. **Past the ceiling.** At 32 stuck starts
+the `essential` reads are refused too, so the process table cannot be read and a stop
+by pid, which needs it, is refused with the reason. The operator's note at the bound of
+four is the warning, and a restart is the only recovery. A command past its timeout
+keeps the last 64 KiB of what it wrote on the `TimeoutExpired`. **Exempt and unbounded.** `client.start_daemon`
 starts the daemon with `os.posix_spawn`, which has no pipe to wait on, and it is the
 call the module's first hypothesis names, so that candidate is neither bounded nor
 excluded.

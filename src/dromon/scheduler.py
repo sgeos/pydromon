@@ -113,7 +113,7 @@ import sys
 import traceback
 from datetime import UTC, datetime, timedelta
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import (
@@ -821,6 +821,11 @@ CHECK_DISCLOSURE_SCHEMA: Final[dict[str, object]] = {
 
 FIRST_FAULT_PAUSE_SECONDS: Final = 1.0
 MAX_FAULT_PAUSE_SECONDS: Final = 60.0
+SECRETS_RETRY_SECONDS: Final = 1.0
+"""**Review of 7744806.** How long the loop rests after a tick in which the log refused
+an event for want of its secret values, as ``SecretsUnavailable`` says. It is fixed
+and not doubled, and it is not a fault, so the other work of the tick has been done
+and nothing else is held."""
 """The scheduler's pause after a fault doubles from 1 second to 1 minute. Shorter than
 the forwarder's backoff, since every line waits on the scheduler."""
 
@@ -2518,6 +2523,12 @@ class Scheduler:
         self._detached: dict[str, tuple[int, ...]] = {}
         self._stuck_noted = False
         """Whether the operator was told of the stuck starts now at the bound."""
+        self.secret_refusals = 0
+        """How many actions of a tick the log refused for want of its secret values."""
+        self._secrets_noted = False
+        """Whether the present episode of such refusals was said on the error stream."""
+        self._tick_refused = False
+        """Whether the tick now running had such a refusal."""
         self._children = ChildLedger()
         """Round 15, item 3. The children seen below each line's engine."""
         self._tree_read: Callable[[], list[TreeRow] | TreeReadFailure] = lambda: (
@@ -2743,6 +2754,38 @@ class Scheduler:
         text = note or ""
         if self._state().walk_limit != text:
             self._append_or_say(WalkLimited(text), "the walk gap")
+
+    @contextlib.contextmanager
+    def _refusing_on_secrets(self, what: str) -> Generator[None]:
+        """The one place where a refused append ends an action of the tick, and no
+        more. **Review of 7744806.** About seventy appends in this module can meet
+        ``credentials.SecretsUnavailable`` when the source of literal secret values
+        fails, and an exception from any of them would reach ``_fault_found``, which
+        pauses the whole scheduler and doubles the pause while the source fails. The
+        tick therefore runs each of its actions inside this guard. The action that
+        met the refusal ends, its event was never stored, so its state is as it was
+        and it is tried again at the next tick, and the other actions of the tick go
+        on. The standard error says so once for each episode, naming the action and
+        never any text, and ``secret_refusals`` counts them. The loop rests
+        ``SECRETS_RETRY_SECONDS`` before the next tick, which is not a fault.
+
+        Not covered, by design. A tool or an operator request calls the log from its
+        own task, and the refusal reaches its caller as an ``EventRejected``, which
+        every such caller already turns into an error. Only a refusal that is raised
+        outside the tick's actions, as from a turn task, still reaches the fault
+        handler."""
+        try:
+            yield
+        except credentials.SecretsUnavailable:
+            self.secret_refusals += 1
+            self._tick_refused = True
+            if not self._secrets_noted:
+                self._secrets_noted = True
+                print(
+                    f"dromond: {what} was refused, because the literal secret values"
+                    " could not be read, and is tried again",
+                    file=sys.stderr,
+                )
 
     def _append_or_say(self, event: Event, what: str) -> bool:
         """Append an event the daemon makes for itself, and say so on the standard error
@@ -4060,37 +4103,43 @@ class Scheduler:
         the note goes no further."""
         fired: list[str] = []
         for line_id in self._due_wakes():
-            pending = self._state().scheduled[line_id]
-            # Task of 2026-10-30, and R1 of its review. A context known below the
-            # threshold needs no compaction. Under the automatic hold the last
-            # compaction did not bring the context below the threshold, or its effect
-            # is unknown, so another would not help, and the wake would cost a turn
-            # only to say so.
-            if self._context_compaction_wake_ids.get(
-                line_id
-            ) == pending.message_id and (
-                self._context_below_compaction_threshold(line_id)
-                or line_id in self._auto_held
-            ):
-                self._log.append(WakeWithdrawn(line_id, pending.message_id))
-                self._context_compaction_wake_ids.pop(line_id, None)
-                self._context_compaction_wakes.discard(line_id)
-                continue
-            address = LineAddress(line_id)
-            body = WITHHELD_WAKE_NOTE if self.discloses(pending.note) else pending.note
-            self._log.append(
-                MessageSent(
-                    pending.message_id,
-                    address,
-                    address,
-                    MessageKind.NOTE,
-                    body,
-                )
-            )
-            self._sent.append(pending.message_id)
-            self._failed.discard(line_id)
-            fired.append(pending.message_id)
+            with self._refusing_on_secrets(f"the wake of line {line_id}"):
+                woken = self._fire_wake(line_id)
+                if woken is not None:
+                    fired.append(woken)
         return fired
+
+    def _fire_wake(self, line_id: str) -> str | None:
+        """Fire the due wake of ``line_id``, and return its message identifier, or
+        ``None`` when the wake was withdrawn instead."""
+        pending = self._state().scheduled[line_id]
+        # Task of 2026-10-30, and R1 of its review. A context known below the
+        # threshold needs no compaction. Under the automatic hold the last
+        # compaction did not bring the context below the threshold, or its effect
+        # is unknown, so another would not help, and the wake would cost a turn
+        # only to say so.
+        if self._context_compaction_wake_ids.get(line_id) == pending.message_id and (
+            self._context_below_compaction_threshold(line_id)
+            or line_id in self._auto_held
+        ):
+            self._log.append(WakeWithdrawn(line_id, pending.message_id))
+            self._context_compaction_wake_ids.pop(line_id, None)
+            self._context_compaction_wakes.discard(line_id)
+            return None
+        address = LineAddress(line_id)
+        body = WITHHELD_WAKE_NOTE if self.discloses(pending.note) else pending.note
+        self._log.append(
+            MessageSent(
+                pending.message_id,
+                address,
+                address,
+                MessageKind.NOTE,
+                body,
+            )
+        )
+        self._sent.append(pending.message_id)
+        self._failed.discard(line_id)
+        return pending.message_id
 
     def _context_below_compaction_threshold(self, line_id: str) -> bool:
         """Whether a known context estimate is below its effective trigger."""
@@ -10609,23 +10658,33 @@ class Scheduler:
     def step(self) -> None:
         """Run one tick: update every line once, then move the sent queue to the post
         office. Turns the tick starts run on after it, as tasks. Scheduled wakes that
-        have fallen due fire first, into the sent queue."""
+        have fallen due fire first, into the sent queue. **Review of 7744806.** Each
+        wake and each line is one action, and an action the log refuses for want of
+        its secret values ends alone, as ``_refusing_on_secrets`` says."""
         self.tick += 1
+        self._tick_refused = False
         self.fire_due_wakes()
         for line_id in sorted(self._state().lines):
-            if not self._can_start(line_id):
-                continue
-            messages = self.deliverable(line_id)
-            if not messages or not self.peer_turns.may_wake(
-                line_id, (message for _, message in messages)
-            ):
-                continue
-            if self._nothing_new(line_id, messages):
-                self._deliver_without_turn(messages)
-                continue
-            self._begin_turn(line_id, messages)
+            with self._refusing_on_secrets(f"the update of line {line_id}"):
+                self._update_line(line_id)
         self._post_office.update(self._sent)
         self._sent.clear()
+        if not self._tick_refused:
+            self._secrets_noted = False
+
+    def _update_line(self, line_id: str) -> None:
+        """One line's part of a tick: begin its turn or deliver its mail, if any."""
+        if not self._can_start(line_id):
+            return
+        messages = self.deliverable(line_id)
+        if not messages or not self.peer_turns.may_wake(
+            line_id, (message for _, message in messages)
+        ):
+            return
+        if self._nothing_new(line_id, messages):
+            self._deliver_without_turn(messages)
+            return
+        self._begin_turn(line_id, messages)
 
     async def run(self, stop: asyncio.Event) -> None:
         """Run ticks while there is work, until ``stop`` is set. A tick or a sweep
@@ -10641,7 +10700,13 @@ class Scheduler:
                         continue
                     self._fault_pause = 0.0
                     self.fault = None
-                    if self._tick_seconds:
+                    if self._tick_refused:
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(
+                                stop.wait(),
+                                max(SECRETS_RETRY_SECONDS, self._tick_seconds),
+                            )
+                    elif self._tick_seconds:
                         with contextlib.suppress(TimeoutError):
                             await asyncio.wait_for(stop.wait(), self._tick_seconds)
                     else:
@@ -10651,7 +10716,8 @@ class Scheduler:
                 # Each rest, at most MAX_REST_SECONDS apart, also sweeps the launch
                 # records of launchers that exited between turns. Review N1.
                 try:
-                    self.collect_left()
+                    with self._refusing_on_secrets("the sweep of left processes"):
+                        self.collect_left()
                     self.note_stuck_starts()
                 except Exception as error:  # noqa: BLE001
                     await self._fault_found(error, stop)

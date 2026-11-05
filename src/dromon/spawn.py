@@ -43,7 +43,9 @@ bound. A start that never returns holds its slot until the daemon restarts, whic
 note says. A read that a stop or a hold depends on, the process table, is started with
 ``essential``, which the bound does not refuse, so a daemon with stuck starts can still
 find and stop a process. It is refused only past ``MAX_STRANDED_ESSENTIAL`` stuck
-starts, a ceiling that keeps the threads bounded. A stuck start keeps one blocked
+starts, a ceiling that keeps the threads bounded. **Past the ceiling, review of
+7744806.** A stop by pid is refused as well, because it cannot read the process table,
+and a restart of the daemon is the only recovery. A stuck start keeps one blocked
 daemon thread, which never holds the interpreter open, and its pipe until the start
 ends or the process exits. A caller that closed a descriptor it passed to a start it
 was told stalled would leave the late start to fail with ``EBADF``, or in the worst
@@ -168,6 +170,8 @@ def _kill(process: subprocess.Popen[Any]) -> None:
     """Send ``SIGKILL`` to a child that has not been reaped, and to its process group
     when the child leads one of its own, as it does with ``start_new_session`` or
     ``process_group``. **Review of 151cbcd.** The daemon's own group is never signalled.
+    **Review of 7744806.** A child that shares the daemon's group is killed alone, so
+    its descendants are not reached.
     The pid cannot have been reused, since the child is not reaped."""
     with contextlib.suppress(OSError):
         group = os.getpgid(process.pid)
