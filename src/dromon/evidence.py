@@ -240,6 +240,26 @@ def record(direction: str, frame: Mapping[str, object]) -> None:
         recording.frame(direction, frame)
 
 
+@dataclass(slots=True)
+class StartupDiagnostics:
+    """A bounded, masked startup error retained only for an operator check."""
+
+    raw: bytearray = field(default_factory=bytearray)
+
+    def append(self, chunk: bytes) -> None:
+        self.raw.extend(chunk[: max(0, 8192 - len(self.raw))])
+
+    def text(self) -> str:
+        masked = redact.mask(self.raw.decode("utf-8", "replace"))
+        return " ".join("".join(c if c.isprintable() else " " for c in masked).split())
+
+
+STARTUP_STDERR: ContextVar[StartupDiagnostics | None] = ContextVar(
+    "dromon_startup_stderr",
+    default=None,
+)
+
+
 async def drain_stderr(
     stream: asyncio.StreamReader, recording: Recording | None
 ) -> None:
@@ -249,6 +269,9 @@ async def drain_stderr(
         chunk = await stream.read(4096)
         if not chunk:
             return
+        diagnostics = STARTUP_STDERR.get()
+        if diagnostics is not None:
+            diagnostics.append(chunk)
         if recording is not None:
             recording.stderr(chunk)
 

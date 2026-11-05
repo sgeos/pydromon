@@ -53,6 +53,7 @@ from typing import Any, Final, Protocol, cast
 from claude_agent_sdk import SdkMcpTool
 from OpenSSL.SSL import Context as OpenSSLContext
 
+from dromon.scheduler import StartCheckEngine
 from dromon import __version__, exits, fleet, grok, peercred, registry, restart, runs
 from dromon import evidence
 from dromon import proposals as proposal_store
@@ -3804,19 +3805,135 @@ def check_scratch(paths: ProjectPaths) -> Path:
         ) from error
 
 
+ENGINE_CHECK_SECONDS: Final = 90
+"""The no-prompt startup deadline for each configured line."""
+
+
+async def check_engine_launches(daemon: Daemon, socket_path: Path) -> bool:
+    """Check each effective line through the production factory without a prompt.
+
+    A private bridge permits tool discovery only. Every tool call is refused, so
+    an unexpected engine request cannot mutate even the copied event log.
+    """
+    writers: set[asyncio.StreamWriter] = set()
+    tasks: set[asyncio.Task[None]] = set()
+
+    async def respond(line: bytes) -> Response:
+        try:
+            request = decode_request(line)
+        except ProtocolError:
+            return await daemon.respond_line(line)
+        if request.operation not in (Operation.PING, Operation.AGENT_TOOLS):
+            return _refusal(
+                request.request_id,
+                ErrorCode.REJECTED,
+                "engine startup checks permit tool discovery only",
+            )
+        return await daemon.respond_line(line)
+
+    async def accept(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            tasks.add(task)
+        writers.add(writer)
+        try:
+            await _guarded(
+                writer,
+                os.getuid(),
+                lambda: _connection(daemon, reader, writer, respond),
+            )
+        finally:
+            writers.discard(writer)
+            if task is not None:
+                tasks.discard(task)
+
+    passed = True
+    server = await asyncio.start_unix_server(
+        accept,
+        path=str(socket_path),
+        limit=MAX_LINE_BYTES,
+    )
+    socket_path.chmod(0o600)
+    try:
+        async with server:
+            for line_id in sorted(daemon.log.state.lines):
+                state = daemon.log.state
+                inactive = (
+                    "retired"
+                    if line_id in state.retired_lines
+                    else "hibernated"
+                    if state.lines[line_id].hibernated
+                    else None
+                )
+                if inactive is not None:
+                    print(
+                        f"dromond: line {line_id} skipped because it is {inactive}",
+                        file=sys.stderr,
+                    )
+                    continue
+                model = daemon.scheduler.model_of(line_id)
+                engine_name = ENGINE_OF[model]
+                if engine_name in ("cursor-agent", "antigravity"):
+                    print(
+                        f"dromond: line {line_id} engine {engine_name} not checkable:"
+                        " no no-prompt startup check; skipped without refusing restart",
+                        file=sys.stderr,
+                    )
+                    continue
+                diagnostics = evidence.StartupDiagnostics()
+                token = evidence.STARTUP_STDERR.set(diagnostics)
+                try:
+                    engine = daemon.scheduler.engine_for(line_id, startup_only=True)
+                    if not isinstance(engine, StartCheckEngine):
+                        raise EngineRefused(
+                            "this adapter has no no-prompt startup check"
+                        )
+                    async with asyncio.timeout(ENGINE_CHECK_SECONDS):
+                        await engine.check_start()
+                except Exception as error:  # noqa: BLE001
+                    passed = False
+                    print(
+                        f"dromond: line {line_id} engine {engine_name} failed:"
+                        f" {type(error).__name__}: {error}"
+                        f" {diagnostics.text()}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"dromond: line {line_id} engine {engine_name} passed",
+                        file=sys.stderr,
+                    )
+                finally:
+                    evidence.STARTUP_STDERR.reset(token)
+    finally:
+        for writer in tuple(writers):
+            writer.close()
+        for task in tuple(tasks):
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tuple(tasks), return_exceptions=True)
+        await daemon.scheduler.close_engines()
+        socket_path.unlink(missing_ok=True)
+    return passed
+
+
 def run(
     paths: ProjectPaths,
     *,
     overrides: Overrides | None = None,
     hold_wakes: bool = False,
     check_only: bool = False,
+    launch_checks: bool = False,
 ) -> int:
     """Run the daemon for ``paths`` in the foreground and return its exit status.
 
     The project file ``.dromon/dromon.toml``, when present, supplies lines, limits and
     the wake policy. ``overrides`` from the command line take precedence over it.
 
-    With ``check_only``, the start checks run and nothing starts, which is what
+    With ``check_only``, the static start checks run without a daemon. Optional
+    ``launch_checks`` also starts each engine until its first prompt, which is what
     ``dromon restart`` asks of the installed code before it stops the running
     daemon. The checks are this function's own, in its own order, so a check added
     to a start is a check of the preflight too. They read the project file and a
@@ -3882,6 +3999,8 @@ def run(
             scratch = check_scratch(paths)
             log_path = scratch / paths.event_log.name
             snapshot(paths.event_log, log_path)
+            if launch_checks:
+                launcher.configure(scratch / "left")
         with EventLog(log_path, snapshots=not check_only) as log:
             report_start(log, paths.event_log, check_only)
             scheduler = Scheduler(
@@ -3892,7 +4011,11 @@ def run(
                     project_settings=config.settings,
                     protected=protected_dirs(paths, config.federation, registry_dir),
                     line_tokens=line_tokens,
-                    line_socket=paths.line_socket,
+                    line_socket=(
+                        scratch / "lines.sock"
+                        if launch_checks and scratch is not None
+                        else paths.line_socket
+                    ),
                     line_secrets=line_secrets,
                     line_git_ssh=line_git_ssh,
                     read_only_paths=config.read_only_paths,
@@ -3973,6 +4096,13 @@ def run(
                     print(f"dromond: {said}", file=sys.stderr)
                     if not agrees:
                         return exits.FAILURE
+                    if launch_checks:
+                        if scratch is None:
+                            raise LogError("engine checks require a private directory")
+                        if not asyncio.run(
+                            check_engine_launches(daemon, scratch / "lines.sock")
+                        ):
+                            return exits.FAILURE
                     print(CHECK_PASSED, file=sys.stderr)
                     return exits.OK
                 entry = open_registration(
@@ -4009,6 +4139,8 @@ def run(
         TeacherError,
         SandboxError,
         FederationError,
+        EngineRefused,
+        OSError,
     ) as error:
         print(f"dromond: {error}", file=sys.stderr)
         return exits.FAILURE
@@ -4083,6 +4215,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="record messages but wake no line, for maintenance and tests",
     )
     parser.add_argument(
+        "--check-engines",
+        action="store_true",
+        help="with --check, launch each line through its startup handshake"
+        " without a prompt",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="run the start checks against the project file and a copy of the event"
@@ -4130,7 +4268,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return exits.USAGE
     hold: bool = arguments.hold_wakes
     check: bool = arguments.check
-    return run(paths, overrides=overrides, hold_wakes=hold, check_only=check)
+    if arguments.check_engines and not check:
+        print("dromond: --check-engines requires --check", file=sys.stderr)
+        return exits.USAGE
+    return run(
+        paths,
+        overrides=overrides,
+        hold_wakes=hold,
+        check_only=check,
+        launch_checks=arguments.check_engines,
+    )
 
 
 if __name__ == "__main__":

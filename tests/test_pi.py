@@ -1064,3 +1064,12 @@ def test_a_pi_line_given_git_ssh_carries_its_command_and_no_other(
     plain = FakePi()
     run(line(plain, home, environment={"PATH": "/bin", COMMAND_VARIABLE: "x"}))
     assert COMMAND_VARIABLE not in plain.environment
+
+
+def test_start_check_reads_state_without_a_model_prompt(home: Path) -> None:
+    server = FakePi()
+    target = line(server, home)
+    asyncio.run(target.check_start())
+    methods = [message.get("type") for message in server.sent]
+    assert "get_state" in methods
+    assert "prompt" not in methods

@@ -651,7 +651,19 @@ class PiLine:
         self._interrupted_cost: float | None = None
         """What a cancelled turn had cost when it was cancelled, until taken."""
 
+    async def check_start(self) -> None:
+        """Run the ordinary startup path and close before sending a prompt."""
+        await self._execute("", check_only=True)
+
     async def run_turn(self, prompt: str) -> TurnReport:
+        result = await self._execute(prompt)
+        if result is None:
+            raise RuntimeError("a turn ended without its report")
+        return result
+
+    async def _execute(
+        self, prompt: str, *, check_only: bool = False
+    ) -> TurnReport | None:
         """Run one turn for ``prompt`` and return what happened."""
         reason = unsupported(self.config)
         if reason is not None:
@@ -692,7 +704,9 @@ class PiLine:
             async with self._connect(arguments, self.cwd, environment) as connection:
                 self._connection = connection
                 try:
-                    session_file = await self._converse(prompt, turn)
+                    session_file = await self._converse(
+                        prompt, turn, check_only=check_only
+                    )
                 finally:
                     self._connection = None
         except asyncio.CancelledError:
@@ -702,6 +716,8 @@ class PiLine:
             raise EngineRefused(turn.refusal)
         if session_file is not None and os.path.isfile(session_file):
             self.session_id = session_file
+        if check_only:
+            return None
         return self._report(turn, credential)
 
     def take_interrupted_cost(self) -> float | None:
@@ -812,7 +828,9 @@ class PiLine:
                 return cast(dict[str, Any], data) if isinstance(data, dict) else {}
             await self._dispatch(record, turn)
 
-    async def _converse(self, prompt: str, turn: _Turn) -> str | None:
+    async def _converse(
+        self, prompt: str, turn: _Turn, *, check_only: bool = False
+    ) -> str | None:
         """The turn's exchange. Returns the session file Pi reports."""
         state = await self._call("get_state", turn)
         reported = state.get("model")
@@ -836,6 +854,8 @@ class PiLine:
                 f"the engine opened the session {session_file!r}, not {expected}"
             )
             return None
+        if check_only:
+            return session_file
         self.driver.step(Event("turn_start"))
         answer = await self._call("prompt", turn, message=prompt)
         disposition = answer.get("disposition")

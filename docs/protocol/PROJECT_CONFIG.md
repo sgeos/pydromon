@@ -358,6 +358,25 @@ stops the start, or refuses the reload and keeps the previous list.
 - **Limits.** A term written another way, split across messages, or encoded passes.
   The guard catches accidents and is not a barrier against a line that tries to evade
   it. Engine transcripts, which the engines keep themselves, are outside it.
+- **A file already checked costs nothing more.** **Round 15, item 4.** A line is told
+  to check a draft before it writes it and to check the file it wrote. Checking the
+  draft as `text` and then the file spent two checks of the ten. The daemon now
+  remembers the SHA-256 of every text that passed and of every text `write_scratch`
+  wrote, per line, and a later `check_disclosure` of a file whose exact bytes have that
+  digest answers `pass`, says it spent no check, records nothing and is answered even
+  at the limit, since it tells the line nothing it did not learn when the bytes passed.
+  A list of files costs nothing only when every file is remembered, and otherwise costs
+  one check and remembers each file that passed. Any edit, even of one byte, is a
+  different digest. A failed check is never remembered. A file that passed only
+  through an operator's accepted line is remembered for its own path alone. **Limits.**
+  The memory is in the daemon's process, holds the 64 most recent passes of a line,
+  and is emptied by a restart and when the list is replaced, so the next check then
+  spends. **Round 15 review, G1.** It is also emptied for a line whose effective
+  configuration differs from the one the passes were made under, such as another
+  working directory, because a pass is bound to a path relative to that directory and
+  the operator's accepted lines to the project path it resolves to. Any change of the
+  configuration forgets the line's passes, which costs at most one more check, and the
+  same configuration set again keeps them. A text check is never answered from memory. A held line is refused first.
 - **Checking before sending.** **Item B2 of 2026-10-28.** A line's `check_disclosure`
   tool checks exactly one of `text`, a `path`, or a `paths` list of one to eight files
   relative to its working directory, and answers `pass` or `fail` with how many lines

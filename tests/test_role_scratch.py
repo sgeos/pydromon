@@ -97,7 +97,7 @@ class Kept(Done):
 
 class World:
     """Role core on ``TREE`` with seats alpha and beta on Claude Code and gina on Grok,
-    whose engine cannot confine a seat yet. Alpha owns the role unless ``vacant``. Line
+    treated as unconfined in this fixture. Alpha owns the role unless ``vacant``. Line
     delta runs in ``OTHER`` with no writing tool and gamma there with one, and
     neither is a seat."""
 
@@ -127,6 +127,8 @@ class World:
             root=root,
             protected=(root / ".dromon",),
             read_only_paths=read_only_paths,
+            # Model an unconfined Grok seat independently of the live table.
+            confining_engines=frozenset({"claude-code", "codex"}),
         )
         self.scheduler.ensure_operator("ana")
         seats = {"alpha": HAIKU, "beta": HAIKU, "gina": GROK}

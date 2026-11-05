@@ -14,7 +14,7 @@ from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
@@ -2094,3 +2094,163 @@ def test_replacement_cannot_reuse_contested_id(monkeypatch: pytest.MonkeyPatch) 
         run(target)
     assert target.session_id == previous
     assert "turn/start" not in server.methods()
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [
+        None,
+        {"type": "stdio", "command": "worker"},
+        {"type": "streamable_http", "url": "https://example.invalid/mcp"},
+    ],
+)
+def test_listing_preserves_transport_and_selects_valid_disabled_toml(
+    transport: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(codex_module, "codex_path", lambda: "/unused/codex")
+
+    def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps([{"name": "mail", "transport": transport}])
+        )
+
+    monkeypatch.setattr(codex_module.subprocess, "run", fake_run)
+    listed = codex_module.list_servers({})
+    arguments = server_arguments(listed, LineConfig())
+    entry = next(value for value in arguments if value.startswith("mcp_servers.mail"))
+    disabled = tomllib.loads(entry)["mcp_servers"]["mail"]
+    assert disabled["enabled"] is False
+    if transport is None:
+        assert disabled == {"enabled": False, "command": "/usr/bin/false", "args": []}
+    else:
+        assert disabled == {"enabled": False}
+        # Model the ordinary table merge that must preserve the existing transport.
+        assert isinstance(transport, dict)
+        original = {
+            key: value
+            for key, value in cast(dict[str, str], transport).items()
+            if key != "type"
+        }
+        merged = {**original, **disabled}
+        assert merged == {**original, "enabled": False}
+        assert not ({"url", "command"} <= merged.keys())
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [
+        [],
+        {},
+        {"type": "stdio"},
+        {"type": "streamable_http", "url": ""},
+        {"type": "unknown", "url": "x"},
+    ],
+)
+def test_listing_refuses_malformed_transport_without_echoing_values(
+    transport: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(codex_module, "codex_path", lambda: "/unused/codex")
+
+    def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps([{"name": "mail", "transport": transport}])
+        )
+
+    monkeypatch.setattr(codex_module.subprocess, "run", fake_run)
+    with pytest.raises(EngineRefused, match=r"\[0\].transport"):
+        codex_module.list_servers({})
+
+
+def test_conflicting_listed_transports_are_refused() -> None:
+    with pytest.raises(EngineRefused, match="conflicting transport"):
+        server_arguments(
+            [
+                codex_module.ListedServer("mail", True),
+                codex_module.ListedServer("mail", False),
+            ],
+            LineConfig(),
+        )
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_start_check_uses_launch_and_account_path_without_a_turn(keep: bool) -> None:
+    server = FakeServer()
+    target = line(server, config=LineConfig(keep_session=keep))
+    asyncio.run(target.check_start())
+    assert "initialize" in server.methods()
+    assert "account/read" in server.methods()
+    assert "thread/start" in server.methods()
+    assert "mcpServerStatus/list" in server.methods()
+    assert "turn/start" not in server.methods()
+    assert target.kept_status()["kept"] is False
+
+
+def test_start_check_rejects_an_invalid_mcp_merge_before_a_turn() -> None:
+    server = FakeServer(
+        failing="initialize",
+        failing_error={"code": -1, "message": "invalid MCP merge: url and command"},
+    )
+    with pytest.raises(EngineRefused, match="invalid MCP merge"):
+        asyncio.run(line(server).check_start())
+    assert server.methods() == ["initialize"]
+
+
+def test_start_check_rejects_the_wrong_account_without_a_turn() -> None:
+    server = FakeServer(account={"type": "apiKey"})
+    with pytest.raises(EngineRefused):
+        asyncio.run(line(server).check_start())
+    assert "turn/start" not in server.methods()
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_cancelled_start_check_closes_its_connection_without_a_prompt(
+    keep: bool,
+) -> None:
+    async def check() -> None:
+        opened = asyncio.Event()
+        closed: list[bool] = []
+
+        class Waiting(FakeServer):
+            async def receive(self) -> dict[str, Any] | None:
+                opened.set()
+                await asyncio.Event().wait()
+                raise AssertionError("startup should have been cancelled")
+
+        server = Waiting()
+
+        @asynccontextmanager
+        async def connect(
+            arguments: list[str], cwd: Path, env: Mapping[str, str]
+        ) -> AsyncGenerator[Connection]:
+            try:
+                yield server
+            finally:
+                closed.append(True)
+
+        target = CodexLine(
+            luna(),
+            CWD,
+            config=LineConfig(keep_session=keep),
+            session_id="existing-session",
+            environment={},
+            connection_factory=connect,
+            server_lister=lambda env: [],
+        )
+        task = asyncio.create_task(target.check_start())
+        await asyncio.wait_for(opened.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert closed == [True]
+        assert target.session_id == "existing-session"
+        assert target.kept_status()["kept"] is False
+        assert "initialize" in server.methods()
+        assert "turn/start" not in server.methods()
+
+    asyncio.run(check())
