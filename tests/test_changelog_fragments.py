@@ -790,6 +790,14 @@ def test_the_gate_shows_a_skip_as_a_skip(tmp_path: Path) -> None:
     (root / "scripts").mkdir()
     shutil.copy2(REPOSITORY / "scripts" / "check.sh", root / "scripts" / "check.sh")
     shutil.copy2(SCRIPT, root / "scripts" / "assemble_changelog.py")
+    shutil.copy2(
+        REPOSITORY / "scripts" / "ci_pythons.py", root / "scripts" / "ci_pythons.py"
+    )
+    (root / ".github" / "workflows").mkdir(parents=True)
+    shutil.copy2(
+        REPOSITORY / ".github" / "workflows" / "ci.yml",
+        root / ".github" / "workflows" / "ci.yml",
+    )
     (root / "CHANGELOG.md").write_text(collapse_text(REPEATED), encoding="utf-8")
     (root / "README.md").write_text("# Example\n", encoding="utf-8")
     ignore = "/tm" + "p/*\n!/tm" + "p/.gitkeep\n"

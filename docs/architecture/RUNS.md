@@ -409,6 +409,21 @@ the socket tests were deselected and that seven launcher tests that read the pro
 table were skipped. A run executes outside every engine sandbox, as the trust section
 says, so it can run the whole gate.
 
+**Round 15, items 1 and 2. What the gate states about itself.** The gate type-checks
+every Python version the workflow's matrix lists, on both platforms. It reads the list
+from `.github/workflows/ci.yml` with `scripts/ci_pythons.py`, which fails when it finds
+no versions in the one-line form `python: ["3.12", "3.15"]`, so a gate that read none
+cannot pass having checked none. **Fact.** Pyright reads the standard library stubs for
+the version it is given, so the other interpreters need not be installed, and each run
+took about 20 seconds on the author's host, four in all. **Fact.** The earlier gate
+checked the interpreter it ran on, and the workflow's other interpreter found Python
+3.12 errors it had missed. The last line of the pytest summary is now one line,
+`not run here: N socket tests (...), N live tests (...), N process-table tests (...)`,
+naming each kind left out and why, or `(all run)`, so a green gate cannot be read as
+having run what it left out. **Limit.** The process-table kind is recognised by its
+skip reason, which every such test shares, and a test finds one that does not. Another
+kind of omission appears in the grouped list above that line, not in it.
+
 **The declaration.**
 
 ```toml
