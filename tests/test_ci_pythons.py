@@ -22,7 +22,7 @@ def test_the_matrix_line_is_read_in_order() -> None:
     [
         ("name: CI\n", "found 0"),
         ('python: ["3.12"]\npython: ["3.13"]\n', "found 2"),
-        ("python: []\n", "not a MAJOR.MINOR"),
+        ("python: []\n", "not quoted"),
         ('python: ["3.12", "3"]\n', "not a MAJOR.MINOR"),
         ('python: ["3.12", "3.12"]\n', "listed twice"),
         ('python: ["3.12", "latest"]\n', "not a MAJOR.MINOR"),
@@ -34,6 +34,46 @@ def test_a_workflow_that_does_not_list_versions_in_the_form_is_an_error(
 ) -> None:
     with pytest.raises(WorkflowError, match=phrase):
         versions(text)
+
+
+MATRIX = 'strategy:\n  matrix:\n    python: ["3.12"]\n'
+
+
+@pytest.mark.parametrize(
+    ("addition", "phrase"),
+    [
+        # Round 15 review, V1. Each adds a version the one flow line does not list.
+        ('    include:\n      - python: "3.13"\n', "found 2 'python' keys"),
+        ('      - {os: a, python: "3.13"}\n', "found 2 'python' keys"),
+        ('      - "python": "3.13"\n', "found 2 'python' keys"),
+        ('    python:\n      - "3.13"\n', "found 2 'python' keys"),
+        ("    exclude:\n      - os: b\n", "include or exclude"),
+        ('    include: [{python: "3.13"}]\n', "found 2 'python' keys"),
+    ],
+)
+def test_a_version_added_another_way_is_an_error_and_not_missed(
+    addition: str, phrase: str
+) -> None:
+    assert versions(MATRIX) == ["3.12"]
+    with pytest.raises(WorkflowError, match=phrase):
+        versions(MATRIX + addition)
+
+
+def test_an_unquoted_version_is_refused_because_yaml_reads_it_as_a_number() -> None:
+    with pytest.raises(WorkflowError, match="not quoted"):
+        versions("python: [3.10]\n")
+    with pytest.raises(WorkflowError, match="not quoted"):
+        versions('python: ["3.12", 3.13]\n')
+
+
+def test_other_keys_and_comments_that_mention_python_are_not_versions() -> None:
+    text = (
+        MATRIX
+        + '# python: ["3.99"] and include: are only a comment\n'
+        + "steps:\n  - uses: x\n    with:\n      python-version: ${{ matrix.python }}\n"
+        + "name: test (Python ${{ matrix.python }})  # include: no\n"
+    )
+    assert versions(text) == ["3.12"]
 
 
 def test_the_real_workflow_lists_versions_and_the_command_prints_them() -> None:

@@ -424,6 +424,23 @@ having run what it left out. **Limit.** The process-table kind is recognised by 
 skip reason, which every such test shares, and a test finds one that does not. Another
 kind of omission appears in the grouped list above that line, not in it.
 
+**Round 15 review, V1 and G4. Reading the matrix strictly, and testing the loop.** The
+reader first read only the one flow line, so a matrix `include` entry such as
+`- python: "3.13"` added a version CI tested and the gate did not (fact, shown by the
+reviewer). It now refuses a workflow with any other `python` key, in block, entry or
+inline form, with an `include` or `exclude` key, or with an unquoted entry, which YAML
+reads as a number, so `3.10` would become 3.1. **Inference.** A failure is the safe
+direction, since a version the reader cannot see would otherwise go unchecked, and the
+cost is that an operator who adds such a key must change the reader or the workflow.
+**Limit.** The reader still does not parse YAML, so a version supplied by an expression
+such as `fromJSON` is not seen. It is refused only if the line shape is absent, and the
+other operating systems the workflow lists are not read, since the gate checks Linux
+and macOS as written. The loop in `check.sh` is now run by tests with a stand-in `uv`,
+in `tests/test_changelog_fragments.py`. They check the four calls, a failure of any one,
+no call at all when the versions cannot be read, no default when the reader fails, and
+the failure when a reader succeeds with no version. Removing the no-version check, or
+defaulting a failed read, fails them (shown by editing the script and running them).
+
 **The declaration.**
 
 ```toml

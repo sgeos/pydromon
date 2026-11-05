@@ -3,6 +3,7 @@ and wake notes, ``read_instructions``, ``write_scratch``, the daemon's commit an
 Codex cache default."""
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import os
@@ -45,6 +46,7 @@ from dromon.model import (
     MAX_DISCLOSURE_CHECKS,
     AgentAddress,
     DisclosureChecked,
+    RestartNoted,
     HarnessAddress,
     LineAddress,
     LineCreated,
@@ -2650,6 +2652,55 @@ def test_replacing_the_list_forgets_what_passed(world: World, tmp_path: Path) ->
     assert text.startswith("fail") and spent(world) == 1
 
 
+def test_a_change_of_working_directory_forgets_what_passed(
+    world: World, tmp_path: Path
+) -> None:
+    """Review G1. A pass is bound to a path relative to the working directory, and
+    the operator's accepted lines to the project path it resolves to. The same
+    relative name and bytes in another directory must be checked again."""
+    (world.root / "one").mkdir()
+    (world.root / "two").mkdir()
+    one = LineConfig(workdir="one", builtin_tools=WRITING.builtin_tools)
+    world.scheduler.configure_line("alpha", one)
+    listed(world, tmp_path)
+    world.call("write_scratch", {"path": "same.md", "text": "plain\n"})
+    text, error = world.call("check_disclosure", {"path": "tmp/same.md"})
+    assert not error and "spent no check" in text and spent(world) == 0
+    # The same configuration again keeps the memory.
+    world.scheduler.configure_line("alpha", one)
+    text, _ = world.call("check_disclosure", {"path": "tmp/same.md"})
+    assert "spent no check" in text and spent(world) == 0
+    # Another directory holding a file of the same name and bytes is checked.
+    world.scheduler.configure_line(
+        "alpha", LineConfig(workdir="two", builtin_tools=WRITING.builtin_tools)
+    )
+    (world.root / "two" / "tmp").mkdir()
+    (world.root / "two" / "tmp" / "same.md").write_text("plain\n")
+    text, error = world.call("check_disclosure", {"path": "tmp/same.md"})
+    assert not error and text.startswith("pass")
+    assert "spent no check" not in text and spent(world) == 1
+    text, _ = world.call("check_disclosure", {"path": "tmp/same.md"})
+    assert "spent no check" in text and spent(world) == 1
+
+
+def test_an_override_of_the_line_forgets_what_passed(
+    world: World, tmp_path: Path
+) -> None:
+    """Any change of the effective configuration forgets the memory, not only the
+    working directory, which costs at most one more check."""
+    as_writer(world)
+    listed(world, tmp_path)
+    world.call("write_scratch", {"path": "o.md", "text": "plain\n"})
+    text, _ = world.call("check_disclosure", {"path": "tmp/o.md"})
+    assert "spent no check" in text
+    world.scheduler.configure_line(
+        "alpha",
+        LineConfig(builtin_tools=WRITING.builtin_tools, instructions=("changed.md",)),
+    )
+    text, _ = world.call("check_disclosure", {"path": "tmp/o.md"})
+    assert "spent no check" not in text and spent(world) == 1
+
+
 def test_nothing_is_remembered_while_no_list_is_configured(world: World) -> None:
     as_writer(world)
     world.call("write_scratch", {"path": "n.md", "text": "plain\n"})
@@ -2768,3 +2819,16 @@ def test_a_compaction_wake_starts_its_turn_even_when_answered(world: World) -> N
     assert world.scheduler._nothing_new("alpha", messages) is False  # pyright: ignore[reportPrivateUsage]
     del world.scheduler._compact_wake["alpha"]  # pyright: ignore[reportPrivateUsage]
     assert world.scheduler._nothing_new("alpha", messages) is True  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_restart_note_starts_its_turn_even_when_answered(world: World) -> None:
+    """Review G3. A restart note wakes a line to carry on its work, so an answer
+    does not cancel it, and only the note's own mark makes the difference."""
+    world.log.append(RestartNoted("alpha", "rn-1", "A restart ended your turn."))
+    ((message_id, note),) = world.scheduler.pending("alpha")
+    assert note.restart_note
+    answered = dataclasses.replace(note, replied=True)
+    scheduler = world.scheduler
+    assert scheduler._nothing_new("alpha", [(message_id, answered)]) is False  # pyright: ignore[reportPrivateUsage]
+    ordinary = dataclasses.replace(answered, restart_note=False)
+    assert scheduler._nothing_new("alpha", [(message_id, ordinary)]) is True  # pyright: ignore[reportPrivateUsage]

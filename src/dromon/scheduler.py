@@ -2298,6 +2298,13 @@ class Scheduler:
         listed is answered as a pass without another check. In memory, bounded by
         ``MAX_CLEAN_CHECKED``, emptied when the list is replaced. **Round 15, item
         4.**"""
+        self._clean_context: dict[str, LineConfig] = {}
+        """The configuration each line's remembered passes were made under. A pass is
+        bound to a path relative to the working directory, and the operator's accepted
+        lines to the project path it resolves to, so a line configured with another
+        working directory, or any other setting, could otherwise be answered for a
+        file of the new directory that has the same relative name and bytes. The
+        memory is dropped when the configuration differs. **Round 15 review, G1.**"""
         self._disclosure_spent: set[str] = set()
         """Lines that spent their disclosure limit and are held for it. Every
         disclosure-checked tool answers ``DISCLOSURE_HELD`` for them until an
@@ -2902,13 +2909,25 @@ class Scheduler:
             relative = ""
         return self._disclosure_accepted.get(relative, ())
 
+    def _clean_memory(self, line_id: str) -> dict[tuple[str, str], None]:
+        """The line's remembered passes, emptied first when the line's effective
+        configuration is not the one they were made under. A configuration change
+        of any kind forgets them, which costs the line at most one more check of a
+        file, and the working directory is the change that matters. **Round 15
+        review, G1.**"""
+        current = self.effective_config(line_id)
+        if self._clean_context.get(line_id) != current:
+            self._clean_checked.pop(line_id, None)
+            self._clean_context[line_id] = current
+        return self._clean_checked.setdefault(line_id, {})
+
     def _remember_clean(self, line_id: str, path: str, data: bytes) -> None:
         """Record that ``data`` passed the list, for ``path`` or, with an empty path,
         for any. Nothing is recorded while no list is configured, since nothing was
         checked then."""
         if not self._disclosure:
             return
-        kept = self._clean_checked.setdefault(line_id, {})
+        kept = self._clean_memory(line_id)
         key = (path, hashlib.sha256(data).hexdigest())
         kept.pop(key, None)
         kept[key] = None
@@ -2919,7 +2938,7 @@ class Scheduler:
         """Whether ``data`` already passed the list as a text, as ``path`` or as a
         file ``write_scratch`` wrote. The pass is bound to the exact bytes by their
         digest, so an edit of one byte is not covered."""
-        kept = self._clean_checked.get(line_id, {})
+        kept = self._clean_memory(line_id)
         digest = hashlib.sha256(data).hexdigest()
         return ("", digest) in kept or (path, digest) in kept
 
@@ -2972,6 +2991,7 @@ class Scheduler:
         """Replace the disclosure terms the tools check, already case folded."""
         self._disclosure = tuple(terms)
         self._clean_checked.clear()
+        self._clean_context.clear()
 
     def discloses(self, *texts: str) -> bool:
         """Whether any of ``texts`` holds a term of the project's disclosure list."""

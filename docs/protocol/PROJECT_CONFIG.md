@@ -370,7 +370,12 @@ stops the start, or refuses the reload and keeps the previous list.
   through an operator's accepted line is remembered for its own path alone. **Limits.**
   The memory is in the daemon's process, holds the 64 most recent passes of a line,
   and is emptied by a restart and when the list is replaced, so the next check then
-  spends. A text check is never answered from memory. A held line is refused first.
+  spends. **Round 15 review, G1.** It is also emptied for a line whose effective
+  configuration differs from the one the passes were made under, such as another
+  working directory, because a pass is bound to a path relative to that directory and
+  the operator's accepted lines to the project path it resolves to. Any change of the
+  configuration forgets the line's passes, which costs at most one more check, and the
+  same configuration set again keeps them. A text check is never answered from memory. A held line is refused first.
 - **Checking before sending.** **Item B2 of 2026-10-28.** A line's `check_disclosure`
   tool checks exactly one of `text`, a `path`, or a `paths` list of one to eight files
   relative to its working directory, and answers `pass` or `fail` with how many lines
