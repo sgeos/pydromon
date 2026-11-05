@@ -79,7 +79,13 @@ kept narrow by these rules, each of which a test checks.
   time refuses the start and its child is killed and reaped. `re` holds the
   interpreter lock while it matches, so a worker thread would not have freed the loop,
   and a process does. A child that fails or answers anything but one result for each
-  value refuses the start, so a broken matcher lets nothing through.
+  value refuses the start, so a broken matcher lets nothing through. The child's
+  start, match, kill and reap all run on one worker thread, which closes its pipes on
+  every path out. A start that is cancelled, as when the line's turn ends, kills the
+  child at once, or has the worker kill it as soon as its start ends, and the
+  cancellation goes on only once the child is reaped. Before the fix of 2026-11-05, a
+  cancellation after the child started and before the worker handed it back left the
+  child running with both pipes open, which core's full gate observed.
 - **The record.** `run_started` records `argv` with the values in place, so the log
   and `run_status` show exactly what ran.
 - **Refused before anything else.** A value that is refused stops the start before the
@@ -704,7 +710,8 @@ commit run is stopped with the same access it was started with.
    there, so it is in the state directory instead, which every line's sandbox denies.
    The start makes or checks `commit-runs` with the other private directories.
 3. The run then starts as any run does, with `tree` as its command's working
-   directory, `home` as its `HOME`, and its output file under `tmp/runs` in the
+   directory, `home` as its `HOME`, uv's `UV_PYTHON` and `UV_PYTHON_DOWNLOADS` as
+   "The interpreter" below gives, and its output file under `tmp/runs` in the
    reading line's working directory, which the daemon writes, not the line, as it
    writes the output of any run.
 
@@ -775,12 +782,22 @@ nothing.
   confinement, since the command can still name any path.
 - **What is not shared.** The checkout has no virtual environment, so the command makes
   its own, with `uv sync --locked` in its first step. Its `HOME` is the fresh `home`,
-  so uv starts with an empty cache, and a tool that keeps an interpreter or a download
-  under `HOME` fetches it again. **Hypothesis, not verified.** The project's gate then
-  still passes, given the network, more slowly, since the supervisor runs outside
-  every sandbox and uv and pyright fetch what they need. No commit run with the fresh
-  home has been run, since the daemon running when it was written held older code.
+  so uv starts with an empty cache and fetches the packages again, given the network.
   Nothing of a line's uncommitted work reaches it.
+- **The interpreter.** **Fact, observed on 2026-11-05.** A commit run with the fresh
+  `home`, `review-gate` on `d346f4a`, exited 2. The fresh `home` hid
+  the interpreters uv manages under the operator's home, so `uv sync` took the first
+  Python on the search path, a Python 3.14 without Tk, and the tests failed to
+  collect. A commit run is therefore given `UV_PYTHON`, the path of the base
+  interpreter of the virtual environment the daemon runs from, which is the project's
+  own and the one the operator's gate syncs and runs in, and `UV_PYTHON_DOWNLOADS`
+  set to `never`. The interpreter is named by its path, so nothing else of the
+  operator's home is given. A start is refused before its checkout when that
+  interpreter is not an executable file. The cache is not shared, since uv has no
+  read-only cache and a shared one could be written by the commit's code through uv.
+  **Assumption.** The daemon runs from the project's environment. One started from
+  another interpreter gives commit runs that interpreter. Nothing makes the
+  interpreter read-only, since the command runs outside every sandbox.
 
 **What a green commit run proves.** **Round 14, review of 1449c5c, C4.** Exit code 0
 means that the commit's own command, such as its own `scripts/check.sh`, exited 0 in

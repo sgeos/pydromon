@@ -6,6 +6,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Generator, Sequence
 from datetime import UTC, datetime
@@ -242,10 +243,13 @@ def spawned_children(
 
 
 def assert_killed(child: subprocess.Popen[bytes]) -> None:
-    """The child was killed and reaped, so it no longer exists."""
+    """The child was killed and reaped, so it no longer exists, and its pipes are
+    closed, so none is left for the collector to report in a later test."""
     assert child.returncode == -9, "the child was not killed"
     with pytest.raises(ProcessLookupError):
         os.kill(child.pid, 0)
+    assert child.stdin is not None and child.stdin.closed
+    assert child.stdout is not None and child.stdout.closed
 
 
 def test_the_child_is_killed_at_the_default_deadline(
@@ -270,30 +274,60 @@ def test_the_child_is_killed_at_the_default_deadline(
     assert_killed(child)
 
 
+@pytest.mark.parametrize("window", ["while it starts", "while it matches"])
 def test_the_child_is_killed_when_the_start_is_cancelled(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, window: str
 ) -> None:
-    """A start whose call is cancelled while the child matches, as when the line's
-    turn ends, kills and reaps the child before the cancellation goes on."""
+    """A start whose call is cancelled, as when the line's turn ends, kills and reaps
+    the child and closes its pipes before the cancellation goes on.
+
+    Fix of 2026-11-05. Core's full gate cancelled in the window after the child
+    started and before the worker handed it back, and the child was left running
+    with both pipes open, which the next test's teardown reported. That window is
+    now held open by the test, so it is reached on every run, and the test waits on
+    events rather than a fixed time. Whatever the outcome, the child is reaped
+    before the test ends, so a failure here does not leak into the next test."""
     monkeypatch.setattr(runparams, "MATCHER", SLOW_MATCHER)
-    started = spawned_children(monkeypatch)
+    started: list[subprocess.Popen[bytes]] = []
+    began = threading.Event()
+    cancelled = threading.Event()
+    real = cast(Any, spawn.start)
+
+    def holding(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        child = cast(subprocess.Popen[bytes], real(*args, **kwargs))
+        started.append(child)
+        began.set()
+        if window == "while it starts":
+            # The worker holds the child until the call is cancelled.
+            assert cancelled.wait(WAIT_SECONDS), "the call was never cancelled"
+        return child
+
+    monkeypatch.setattr(runparams.spawn, "start", holding)
     prepared = runparams.prepare(
         ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
     )
 
     async def scenario() -> None:
-        task = asyncio.create_task(runparams.match(prepared))
-        for _ in range(1000):
-            if started:
-                break
-            await asyncio.sleep(0.01)
+        # A deadline past the test's own bound, so only the kill on cancellation,
+        # and never the deadline, can end the child in time.
+        task = asyncio.create_task(runparams.match(prepared, 3 * WAIT_SECONDS))
+        assert await asyncio.to_thread(began.wait, WAIT_SECONDS), "no child started"
         task.cancel()
+        # Let the cancellation reach the call before the worker goes on.
+        await asyncio.sleep(0)
+        cancelled.set()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    asyncio.run(asyncio.wait_for(scenario(), 20))
-    [(child, _)] = started
-    assert_killed(child)
+    try:
+        asyncio.run(asyncio.wait_for(scenario(), WAIT_SECONDS))
+        [child] = started
+        assert_killed(child)
+    finally:
+        cancelled.set()
+        for child in started:
+            with child:
+                child.kill()
 
 
 def test_a_child_that_fails_refuses_the_start(monkeypatch: pytest.MonkeyPatch) -> None:
