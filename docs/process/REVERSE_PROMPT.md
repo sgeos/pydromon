@@ -4,36 +4,35 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-11-01, round 14, address all known issues
+## 2026-11-05, round 15, address all known issues
 
-**Done, merged in pull requests 123 to 134.**
+**Done, merged in pull requests 136 to 142.**
 
-- **Team.** A new `runtime` role on Claude Sonnet 5.5 for processes and the sandbox,
-  and the `full-gate` run declared, which writing lines started 36 times.
-- **Engines.** Codex writer conflicts recover to a new thread. Grok sessions renew
-  when rules or tools change, its model pin sends a bare value, and a PreToolUse hook
-  and documented switches withhold Grok's own tools. A disallowed Codex call is
-  refused alone.
-- **Confinement.** The ViewImage rule now runs as a hook on every Claude Code `Read`,
-  after a live check found in-directory reads bypassed it. Line temporary directories
-  are private, and `worktree_status` reads git from outside the sandbox. A roster
-  oracle on the disclosure list is closed. Credentials are sealed out of the log.
-- **Mail and roles.** Replies close what they answer, `@operator` resolves, a turn
-  ends when its role ownership changes, and leases can be listed.
-- **Operator.** Commit runs for reading lines, `retire`, `renew`, `run status`,
-  `sync-worktrees` without running a line's interpreter, and a restart that reports
-  both commits.
-- **Hotfixes.** Two regressions stopped every Grok line and then every Codex line.
-  Both were found by a live turn and fixed in #128 and #130.
+- **Engines.** Every configured line's engine is started through its adapter's own
+  path and closed before a prompt, in `dromon check-engines` and the restart
+  preflight, with the two round 14 regressions as tests. Grok's remaining tools are
+  blocked by hook, a stale Grok model list is retried on a fresh session, read-only
+  Grok lines are allowed after a live probe, and `dromon grok-home` regenerates
+  Grok's home files with backups.
+- **Lines.** Whole cost survives releases and restarts, with estimates for Codex.
+  Unanswered mail counts only real asks. Stale or unknown briefs are flagged at the
+  head of a turn. A start may restore a verified snapshot. Failed turns record a
+  fixed-word cause. Roles may name whom they review.
+- **Operator.** Disclosure checks are budgeted by passes, failures and bytes. Runs
+  record their end promptly, `wake_after` takes a run, declared runs take checked
+  parameters, `dromon ci-log` copies a CI log to a line, and `review-gate` is declared.
+- **Processes.** Child starts are bounded, credential-shaped text is scrubbed from the
+  log, a pid ledger lets a line stop its own children, and the gate type-checks every
+  CI interpreter.
 
-**Verified live.** ViewImage on Claude Code and Codex before and after the fix,
-`read_only_paths` on both, a line's temporary directory, the Grok tool list before and
-after the switches, five supervised runs through a restart, and the event log's start
-time. Full gates outside the sandbox and continuous integration on every merge.
+**Verified live.** The engine check against every active line, a Grok reader's write
+denied, Grok's home regenerated, `dromon ci-log` against real CI, and a review
+seat's `review-gate` run, which found the wrong interpreter that #143 fixes.
 
 **Not verified.** The items under Unverified live in `HANDOFF.md`.
 
-**Also this round.** The operator merged #128 with one failing check. That was a flake,
-and every later merge tested the counts first. Six of eight lines are satisfied. The
-operator is not, and names a no-cost live check of each engine's launch arguments as
+**Also this round.** Main has failed intermittently since #138 on a process-start
+stall, which I did not catch before merging #139 and #140 because I re-ran failures as
+flakes. Bisect runs by hand put the rise at #138 and the stall itself earlier. Five of
+eight lines are satisfied. The operator is not, and names a stall-free child start as
 the change that would most move it.
