@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Generator, Sequence
@@ -48,12 +49,56 @@ STATUS_BOUND_SECONDS = 0.5
 """How long a status may take while git hangs, a tenth of ``GIT_SECONDS``."""
 
 
+START_SECONDS = 120.0
+"""How long a test waits for a git process it starts, the start included. ``timeout``
+of ``subprocess.run`` begins only once the child exists, and the wait for the child to
+reach ``exec`` has no bound, which stopped a full gate for its five minutes on
+2026-11-05 in this file's second test. **Round 15.** The wait is now on a thread, and a
+start that overruns fails the test with a message that names it."""
+
+
+def run_git(
+    command: list[str], environment: dict[str, str] | None
+) -> subprocess.CompletedProcess[str]:
+    """``command`` run to its end, or a failed test when the process did not finish
+    within ``START_SECONDS``. A failed git raises as ``subprocess.run`` does."""
+    outcome: list[subprocess.CompletedProcess[str] | BaseException] = []
+    done = threading.Event()
+
+    def target() -> None:
+        try:
+            outcome.append(
+                subprocess.run(  # noqa: S603
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=True,
+                    env=environment,
+                )
+            )
+        except BaseException as error:  # noqa: BLE001
+            outcome.append(error)
+        finally:
+            done.set()
+
+    threading.Thread(target=target, name="test-git", daemon=True).start()
+    if not done.wait(START_SECONDS):
+        pytest.fail(
+            f"git did not start or finish within {START_SECONDS} seconds: {command[:4]}"
+        )
+    result = outcome[0]
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
 def git(directory: Path, *arguments: str) -> str:
     environment = {
         name: value for name, value in os.environ.items() if not name.startswith("GIT_")
     }
-    done = subprocess.run(  # noqa: S603
-        [  # noqa: S607
+    done = run_git(
+        [
             "git",
             "-C",
             str(directory),
@@ -67,11 +112,7 @@ def git(directory: Path, *arguments: str) -> str:
             "core.hooksPath=/dev/null",
             *arguments,
         ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=True,
-        env=environment,
+        environment,
     )
     return done.stdout.strip()
 
@@ -241,13 +282,7 @@ def test_git_variables_in_the_daemons_environment_do_not_change_an_answer(
     monkeypatch.setenv("GIT_INDEX_FILE", str(decoy.root / ".git" / "index"))
     # The variables take effect for a git that keeps them, so the test would see
     # the filter go.
-    unfiltered = subprocess.run(  # noqa: S603
-        ["git", "-C", str(root), "rev-parse", "HEAD"],  # noqa: S607
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=True,
-    )
+    unfiltered = run_git(["git", "-C", str(root), "rev-parse", "HEAD"], None)
     assert unfiltered.stdout.strip() == decoy.code != repository.code
     assert answers() == clean
 
@@ -582,3 +617,126 @@ def test_a_prompt_does_not_wait_for_git_and_tells_the_turn_after(
     asked(stale_world.trees, lambda: stale_world.scheduler.daemon_behind("alpha"))
     stale_world.run("two")
     assert told in stale_world.last_prompt()
+
+
+# The start of a git, which ``subprocess.run`` does not bound. Round 15.
+
+
+class StalledStart:
+    """A stand-in for the ``subprocess`` module whose ``run`` blocks, as a start that
+    never reaches ``exec`` does, until the test releases it. Once released, or when
+    ``stall`` is off, it runs the real command."""
+
+    TimeoutExpired = subprocess.TimeoutExpired
+    CompletedProcess = subprocess.CompletedProcess
+
+    def __init__(self) -> None:
+        self.gate = threading.Event()
+        self.stall = True
+        self.calls = 0
+        self.fail: BaseException | None = None
+
+    def run(
+        self,
+        command: list[str],
+        **keywords: Any,  # noqa: ANN401
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls += 1
+        if self.fail is not None:
+            raise self.fail
+        if self.stall:
+            self.gate.wait(60)
+        return cast(
+            "subprocess.CompletedProcess[str]",
+            subprocess.run(command, **keywords),  # noqa: S603
+        )
+
+
+@pytest.fixture
+def stalled(monkeypatch: pytest.MonkeyPatch) -> Generator[StalledStart]:
+    fake = StalledStart()
+    monkeypatch.setattr(codetree, "subprocess", fake)
+    monkeypatch.setattr(codetree, "GIT_SECONDS", 0.2)
+    monkeypatch.setattr(codetree, "START_GRACE_SECONDS", 0.2)
+    yield fake
+    fake.gate.set()
+    # Let every stranded thread end, then forget them, so no test sees another's.
+    deadline = time.monotonic() + 10
+    while codetree._stranded_count() and time.monotonic() < deadline:  # pyright: ignore[reportPrivateUsage]
+        time.sleep(0.01)
+
+
+def test_a_git_that_does_not_start_ends_the_wait_and_is_counted(
+    repository: Repository, stalled: StalledStart
+) -> None:
+    began = time.monotonic()
+    with pytest.raises(codetree._Timeout):  # pyright: ignore[reportPrivateUsage]
+        codetree._git(repository.root, "rev-parse", "HEAD")  # pyright: ignore[reportPrivateUsage]
+    # Derived from the two bounds, with a margin for a loaded runner.
+    assert time.monotonic() - began < 10 * (codetree.GIT_SECONDS + 0.2)
+    assert codetree._stranded_count() == 1  # pyright: ignore[reportPrivateUsage]
+    stalled.gate.set()
+    deadline = time.monotonic() + 10
+    while codetree._stranded_count() and time.monotonic() < deadline:  # pyright: ignore[reportPrivateUsage]
+        time.sleep(0.01)
+    assert codetree._stranded_count() == 0  # pyright: ignore[reportPrivateUsage]
+
+
+def test_no_more_gits_start_while_the_most_allowed_are_stuck(
+    repository: Repository, stalled: StalledStart, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(codetree, "MAX_STRANDED", 2)
+    for _ in range(2):
+        with pytest.raises(codetree._Timeout):  # pyright: ignore[reportPrivateUsage]
+            codetree._git(repository.root, "rev-parse", "HEAD")  # pyright: ignore[reportPrivateUsage]
+    assert stalled.calls == 2
+    with pytest.raises(codetree._Timeout):  # pyright: ignore[reportPrivateUsage]
+        codetree._git(repository.root, "rev-parse", "HEAD")  # pyright: ignore[reportPrivateUsage]
+    assert stalled.calls == 2, "a third start was made past the bound"
+
+
+def test_a_stalled_start_does_not_wedge_the_worker(
+    repository: Repository, stalled: StalledStart
+) -> None:
+    """The worker ends on a stalled start, the question is unknown, and once git can
+    start the question is asked again and answered."""
+    now = [0.0]
+    trees = codetree.CodeTrees(clock=lambda: now[0])
+    package = repository.root / "src" / "dromon"
+    assert trees.package_path(package) is None
+    assert trees.settle(SETTLE_SECONDS), "the worker never ended on a stalled start"
+    assert trees.package_path(package) is None
+    stalled.stall = False
+    stalled.gate.set()
+    now[0] += codetree.RETRY_SECONDS + 1
+    assert asked(trees, lambda: trees.package_path(package)) == "src/dromon"
+
+
+def test_a_start_that_fails_is_unknown_and_a_timeout_is_a_timeout(
+    repository: Repository, stalled: StalledStart
+) -> None:
+    stalled.fail = FileNotFoundError("git")
+    assert codetree._git(repository.root, "rev-parse", "HEAD") is None  # pyright: ignore[reportPrivateUsage]
+    stalled.fail = subprocess.TimeoutExpired("git", 1)
+    with pytest.raises(codetree._Timeout):  # pyright: ignore[reportPrivateUsage]
+        codetree._git(repository.root, "rev-parse", "HEAD")  # pyright: ignore[reportPrivateUsage]
+    stalled.fail = RuntimeError("unexpected")
+    with pytest.raises(RuntimeError):
+        codetree._git(repository.root, "rev-parse", "HEAD")  # pyright: ignore[reportPrivateUsage]
+    stalled.fail = None
+    stalled.stall = False
+    done = codetree._git(repository.root, "rev-parse", "HEAD")  # pyright: ignore[reportPrivateUsage]
+    assert done is not None
+    assert done.stdout.strip() == repository.code
+    assert codetree._stranded_count() == 0  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_test_helper_fails_with_a_message_when_a_process_overruns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(globals(), "START_SECONDS", 0.3)
+    with pytest.raises(pytest.fail.Exception, match="did not start or finish"):
+        run_git([sys.executable, "-c", "import time; time.sleep(3)"], None)
+    assert run_git([sys.executable, "-c", "print(1)"], None).stdout.strip() == "1"
+    with pytest.raises(subprocess.CalledProcessError):
+        run_git([sys.executable, "-c", "raise SystemExit(3)"], None)

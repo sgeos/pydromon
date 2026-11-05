@@ -84,6 +84,36 @@ def test_a_denied_write_names_the_denying_entry_and_outranks_a_grant(
     assert elsewhere["result"] == "allowed"
 
 
+def test_a_write_only_the_working_directory_would_cover_is_unknown_not_allowed(
+    tmp_path: Path,
+) -> None:
+    # Review of 3344ca6. The document lists no grant of the working directory, so the
+    # answer must not assume the engine's default.
+    work = tmp_path / "work"
+    scratch = work / "scratch"
+    sandbox = document(work, {})
+    found = probe(sandbox, work, scratch, "write", "note.txt")
+    assert found["result"] == "unknown"
+    assert found["working_directory"] == str(work)
+    assert "does not say" in cast(str, found["rule"])
+    listed = document(work, {"filesystem": {"allowWrite": [str(work)]}})
+    assert probe(listed, work, scratch, "write", "note.txt")["result"] == "allowed"
+
+
+def test_a_write_outside_every_grant_and_the_working_directory_is_denied(
+    tmp_path: Path,
+) -> None:
+    work = tmp_path / "work"
+    scratch = work / "scratch"
+    # The scratch directory lies inside the working directory by construction, so a
+    # working directory that is elsewhere stands for a document that names none.
+    elsewhere = tmp_path / "elsewhere"
+    sandbox = document(work, {})
+    found = probe(sandbox, elsewhere, scratch, "write", "note.txt")
+    assert found["result"] == "denied"
+    assert "working_directory" not in found
+
+
 def test_a_read_is_denied_by_denyread_and_lifted_by_allowread(tmp_path: Path) -> None:
     work = tmp_path / "work"
     scratch = work / "scratch"
@@ -202,7 +232,7 @@ def test_the_tool_answers_for_the_line_and_a_scratch_relative_path(
     scratch = world.project / "tmp" / "lines" / "alpha"
     assert found["path"] == str(scratch / "note.txt")
     assert found["operating_system_probe"] is False
-    assert found["result"] in ("allowed", "denied")
+    assert found["result"] in ("allowed", "denied", "unknown")
 
 
 def test_the_tool_refuses_bad_arguments_and_a_line_without_a_document(

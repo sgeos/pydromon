@@ -1,6 +1,7 @@
 """Round 14, item 6. A sandboxed line has a temporary directory and a package cache
 that it may write, outside its working directory, and its shell is pointed at them."""
 
+import errno
 import os
 import shutil
 import stat
@@ -460,14 +461,76 @@ def test_a_tree_and_a_link_are_removed_whole_and_the_link_target_is_kept(
     assert (target / "keep").exists() and not link.is_symlink()
 
 
-def test_a_directory_with_too_many_entries_is_treated_as_over_its_bound(
+def test_a_walk_cut_short_within_the_bound_removes_nothing_and_says_so(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Review of 3344ca6. Many small entries once cost the directory its oldest ten
+    # thousand whatever the bytes. The count is a lower bound, so it proves nothing.
     monkeypatch.setattr(linetemp, "MAX_WALK_ENTRIES", 3)
     for index in range(8):
         stuff(tmp_path, f"f{index}", 10, float(100 - index))
     done = linetemp.trim(tmp_path, 10**9)
-    assert done.removed and not (tmp_path / "f0").exists()
+    assert done.removed == () and done.incomplete
+    assert all((tmp_path / f"f{index}").exists() for index in range(8))
+    said = linetemp.trim_notice((done,)) or ""
+    assert "could not be measured in full" in said
+
+
+def test_a_walk_cut_short_over_the_bound_removes_only_down_to_half_of_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(linetemp, "MAX_WALK_ENTRIES", 12)
+    for index in range(10):
+        stuff(tmp_path, f"f{index}", 100_000, float(1000 - index))
+    stuff(tmp_path / "pad", "x", 10)
+    done = linetemp.trim(tmp_path, 300_000)
+    # The count is a lower bound that is over 300 kB, so removal starts. It stops once
+    # the count is at most 150 kB, so the newest entries survive and not all go.
+    assert 0 < len(done.removed) < 10
+    assert done.removed[:1] == ("f0",)
+    assert (tmp_path / "f9").exists()
+
+
+def test_an_entry_written_deep_below_is_not_taken_for_an_old_one(
+    tmp_path: Path,
+) -> None:
+    stuff(tmp_path / "busy" / "deep" / "deeper", "log", 100_000, 0.0)
+    os.utime(tmp_path / "busy", (1.0, 1.0))
+    os.utime(tmp_path / "busy" / "deep", (1.0, 1.0))
+    stuff(tmp_path, "idle", 200_000, 500.0)
+    done = linetemp.trim(tmp_path, 250_000)
+    assert done.removed == ("idle",)
+    assert (tmp_path / "busy" / "deep" / "deeper" / "log").exists()
+
+
+def test_a_newest_change_walk_without_budget_gives_the_entrys_own_time(
+    tmp_path: Path,
+) -> None:
+    stuff(tmp_path / "e", "f", 10, 0.0)
+    os.utime(tmp_path / "e", (5.0, 5.0))
+    assert linetemp._newest_change(tmp_path / "e", 0) == (5.0, 0)  # pyright: ignore[reportPrivateUsage]
+    newest, left = linetemp._newest_change(tmp_path / "e", 10)  # pyright: ignore[reportPrivateUsage]
+    assert newest > 5.0 and left == 9
+    assert linetemp._newest_change(tmp_path / "gone", 10) == (0.0, 10)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_removal_that_a_writer_defeats_is_reported_and_not_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stuff(tmp_path / "busy", "f", 200_000, 500.0)
+    stuff(tmp_path, "other", 200_000, 400.0)
+    real = linetemp.shutil.rmtree
+
+    def raced(path: object, *args: object, **kwargs: object) -> None:
+        if str(path).endswith("busy"):
+            raise OSError(errno.ENOTEMPTY, "Directory not empty")
+        real(path, *args, **kwargs)  # pyright: ignore[reportArgumentType, reportCallIssue]
+
+    monkeypatch.setattr(linetemp.shutil, "rmtree", raced)
+    done = linetemp.trim(tmp_path, 100_000)
+    assert "busy" not in done.removed and "other" in done.removed
+    assert any("busy" in item and "not empty" in item.lower() for item in done.failed)
+    assert (tmp_path / "busy" / "f").exists()
 
 
 def test_an_entry_another_user_owns_is_left_and_reported(tmp_path: Path) -> None:

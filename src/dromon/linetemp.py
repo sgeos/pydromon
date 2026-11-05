@@ -40,8 +40,10 @@ so the daemon measures each directory before a line's turn starts and, when it h
 more than ``MAX_TEMP_BYTES`` or ``MAX_CACHE_BYTES``, removes whole top-level entries,
 oldest change first, until it holds at most half the bound. The line is told in that
 turn's prompt what was removed. The measure is allocated bytes with ``os.lstat`` and no
-following of links, at most ``MAX_WALK_ENTRIES`` entries, and a directory that holds
-more than that is treated as over the bound, which fails safe. **Residual.** A line can
+following of links, at most ``MAX_WALK_ENTRIES`` entries. A walk cut short counts a
+lower bound, so removal starts only when that count already exceeds the bound, and a
+directory of more entries whose counted bytes are within it is reported as not measured
+in full and loses nothing, as ``trim`` says. **Residual.** A line can
 exceed the bound within a turn, as far as the disk allows, and the bound is checked
 only at a turn start. A file in use by a command that outlives the turn can be removed,
 which the line is told. Hard links to one file count once for each name. The bounds are
@@ -81,7 +83,7 @@ MAX_CACHE_BYTES: Final = 4 * 2**30
 """The most a line's package cache may hold at a turn start, four gibibytes."""
 MAX_WALK_ENTRIES: Final = 100_000
 """The most entries one measure visits, so the work is bounded. A directory with more
-is treated as over its bound."""
+is counted as far as the limit and reported as not measured in full."""
 MAX_TOP_ENTRIES: Final = 10_000
 """The most top-level entries one trim considers."""
 TEMP_VARIABLE: Final = "TMPDIR"
@@ -367,17 +369,69 @@ def _allocated(found: os.stat_result) -> int:
     return blocks * 512 if isinstance(blocks, int) else found.st_size
 
 
+def _newest_change(path: Path, budget: int) -> tuple[float, int]:
+    """The latest modification time of ``path`` and of what lies under it, found by a
+    walk of at most ``budget`` entries that follows no link, and the budget left. A
+    directory's own time changes only when its direct entries do, so a tree written
+    deep below would look old by it alone. A walk cut short by the budget gives the
+    latest time seen, which is never older than the entry's own."""
+    try:
+        newest = os.lstat(path).st_mtime
+    except OSError:
+        return 0.0, budget
+    pending = [path]
+    while pending and budget > 0:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    budget -= 1
+                    if budget < 0:
+                        return newest, 0
+                    try:
+                        found = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    newest = max(newest, found.st_mtime)
+                    if stat.S_ISDIR(found.st_mode):
+                        pending.append(Path(entry.path))
+        except OSError:
+            continue
+    return newest, max(budget, 0)
+
+
 def trim(place: Path, bound: int, user: int | None = None) -> Trimmed:
     """Keep ``place`` within ``bound`` bytes by removing top-level entries, oldest
-    change first, until it holds at most half of ``bound``. Nothing is removed while it
-    holds at most ``bound`` and the walk is complete. Links are unlinked, not followed,
-    and an entry another user owns is left and reported. Considers at most
-    ``MAX_TOP_ENTRIES`` entries, which leaves a directory with more of them over its
-    bound, as the report says through ``failed``."""
+    first, until it holds at most half of ``bound``.
+
+    **What proves a directory over its bound.** A walk that reaches its limit has
+    counted a lower bound of the bytes, never more than the directory holds. Removal
+    starts only when that count already exceeds ``bound``, whether or not the walk
+    finished, and continues only while the count exceeds half of ``bound``. A walk cut
+    short whose count is within ``bound`` proves nothing, so nothing is removed and
+    ``incomplete`` says the size is unknown. **Round 15, review of 3344ca6.** A
+    directory of many small entries was purged to its oldest ten thousand whatever its
+    size before this rule. The residual is that such a directory can stay over the
+    bound unseen, which the notice says.
+
+    **Age.** An entry's age is the latest modification time found in it by a walk
+    that shares one budget of ``MAX_WALK_ENTRIES`` entries between all entries, and
+    the entry's own time where the budget ran out, so a tree written deep below is not
+    mistaken for an old one, up to that budget.
+
+    **A writer racing the trim.** A command that outlives its turn can write into an
+    entry as it is removed. It may see its file vanish or a path missing, and may
+    recreate a directory that then stays. An entry whose removal fails because the
+    writer added to it is reported in ``failed`` and not counted as removed, and
+    ``freed`` is measured before removal, so it can differ from what the disk
+    returned. Links are unlinked, not followed, and an entry another user owns is left
+    and reported. Considers at most ``MAX_TOP_ENTRIES`` entries, which leaves a
+    directory with more of them over its bound, as the report says through
+    ``failed``."""
     owner = os.getuid() if user is None else user
     total, complete = measure(place)
-    if complete and total <= bound:
-        return Trimmed(place.name, bound, (), 0, False, ())
+    if total <= bound:
+        return Trimmed(place.name, bound, (), 0, not complete, ())
     try:
         names = os.listdir(place)
     except OSError as error:
@@ -388,18 +442,20 @@ def trim(place: Path, bound: int, user: int | None = None) -> Trimmed:
             f"{place}: more than {MAX_TOP_ENTRIES} entries, oldest considered"
         )
     dated: list[tuple[float, str]] = []
+    budget = MAX_WALK_ENTRIES
     for name in names:
-        try:
-            dated.append((os.lstat(place / name).st_mtime, name))
-        except OSError as error:
-            failed.append(f"{place / name}: {error.strerror}")
+        changed, budget = _newest_change(place / name, budget)
+        if changed == 0.0 and not os.path.lexists(place / name):
+            failed.append(f"{place / name}: vanished")
+            continue
+        dated.append((changed, name))
     dated.sort()
     removed: list[str] = []
     freed = 0
     target = bound // 2
     since, batch = 0, 1
     for _, name in dated[:MAX_TOP_ENTRIES]:
-        if complete and total <= target:
+        if total <= target:
             break
         path = place / name
         size, _ = measure(path)
@@ -413,7 +469,9 @@ def trim(place: Path, bound: int, user: int | None = None) -> Trimmed:
         since += 1
         if not complete and since >= batch:
             # Measured again after 1, 2, 4 and so on removals, so the walk limit
-            # bounds the work at a few measures and not one for each entry.
+            # bounds the work at a few measures and not one for each entry. Between
+            # two measures the count is a lower bound less a lower bound, so it can
+            # overshoot, by at most the entries of one batch.
             total, complete = measure(place)
             since, batch = 0, batch * 2
     return Trimmed(
@@ -452,7 +510,8 @@ def trim_notice(found: tuple[Trimmed, ...]) -> str | None:
         elif item.incomplete or item.failed:
             parts.append(
                 f"nothing from {item.place}, which is over its bound of {item.bound}"
-                " bytes or could not be measured, and may fail your next write"
+                " bytes or could not be measured in full, and may fail your next"
+                " write"
             )
     if not parts:
         return None

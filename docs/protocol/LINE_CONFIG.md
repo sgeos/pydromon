@@ -236,7 +236,7 @@ argument outside a tool's schema is refused.
 | `read_instructions` | Shows the instructions the line's next turn receives, as below |
 | `write_scratch` | Writes a file under the line's scratch in its working directory, `tmp/` or `tmp/lines/LINE`, as below. Its result gives the absolute path written and the bytes written |
 | `check_disclosure` | Checks text, one file, or a list of up to eight files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term, a file name or a line location. Files are checked independently, so a match cannot span files. A file is read in parts of at most 1 MiB cut after a newline and the counts are summed, a line may not exceed 1 MiB, and the combined content is at most 16 MiB. A path may be the absolute path `write_scratch` reported. One call, including a list, spends one recorded check, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies. Added on 2026-10-28 |
-| `list_processes`, `stop_process` | List and stop the processes the line started, as below. Where the daemon cannot attribute processes to the line, `list_processes` says it is unavailable and why, and never returns an empty list. Changed in round 14 |
+| `list_processes`, `stop_process` | List and stop the processes the line started, as below. Where the daemon cannot attribute processes to the line, `list_processes` says it is unavailable and why, and never returns an empty list. Changed in round 14. From round 15 the children the daemon saw below the engine are listed and stopped by pid and start time where the mark cannot be read, as below |
 | `worktree_status` | Gives the state of the line's own working directory, computed by the daemon outside the line's sandbox, as the processes section below specifies. Added in round 14, item 7 |
 
 **Issues.** **Round 11, item 3, decided by core for review on 2026-10-31.** A line
@@ -821,7 +821,49 @@ rests on. A **fact** was observed, an **inference** follows from facts, and a
   verified without a live daemon on a platform with an unreadable mark, which no test
   here has. **Inference.** Until then a line on such a platform can use the commands of
   its own shell and its engine's own task tools, and `stop_process` refuses rather than
-  guesses, which is the safe direction.
+  guesses, which is the safe direction. **Round 15, item 3, built in part, as the next
+  entry says.**
+- **A former holder is `ended` only when every process was read, review of 3344ca6.**
+  `role_status` answered `ended` for a count of zero taken after the daemon's launchers
+  and their engines were left out and every process with an unreadable environment was
+  skipped, so a former holder's engine could run unseen. The observation now reads the
+  mark of every process of the daemon's user but the daemon itself, the launchers and
+  their engines included, since it only observes. A process whose environment is
+  missing is read once more, so one that began or ended between the two listings is not
+  taken for unreadable. A process present and unreadable both times makes the state
+  `unknown`, with `unseen` giving their number. **Residual.** On a platform that cannot
+  read some processes of the user, `ended` may never be reached, which is the safe
+  direction, and a process begun after the observation is not seen.
+- **The ledger of a line's children, round 15, item 3.** The daemon keeps in memory,
+  for each line, the processes it saw below the line's engine, each with its pid, its
+  start time as `ps` prints it, and its command. **How it answers the three reasons
+  above.** The launcher's own record, a file in the daemon's private report directory
+  that names the line and the engine's pid, gives the root of the walk, so no
+  environment is read. A child is recorded while the engine's tree stands, which is
+  at each `list_processes` and `stop_process` call and at the end of each turn, so a
+  child that detaches later is already in the ledger. A signal is sent only after the
+  process table, read with start times, shows the same pid with the recorded start
+  time and command, and after the start time is read once more immediately before the
+  signal, so a pid given to another process is refused as `no longer the one recorded`
+  or `changed while it was checked`. A table that cannot be read refuses the stop.
+  A pid that is not in the calling line's own ledger is refused as not one of
+  the line's, which keeps one line from another's processes, and the daemon's own pid
+  is never signalled.
+  **Where it is used.** Where the mark cannot be read, `list_processes` lists the
+  ledger's children that still run, each with `basis` `ledger` and `started` in place
+  of `elapsed`, and answers unavailable, as before, when the ledger is empty, since an
+  empty ledger says nothing about the line's processes. Where the mark can be read,
+  the ledger adds the children the mark does not show, such as one that cleared its
+  environment with `env -i`. `stop_process` uses the ledger for a pid that it holds.
+  **Limits, none removed.** A child that detached before any look is not in the ledger,
+  so a listing from it is not complete, and no answer says that it is. The engine's own
+  helpers are in its tree and are recorded, since the daemon cannot tell them from a
+  task's child, so the listing can name one. The line could already signal it from its
+  shell. The ledger is lost at a restart. A window of microseconds remains between the
+  last read and the signal. `wake_after` with `pid:NUMBER` still waits only for a
+  process the mark shows. **Not verified live.** Every test here uses a fake process
+  table, since a line may not start a daemon, so the walk on a real macOS host is a
+  hypothesis until a live run shows it.
 - **`wake_after` waits for a process of the line's own.** A `task_id` of the form
   `pid:NUMBER` is accepted only after the daemon has read, as `stop_process` does,
   that the process carries the line's mark. The daemon then looks every five seconds, on

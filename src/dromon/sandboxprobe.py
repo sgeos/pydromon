@@ -5,6 +5,13 @@ sandbox document and from one failed command. This answers ``allowed`` or ``deni
 for a read or a write of a named path, with the rule that decided it, so a rule is
 tested by asking and not by inferring.
 
+**Round 15, review of 3344ca6.** A write answers from the document alone. The effective
+document does not list the line's working directory, which Claude Code may grant by
+default, so a path that only the working directory would cover is answered ``unknown``
+with the directory named, and never ``allowed`` on an assumption the document does not
+hold. A read of a path no ``denyRead`` entry covers is ``allowed`` for the same reason
+the other way, since reads are open unless denied.
+
 **What it is, stated plainly.** It evaluates the effective sandbox document the
 engine was given, the same document ``line_status`` shows, against the path. It is a
 **check of configuration, not a probe by the operating system**. The daemon cannot run
@@ -21,7 +28,8 @@ at, a ``..`` that leaves it included. Nothing it returns names a file's content.
 Failure modes. An unknown operation, an empty or oversize path, a path that leaves
 the scratch directory and a line with no sandbox document are refused with the reason.
 A document whose fields are not the expected shapes is read as having no entries for
-them, which fails toward ``denied`` for a write and toward ``allowed`` for a read, so
+them, which fails toward ``denied`` or ``unknown`` for a write and toward ``allowed``
+for a read, so
 the answer is stated with its rule and should be checked against ``line_status`` by a
 reviewer who doubts it.
 
@@ -104,11 +112,23 @@ def probe(
         if denied is not None:
             answer.update(result="denied", rule=f"denyWrite {denied}")
             return answer
-        granted = _covered(target, [str(cwd), *_entries(filesystem.get("allowWrite"))])
-        if granted is None:
-            answer.update(result="denied", rule="no allowWrite entry covers it")
-        else:
+        granted = _covered(target, _entries(filesystem.get("allowWrite")))
+        if granted is not None:
             answer.update(result="allowed", rule=f"allowWrite {granted}")
+        elif _covered(target, [str(cwd)]) is not None:
+            # Review of 3344ca6. The document does not list the working directory,
+            # so a grant from the engine's own default is not shown by it and is not
+            # claimed here.
+            answer.update(
+                result="unknown",
+                rule=(
+                    "no allowWrite entry of the document covers it, and the document"
+                    " does not say whether the engine grants the working directory"
+                ),
+                working_directory=str(cwd),
+            )
+        else:
+            answer.update(result="denied", rule="no allowWrite entry covers it")
         return answer
     blocked = _covered(target, _entries(filesystem.get("denyRead")))
     lifted = _covered(target, _entries(filesystem.get("allowRead")))

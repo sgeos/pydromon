@@ -536,15 +536,18 @@ unaffected.
   `message_acknowledged` and `commit_run_refused`. `note` of `wake_scheduled`,
   `stop_unverified`, `walk_limited`, `budget_stated`, `lease_acquired` and `run_ended`.
   `task`, `decisions`, `artifacts` and `next_action` of `brief_set`. `command` of
-  `task_recorded` and `commands` of `processes_left`. A test fails when an event class is
+  `task_recorded`, `commands` of `processes_left` and, from the review of 3344ca6,
+  `argv` of `run_started`, a copy of the project file's argument vector, since the run is
+  launched from the project file and not from the event. A test fails when an event class is
   neither covered nor listed as holding no free text, so a new event is classified when
   it is added.
 - **What is masked, by pattern.** Values with a known prefix and length, namely GitHub,
   GitLab, Slack, Stripe, SendGrid, npm, PyPI, Hugging Face, DigitalOcean, Google and
   Anthropic or OpenAI keys, Amazon access key identifiers and the session token of an
   Amazon temporary credential, JSON web tokens, and a private key block. The credential
-  after `Bearer` or `Basic`. The user and password of a URL. The value of an upper case
-  `NAME=value` whose name says token, secret, password, credential, access key, private
+  after `Bearer` or `Basic`. The user and password of a URL, and from the review of
+  3344ca6 those before a host with no scheme, apart from an image digest. The value of a
+  `NAME=value` in any case, such as `github_token=...` or `--api-key=...`, whose name says token, secret, password, credential, access key, private
   key, API key or session. The value of a JSON member whose name says the same.
 - **What is masked, by name.** The literal value of every environment variable that the
   project grants a line in a `secrets` list, wherever it appears, when it has at least
@@ -557,7 +560,17 @@ unaffected.
   file and the engine's transcript, since Dromon does not author them and the log holds
   only a digest of the first. A credential with no known prefix, no `NAME=value` shape and
   no listed name. A listed secret shorter than eight characters. A value split across two
-  texts. The operator settings in `line_overridden` and `project_overridden`, and an
+  texts. **Left unmasked on purpose, review of 3344ca6.** `line_configured`,
+  `line_overridden` and `project_overridden` are canonical JSON that the daemon decodes
+  again to build an engine, so a mask inside would change the configuration a line runs
+  under, and the credentials a configuration carries in an MCP server's environment and
+  headers are sealed before the event is written. A credential written into another
+  part, such as the instructions, is recorded as written. `peer_declared.policy` never
+  holds a token, and the command names of `run_started` and `commit_run_refused` are
+  identifiers. **Choices.** A question whose choices differ only by a credential is
+  refused, not stored, since an answer names a choice by its text and two equal choices
+  cannot be told apart. The refusal says the text repeated once masked, and echoes no
+  value. The operator settings in `line_overridden` and `project_overridden`, and an
   operator's own free text in a client, which is masked like any message body. A text
   that really holds such a value as an example is masked too, which fails safe.
 - **Failure modes.** A secret source that raises is treated as empty, so the patterns

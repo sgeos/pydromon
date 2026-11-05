@@ -1893,8 +1893,110 @@ def test_no_marked_process_is_shown_as_ended_with_what_that_means(
     world.scheduler.relinquish_ownership("alpha", "over", "beta", None)
     view = observe(world, _Table({4001: "gamma.0123"}))
     assert view["state"] == "ended" and view["count"] == 0
-    assert "among the environments that could be read" in view["basis"]
-    assert view["observed_at"] is not None
+    assert "every process of the daemon's user was read" in view["basis"]
+    assert view["observed_at"] is not None and view["unseen"] == 0
+
+
+class _Shaped:
+    """A table with parents and environments the test writes. ``env`` gives a pid its
+    entries, a pid in ``rows`` with no entry in ``env`` is unreadable. ``later`` is the
+    environment of the second reading, where it differs."""
+
+    def __init__(
+        self,
+        rows: dict[int, int],
+        env: dict[int, list[str]],
+        later: dict[int, list[str]] | None = None,
+        gone: frozenset[int] = frozenset(),
+    ) -> None:
+        self.rows = rows
+        self.env = env
+        self.later = later
+        self.gone = gone
+        self.reads = 0
+
+    def own_processes(self) -> Sequence[ProcessInfo]:
+        second = self.reads > 0
+        return [
+            ProcessInfo(pid, ppid, "00:05", f"cmd{pid}")
+            for pid, ppid in self.rows.items()
+            if not (second and pid in self.gone)
+        ]
+
+    def has_variable(self, pid: int, assignment: str) -> bool:
+        return assignment in self.environments().get(pid, [])
+
+    def environments(self) -> dict[int, list[str]]:
+        found = self.later if self.reads > 0 and self.later is not None else self.env
+        self.reads += 1
+        return dict(found)
+
+    def send(self, pid: int, signal_number: int) -> None:
+        raise ProcessLookupError(pid)
+
+
+def mark(line: str) -> list[str]:
+    return [f"{MARK_VARIABLE}={line}.0123"]
+
+
+def shaped(world: World, table: _Shaped) -> dict[str, Any]:
+    world.scheduler.relinquish_ownership("alpha", "over", "beta", None)
+    return observe(world, cast(_Table, table))
+
+
+def test_a_marked_engine_that_is_a_daemon_child_or_grandchild_is_seen_as_running(
+    world: World,
+) -> None:
+    # Review of 3344ca6. These were left out as the daemon's launchers and engines, and
+    # the count of zero was read as ended.
+    daemon = os.getpid()
+    rows = {daemon: 1, 5001: daemon, 5002: 5001, 5003: 5001}
+    env: dict[int, list[str]] = {
+        daemon: [],
+        5001: [],
+        5002: mark("alpha"),
+        5003: mark("gamma"),
+    }
+    view = shaped(world, _Shaped(rows, env))
+    assert view["state"] == "running" and view["count"] == 1
+
+
+def test_an_unreadable_process_makes_the_answer_unknown_not_ended(world: World) -> None:
+    daemon = os.getpid()
+    rows = {daemon: 1, 5001: daemon, 5002: 5001}
+    # 5002 is the engine of some line, a child of a launcher, and cannot be read.
+    env: dict[int, list[str]] = {daemon: [], 5001: mark("gamma")}
+    view = shaped(world, _Shaped(rows, env))
+    assert view["state"] == "unknown" and view["unseen"] == 1
+    assert "could not be read" in view["basis"] and view["count"] == 0
+
+
+def test_a_process_unreadable_once_and_readable_on_the_second_reading_is_judged(
+    world: World,
+) -> None:
+    daemon = os.getpid()
+    rows = {daemon: 1, 5002: 1}
+    env: dict[int, list[str]] = {daemon: []}
+    later: dict[int, list[str]] = {daemon: [], 5002: mark("alpha")}
+    view = shaped(world, _Shaped(rows, env, later))
+    assert view["state"] == "running" and view["count"] == 1 and view["unseen"] == 0
+
+
+def test_a_process_that_ended_between_the_readings_is_not_unseen(world: World) -> None:
+    daemon = os.getpid()
+    rows = {daemon: 1, 5002: 1}
+    view = shaped(
+        world, _Shaped(rows, {daemon: []}, {daemon: []}, gone=frozenset({5002}))
+    )
+    assert view["state"] == "ended" and view["unseen"] == 0
+
+
+def test_the_daemons_own_unreadable_environment_is_not_counted_as_unseen(
+    world: World,
+) -> None:
+    daemon = os.getpid()
+    view = shaped(world, _Shaped({daemon: 1, 5001: 1}, {5001: []}))
+    assert view["state"] == "ended"
 
 
 def test_a_process_with_the_former_holders_mark_is_shown_as_running(

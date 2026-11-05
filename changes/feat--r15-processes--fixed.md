@@ -1,0 +1,4 @@
+Type: Fixed
+
+- The worker that asks git about the daemon's code no longer waits without a bound for a git process to start. `subprocess.run` times a process only from the moment it exists, so a start that stalled held the worker for good and every later question stayed unknown. The wait now ends after the git timeout plus a grace period, the stalled start is left on a thread of its own, and no more than four such starts are tolerated at once. The staleness tests wait for their own git processes the same way, so a stalled start fails with a message instead of running into the gate's five minute limit.
+- The byte bound on a line's temporary directory purged a directory of more than 100,000 entries to its oldest ten thousand whatever its size. Removal now starts only when the counted bytes already exceed the bound, stops at half of it, ages an entry by the latest change inside it, and reports a directory it could not measure in full.

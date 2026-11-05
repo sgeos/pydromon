@@ -13,6 +13,10 @@ engine each launcher started, as ``dromon.launcher`` describes, and
 moment of stopping. Claude Code, Codex and Grok Build scope their own process
 controls to the agent's own session in the same way.
 
+Ledger. **Round 15, item 3.** Where the mark cannot be read, ``ChildLedger`` keeps the
+children the daemon saw below a line's engine, with their start times, so they can be
+listed and stopped without reading an environment. See the class for its limits.
+
 Execution. Daemon calls run on one worker thread with a bounded queue. Process-table
 inspection can be slow under load, so it must not block the daemon's event loop or
 allow an unbounded backlog of requests. Stopping the daemon closes the queue, rejects
@@ -628,7 +632,12 @@ def attached(root: int, timeout: float = ATTACHED_SECONDS) -> list[TreeRow] | No
     rows = read_tree(os.getuid(), timeout, with_start=True)
     if rows is None:
         return None
-    me = os.getpid()
+    return below(rows, root, os.getpid())
+
+
+def below(rows: Sequence[TreeRow], root: int, me: int) -> list[TreeRow]:
+    """The part of ``attached`` that works on a reading already taken: the descendants
+    of ``root`` in ``rows`` without ``me``, ``root`` and the listing ``me`` ran."""
     return [
         row
         for row in descendants(rows, root)
@@ -715,12 +724,68 @@ def marked_processes(
     return found
 
 
-def former_holder_processes(table: ProcessTable, line_id: str, daemon_pid: int) -> int:
-    """How many processes of the daemon's user carry a mark of ``line_id``, of this run
-    or an earlier one. Zero says none was found among the environments that could be
-    read, not that none exists. Raises ``ProcessRefused`` when the table could not be
-    read, which is not an answer of zero. **Round 15, item 4.**"""
-    return len(marked_processes(table, daemon_pid).get(line_id, []))
+@dataclass(frozen=True, slots=True)
+class FormerReading:
+    """What one observation of a former holder's processes found. ``marked`` counts the
+    processes carrying a mark of the line, and ``unseen`` the processes of the daemon's
+    user, the daemon excepted, whose environment could not be read in either of two
+    readings, which might carry the mark and are therefore not ruled out."""
+
+    marked: int
+    unseen: int
+
+
+def _marked_for(entries: Sequence[str], line_id: str) -> bool:
+    prefix = f"{MARK_VARIABLE}="
+    for entry in entries:
+        if entry.startswith(prefix):
+            mark = entry[len(prefix) :]
+            return "." in mark and mark.rsplit(".", 1)[0] == line_id
+    return False
+
+
+def former_holder_reading(
+    table: ProcessTable, line_id: str, daemon_pid: int
+) -> FormerReading:
+    """Count the processes of the daemon's user that carry a mark of ``line_id``, of
+    this run or an earlier one, and the processes whose environment could not be read.
+
+    **Round 15, review of 3344ca6.** ``ended`` was claimed for a count of zero taken
+    after the daemon's launchers and their engines were left out, and after every
+    process with an unreadable environment was skipped, so a former holder's engine
+    could run unseen. Neither is left out here. A daemon's child or grandchild that
+    carries the mark counts as a process of the line, since this only observes and
+    stops nothing. A process whose environment is absent from the reading is read
+    again once, so that one which began or ended between the two listings is not
+    taken for an unreadable one, and only a process present and unreadable both times
+    counts as ``unseen``. The caller must answer ``unknown``, not ``ended``, while
+    ``unseen`` is above zero. Raises ``ProcessRefused`` when the table could not be
+    read, which is not an answer of zero."""
+    environments = table.environments()
+    processes = table.own_processes()
+    _require_readable(environments, processes)
+    marked = 0
+    missing: set[int] = set()
+    for process in processes:
+        if process.pid == daemon_pid:
+            continue
+        entries = environments.get(process.pid)
+        if entries is None:
+            missing.add(process.pid)
+        elif _marked_for(entries, line_id):
+            marked += 1
+    if not missing:
+        return FormerReading(marked, 0)
+    again_environments = table.environments()
+    again_processes = {p.pid for p in table.own_processes()}
+    unseen = 0
+    for pid in sorted(missing & again_processes):
+        entries = again_environments.get(pid)
+        if entries is None:
+            unseen += 1
+        elif _marked_for(entries, line_id):
+            marked += 1
+    return FormerReading(marked, unseen)
 
 
 def line_process_ended(
@@ -893,3 +958,179 @@ def signal_if_same(
     except (ProcessLookupError, PermissionError):
         return False
     return True
+
+
+MAX_LEDGER_PER_LINE: Final = 64
+"""The most children kept for one line, the oldest observed dropped first."""
+
+MAX_LEDGER_LINES: Final = 64
+"""The most lines the ledger keeps children for, so its size is bounded."""
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerEntry:
+    """A child that a line's engine had running when the daemon looked, as the daemon
+    saw it. The start time is what tells the process from one that was later given its
+    pid, so an entry without one is never made."""
+
+    pid: int
+    started: str
+    command: str
+
+
+class ChildLedger:
+    """The pids of the processes below a line's engine that the daemon saw, kept with
+    their start times so a later listing and a later signal can tell each from a
+    process that was given its pid since. **Round 15, item 3.**
+
+    Why it exists. ``list_processes`` and ``stop_process`` find a line's processes by
+    the mark in their environment, which this platform may not let the daemon read, and
+    which a child can clear with ``env -i``. Ancestry cannot be cleared, but it is lost
+    when a parent exits, so it must be read while the engine's tree stands. The ledger
+    keeps what was read then.
+
+    What it knows. A child is recorded only when a walk of the engine's tree, taken
+    while the engine ran, found it. **Limits, all of them stated.** A child that left
+    the tree before any walk is not in the ledger. A child the engine started for its
+    own use, such as a helper, is in the tree and is recorded, since the daemon cannot
+    tell it from a task's child, and the line that names it to ``stop_process`` has
+    the power to signal it from its shell as well. The ledger is in memory and is lost
+    at a restart, when the marks are lost too. Nothing in it is trusted at the time of
+    use. ``running`` and ``stop_ledgered`` check start time and command again.
+
+    Bounds. ``MAX_LEDGER_PER_LINE`` children for each of ``MAX_LEDGER_LINES`` lines.
+    Porting note. Plain data keyed by line, with no clock."""
+
+    def __init__(self) -> None:
+        self._entries: dict[str, dict[int, LedgerEntry]] = {}
+
+    def record(self, line_id: str, rows: Sequence[TreeRow]) -> int:
+        """Keep the children among ``rows`` that carry a start time, and return how many
+        were new or replaced a different process of the same pid. A row without a start
+        time, or whose process has exited and not been reaped, is not kept."""
+        held = self._entries.get(line_id)
+        if held is None:
+            if len(self._entries) >= MAX_LEDGER_LINES:
+                del self._entries[next(iter(self._entries))]
+            held = self._entries.setdefault(line_id, {})
+        changed = 0
+        for row in rows:
+            if row.started == "" or "<defunct>" in row.command or row.pid <= 1:
+                continue
+            entry = LedgerEntry(row.pid, row.started, row.command)
+            if held.get(row.pid) != entry:
+                held.pop(row.pid, None)
+                held[row.pid] = entry
+                changed += 1
+        while len(held) > MAX_LEDGER_PER_LINE:
+            del held[next(iter(held))]
+        return changed
+
+    def entries(self, line_id: str) -> list[LedgerEntry]:
+        """The line's entries, lowest pid first."""
+        return sorted(self._entries.get(line_id, {}).values(), key=lambda e: e.pid)
+
+    def find(self, line_id: str, pid: int) -> LedgerEntry | None:
+        return self._entries.get(line_id, {}).get(pid)
+
+    def forget(self, line_id: str, pid: int) -> None:
+        self._entries.get(line_id, {}).pop(pid, None)
+
+    def prune(self, line_id: str, rows: Sequence[TreeRow]) -> list[LedgerEntry]:
+        """Drop the line's entries that are not running in ``rows`` as the same process,
+        by pid, start time and command, and return the ones that are. A pid that
+        ``rows`` show with another start time was reused, and is dropped. ``rows`` must
+        carry start times, and an entry is not kept on a row that lacks one."""
+        alive = {row.pid: row for row in rows}
+        kept: list[LedgerEntry] = []
+        for entry in self.entries(line_id):
+            row = alive.get(entry.pid)
+            if (
+                row is None
+                or row.started == ""
+                or row.started != entry.started
+                or row.command != entry.command
+            ):
+                self.forget(line_id, entry.pid)
+                continue
+            kept.append(entry)
+        return kept
+
+
+def ledger_listing(
+    ledger: ChildLedger,
+    line_id: str,
+    rows: Sequence[TreeRow],
+    exclude: Callable[[int], bool] = lambda pid: False,
+) -> list[dict[str, object]]:
+    """The ledger's children of ``line_id`` that ``rows`` show running as the same
+    process, in the shape ``line_processes`` gives, marked ``"basis": "ledger"`` and
+    with their start time in place of an elapsed time. ``exclude`` drops a pid, such as
+    the daemon's own."""
+    return [
+        {
+            "pid": entry.pid,
+            "task_id": pid_task_id(entry.pid),
+            "started": entry.started,
+            "command": entry.command[:MAX_COMMAND_CHARACTERS],
+            "basis": "ledger",
+        }
+        for entry in ledger.prune(line_id, rows)
+        if not exclude(entry.pid)
+    ]
+
+
+def stop_ledgered(
+    ledger: ChildLedger,
+    line_id: str,
+    pid: int,
+    force: bool,
+    *,
+    read_rows: Callable[[], list[TreeRow] | TreeReadFailure],
+    identity: Callable[[int], tuple[int, str] | None],
+    send: Callable[[int, int], None],
+    forbidden: Callable[[int], bool] = lambda pid: False,
+) -> str:
+    """Send ``SIGTERM``, or ``SIGKILL`` with ``force``, to ``pid`` if the ledger holds
+    it for ``line_id`` and it is still the process the ledger recorded. Returns what was
+    done, or raises ``ProcessRefused``.
+
+    The checks, in order. The pid is in the line's ledger, which is where a process of
+    another line or of the operator is turned away. The process table is read, with
+    start times, and the process must be there with the recorded start time and
+    command, which turns away a pid given to another process since. The start time is
+    read again immediately before the signal. **Residual.** As for ``stop_line_process``
+    there is no process handle on this platform, so a pid reused between the last read
+    and the signal is not seen, a window of microseconds. A table that cannot be read
+    refuses the stop, since not knowing is not a match. ``forbidden`` names pids that
+    are never signalled, such as the daemon's own."""
+    if type(pid) is not int or pid <= 1:
+        raise ProcessRefused("pid must be a whole number above 1")
+    entry = ledger.find(line_id, pid)
+    if entry is None or forbidden(pid):
+        raise ProcessRefused(f"process {pid} is not one of yours")
+    rows = read_rows()
+    if isinstance(rows, TreeReadFailure):
+        raise ProcessRefused(f"the process table could not be read: {rows}")
+    row = next((row for row in rows if row.pid == pid), None)
+    if row is None:
+        ledger.forget(line_id, pid)
+        raise ProcessRefused(f"process {pid} has already ended")
+    if row.started != entry.started or row.command != entry.command:
+        ledger.forget(line_id, pid)
+        raise ProcessRefused(
+            f"process {pid} is no longer the one recorded, so it was not signalled"
+        )
+    now = identity(pid)
+    if now is None or now[1] != entry.started:
+        raise ProcessRefused(
+            f"process {pid} changed while it was checked, so it was not signalled"
+        )
+    chosen = signal.SIGKILL if force else signal.SIGTERM
+    try:
+        send(pid, chosen)
+    except ProcessLookupError as error:
+        raise ProcessRefused(f"process {pid} has already ended") from error
+    except PermissionError as error:
+        raise ProcessRefused(f"process {pid} cannot be signalled") from error
+    return f"sent {chosen.name} to process {pid}, which the ledger recorded"

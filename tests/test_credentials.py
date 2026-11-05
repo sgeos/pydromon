@@ -25,6 +25,7 @@ from dromon.model import (
     OperatorRegistered,
     RoleNoted,
     RunEnded,
+    RunStarted,
     RunStatus,
     TaskNoted,
 )
@@ -114,6 +115,26 @@ def test_the_forms_of_an_environment_dump_and_a_service_reply_are_masked() -> No
 )
 def test_ordinary_text_is_left_alone(text: str) -> None:
     assert scrub_text(text) == text
+
+
+def test_lower_case_names_and_a_user_and_password_without_a_scheme_are_masked() -> None:
+    # Review of 3344ca6. The upper case pattern and the scheme pattern missed these.
+    assert scrub_text("github_token=abcdefgh12345678 ok") == f"github_token={MASK} ok"
+    assert scrub_text("run --api-key=abcdefgh12345678") == f"run --api-key={MASK}"
+    assert scrub_text("Db_Password=hunter2hunter2") == f"Db_Password={MASK}"
+    assert (
+        scrub_text("psql admin:s3cretpw@db.internal/x") == f"psql {MASK}@db.internal/x"
+    )
+    # An image reference with a digest, an address, a time and prose are left alone.
+    for kept in (
+        "image python:3.12@sha256:" + "ab" * 32,
+        "mail ana@example.org about it",
+        "at 12:30@home",
+        "git@github.com:org/repo.git",
+        "token_count=12",
+        "session=short",
+    ):
+        assert scrub_text(kept) == kept, kept
 
 
 def test_masking_is_idempotent_and_never_lengthens_a_text_past_a_mask() -> None:
@@ -225,7 +246,6 @@ def test_every_event_class_is_classified_as_scrubbed_or_without_free_text() -> N
         "RoleHeld": "an identifier and a time",
         "RoleRetired": "an identifier and a time",
         "RunCleared": "identifiers and a time",
-        "RunStarted": "a declared command and its arguments, from the project file",
         "SeatBound": "identifiers",
         "SeatUnbound": "identifiers",
         "TurnCorrelated": "identifiers",
@@ -240,6 +260,65 @@ def test_every_event_class_is_classified_as_scrubbed_or_without_free_text() -> N
     for cls, names in credentials.COVERED.items():
         fields = {field.name for field in dataclasses.fields(cls)}
         assert set(names) <= fields
+
+
+def test_a_run_started_event_has_its_arguments_masked_and_its_names_kept() -> None:
+    token = FAKES["github"]
+    started = RunStarted(
+        "r-1",
+        "alpha",
+        None,
+        None,
+        "full-gate",
+        ("tool", f"--token={token}", f"--auth={token}"),
+        "/w",
+        "out.txt",
+        4242,
+        AT,
+        AT,
+    )
+    found = scrub_event(started)
+    assert isinstance(found, RunStarted)
+    assert token not in "".join(found.argv) and found.argv[0] == "tool"
+    assert found.command == "full-gate" and found.pid == 4242
+
+
+def test_the_events_left_unscrubbed_on_purpose_are_named_with_a_reason() -> None:
+    # The classification test above lists them. The configuration events pass through
+    # whole, since the daemon decodes them again to build an engine.
+    token = FAKES["github"]
+    configured = model.LineOverridden("alpha", f'{{"instructions": "{token}"}}')
+    assert scrub_event(configured) is configured
+    for name in ("LineConfigured", "LineOverridden", "ProjectOverridden"):
+        assert name not in {cls.__name__ for cls in credentials.COVERED}
+
+
+def test_choices_that_differ_only_by_a_credential_are_refused_with_the_reason(
+    tmp_path: Path,
+) -> None:
+    # Review of 3344ca6. Masked, the two are equal, and an answer names a choice by its
+    # text, so storing them would be ambiguous and dropping one silent. The refusal is
+    # right. The reason must be told and must not echo a value.
+    first, second = FAKES["github"], FAKES["gitlab"]
+    question = MessageSent(
+        "m1",
+        ALPHA,
+        ANA,
+        MessageKind.QUESTION,
+        "which?",
+        (f"use {first}", f"use {second}"),
+    )
+    with pytest.raises(model.InvalidField) as caught:
+        scrub_event(question)
+    text = str(caught.value)
+    assert "masked" in text and "repeat" in text
+    assert first not in text and second not in text
+    with EventLog(tmp_path / "events.sqlite") as log:
+        log.append(OperatorRegistered("ana"))
+        log.append(LineCreated("alpha", ENGINE, "subscription"))
+        with pytest.raises(model.InvalidField):
+            log.append(question)
+        assert "m1" not in log.state.messages
 
 
 def test_the_log_stores_and_applies_the_masked_text(tmp_path: Path) -> None:

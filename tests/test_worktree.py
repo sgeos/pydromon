@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from collections.abc import Generator, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -411,3 +412,59 @@ def test_the_tool_is_unavailable_where_the_directory_does_not_resolve(
 ) -> None:
     text, error = call(scheduler, {})
     assert error and text.startswith("worktree_status is unavailable: ")
+
+
+def test_a_git_whose_start_never_completes_is_reported_and_does_not_hold_the_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Round 15. subprocess.run waits for the child to reach exec without a bound.
+    release = threading.Event()
+
+    def stalled(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        release.wait(60)
+        raise OSError("released")
+
+    monkeypatch.setattr(worktree.subprocess, "run", stalled)
+    monkeypatch.setattr(worktree, "GIT_SECONDS", 0.2)
+    monkeypatch.setattr(worktree, "START_GRACE_SECONDS", 0.2)
+    monkeypatch.setattr(worktree, "_stranded", [])
+    try:
+        ran = worktree.run_git(tmp_path, ["status"])
+        assert ran.code == 124 and "did not finish" in ran.stderr
+        assert len(worktree._stranded) == 1  # pyright: ignore[reportPrivateUsage]
+    finally:
+        release.set()
+
+
+def test_starts_stranded_to_the_cap_stop_further_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = threading.Event()
+    blockers = [
+        threading.Thread(target=release.wait, args=(60,), daemon=True)
+        for _ in range(worktree.MAX_STRANDED)
+    ]
+    for blocker in blockers:
+        blocker.start()
+    monkeypatch.setattr(worktree, "_stranded", list(blockers))
+    try:
+        ran = worktree.run_git(tmp_path, ["status"])
+        assert ran.code == 127 and "still stuck" in ran.stderr
+    finally:
+        release.set()
+
+
+def test_a_git_that_cannot_be_started_and_one_that_overruns_are_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def missing(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError("no git")
+
+    monkeypatch.setattr(worktree.subprocess, "run", missing)
+    assert worktree.run_git(tmp_path, ["status"]).code == 127
+
+    def slow(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired("git", 1.0)
+
+    monkeypatch.setattr(worktree.subprocess, "run", slow)
+    assert worktree.run_git(tmp_path, ["status"]).code == 124

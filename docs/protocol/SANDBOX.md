@@ -117,8 +117,18 @@ that changes its directory makes the note wrong until `claude_shell_tmpdir` is u
 daemon applies one between turns. Before a line's turn starts it measures the line's
 `tmp` and its package cache, in allocated bytes with no link followed and at most
 100,000 entries. A directory over its bound, one gibibyte for `tmp` and four for the
-cache, or one that holds more entries than the walk limit, loses whole top-level entries,
-oldest change first, until it holds at most half of the bound. A link is unlinked and its
+cache, loses whole top-level entries, oldest first, until it holds at most half of the
+bound. **Review of 3344ca6.** A walk that reaches the limit has counted a lower bound
+of the bytes, so removal starts only when that count already exceeds the bound, and
+stops once it is at most half of it. A directory of more entries whose counted bytes are
+within the bound loses nothing, and the prompt says it could not be measured in full,
+which leaves such a directory over its bound unseen, a residual. Before this rule it was
+purged to its oldest ten thousand entries whatever its size. Age is the latest
+modification time found in the entry, by a walk that shares one budget of 100,000
+entries, so a tree written deep below is not taken for an old one, and an entry past the
+budget is aged by its own time. A command that outlives the turn and writes into an
+entry as it is removed may see files vanish or recreate a directory. A removal that
+fails because it did so is reported and not counted. A link is unlinked and its
 target is kept, and an entry another user owns is left and reported. The turn's prompt
 then says how many entries and bytes were removed, naming no file. **Residuals.** The
 bound holds between turns only, so a line can exceed it within a turn as far as the disk
@@ -131,7 +141,10 @@ start still removes what has gone unchanged for a week.
 `denied` with the entry of the effective sandbox document that decides it. **It checks
 the document the engine was given and is not a probe by the operating system**, which
 every answer says, because the daemon cannot run a process under Claude Code's
-confinement. It reads and writes nothing of the path, resolves links only to name the
+confinement. **Review of 3344ca6.** A write is `allowed` only by an `allowWrite` entry of
+the document and `denied` by a `denyWrite` entry or by no coverage. The document does not
+list the working directory, which Claude Code may grant by default, so a path only the
+working directory would cover is `unknown`, with the directory named. It reads and writes nothing of the path, resolves links only to name the
 deciding rule, and refuses a path that leaves the scratch directory without looking at
 it, so it cannot widen what the line may do. A rule that the engine applies differently
 from the document is not seen. It is offered to every line and refuses a line whose

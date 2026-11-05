@@ -65,6 +65,11 @@ _NAME_WORDS: Final = (
     r"|SESSION)"
 )
 
+_NAME_WORDS_LOWER: Final = (
+    r"(?:token|secret|password|passwd|credential|access[_-]?key|private[_-]?key"
+    r"|api[_-]?key|session)"
+)
+
 _JSON_WORDS: Final = (
     r"(?:token|secret|password|passwd|credential|apikey|api_key|accesskey|access_key"
     r"|sessiontoken|session_token|private_key|privatekey)"
@@ -105,6 +110,24 @@ _PATTERNS: Final = (
     (
         re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@"),
         rf"\1{MASK}@",
+    ),
+    (
+        # A user and password before a host with no scheme, as a connection string
+        # or a remote shorthand prints it. An image reference with a digest is kept.
+        re.compile(
+            r"(?<![\w/:@.*-])[^\s/@:'\"<>*]{1,64}:[^\s/@:'\"<>*]{3,128}"
+            r"@(?!sha256:)(?=[A-Za-z0-9])"
+        ),
+        f"{MASK}@",
+    ),
+    (
+        # The same names in lower case or mixed case, such as ``github_token=...`` or
+        # ``--api-key=...``, which the upper case pattern below does not reach.
+        re.compile(
+            rf"(?i)(?<![A-Za-z0-9_])([a-z0-9_.-]*{_NAME_WORDS_LOWER}[a-z0-9_.-]*=)"
+            r"[^\s'\"]{8,}"
+        ),
+        rf"\1{MASK}",
     ),
     (
         re.compile(rf"\b([A-Z][A-Z0-9_]*{_NAME_WORDS}[A-Z0-9_]*=)[^\s'\"]{{8,}}"),
@@ -170,8 +193,25 @@ COVERED: Final[dict[type, tuple[str, ...]]] = {
     model.LeaseAcquired: ("note",),
     model.RunEnded: ("note",),
     model.CommitRunRefused: ("reason",),
+    model.RunStarted: ("argv",),
 }
-"""The events with free text, and the fields of each that are scrubbed."""
+"""The events with free text, and the fields of each that are scrubbed. **Round 15,
+review of 3344ca6.** ``RunStarted.argv`` is added. It is the project file's argument
+vector for a run, and the run is launched from the project file and never from the
+event, so masking the recorded copy changes only what a view shows.
+
+Fields with text that are deliberately **not** scrubbed.
+- ``LineConfigured.config``, ``LineOverridden.overrides`` and
+  ``ProjectOverridden.overrides`` are canonical JSON that the daemon decodes again to
+  build a line's engine, so a mask inside them would change the configuration the line
+  runs under. The values a configuration may carry as credentials, the environment and
+  headers of an MCP server, are taken out into the sealed store before the event is
+  written, as ``dromon.sealed`` says. A credential written into another place, such as
+  the instructions, is recorded as written, and the operator is told so.
+- ``PeerDeclared.policy`` is written by the federation module and never holds a token.
+- ``RunStarted.command``, ``CommitRunRefused.command`` and ``LeaseReleased.name`` are
+  names the project file declares, checked as identifiers, not free text.
+"""
 
 
 def scrub_event(event: Event, secrets: Iterable[str] = ()) -> Event:
@@ -199,4 +239,15 @@ def scrub_event(event: Event, secrets: Iterable[str] = ()) -> Event:
                 changes[name] = items
     if not changes:
         return event
-    return dataclasses.replace(event, **changes)  # pyright: ignore[reportArgumentType]
+    try:
+        return dataclasses.replace(event, **changes)  # pyright: ignore[reportArgumentType]
+    except model.InvalidField as error:
+        # Review of 3344ca6. Two choices that differed only by a credential are equal
+        # once masked, and an event that repeats a choice is refused, not stored. That
+        # is right, since an answer names a choice by its text and two equal choices
+        # cannot be told apart, and storing one of them would drop a choice silently.
+        # The refusal says why, without echoing a value.
+        raise model.InvalidField(
+            f"after credential-shaped values were masked, {error}. Do not put a"
+            " credential in this text"
+        ) from error

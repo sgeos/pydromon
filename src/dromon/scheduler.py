@@ -208,6 +208,7 @@ from dromon import codetree
 from dromon.gitssh import GitSshAccess, sandbox_layer, unreadable
 from dromon.settings import SettingsConfig
 from dromon.processes import (
+    ChildLedger,
     ProcessRefused,
     ProcessTable,
     ProcessWorker,
@@ -216,13 +217,18 @@ from dromon.processes import (
     unavailable,
     SystemProcesses,
     TreeRow,
-    former_holder_processes,
+    below,
+    former_holder_reading,
+    identity_of,
+    ledger_listing,
     line_process_ended,
     line_processes,
     marked_processes,
     pid_of_task,
     pid_task_id,
+    stop_ledgered,
     stop_line_process,
+    tree_or_reason,
 )
 from dromon.projectconfig import ProjectConfig
 from dromon.worktree import (
@@ -2460,6 +2466,15 @@ class Scheduler:
         self._sweep_failure: str | None = None
         """Why the last sweep could not read the process table, said once."""
         self._detached: dict[str, tuple[int, ...]] = {}
+        self._children = ChildLedger()
+        """Round 15, item 3. The children seen below each line's engine."""
+        self._tree_read: Callable[[], list[TreeRow] | TreeReadFailure] = lambda: (
+            tree_or_reason(os.getuid(), with_start=True)
+        )
+        """Reads every process of the daemon's user with start times. A test replaces
+        it with a fake table."""
+        self._identity_read: Callable[[int], tuple[int, str] | None] = identity_of
+        self._harness_read: Callable[[str], int | None] = self._launched_harness
         """The pids each line was last reported to have left outside its engine's
         tree, so the same set is not recorded again at every turn."""
         self._processes_identifiable = processes_identifiable
@@ -6996,6 +7011,49 @@ class Scheduler:
             handler=handler,
         )
 
+    def _launched_harness(self, line_id: str) -> int | None:
+        """The pid of the engine process the newest launch record of ``line_id`` names,
+        when its launcher has not finished, or ``None``. Blocking file reads, so a
+        caller on the event loop runs it on the process worker. **Round 15, item 3.**"""
+        records = [
+            record
+            for record in launcher.read_launches(self._report_dir)
+            if record.line_id == line_id and not record.done
+        ]
+        if not records:
+            return None
+        return max(records, key=lambda record: record.launched_ns or 0).harness
+
+    async def _see_children(self, line_id: str) -> list[TreeRow] | TreeReadFailure:
+        """Read the process table once with start times, keep the line's children seen
+        below its engine in the ledger, and return the table. A line with no running
+        engine adds nothing, and its earlier entries are checked against the table by
+        the caller. Raises ``ProcessRefused`` when the worker's queue is full."""
+
+        known = bool(self._children.entries(line_id))
+
+        def look() -> tuple[int | None, list[TreeRow] | TreeReadFailure]:
+            harness = self._harness_read(line_id)
+            if harness is None and not known:
+                # Nothing to record and nothing to check, so no process is run.
+                return None, []
+            return harness, self._tree_read()
+
+        harness, rows = await self._process_worker.run(look)
+        if harness is not None and not isinstance(rows, TreeReadFailure):
+            self._children.record(line_id, below(rows, harness, os.getpid()))
+        return rows
+
+    async def children_listing(self, line_id: str) -> list[dict[str, object]] | str:
+        """The line's ledgered children that still run as the same process, or the
+        reason the table could not be read. Used when the mark cannot be read, and to
+        add what the mark does not show. **Round 15, item 3.**"""
+        rows = await self._see_children(line_id)
+        if isinstance(rows, TreeReadFailure):
+            return str(rows)
+        me = os.getpid()
+        return ledger_listing(self._children, line_id, rows, lambda pid: pid == me)
+
     def list_processes_tool(self, line_id: str) -> SdkMcpTool[Any]:
         """The ``list_processes`` tool for ``line_id``, which sees only its own."""
 
@@ -7004,9 +7062,23 @@ class Scheduler:
             if unexpected:
                 return _tool_error(unexpected)
             if not self._processes_identifiable:
-                return _tool_error(
-                    unavailable(LIST_PROCESSES_TOOL_NAME, UNIDENTIFIABLE)
-                )
+                # Round 15, item 3. The mark cannot be read here, so what the daemon
+                # saw below the engine is all there is. An empty ledger says nothing
+                # about the line's processes, so it is the same answer as before.
+                try:
+                    ledgered = await self.children_listing(line_id)
+                except ProcessRefused as error:
+                    return _tool_error(
+                        unavailable(LIST_PROCESSES_TOOL_NAME, str(error))
+                    )
+                if isinstance(ledgered, str):
+                    # A table that could not be read is not an empty ledger.
+                    return _tool_error(unavailable(LIST_PROCESSES_TOOL_NAME, ledgered))
+                if not ledgered:
+                    return _tool_error(
+                        unavailable(LIST_PROCESSES_TOOL_NAME, UNIDENTIFIABLE)
+                    )
+                return _tool_text(json.dumps(ledgered, indent=2))
             mark = self.line_mark(line_id)
             try:
                 found = await self._process_worker.run(
@@ -7016,6 +7088,15 @@ class Scheduler:
                 # A failed inspection is never an empty list, which would say that
                 # the line has no process.
                 return _tool_error(unavailable(LIST_PROCESSES_TOOL_NAME, str(error)))
+            # The ledger adds the children the mark does not show, such as one that
+            # cleared its environment. A failure to read it never fails the listing.
+            try:
+                ledgered = await self.children_listing(line_id)
+            except ProcessRefused:
+                ledgered = []
+            if not isinstance(ledgered, str):
+                shown = {entry["pid"] for entry in found}
+                found = [*found, *(e for e in ledgered if e["pid"] not in shown)]
             return _tool_text(json.dumps(found, indent=2))
 
         return SdkMcpTool(
@@ -7032,6 +7113,29 @@ class Scheduler:
             handler=handler,
         )
 
+    async def _stop_ledgered(
+        self, line_id: str, pid: int, force: bool
+    ) -> dict[str, Any]:
+        """Stop a ledgered child by pid after checking its start time and command
+        against a fresh reading, on the process worker. **Round 15, item 3.**"""
+        me = os.getpid()
+        try:
+            done = await self._process_worker.run(
+                lambda: stop_ledgered(
+                    self._children,
+                    line_id,
+                    pid,
+                    force,
+                    read_rows=self._tree_read,
+                    identity=self._identity_read,
+                    send=self._processes.send,
+                    forbidden=lambda candidate: candidate == me,
+                )
+            )
+        except ProcessRefused as error:
+            return _tool_error(str(error))
+        return _tool_text(done)
+
     def stop_process_tool(self, line_id: str) -> SdkMcpTool[Any]:
         """The ``stop_process`` tool for ``line_id``, which stops only its own."""
 
@@ -7045,8 +7149,13 @@ class Scheduler:
                 return _tool_error("pid must be a whole number")
             if type(force) is not bool:
                 return _tool_error("force must be true or false")
-            if not self._processes_identifiable:
+            ledgered = self._children.find(line_id, pid) is not None
+            if not self._processes_identifiable and not ledgered:
                 return _tool_error(unavailable(STOP_PROCESS_TOOL_NAME, UNIDENTIFIABLE))
+            if ledgered:
+                # Round 15, item 3. A child the daemon saw below the engine is stopped
+                # by its pid and start time, without reading any environment.
+                return await self._stop_ledgered(line_id, pid, force)
             mark = self.line_mark(line_id)
             try:
                 done = await self._process_worker.run(
@@ -7405,10 +7514,14 @@ class Scheduler:
         observation found a process carrying its mark, ``ended`` when the last
         observation read the process table and found none, and ``unknown`` otherwise,
         which includes a platform that cannot attribute processes, a table that could
-        not be read and a change not yet observed. ``ended`` means none was found among
-        the environments that could be read at ``observed_at``, so a process that
-        removed its mark or whose environment is unreadable is not seen. It does not
-        say a process of an engine session ended, only what the table showed."""
+        not be read and a change not yet observed. ``ended`` is
+        answered only when every process of the daemon's user was read at
+        ``observed_at``, the daemon's own launchers and their engines included, and none
+        carried the mark. A process whose environment cannot be read makes the answer
+        ``unknown``, with their number in ``unseen``. **Residual.** A process that
+        removed its mark from its own environment, or one begun after the observation,
+        is not seen, and ``ended`` says what the table showed and nothing of an engine
+        session."""
         role = self._state().roles.get(role_id)
         change = None if role is None else role.changed
         if change is None or change.previous is None:
@@ -7421,6 +7534,7 @@ class Scheduler:
             else {
                 "state": "unknown",
                 "count": None,
+                "unseen": None,
                 "observed_at": None,
                 "basis": "not observed since this change of owner",
             }
@@ -7447,34 +7561,50 @@ class Scheduler:
             observation: dict[str, object] = {
                 "state": "unknown",
                 "count": None,
+                "unseen": None,
                 "observed_at": stamp,
                 "basis": UNIDENTIFIABLE,
             }
         else:
             try:
-                count = await self._process_worker.run(
-                    lambda: former_holder_processes(
-                        self._processes, former, os.getpid()
-                    )
+                reading = await self._process_worker.run(
+                    lambda: former_holder_reading(self._processes, former, os.getpid())
                 )
             except (ProcessRefused, OSError) as error:
                 observation = {
                     "state": "unknown",
                     "count": None,
+                    "unseen": None,
                     "observed_at": stamp,
                     "basis": f"the process table could not be read: {error}",
                 }
             else:
+                count = reading.marked
+                if count:
+                    state, basis = (
+                        "running",
+                        "processes carrying the former holder's mark were found",
+                    )
+                elif reading.unseen:
+                    state, basis = (
+                        "unknown",
+                        f"none carrying the former holder's mark was found, but"
+                        f" {reading.unseen} processes of the daemon's user could not"
+                        " be read, and one of them might be the former holder's",
+                    )
+                else:
+                    state, basis = (
+                        "ended",
+                        "no process carrying the former holder's mark was found, and"
+                        " every process of the daemon's user was read, the daemon's"
+                        " own launchers and their engines included",
+                    )
                 observation = {
-                    "state": "running" if count else "ended",
+                    "state": state,
                     "count": count,
+                    "unseen": reading.unseen,
                     "observed_at": stamp,
-                    "basis": (
-                        "processes carrying the former holder's mark were found"
-                        if count
-                        else "no process carrying the former holder's mark was found"
-                        " among the environments that could be read"
-                    ),
+                    "basis": basis,
                 }
         self._former_observed[role_id] = (change.entry_id, observation)
 
@@ -11265,6 +11395,21 @@ class Scheduler:
         task = loop.create_task(self.report_detached(line_id))
         self._halting.add(task)
         task.add_done_callback(self._halting.discard)
+        seen = loop.create_task(self._note_children(line_id))
+        self._halting.add(seen)
+        seen.add_done_callback(self._halting.discard)
+
+    async def _note_children(self, line_id: str) -> None:
+        """Record the children below the line's engine at a turn's end, while a kept
+        engine still stands. An engine that has ended leaves nothing to read, and
+        what earlier looks recorded stays. A failure is dropped, since the ledger is a
+        help and no turn depends on it. **Round 15, item 3.**"""
+        if line_id not in self._state().lines:
+            return
+        try:
+            await self._see_children(line_id)
+        except (ProcessRefused, OSError):
+            return
 
     def _correlate(
         self, line_id: str, keys: tuple[str, ...], report: TurnReport | None

@@ -31,9 +31,11 @@ line is denied that file, as ``dromon.workdir`` describes.
 
 Failure modes. Every failure, a missing git, a timeout, a commit the repository does not
 hold, and a question still queued, answers ``None``, which callers report as unknown,
-never as a difference. The worker is a daemon thread, so it never holds the daemon's
-exit. A git it is running when the daemon exits is left to end by itself, which a
-command that only reads does without harm.
+never as a difference. **Round 15.** The start of a git is bounded too, by a thread
+that is left behind when the start stalls, so one stalled start cannot hold the worker
+for good. See ``_start_and_wait``. The worker is a daemon thread, so it never holds
+the daemon's exit. A git it is running when the daemon exits is left to end by
+itself, which a command that only reads does without harm.
 
 Porting note. The worker is a thread with a lock, which maps onto a ``std::thread``
 with a channel in the Rust port, and onto an external effect of a bounded stream
@@ -54,6 +56,14 @@ from typing import Final, Literal
 
 GIT_SECONDS: Final = 5.0
 """How long one git command may take before its answer counts as unknown."""
+
+START_GRACE_SECONDS: Final = 5.0
+"""How long past ``GIT_SECONDS`` a git may take to start before the wait for it ends.
+``subprocess.run`` does not bound the start."""
+
+MAX_STRANDED: Final = 4
+"""The most git starts left stuck at once. At the bound no further git is started and
+each question answers unknown, to be asked again after ``RETRY_SECONDS``."""
 
 RETRY_SECONDS: Final = 60.0
 """How long an answer git could not give is kept before it is asked again. A git that
@@ -90,26 +100,84 @@ class _Answer:
     """When the answer is asked again, or ``None`` for a definite answer."""
 
 
+class _Run:
+    """The outcome of one git process, written by the thread that started it."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.completed: subprocess.CompletedProcess[str] | None = None
+        self.error: BaseException | None = None
+
+
+_stranded: list[threading.Thread] = []
+_stranded_lock = threading.Lock()
+
+
+def _stranded_count() -> int:
+    with _stranded_lock:
+        _stranded[:] = [thread for thread in _stranded if thread.is_alive()]
+        return len(_stranded)
+
+
+def _start_and_wait(command: list[str], environment: dict[str, str]) -> _Run:
+    """Run ``command`` in a thread of its own and wait for it at most ``GIT_SECONDS``
+    plus ``START_GRACE_SECONDS``.
+
+    **Round 15.** ``subprocess.run`` bounds a process from the moment it exists, and
+    waits for the child to reach ``exec`` with no bound at all, in a read of the pipe
+    that reports a failed start. A full gate on macOS was stopped by its five minute
+    limit with its only thread in that read. **Fact.** That read was the wait. **Not
+    found.** Why the child did not start, which did not reproduce in isolation. A worker
+    that waited there would never answer again and would hold ``_running`` for good.
+    The thread is left behind when it overruns, as a daemon thread that ends whenever
+    the start does, and at most ``MAX_STRANDED`` such threads are tolerated at once so
+    a host that cannot start processes is not given more of them."""
+    run = _Run()
+
+    def target() -> None:
+        try:
+            run.completed = subprocess.run(  # noqa: S603
+                command,
+                capture_output=True,
+                text=True,
+                timeout=GIT_SECONDS,
+                check=False,
+                env=environment,
+            )
+        except BaseException as error:  # noqa: BLE001
+            # Carried to the waiting thread, which decides what it means.
+            run.error = error
+        finally:
+            run.done.set()
+
+    thread = threading.Thread(target=target, name="dromon-git", daemon=True)
+    thread.start()
+    if not run.done.wait(GIT_SECONDS + START_GRACE_SECONDS):
+        with _stranded_lock:
+            _stranded.append(thread)
+        raise _Timeout
+    return run
+
+
 def _git(directory: Path, *arguments: str) -> subprocess.CompletedProcess[str] | None:
     """Run git in ``directory``, or ``None`` when it cannot be started. Raises
-    ``_Timeout`` when it runs past ``GIT_SECONDS``."""
+    ``_Timeout`` when it runs past ``GIT_SECONDS``, or does not start within
+    ``START_GRACE_SECONDS`` beyond it, or when ``MAX_STRANDED`` earlier starts are
+    still stuck."""
     environment = {
         name: value for name, value in os.environ.items() if not name.startswith("GIT_")
     }
     environment["GIT_OPTIONAL_LOCKS"] = "0"
-    try:
-        return subprocess.run(  # noqa: S603
-            ["git", "-C", str(directory), *arguments],  # noqa: S607
-            capture_output=True,
-            text=True,
-            timeout=GIT_SECONDS,
-            check=False,
-            env=environment,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise _Timeout from error
-    except OSError:
+    if _stranded_count() >= MAX_STRANDED:
+        raise _Timeout
+    run = _start_and_wait(["git", "-C", str(directory), *arguments], environment)
+    if isinstance(run.error, subprocess.TimeoutExpired):
+        raise _Timeout from run.error
+    if isinstance(run.error, OSError):
         return None
+    if run.error is not None:
+        raise run.error
+    return run.completed
 
 
 def _ask_package(directory: Path) -> tuple[str | None, bool]:
