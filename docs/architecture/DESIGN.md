@@ -60,6 +60,42 @@ caused most of the flaky runs. **Fact.** That read was where the stalled threads
 hypotheses are recorded in the module, and a traceback of every thread at the next hang
 would tell them apart.
 
+**Stall diagnostics, 2026-11-05.** The stall also occurred on a Linux runner, so it is
+not peculiar to one macOS host. A start that stalls now raises `StartStalled` with a
+report, which is written to the daemon's standard error as well. It gives where the
+start's thread is in Python, how many starts were in flight together, the number of
+threads, and each child of the daemon with its state, its program name, whether it has
+executed and what it waits on, from `/proc` on Linux and from `ps` elsewhere. It names
+no argument. **Inference.** A child that is stuck before its program runs holds a copy of
+the exec-failure pipe of every start that overlaps it, so the report's overlap and
+children tell a stuck child from a missing fork. The module records the full reading and
+three further hypotheses. No cause is fixed.
+
+**Watchdog and worker threads, 2026-11-05.** The faulthandler dump of a hung Linux run
+shows 100 threads, its limit, of which 99 are idle process workers that tests never
+stopped, so the main thread is missing. The waiting thread had already returned from its
+timed wait, so it was waiting for the interpreter lock. **Hypothesis.** A thread in
+`fork_exec` holds the lock while a child stalls before its program, which freezes every
+Python thread, the stall report included. `spawn.watch_starts`, which the daemon turns
+on while it serves, sets `faulthandler`'s timer, which needs no lock, to dump every
+thread a margin past a start's bound. The tests now stop each scheduler's process
+workers, and fail if one outlives its test.
+
+**Fork lock, 2026-11-05.** Main failed three pushes running with the stall. **Inference.**
+Starting children from more threads at once made it frequent. Every fork in the daemon
+process is now made under one lock, `spawn.forking`, which `spawn.install_fork_lock`
+puts around `subprocess._fork_exec`, `os.posix_spawn` and `os.posix_spawnp` when the
+module is imported, so it covers the engine drivers and the launcher as well as
+`spawn.start`. A start that waits 30 seconds for it is refused with `StartStalled`.
+Whether this ends the stall is not known, and the watchdog, which times each fork, shows
+a stall that remains. A port holds one mutex around its spawn call.
+
+**A stall with the lock in place.** A sandbox gate on macOS stalled a real `git` start at
+the exec-pipe read with one start in flight and two threads alive, so overlapping forks
+did not cause that one. **Inference.** The child was stuck before its program ran, or the
+system was slow to execute it. The report reads children from `libproc` on macOS, which
+needs no process, and shows a child still being created as state `I`.
+
 The start bound, `START_SECONDS`, is named once. A start past it fails at once with
 `StartStalled`, a `TimeoutError` and so an `OSError`, whose message names the program and
 the bound. The child is killed and reaped should it start later, and at most four stuck

@@ -442,6 +442,46 @@ def _no_real_process_table(
         monkeypatch.setattr(scheduler_module, "SystemProcesses", NoProcesses)
 
 
+def _worker_threads() -> list[threading.Thread]:
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "dromon-processes" and thread.is_alive()
+    ]
+
+
+@pytest.fixture(autouse=True)
+def _stopped_scheduler_workers(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Stop the process workers of every scheduler a test builds, when the test ends,
+    and fail the test if a worker thread it started is still alive. **Found on
+    2026-11-05.** A scheduler starts up to five ``dromon-processes`` threads on first
+    use and stops them only in ``stop_workers``, which the daemon calls and almost no
+    test did. In a run on a Linux runner a hang left 99 of them, idle, in one dump,
+    with ``faulthandler`` showing at most 100 threads, so the main thread was not in
+    it. Idle threads do no harm of themselves, but every child start copies a process
+    that holds them, a fork under a hundred threads is slower, and a dump that cannot
+    reach the main thread cannot be read. ``stop_workers`` is idempotent, so a test
+    that stops its own scheduler is not affected. **Porting note.** Python-only, since
+    a Rust worker would be dropped with its owner."""
+    before = set(_worker_threads())
+    built: list[scheduler_module.Scheduler] = []
+    original = scheduler_module.Scheduler.__init__
+
+    def record(self: scheduler_module.Scheduler, *args: Any, **kwargs: Any) -> None:  # noqa: ANN401
+        original(self, *args, **kwargs)
+        built.append(self)
+
+    monkeypatch.setattr(scheduler_module.Scheduler, "__init__", record)
+    yield
+    for each in built:
+        each.stop_workers()
+    left = [thread for thread in _worker_threads() if thread not in before]
+    for thread in left:
+        thread.join(2.0)
+    left = [thread for thread in left if thread.is_alive()]
+    assert not left, f"{len(left)} process worker threads outlived the test"
+
+
 @pytest.fixture(autouse=True)
 def _isolated_spawn_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every test starts with no stranded start, and the real list is put back when it
@@ -454,6 +494,12 @@ def _isolated_spawn_state(monkeypatch: pytest.MonkeyPatch) -> None:
     ``stalled_start`` or by patching ``MAX_STRANDED``. The list is replaced by name, as
     ``spawn`` reads it at each call, and ``monkeypatch`` puts the original back."""
     monkeypatch.setattr(spawn, "_stranded", [])
+    # Found on 2026-11-05. A real stall left its thread in the set of starts in flight,
+    # so every later test counted it, and the three that count the overlap failed. The
+    # stuck thread removes itself from whichever set is current when it ends.
+    monkeypatch.setattr(spawn, "_active", set[Any]())
+    monkeypatch.setattr(spawn, "_watched", set[Any]())
+    monkeypatch.setattr(spawn, "_armed", None)
 
 
 class StalledStart:
@@ -477,14 +523,20 @@ class StalledStart:
             time.sleep(0.01)
 
     def until_reaped(self, seconds: float = 10.0) -> subprocess.Popen[Any]:
-        """The one child started, once its pipes are closed, which the late-start reap
-        does last. Fails the test when that takes longer than ``seconds``."""
+        """The one child started, once it has ended and its pipes are closed, which
+        the late-start reap does last. Fails the test when that takes longer than
+        ``seconds``."""
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             if self.started:
                 child = self.started[0]
                 pipes = [child.stdin, child.stdout, child.stderr]
-                if all(pipe is None or pipe.closed for pipe in pipes):
+                # Found on 2026-11-05. A child with no pipe has none to be closed, so
+                # the pipes alone said "reaped" before the late-start reap had
+                # killed it, and a test that then polled failed one run in six.
+                if child.poll() is not None and all(
+                    pipe is None or pipe.closed for pipe in pipes
+                ):
                     return child
             time.sleep(0.01)
         pytest.fail("the late child was not reaped in time")
