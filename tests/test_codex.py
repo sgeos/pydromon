@@ -2206,3 +2206,51 @@ def test_start_check_rejects_the_wrong_account_without_a_turn() -> None:
     with pytest.raises(EngineRefused):
         asyncio.run(line(server).check_start())
     assert "turn/start" not in server.methods()
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_cancelled_start_check_closes_its_connection_without_a_prompt(
+    keep: bool,
+) -> None:
+    async def check() -> None:
+        opened = asyncio.Event()
+        closed: list[bool] = []
+
+        class Waiting(FakeServer):
+            async def receive(self) -> dict[str, Any] | None:
+                opened.set()
+                await asyncio.Event().wait()
+                raise AssertionError("startup should have been cancelled")
+
+        server = Waiting()
+
+        @asynccontextmanager
+        async def connect(
+            arguments: list[str], cwd: Path, env: Mapping[str, str]
+        ) -> AsyncGenerator[Connection]:
+            try:
+                yield server
+            finally:
+                closed.append(True)
+
+        target = CodexLine(
+            luna(),
+            CWD,
+            config=LineConfig(keep_session=keep),
+            session_id="existing-session",
+            environment={},
+            connection_factory=connect,
+            server_lister=lambda env: [],
+        )
+        task = asyncio.create_task(target.check_start())
+        await asyncio.wait_for(opened.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert closed == [True]
+        assert target.session_id == "existing-session"
+        assert target.kept_status()["kept"] is False
+        assert "initialize" in server.methods()
+        assert "turn/start" not in server.methods()
+
+    asyncio.run(check())

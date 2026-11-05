@@ -3763,6 +3763,13 @@ async def check_engine_launches(daemon: Daemon, socket_path: Path) -> bool:
                     continue
                 model = daemon.scheduler.model_of(line_id)
                 engine_name = ENGINE_OF[model]
+                if engine_name in ("cursor-agent", "antigravity"):
+                    print(
+                        f"dromond: line {line_id} engine {engine_name} not checkable:"
+                        " no no-prompt startup check; skipped without refusing restart",
+                        file=sys.stderr,
+                    )
+                    continue
                 diagnostics = evidence.StartupDiagnostics()
                 token = evidence.STARTUP_STDERR.set(diagnostics)
                 try:

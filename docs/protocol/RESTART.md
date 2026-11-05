@@ -221,7 +221,10 @@ Hibernated and retired lines are skipped with an explicit note before their
 worktrees or engine configurations are opened. They cannot refuse a restart.
 Each remaining effective line in the copied state is built through the production factory,
 including lines recorded only in the event log and the current role access policy.
-The check reports each line and engine as passed or failed. Any failure refuses
+The check reports each supported line and engine as passed or failed.
+Cursor and Antigravity have no no-prompt startup check. They are reported as not
+checkable and skipped without refusing restart before adapter construction.
+Their launch arguments and configuration remain unverified by preflight. Any failure refuses
 restart before the client sends its restart request.
 
 Fact. Codex reuses launch preparation, initialization, account reading, fresh thread

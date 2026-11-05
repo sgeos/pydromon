@@ -1915,3 +1915,50 @@ def test_inactive_line_does_not_build_an_engine_or_block_checks(
     assert built == ["beta"]
     condition = "retired" if retired else "hibernated"
     assert f"line alpha skipped because it is {condition}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("engine_name", ["cursor-agent", "antigravity"])
+def test_uncheckable_engines_are_not_launched_and_do_not_refuse_restart(
+    world: World,
+    paths: ProjectPaths,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    engine_name: str,
+) -> None:
+    # Select each real model-to-engine mapping through the scheduler boundary.
+    model = next(
+        name for name, engine in daemon.ENGINE_OF.items() if engine == engine_name
+    )
+
+    def model_of(line_id: str) -> str:
+        return model
+
+    monkeypatch.setattr(world.scheduler, "model_of", model_of)
+
+    def build(*args: object, **kwargs: object) -> None:
+        raise AssertionError("uncheckable engines must not be constructed")
+
+    class Server:
+        async def __aenter__(self) -> "Server":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return
+
+    socket_path = tmp_path / "uncheckable.sock"
+
+    async def start(*args: object, **kwargs: object) -> Server:
+        socket_path.touch()
+        return Server()
+
+    monkeypatch.setattr(world.scheduler, "_engine_factory", build)
+    monkeypatch.setattr(daemon.asyncio, "start_unix_server", start)
+    assert asyncio.run(
+        daemon.check_engine_launches(make_daemon(world, paths), socket_path)
+    )
+    output = capsys.readouterr().err
+    for line_id in ("alpha", "beta"):
+        assert f"line {line_id} engine {engine_name} not checkable" in output
+    assert "passed" not in output
+    assert not socket_path.exists()
