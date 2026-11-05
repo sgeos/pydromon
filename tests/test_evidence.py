@@ -1452,3 +1452,29 @@ def test_a_scrub_refuses_a_configuration_name_it_left(tmp_path: Path) -> None:
     )
     assert {"notes-keeper", "workbench-seven.lan", "agent-kestrel"} <= replaced
     assert evidence.leaks(json.dumps(recorded.frames), HOME, replaced) == []
+
+
+def test_startup_diagnostics_are_bounded_masked_and_drained_without_a_recording() -> (
+    None
+):
+    async def read() -> str:
+        stream = asyncio.StreamReader()
+        stream.feed_data(
+            b"unexpected argument --deny\nAuthorization: Bearer sk-invented-value\n"
+        )
+        stream.feed_data(b"x" * 10000)
+        stream.feed_eof()
+        diagnostics = evidence.StartupDiagnostics()
+        token = evidence.STARTUP_STDERR.set(diagnostics)
+        try:
+            await evidence.drain_stderr(stream, None)
+        finally:
+            evidence.STARTUP_STDERR.reset(token)
+        assert len(diagnostics.raw) == 8192
+        return diagnostics.text()
+
+    text = asyncio.run(read())
+    assert "unexpected argument --deny" in text
+    assert "sk-invented-value" not in text
+    assert "Authorization: ***" in text
+    assert "\n" not in text

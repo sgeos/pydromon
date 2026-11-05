@@ -56,6 +56,7 @@ the Codex adapter is.
 
 import asyncio
 import hashlib
+import difflib
 import json
 import os
 import shutil
@@ -64,6 +65,7 @@ import tomllib
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
@@ -572,6 +574,97 @@ def _own_directory(directory: Path, label: str) -> None:
             f"{label} {directory} may be written by other users. Make it owner-only,"
             " as Grok's guide asks of a home that holds a sign-in."
         )
+
+
+@dataclass(frozen=True, slots=True)
+class HomeChange:
+    name: str
+    before: str | None
+    after: str
+
+
+def _migration_text(file: Path) -> str | None:
+    try:
+        info = file.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise EngineRefused(f"{file} must be a regular file without links")
+    return _read_small(file)
+
+
+def home_changes(home: Path) -> tuple[HomeChange, ...]:
+    """Preview only the two generated files, without reading credentials."""
+    if home.is_symlink():
+        raise EngineRefused(f"{home} must not be a symbolic link")
+    changes: list[HomeChange] = []
+    for name, expected in (
+        ("config.toml", HOME_CONFIG),
+        ("requirements.toml", HOME_REQUIREMENTS),
+    ):
+        before = _migration_text(home / name)
+        if before != expected:
+            changes.append(HomeChange(name, before, expected))
+    return tuple(changes)
+
+
+def home_diff(changes: Sequence[HomeChange]) -> str:
+    return "".join(
+        line
+        for change in changes
+        for line in difflib.unified_diff(
+            (change.before or "").splitlines(keepends=True),
+            change.after.splitlines(keepends=True),
+            fromfile=change.name,
+            tofile=change.name + " (generated)",
+        )
+    )
+
+
+def replace_home(home: Path, changes: Sequence[HomeChange]) -> tuple[Path, ...]:
+    """Back up and replace each previewed file in order after confirmation.
+
+    This is an operator operation. Files are individually atomic. A crash can
+    leave mixed generations, which normal startup refuses and a rerun repairs.
+    It must run while Grok lines are idle and no other migration is running.
+    """
+    expected = {"config.toml": HOME_CONFIG, "requirements.toml": HOME_REQUIREMENTS}
+    names = [change.name for change in changes]
+    if names != [name for name in expected if name in names] or any(
+        change.after != expected.get(change.name) for change in changes
+    ):
+        raise EngineRefused("migration is not the generated home preview")
+    _own_directory(home, "Dromon's Grok home")
+    for change in changes:
+        if _migration_text(home / change.name) != change.before:
+            raise EngineRefused("Grok home changed after preview, so preview it again")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    backups: list[Path] = []
+    for change in changes:
+        file = home / change.name
+        backup = home / f"{change.name}.{stamp}.bak"
+        pending = home / f".{change.name}.{stamp}.new"
+        try:
+            if _migration_text(file) != change.before:
+                raise EngineRefused("Grok home changed during replacement")
+            if change.before is not None:
+                with backup.open("x", encoding="utf-8") as handle:
+                    os.fchmod(handle.fileno(), 0o600)
+                    handle.write(change.before)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                backups.append(backup)
+            with pending.open("x", encoding="utf-8") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                handle.write(change.after)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(pending, file)
+        except OSError as error:
+            raise EngineRefused(f"cannot migrate {file}: {error}") from error
+        finally:
+            pending.unlink(missing_ok=True)
+    return tuple(backups)
 
 
 def prepare_home(
@@ -1437,12 +1530,31 @@ class GrokLine:
         """The agent and pinned hosts of the project's ``[git_ssh]`` table, if the
         line was given them."""
         """The process mark every process of this line inherits, if issued."""
+        self._checking_start = False
         self._client: acp.Client | None = None
         self.session_id_in_use: str | None = None
         self.protocol_version: int | None = None
         self._model_replaced = False
 
+    async def check_start(self) -> None:
+        """Run the ordinary startup path and close before sending a prompt."""
+        session_id, self.session_id = self.session_id, None
+        self._checking_start = True
+        try:
+            await self._execute("", check_only=True)
+        finally:
+            self._checking_start = False
+            self.session_id = session_id
+
     async def run_turn(self, prompt: str) -> TurnReport:
+        result = await self._execute(prompt)
+        if result is None:
+            raise RuntimeError("a turn ended without its report")
+        return result
+
+    async def _execute(
+        self, prompt: str, *, check_only: bool = False
+    ) -> TurnReport | None:
         """Run one turn for ``prompt`` and return what happened."""
         strategy = self.driver.settings.strategy
         environment = engine_environment(self._environment, strategy)
@@ -1501,7 +1613,7 @@ class GrokLine:
                     raise EngineRefused(
                         f"Grok start timed out during {stage}"
                     ) from error
-                if turn.refusal is None:
+                if turn.refusal is None and not check_only:
                     stop = await self._prompt(session_id, prompt, turn)
                     unconfirmed = turn.unconfirmed_refusal()
                     if unconfirmed is not None:
@@ -1539,6 +1651,8 @@ class GrokLine:
             raise EngineRefused(turn.refusal)
         if credential is None or session_id is None:
             raise EngineRefused("the engine did not finish cancelling its turn")
+        if check_only:
+            return None
         self.session_id = f"{session_id}:rules-{self._rules_digest}"
         subtype = "success" if stop == "end_turn" else stop
         self.driver.step(Event("result", subtype, 1))
@@ -1823,6 +1937,10 @@ class GrokLine:
     async def _answer(
         self, request_id: object, method: str, params: dict[str, Any], turn: _Turn
     ) -> None:
+        if self._checking_start:
+            raise EngineRefused(
+                "the engine requested an action during its startup check"
+            )
         if method == "session/request_permission":
             raw: object = params.get("toolCall")
             tool_call = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}

@@ -1013,3 +1013,33 @@ model. Actual recovery remains live-unverified. Replacement identifiers are cach
 before later checks, as for rules replacement. Reconstructing the adapter or another
 turn can permit another attempt, so this is a bound per startup attempt rather than
 a persistent recovery budget.
+
+
+## Generated home replacement
+
+Fact. `dromon grok-home` previews differences for only `config.toml` and
+`requirements.toml` in Dromon's Grok home. `dromon grok-home --apply` prints that
+preview and asks for confirmation. `--apply --yes` supplies confirmation for an
+operator script. Run replacement while Grok lines are idle and no other
+replacement command is running. The command does not read sign-in files or change
+sandbox profiles.
+
+Fact. Replacement verifies the preview is still current. In order, it writes a
+private timestamped backup of an existing file, writes and synchronizes a private
+replacement, and renames the replacement over that file. Missing files have no
+original to back up. Existing symbolic links and hard links are refused. Backups
+are never overwritten. The two replacements are not one atomic transaction.
+
+Fact. A crash between replacements leaves the first generated file updated and the
+second unchanged. Normal home validation refuses any file still differing from
+the generated policy. Rerun the preview and replacement command to repair only the
+remaining differences, retaining previous backups. An interruption can leave a
+private `.new` file and additional backups. A rerun uses new timestamped names.
+Backups and abandoned `.new` files may be removed by the operator after inspection.
+This command assumes exclusive operator access during replacement. It does not
+provide a cross-process lock or a guarantee against power loss.
+
+Fact. `dromon check-engines` checks this home and launches Grok through its ordinary
+startup path, then closes after a fresh session passes its model and server checks.
+No `session/prompt` is sent. Run this outside engine sandboxes after replacement
+and before restarting. A startup check does not verify a model response.

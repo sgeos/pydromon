@@ -1415,6 +1415,13 @@ class LineEngine(Protocol):
 
 
 @runtime_checkable
+class StartCheckEngine(Protocol):
+    """An adapter with a no-prompt check of its ordinary startup path."""
+
+    async def check_start(self) -> None: ...
+
+
+@runtime_checkable
 class KeptEngine(Protocol):
     """An engine that may keep its connection between turns, as a Claude Code line
     with ``keep_session`` does. Porting note: the scheduler tells such an engine
@@ -12061,7 +12068,7 @@ class Scheduler:
             "tasks": status.get("tasks", []),
         }
 
-    def engine_for(self, line_id: str) -> LineEngine:
+    def engine_for(self, line_id: str, *, startup_only: bool = False) -> LineEngine:
         """The line's engine, built on first use and kept for the session's life."""
         engine = self._engines.get(line_id)
         if engine is None:
@@ -12095,7 +12102,20 @@ class Scheduler:
                     self.engine_budget_reported(line_id, remaining, reset, note, window)
                 ),
             )
-            engine = self._engine_factory(spec, self.own_tools(line_id))
+            tools = self.own_tools(line_id)
+            if startup_only:
+
+                async def refused(args: dict[str, Any]) -> dict[str, Any]:
+                    del args
+                    return {
+                        "content": [
+                            {"type": "text", "text": "startup check refuses tool calls"}
+                        ],
+                        "isError": True,
+                    }
+
+                tools = [replace(tool, handler=refused) for tool in tools]
+            engine = self._engine_factory(spec, tools)
             self._engines[line_id] = engine
             self._engine_built[line_id] = time.time_ns()
         return engine

@@ -4075,3 +4075,55 @@ def test_a_read_only_grok_line_can_start_with_checked_reader_profile(
         == "done"
     )
     assert server.environment["GROK_SANDBOX"] == READER_PROFILE
+
+
+def test_start_check_opens_a_checked_session_without_a_prompt(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok()
+    asyncio.run(line(server, project).check_start())
+    assert "initialize" in server.methods()
+    assert "session/new" in server.methods()
+    assert "session/prompt" not in server.methods()
+    assert server.stops == 1
+
+
+def test_start_check_rejects_a_refused_argument_before_a_prompt(
+    project: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = FakeGrok()
+    target = line(server, project)
+    original = grok_module.grok_arguments
+
+    def arguments(model: str, effort: str, config: LineConfig) -> list[str]:
+        return [*original(model, effort, config), "--deny", "WebFetch"]
+
+    monkeypatch.setattr(grok_module, "grok_arguments", arguments)
+
+    @asynccontextmanager
+    async def refused(
+        arguments: list[str],
+        cwd: Path,
+        env: Mapping[str, str],
+    ) -> AsyncGenerator[Connection]:
+        del cwd, env
+        assert arguments[0] == "agent" and "--deny" in arguments
+        raise EngineRefused("unexpected argument '--deny' found")
+        yield server
+
+    monkeypatch.setattr(target, "_connect", refused)
+    with pytest.raises(EngineRefused, match="unexpected argument"):
+        asyncio.run(target.check_start())
+    assert not server.sent
+
+
+def test_start_check_rejects_a_wrong_grok_model_without_a_prompt(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok(model="foreign")
+    server.set_config_result = {"configOptions": [model_option("foreign")]}
+    with pytest.raises(EngineRefused):
+        asyncio.run(line(server, project).check_start())
+    assert "session/prompt" not in server.methods()
+    assert server.stops == 1

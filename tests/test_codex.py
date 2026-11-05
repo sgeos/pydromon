@@ -2176,3 +2176,33 @@ def test_conflicting_listed_transports_are_refused() -> None:
             ],
             LineConfig(),
         )
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_start_check_uses_launch_and_account_path_without_a_turn(keep: bool) -> None:
+    server = FakeServer()
+    target = line(server, config=LineConfig(keep_session=keep))
+    asyncio.run(target.check_start())
+    assert "initialize" in server.methods()
+    assert "account/read" in server.methods()
+    assert "thread/start" in server.methods()
+    assert "mcpServerStatus/list" in server.methods()
+    assert "turn/start" not in server.methods()
+    assert target.kept_status()["kept"] is False
+
+
+def test_start_check_rejects_an_invalid_mcp_merge_before_a_turn() -> None:
+    server = FakeServer(
+        failing="initialize",
+        failing_error={"code": -1, "message": "invalid MCP merge: url and command"},
+    )
+    with pytest.raises(EngineRefused, match="invalid MCP merge"):
+        asyncio.run(line(server).check_start())
+    assert server.methods() == ["initialize"]
+
+
+def test_start_check_rejects_the_wrong_account_without_a_turn() -> None:
+    server = FakeServer(account={"type": "apiKey"})
+    with pytest.raises(EngineRefused):
+        asyncio.run(line(server).check_start())
+    assert "turn/start" not in server.methods()

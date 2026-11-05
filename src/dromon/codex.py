@@ -1269,6 +1269,7 @@ class CodexLine:
         """The line's own scratch directory, which a read line may write, if given."""
         self._next_id = 0
         self._thread_id = ""
+        self._checking_start = False
         self._connection: Connection | None = None
         self._clock = clock
         self._poll_seconds = poll_seconds
@@ -1361,7 +1362,25 @@ class CodexLine:
         )
         return note, (compaction, work)
 
+    async def check_start(self) -> None:
+        """Run the ordinary startup path and close before sending a prompt."""
+        session_id, self.session_id = self.session_id, None
+        self._checking_start = True
+        try:
+            await self._execute("", check_only=True)
+        finally:
+            self._checking_start = False
+            self.session_id = session_id
+
     async def run_turn(self, prompt: str) -> TurnReport:
+        result = await self._execute(prompt)
+        if result is None:
+            raise RuntimeError("a turn ended without its report")
+        return result
+
+    async def _execute(
+        self, prompt: str, *, check_only: bool = False
+    ) -> TurnReport | None:
         """Run one turn for ``prompt`` and return what happened. A check that
         refuses the turn also closes a kept connection."""
         request, self._request = self._request, None
@@ -1412,7 +1431,7 @@ class CodexLine:
         except Exception:
             await self.close()
             raise
-        if self.config.keep_session:
+        if self.config.keep_session and not check_only:
             return await self._kept_turn(
                 prompt, arguments, environment, instructions, request
             )
@@ -1430,7 +1449,7 @@ class CodexLine:
                         thread_id, turn, request
                     )
                     prompt = f"{note}\n\n{prompt}"
-                if turn.refusal is None:
+                if turn.refusal is None and not check_only:
                     await self._run(thread_id, prompt, turn)
             except _RpcError as error:
                 raise EngineRefused(f"the engine refused a request: {error}") from error
@@ -1440,6 +1459,8 @@ class CodexLine:
             raise EngineRefused(turn.refusal)
         if turn.limit is not None and turn.status != "completed":
             raise turn.limit
+        if check_only:
+            return None
         return self._report(turn, credential, thread_id, compaction)
 
     def _report(
@@ -1524,6 +1545,10 @@ class CodexLine:
     ) -> None:
         """Answer a request from the engine. Only Dromon's own tools are served, and
         every approval is declined, since the line runs with approvals never asked."""
+        if self._checking_start:
+            raise EngineRefused(
+                "the engine requested an action during its startup check"
+            )
         if method == "item/tool/call":
             tool = self.mcp_tools.get(str(params.get("tool")))
             if tool is None:

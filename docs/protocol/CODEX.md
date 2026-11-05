@@ -608,3 +608,13 @@ both cases, malformed listings and conflicting duplicates. These tests model tab
 merging and do not establish actual engine configuration merging. Post-start zero
 server-tool checks remain necessary. No live launch was performed in the sandbox.
 Official OpenAI documentation could not be fetched because its host did not resolve.
+
+
+## No prompt startup check
+
+Fact. `dromon check-engines` and restart preflight reuse the turn startup path,
+including server listing, generated launch arguments, initialization, account
+reading and fresh thread isolation checks. The connection closes before
+`turn/start`. The check therefore catches launch and configuration merge failures
+without a model query. It can create an unused thread record. It does not establish
+that post-prompt model behavior or resumed session recovery will succeed.

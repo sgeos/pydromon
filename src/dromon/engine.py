@@ -2424,6 +2424,27 @@ class ClaudeCodeLine:
             return preset
         return appended or None
 
+    async def check_start(self) -> None:
+        """Connect and complete SDK initialization without sending a query.
+
+        The later system/init message requires a prompt and is deliberately not
+        awaited here. This checks launch and control initialization only.
+        """
+        check_environment(self._environment, self.driver.settings.strategy)
+        options = self.options()
+        diagnostics = evidence.STARTUP_STDERR.get()
+        if diagnostics is not None:
+
+            def stderr(line: str) -> None:
+                diagnostics.append((line + "\n").encode())
+
+            options = replace(options, stderr=stderr)
+        factory = (
+            self._kept_factory if self.config.keep_session else self._session_factory
+        )
+        async with AsyncExitStack() as stack:
+            await self._enter(stack, factory, options)
+
     async def run_turn(self, prompt: str) -> TurnReport:
         """Run one turn for ``prompt`` and return what happened. A check that
         refuses the turn also closes a kept connection, whose engine may already have

@@ -1173,3 +1173,10 @@ def test_the_operators_settings_document_cannot_switch_hooks_off() -> None:
     )
     with pytest.raises(EngineRefused, match="settings document sets disableAllHooks"):
         run(target)
+
+
+def test_start_check_connects_sdk_without_sending_a_query() -> None:
+    session = Scripted([])
+    asyncio.run(line(session).check_start())
+    assert len(session.options) == 1
+    assert session.prompts == []
