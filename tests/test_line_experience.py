@@ -70,6 +70,7 @@ from dromon.scheduler import (
     COST_UNREPORTED_ENGINES,
     UNKNOWN_COST_RULE,
     UNREPORTED_ENGINE_NOTE,
+    WHOLE_COST_SINCE,
     UNRELEASED_NOTE,
     LineSpec,
     LineToolRefused,
@@ -210,6 +211,16 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
         "counting": UNKNOWN_COST_RULE,
         "limit": "3.00",
         "limit_enforced": True,
+        "estimated_turns": 0,
+        "whole": {
+            "usd": "0.250000",
+            "reported_usd": "0.250000",
+            "estimated_usd": "0.000000",
+            "turns": 1,
+            "between_turns": 0,
+            "unknown_cost": 0,
+            "since": WHOLE_COST_SINCE,
+        },
     }
     assert status["scheduled_wake"] == {"due": due, "message_id": message_id}
     assert status["unread"] == 1 and status["pending"] == 0
@@ -230,12 +241,22 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
     assert full["cost_usd"] == {
         "estimate": "0.2500",
         "basis": "exact",
+        "estimated_turns": 0,
         "unknown_turns": 0,
         "unknown_counts_as_usd": "0.0000",
         "counting": UNKNOWN_COST_RULE,
         "limit": "3.00",
         "limit_enforced": True,
         "note": None,
+        "whole": {
+            "usd": "0.250000",
+            "reported_usd": "0.250000",
+            "estimated_usd": "0.000000",
+            "turns": 1,
+            "between_turns": 0,
+            "unknown_cost": 0,
+            "since": WHOLE_COST_SINCE,
+        },
     }
     assert (full["workdir"], full["workdir_path"]) == (None, str(world.root))
     assert full["engine_session"] == "session-1"
@@ -2491,7 +2512,9 @@ def test_a_line_on_an_engine_that_reports_no_cost_says_its_limit_is_not_enforced
 ) -> None:
     # Review of a9995d8, item 4. The limit beside an unknown estimate read as
     # protection, so the entry says outright that it holds nothing here.
-    world.scheduler.create_line("delta", "gpt-6-luna", Strategy.SUBSCRIPTION)
+    # Round 15, item 1. Codex reports tokens, so its cost is now estimated and its
+    # limit enforced. Grok reports neither cost nor tokens.
+    world.scheduler.create_line("delta", "grok-4.7", Strategy.SUBSCRIPTION)
     cost = world.scheduler.cost_status("delta")
     assert cost["limit_enforced"] is False
     assert cost["note"] == UNREPORTED_ENGINE_NOTE

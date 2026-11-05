@@ -24,7 +24,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
-from dromon.engine import EngineRefused
+from dromon.engine import EngineClosed
 
 PROTOCOL_VERSION: Final = 1
 """The ACP version Dromon speaks, and the only one it accepts in an answer."""
@@ -98,7 +98,7 @@ class Client:
             remaining = max(0.0, self.deadline - asyncio.get_running_loop().time())
             message = await asyncio.wait_for(self._transport.receive(), remaining)
         if message is None:
-            raise EngineRefused("the engine closed its connection during the turn")
+            raise EngineClosed("the engine closed its connection during the turn")
         return message
 
     async def call(self, method: str, params: Mapping[str, object]) -> dict[str, Any]:

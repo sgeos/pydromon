@@ -58,7 +58,7 @@ from dromon.driver import (
     Strategy,
     harness_id,
 )
-from dromon.engine import EngineRefused, TurnReport, read_instructions
+from dromon.engine import EngineClosed, EngineRefused, TurnReport, read_instructions
 from dromon.jsonlines import (
     TURN_SECONDS,
     Connection,
@@ -805,7 +805,7 @@ class PiLine:
             seconds = max(0.0, self._deadline - asyncio.get_running_loop().time())
         record = await asyncio.wait_for(self._open().receive(), seconds)
         if record is None:
-            raise EngineRefused("the engine closed its connection during the turn")
+            raise EngineClosed("the engine closed its connection during the turn")
         return record
 
     async def _call(

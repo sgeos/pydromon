@@ -435,6 +435,22 @@ def test_an_empty_budget_list_says_so(dromon: Run) -> None:
             exits.FAILURE,
             "resets_at is not a valid time",
         ),
+        # Round 15, item 6. Only whole seconds in Coordinated Universal Time with a
+        # capital Z are accepted, and the error names the form.
+        *(
+            (
+                ("budget", "set", PROVIDER, "--resets-at", near_miss),
+                exits.FAILURE,
+                "resets_at is not a valid time of the form YYYY-MM-DDTHH:MM:SSZ",
+            )
+            for near_miss in (
+                "2026-10-27T08:00:00.5Z",
+                "2026-10-27T08:00:00+00:00",
+                "2026-10-27T08:00:00z",
+                "2026-10-27 08:00:00Z",
+                "2026-02-30T08:00:00Z",
+            )
+        ),
     ],
 )
 def test_a_budget_statement_that_does_not_apply_records_nothing(

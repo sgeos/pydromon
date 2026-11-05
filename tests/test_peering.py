@@ -158,7 +158,14 @@ def test_received_mail_is_recorded_with_its_key_and_counted_while_it_waits() -> 
     state.apply(received("r2", "o2", recipient=ANA))
     message = state.messages["r1"]
     assert message == Message(
-        KAIZEN, ALPHA, MessageKind.NOTE, "hello", (), None, origin_id="o1"
+        KAIZEN,
+        ALPHA,
+        MessageKind.NOTE,
+        "hello",
+        (),
+        None,
+        origin_id="o1",
+        thread="r1",
     )
     assert state.received == {(PEER, "o1"): "r1", (PEER, "o2"): "r2"}
     assert state.waiting_from == {PEER: 2}

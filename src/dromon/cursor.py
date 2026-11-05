@@ -56,7 +56,7 @@ from dromon.driver import (
     Strategy,
     harness_id,
 )
-from dromon.engine import EngineRefused, TurnReport, read_instructions
+from dromon.engine import EngineClosed, EngineRefused, TurnReport, read_instructions
 from dromon.jsonlines import (
     TURN_SECONDS,
     Connection,
@@ -455,11 +455,11 @@ class CursorLine:
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
         if turn.credential is None:
-            raise EngineRefused("the engine ended before it reported its credential")
+            raise EngineClosed("the engine ended before it reported its credential")
         if turn.interrupted_for is not None:
             subtype = "interrupted"
         elif turn.result is None:
-            raise EngineRefused("the engine ended without a result")
+            raise EngineClosed("the engine ended without a result")
         elif turn.result.get("subtype") == "success" and not turn.result.get(
             "is_error"
         ):

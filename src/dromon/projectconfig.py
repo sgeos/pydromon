@@ -53,6 +53,7 @@ from dromon.model import (
     MIN_HANDOFF_SECONDS,
     InvalidField,
     LineSession,
+    check_reviews,
     check_workdir,
 )
 from dromon import commitruns
@@ -135,6 +136,7 @@ ROLE_KEYS: Final = frozenset(
         "handoff_seconds",
         "failover",
         "handoff_below_percent",
+        "reviews",
     }
 )
 MAX_SEATS: Final = MAX_ROLE_SEATS
@@ -266,6 +268,10 @@ class RoleDefinition:
     handoff_below_percent: int = DEFAULT_HANDOFF_BELOW_PERCENT
     """The stated budget below which the owner is asked to prepare a handoff, or 0
     for never."""
+    reviews: tuple[str, ...] = ()
+    """The roles whose work this role reviews. **Round 15, item 5.** The file is
+    read without the log, so whether each names a role is checked when the file's
+    roles are planned against it, by ``roles.plan_file_roles``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -739,6 +745,14 @@ class _Reader:
             raise self.fail(
                 f"{key}.handoff_below_percent", "must be a whole number from 0 to 100"
             )
+        reviews = table.get("reviews", [])
+        if not isinstance(reviews, list):
+            raise self.fail(f"{key}.reviews", "must be a list of role identifiers")
+        reviewed = tuple(cast(list[object], reviews))
+        try:
+            check_reviews(role_id, reviewed)
+        except InvalidField as error:
+            raise self.fail(f"{key}.reviews", str(error)) from error
         return RoleDefinition(
             role_id=role_id,
             workdir=cast(str, workdir),
@@ -747,6 +761,7 @@ class _Reader:
             handoff_seconds=seconds,
             failover=FailoverPolicy(cast(str, failover)),
             handoff_below_percent=below,
+            reviews=cast(tuple[str, ...], reviewed),
         )
 
     def wake(self, value: object, key: str, base: int) -> int:

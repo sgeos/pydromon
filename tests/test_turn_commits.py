@@ -173,3 +173,86 @@ def test_a_brief_set_under_an_older_daemon_names_it_only_as_its_stamp(
     commits = cast(dict[str, object], status["commits"])
     assert commits["daemon"] == LOADED
     assert f"under the daemon at commit {LOADED}" in str(commits["cite"])
+
+
+# Round 15, item 3. The daemon's warning in full only when its pair changes, and a
+# stale brief flagged at the head of a new session.
+
+
+def test_the_daemon_warning_is_full_once_then_brief_until_a_commit_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    turns = Turns(tmp_path, LOADED, CHECKED_OUT)
+    monkeypatch.setattr(turns.scheduler, "_workdir_commit", fixed(BRIEFED))
+    full = "WARNING: they differ"
+    short = "They still differ, as told before."
+    try:
+        first = turns.notice()
+        second = turns.notice()
+        assert first is not None and full in first and short not in first
+        assert second is not None and short in second and full not in second
+        assert f"its checkout is at {CHECKED_OUT[:12]}" in second
+        # The checkout moves again, so the warning is given in full once more.
+        (tmp_path / "daemon" / ".git" / "HEAD").write_text(f"{OLDER}\n")
+        third = turns.notice()
+        assert third is not None and full in third
+        fourth = turns.notice()
+        assert fourth is not None and short in fourth
+        # Once the pair agrees, a later difference is told in full again.
+        (tmp_path / "daemon" / ".git" / "HEAD").write_text(f"{LOADED}\n")
+        agreed = turns.notice()
+        assert agreed is not None and "differ" not in agreed
+        (tmp_path / "daemon" / ".git" / "HEAD").write_text(f"{OLDER}\n")
+        again = turns.notice()
+        assert again is not None and full in again
+    finally:
+        turns.log.close()
+
+
+def test_each_line_is_told_the_daemon_warning_in_full_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    turns = Turns(tmp_path, LOADED, CHECKED_OUT)
+    turns.scheduler.create_line("beta", HAIKU, Strategy.SUBSCRIPTION)
+    monkeypatch.setattr(turns.scheduler, "_workdir_commit", fixed(BRIEFED))
+    try:
+        turns.notice()
+        told = turns.scheduler._commits_notice("beta")  # pyright: ignore[reportPrivateUsage]
+        assert told is not None and "WARNING: they differ" in told
+    finally:
+        turns.log.close()
+
+
+def lead(turns: Turns) -> str:
+    text = turns.scheduler._brief_lead("alpha", True)  # pyright: ignore[reportPrivateUsage]
+    assert text is not None
+    return text
+
+
+def test_a_brief_set_before_the_worktree_moved_is_flagged_stale(turns: Turns) -> None:
+    turns.brief(BRIEFED)
+    turns.head = MOVED
+    text = lead(turns)
+    assert text.startswith("STALE BRIEF.")
+    assert "is not your current task" in text
+    assert f"git log --oneline {BRIEFED[:12]}..{MOVED[:12]}" in text
+    assert "current commit" not in text
+    assert "BEGIN STANDING BRIEF DATA" in text
+
+
+def test_a_brief_at_the_current_commit_is_presented_as_current(turns: Turns) -> None:
+    turns.brief(BRIEFED)
+    text = lead(turns)
+    assert not text.startswith("STALE")
+    assert f"at your worktree's current commit {BRIEFED[:12]}" in text
+
+
+@pytest.mark.parametrize(("named", "head"), [("", BRIEFED), (BRIEFED, None)])
+def test_a_brief_that_cannot_be_compared_is_never_called_current(
+    turns: Turns, named: str, head: str | None
+) -> None:
+    turns.brief(named)
+    turns.head = head
+    text = lead(turns)
+    assert "could not compare" in text and "possibly stale" in text
+    assert "current commit" not in text and not text.startswith("STALE")
