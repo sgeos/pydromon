@@ -79,7 +79,13 @@ kept narrow by these rules, each of which a test checks.
   time refuses the start and its child is killed and reaped. `re` holds the
   interpreter lock while it matches, so a worker thread would not have freed the loop,
   and a process does. A child that fails or answers anything but one result for each
-  value refuses the start, so a broken matcher lets nothing through.
+  value refuses the start, so a broken matcher lets nothing through. The child's
+  start, match, kill and reap all run on one worker thread, which closes its pipes on
+  every path out. A start that is cancelled, as when the line's turn ends, kills the
+  child at once, or has the worker kill it as soon as its start ends, and the
+  cancellation goes on only once the child is reaped. Before the fix of 2026-11-05, a
+  cancellation after the child started and before the worker handed it back left the
+  child running with both pipes open, which core's full gate observed.
 - **The record.** `run_started` records `argv` with the values in place, so the log
   and `run_status` show exactly what ran.
 - **Refused before anything else.** A value that is refused stops the start before the

@@ -43,8 +43,9 @@ import json
 import re
 import subprocess
 import sys
+import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final, cast
 
 from dromon import spawn
@@ -268,43 +269,106 @@ async def match(prepared: Prepared, seconds: float = MATCH_SECONDS) -> tuple[str
     payload = json.dumps(
         [[pattern, value] for _, pattern, value in prepared.checks]
     ).encode()
+    matching = _Matching()
+    # Review of the merge of the ops work. ``asyncio.create_subprocess_exec`` runs
+    # ``Popen`` on the event loop's own thread, where a start that stalls in the
+    # exec-pipe read would stop the whole daemon. The child's whole life, its start by
+    # ``spawn.start``, which bounds it, its match, its kill and its reap, runs on one
+    # worker thread, and the loop stays free meanwhile.
+    work = asyncio.ensure_future(
+        asyncio.to_thread(_run_matcher, payload, seconds, matching)
+    )
     try:
-        # Review of the merge of the ops work. ``asyncio.create_subprocess_exec`` runs
-        # ``Popen`` on the event loop's own thread, where a start that stalls in the
-        # exec-pipe read would stop the whole daemon. The start is made by
-        # ``spawn.start`` on a worker thread, which bounds it, and the loop stays free
-        # while the child matches.
-        child = await asyncio.to_thread(
-            spawn.start,
-            [sys.executable, "-I", "-c", MATCHER],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
+        output, code, timed_out = await asyncio.shield(work)
+    except asyncio.CancelledError:
+        # Fix of 2026-11-05. A cancellation that arrived after the child started but
+        # before the worker handed it back left it running with its pipes open, as
+        # core's full gate showed. The child is now killed wherever it is, and the
+        # cancellation goes on only once the worker has reaped it and closed its pipes.
+        matching.abandon()
+        await _settle(work, matching)
+        raise
     except (OSError, TimeoutError) as error:
         # A start that failed or stalled refuses, as a child that fails does, so a
         # broken start never lets a value through.
         raise ParameterRefused(
             "the values could not be matched against their patterns"
         ) from error
-    try:
-        output, _ = await asyncio.wait_for(
-            asyncio.to_thread(child.communicate, payload), seconds
-        )
-    except TimeoutError as error:
+    if timed_out:
         raise ParameterRefused(
             f"the values took longer than {seconds:g} seconds to match their"
             " patterns, so they are refused. A pattern with many optional items or"
             " alternatives in a row can take time exponential in a value's length"
-        ) from error
-    finally:
-        # The kill ends the worker thread's ``communicate`` too, since its pipes
-        # close, so no thread outlives the call by more than the reap.
-        if child.poll() is None:
-            child.kill()
-        await asyncio.to_thread(child.wait)
-    _check_answers(prepared, output, child.returncode)
+        )
+    _check_answers(prepared, output, code)
     return prepared.argv
+
+
+@dataclass(slots=True)
+class _Matching:
+    """The matching child, shared by the worker that owns it and a cancelled call
+    that asks it to be killed. Both read and write it under ``lock``, so a kill asked
+    for before the start ends is seen by the worker once it does."""
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    child: subprocess.Popen[bytes] | None = None
+    abandoned: bool = False
+
+    def abandon(self) -> None:
+        """Kill the child now if it has started, or have the worker kill it as soon
+        as it starts. ``Popen.kill`` does nothing to a child already reaped."""
+        with self.lock:
+            self.abandoned = True
+            child = self.child
+        if child is not None:
+            child.kill()
+
+
+_Outcome = tuple[bytes, int | None, bool]
+"""What the matching child printed, its exit code, and whether it outran its
+deadline."""
+
+
+def _run_matcher(payload: bytes, seconds: float, matching: _Matching) -> _Outcome:
+    """Start the matching child, give it ``payload`` and return what it printed, its
+    exit code and whether it outran ``seconds``. On every path out the child is
+    killed if it still runs, its pipes are closed and it is reaped, by
+    ``Popen.__exit__``, so none outlives this call. A start that fails or stalls
+    raises, and ``spawn`` reaps a start that ends late."""
+    child = spawn.start(
+        [sys.executable, "-I", "-c", MATCHER],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    with matching.lock:
+        matching.child = child
+        abandoned = matching.abandoned
+    with child:
+        try:
+            if abandoned:
+                child.kill()
+            output, _ = child.communicate(payload, timeout=seconds)
+        except subprocess.TimeoutExpired:
+            return b"", None, True
+        finally:
+            # The kill ends a match that outran its deadline or was abandoned, so
+            # the wait in ``__exit__`` returns at once.
+            child.kill()
+    return output, child.returncode, False
+
+
+async def _settle(work: asyncio.Task[_Outcome], matching: _Matching) -> None:
+    """Wait for the worker of a cancelled match to end, killing the child again on
+    each further cancellation, and drop its result, which no caller reads. The
+    worker ends within the start bound and the match deadline, so the loop ends."""
+    while not work.done():
+        try:
+            await asyncio.wait({work})
+        except asyncio.CancelledError:
+            matching.abandon()
+    if not work.cancelled():
+        work.exception()
 
 
 def _check_answers(prepared: Prepared, output: bytes, code: int | None) -> None:
