@@ -60,6 +60,181 @@ caused most of the flaky runs. **Fact.** That read was where the stalled threads
 hypotheses are recorded in the module, and a traceback of every thread at the next hang
 would tell them apart.
 
+**Stall diagnostics, 2026-11-05.** The stall also occurred on a Linux runner, so it is
+not peculiar to one macOS host. A start that stalls now raises `StartStalled` with a
+report, which is written to the daemon's standard error as well. It gives where the
+start's thread is in Python, how many starts were in flight together, the number of
+threads, and each child of the daemon with its state, its program name, whether it has
+executed and what it waits on, from `/proc` on Linux and from `ps` elsewhere. It names
+no argument. **Inference.** A child that is stuck before its program runs holds a copy of
+the exec-failure pipe of every start that overlaps it, so the report's overlap and
+children tell a stuck child from a missing fork. The module records the full reading and
+three further hypotheses. No cause is fixed.
+
+**Watchdog and worker threads, 2026-11-05.** The faulthandler dump of a hung Linux run
+shows 100 threads, its limit, of which 99 are idle process workers that tests never
+stopped, so the main thread is missing. The waiting thread had already returned from its
+timed wait, so it was waiting for the interpreter lock. **Hypothesis.** A thread in
+`fork_exec` holds the lock while a child stalls before its program, which freezes every
+Python thread, the stall report included. `spawn.watch_starts`, which the daemon turns
+on while it serves, sets `faulthandler`'s timer, which needs no lock, to dump every
+thread a margin past a start's bound. The tests now stop each scheduler's process
+workers, and fail if one outlives its test.
+
+**Fork lock, 2026-11-05.** Main failed three pushes running with the stall. **Inference.**
+Starting children from more threads at once made it frequent. Every fork in the daemon
+process is now made under one lock, `spawn.forking`, which `spawn.install_fork_lock`
+puts around `subprocess._fork_exec`, `os.posix_spawn` and `os.posix_spawnp` when the
+module is imported, so it covers the engine drivers and the launcher as well as
+`spawn.start`. A start that waits 30 seconds for it is refused with `StartStalled`.
+Whether this ends the stall is not known, and the watchdog, which times each fork, shows
+a stall that remains. A port holds one mutex around its spawn call.
+
+**A stall with the lock in place.** A sandbox gate on macOS stalled a real `git` start at
+the exec-pipe read with one start in flight and two threads alive, so overlapping forks
+did not cause that one. **Inference.** The child was stuck before its program ran, or the
+system was slow to execute it. The report reads children from `libproc` on macOS, which
+needs no process, and shows a child still being created as state `I`.
+
+**A second stall with the lock in place, and one hypothesis tested.** A full gate on macOS
+stalled again with one start in flight, two threads alive, and one child that had the
+daemon's own program name, so it had not yet executed. The report printed its state as
+`R`, which round 16 found to say nothing, see below, so whether the child ran or waited
+is not known. A hypothesis was that the child closes every descriptor up to the soft limit
+`RLIMIT_NOFILE`, which is 1,048,576 here with an unlimited hard limit, and that a million
+closes pass 30 seconds under load. **Measured, and not supported.** A start took about 20
+milliseconds with the soft limit at 1,048,576 and at 256, for plain starts, with pipes,
+with `start_new_session` and `cwd`, with `preexec_fn` and with `pass_fds`, idle and with
+twice as many busy processes as cores and thirty idle threads. A million closes of
+unused descriptors take 0.34 seconds when called directly. So CPython's child lists the
+open descriptors here and does not close each number, and even the worst case is far
+below 30 seconds. **Not read.** The `_posixsubprocess` source, which is not on this
+machine. The stall report now gives the soft limit, so a stall that does show a large
+limit, or a small one, settles it. No limit was lowered, since nothing showed it helps.
+
+**A Linux hang inside the report, and an experiment.** The second CI run on Linux with
+Python 3.12 hung five minutes with two threads left, so the thread leak is fixed. **Fact.**
+The main thread was inside the stall report itself, in the read of a `/proc` file in
+`_proc_children`, called from a start of `git` that had stalled. **Inference.** A read
+of a child's `/proc` file waited for ever while the child was in the middle of `vfork`
+or `exec`, and Linux CPython starts children with `vfork`. This is the same stall seen
+from the parent, and the first evidence of where the child is. **Not known.** Which file
+it was, since the dump names only the line that read `stat` of some process. The report
+now reads `/proc` on a thread of its own and gives up after three seconds, naming the
+file it was reading and the children it had already found, reads only `stat`, `exe` and
+`wchan`, never `cmdline`, `environ` or `maps`, and the daemon goes on. **Experiment.**
+`spawn.disable_vfork` turns off `subprocess._USE_VFORK` and, since Python 3.15 and
+`glibc` make the same kind of child through `posix_spawn`, `subprocess._USE_POSIX_SPAWN`,
+on Linux only, so every start of the `subprocess` module forks. If Linux CI then stops
+stalling, `vfork` is the cause. If it does not, the change is taken out, since a fork
+copies the daemon's page tables and is slower. Direct calls of `os.posix_spawn` in this
+repository are not changed, and the fork lock still covers them. **Result, recorded
+after the review of pull request 149.** Linux CI went on timing out with the switch, so
+it is off by default again and applies only with `DROMON_NO_VFORK=1`.
+
+**Round 16, the root cause of the stall is not found, and what is known.**
+*Ownership.* `src/dromon/spawn.py`, `tests/test_spawn.py`, `tests/test_spawn_stress.py`
+and the spawn fixtures of `tests/conftest.py` belong to the runtime line. Core owns the
+callers, the scheduler and its tests, and asks for a change in the helper by mail.
+*A correction.* On macOS the state that `libproc` reports for a child is `R` for any
+process that exists, a plain `sleep` child showed it, so the earlier reading that the
+stalled child was running was unfounded. The report now prints `live` for it, and gives
+the processor time of each child and how many of its threads run, from `proc_taskinfo`
+on macOS and from `utime` and `stime` on Linux, which do tell a child that waits from
+one that spins. A test starts a spinning and a sleeping child and checks both.
+*What the Linux logs of 2026-11-08 and 2026-11-11 show.* **Facts.** Each of the two
+Linux logs that show the timing, one on Python 3.12 and one on 3.15, spent about two and
+a half minutes in `tests/test_sandbox_facts.py`, twelve tests that take half a second on
+macOS. The timeout of
+five minutes then fell in `tests/test_stale_brief.py` after thirteen tests had passed on
+3.15 and six on 3.12. The dump on 3.15 shows the one live worker, `asyncio_0`, at the
+start of `dirty_state` in `posixpath.realpath`, before any `git` start, and ninety-nine
+idle `dromon-processe` threads that hide the main thread behind the hundred that
+`faulthandler` prints. A dump on 3.12 shows the worker inside the stall report, in a
+read of `/proc`, the main thread running the test's `settle` loop. **Inferences.** The
+worker at the start of `dirty_state` shows that the test was making calls and not
+waiting in one start, so a loop that never ends, or a run so slow that each step takes
+long, fits it and a single hung start does not. The same two and a half minutes on two
+interpreters shows a slowness that is systematic on the runner and not a chance stall.
+**Hypotheses, none confirmed.** Starts of `git` or `ps` on the Linux runner are slow
+for a reason that is not in this repository, the runner is starved of processor or
+input and output while the tests run, or `vfork` holds every Python thread frozen while
+a child loads its program, which `DROMON_NO_VFORK=1` removes on Linux.
+*What now records the answer.* Each start that takes two seconds or more is written to
+the daemon's standard error and, in a test run, straight to the terminal past pytest's
+capture, and is listed at the end of the run, with where the time went, how long it
+waited for the fork lock, how long it was in the call that forks, how many starts
+overlapped, and the load of the machine from `os.getloadavg` and, on Linux, the pressure
+stall figures of `/proc/pressure` for processor, input and output and memory. A stall
+report says whether the fork call has returned, which is the difference between a
+thread stuck in `vfork` and one waiting for the program, and gives the same figures.
+*The stress test.* `tests/test_spawn_stress.py` starts children from several threads at
+once by `spawn.start`, `spawn.run` with pipes, `os.posix_spawn` and `asyncio`, with a
+ticker thread that measures how long every thread was frozen, with the fork lock and
+without it. On macOS, 24,000 starts at a load of 60 to 70, from 8 and from 16 threads,
+gave no stall with the lock and none without it, so the stress test did not reproduce
+it and no rate before and after can be given. A count from the environment makes a larger
+run possible. The run writes one line for each variant to the summary of the run.
+*A stall reproduced on macOS by the sandbox gate.* **Facts.** One run of the whole
+sandbox gate on 2026-11-11, with Python 3.15.1 at a load of 24 to 34 and swap about
+four fifths used, ended in `StartStalled` for `git config core.hooksPath` in
+`tests/test_land.py`. The same file passed at once when run alone, 57 passed. This is
+the first stall seen off continuous integration, about one in the 2,700 starts that
+core counted for the suite, and the stress test, which gave none in 24,000, is a poorer
+reproduction than the suite. The report shows the start thread in `_execute_child` at
+the read of the pipe that waits for the program, so the fork call had returned, and
+shows the fork lock asked for, taken and released within a hundredth of a second. Two
+threads were alive, the main thread and the start thread, so the daemon was not
+multithreaded at that moment apart from native threads. The one child still ran the
+daemon's own program, with no processor time recorded and none of its threads
+running. **Inferences.** The parent was waiting and not stuck, so `vfork` holding the
+interpreter lock does not apply, since macOS has no `vfork` path here and the report
+shows the call returned. The child had not reached `exec` and was not running, so
+it was blocked between the fork and the program, which the report cannot place. A lock
+held by another thread at the fork is unlikely with two Python threads and is not ruled
+out for native ones. **Hypotheses.** The child waited on memory, since it needs pages
+of a large parent to be read in or copied while the machine swaps, which fits the load
+and the swap, or it waited on a lock taken in the child by code that runs after a
+fork. Neither is confirmed. The report now adds the resident size, the page faults,
+the pages read in, the copy-on-write faults, the Unix system calls and the context
+switches of each child, so the next stall shows whether the child was paging and how
+far it got. **Not done.** A fix. Replacing the fork with `posix_spawn` for the daemon's
+starts is the candidate, because it does not run the parent's code in the child, but it
+needs an absolute program path, `close_fds` off and a replacement for the `Popen`
+conditions, and was not built without a way to measure its effect.
+*What the newest Linux logs add.* **Facts.** Four failing Linux logs on Python 3.12 and
+3.15, of 2026-11-05, 2026-11-08 and 2026-11-11, all show `tests/test_sandbox_facts.py`
+taking between 90 and 180 seconds, and the green run of 2026-11-05 shows it taking five
+seconds. The file started no child at all when run on macOS with a counter on
+`subprocess.Popen`, so its slowness is not in a child start. The run of PR 145 on
+2026-11-11 spent 969 seconds in `tests/test_stale_brief.py`, and its failing assertion
+was a `ReadinessUnknown` for `git could not start`. PR 144's re-run at its head showed a
+timeout with the start thread in the read loop of `communicate` for `git status`, that
+is a child that had started and had not finished. Other files around these two took
+their usual seconds in the same runs. **Inferences.** Two files that run a scheduler
+turn with `asyncio.run` are slow on the runner and the rest are not, so the cause is more
+likely in what a turn does on Linux than in the start of a child. At 30 seconds a
+stall, 969 seconds is about thirty stalls, which fits a state where every start of `git`
+in those tests stalls and not an occasional one. **Hypotheses, none confirmed.** A
+step of a turn waits on a timeout on Linux only, or the runner is starved at those
+minutes. **What now records the answer.** The tests write one line for each test that
+took five seconds or more, past capture, with its name and the load figures, so the next
+slow run names the test and does not leave a file's line unwritten until the next file
+begins.
+*The logs of pull request 149, the first with the ledger.* **Facts.** Both Linux jobs, on 3.12 and 3.15, were killed by the five minute timeout. On 3.12, `test_a_brief_still_current_heads_no_turn` took 244 seconds and recorded two starts of `git` of 19.6 and 16.6 seconds, with 8.8 and 4.1 seconds inside the fork call, none waiting for the fork lock, one start overlapping, three threads, load about 1.1, and processor, input and output and memory pressure at zero. Slow tests of `test_sandbox_facts` took 6.6 to 45.7 seconds on 3.12 and 9.4 and 77.1 seconds on 3.15, with no slow start recorded at all. The 3.12 timeout dump shows the note's own thread inside a `/proc` read, and a worker waiting in the start. The 3.15 dump shows a worker in `os.path.realpath`. Pull requests 147 and 148 passed both Linux jobs in the same hour, and neither has the switch to fork. **What this refutes.** The switch to fork on Linux did not stop the timeouts, which the pull request 144 re-run had already shown, so `vfork` is not the whole cause. **What it does not show.** That fork makes it worse, which is the reviewer's inference. It is consistent with forks of seconds at no pressure, and it is also consistent with a runner that did not run the process for seconds, since a read of `/proc` and a call of `realpath`, which copy nothing, were slow in the same runs. **Changes.** The switch is off by default, as above. The ledger missed the starts of `test_sandbox_facts` because it saw only `spawn.start`, so every call that forks is now timed where it passes, in `forking`, and a call of `SLOW_FORK_SECONDS` or more is recorded with the processor time the thread itself used in it, which tells the kernel copying a large process from a thread or a machine that was not running, the size of this process, the steal time that a virtual machine's host took, and how long the control group's processor quota stopped it. **Hypotheses, to be tested by the next Linux log.** A fork call of seconds with processor time near the whole is a copy of a large address space. One with processor time near zero is a host or a quota that did not run the runner, and the steal and throttle figures should then show it, and `vfork` would not help. **Not done.** `posix_spawn` with an absolute program path, which avoids both a fork and the exec pipe, since it cannot be tested here for Linux.
+
+*More macOS stalls, on 2026-11-11.* **Facts.** (1) Pull request 147's macOS job on Python 3.15.2 failed twice, at 19:24Z with one setup error and at 19:40Z with one failed test, each `StartStalled` for `git` after 30 seconds, in a `test_land` fixture and in a commit run test, among 6663 passed tests each time. The operator also reports one 30 minute cancellation of that branch, whose log was not examined. (2) Another line's full gate on this Mac met the same stall in a `test_code_staleness` fixture earlier the same day. (3) This line's sandbox gate on this Mac, with the fork lock, stopped at the five minute timeout in `test_a_timed_out_ps_at_stop_is_reported_and_exits_unsuccessfully`, in the wait on the exec pipe inside `_execute_child`, called from the tests' own `Popen` in `tests/test_launcher.py`, which does not go through `spawn.start`, so nothing bounded it and no stall report was written. The exec pipe wait is after the fork call has returned, so the fork lock was not held. The machine was at memory pressure warning and load above 13 at the time, which is one observation. (4) **Pull request 147 does not have the fork lock, the ledger or the vfork change.** Those are on this branch only, which a search of `origin/main` and of 147's `spawn.py` shows, so the lock is not what 147 changes and is not shown to be absent from the cause. (5) What 147 does change is fewer starts, since it answers `git status` from the tests without starting git, and it stalled twice in 15 minutes with the fewest starts of any branch in the hour. Pull requests 148 and 149 passed macOS 3.15 in the same hours. (6) **A stuck child, read from outside.** A second sandbox gate of this line stopped at the same place, the wait on the exec pipe, in a direct `subprocess.run` of a fresh interpreter in `tests/test_spawn.py`. A `python3.15` process with parent 1 and a start time within seconds of the last output was found with the module's `libproc` reader and `lsof`. It had used 0 milliseconds of processor time, had 0 of 2 threads running, a resident size of 0 megabytes, 222 faults, 80 of them copy on write, and 28 system calls. Its mapped libraries were the extensions that pytest had loaded, and its working directory was the worktree, so it was a copy of the test process that had not yet run the new program. Its descriptors showed the capture pipes already installed as standard output and error, the exec pipe, and the directory `/dev/fd` open for reading, which is how the child side of `_fork_exec` closes every other descriptor. **Inference.** The child stalled in or just before the close of descriptors, after `dup2` and before `exec`. It is the first observation of the stuck child's own state, and the identification by start time is not certain. `sample` of it was refused for want of privileges, and the process had ended when I looked again, so no stack was read. **Hypothesis, unproven.** The child blocks on the enumeration of `/dev/fd` or on a lock in the C library just before it. **Next evidence.** Run `sample PID` outside the sandbox on the next stuck child before anything ends it. The notes are in this line's scratch directory. **A test of the descriptor step.** Not made, since a child cannot be made to stall there on demand. **Inference.** These are the stall of rounds 15 and 16, a child that was made and did not reach its program, on the macOS fork and exec path. A stall rate per start that is the same on every branch cannot explain two on the branch with the fewest starts, so the rate is not per start alone and may depend on the runner or the hour, which three observations cannot settle. The fork lock was present in only one of the three, and that one stalled after the lock was released, so the lock does not cover the stall seen on macOS. **Not shown.** The rate, the state of the stuck child in these, and whether load raises it. The stress test saw none in 24,000 starts, so a quiet machine is not the condition. **Hypothesis, unproven.** A forked child of a process with other threads waits on a lock that a thread held at the fork, which fits a child with no processor time and is the classic hazard. The fork lock serializes starts and cannot cover threads that are not starting children. **For the owner of 147.** Look for what the branch changes in threads that run while tests start children, such as the scheduler workers that the conftest fixture stops, and in the number of descriptors or the size of the process, rather than in the number of starts. **Consequence for tests.** Starts that bypass `spawn.start`, 18 in `tests/test_launcher.py` among them, are unbounded and take the whole five minutes, so moving a harness onto `spawn.start` turns the stall into a bounded failure with a child report. **Done at the operator's instruction.** The eight in-process starts of `tests/test_launcher.py` now go through `spawn.start` and `spawn.run`, and a test fails on any direct call to `subprocess.Popen`, `run`, `call`, `check_call` or `check_output` in that file, in code and not in the scripts held in strings. **Not done.** Other test files that start children directly, `tests/test_operator_relay.py`, `tests/test_check_script.py`, `tests/test_runs.py` and `tests/test_changelog_fragments.py` among them, whose starts remain unbounded. The list in `BOUNDED_TEST_FILES` is where to add a file once it is moved.
+
+*The child's descriptor step, and a change on macOS, 2026-11-11.* The operator proposed that the stuck child of fact 6 waited in the closing of descriptors, which the following checks bear on. **Facts, read from the interpreter builds on this Mac, not from `_posixsubprocess.c`, which is not on this machine.** The `libpython3.15.dylib` of Python 3.15.1 holds the function `_close_open_fds_maybe_unsafe`, and its disassembly calls `opendir`, `dirfd`, `readdir`, `close` and the module's own `_close_range_except` and no other library function that allocates or locks, and does not call `proc_pidinfo`, whose three callers are elsewhere in the library. The 3.12.12 build imports `opendir`, `readdir` and `closedir` and not `proc_pidinfo`. The name says that CPython itself marks the function as maybe unsafe after a fork. **Inference.** With `close_fds` set, which is the default, the macOS child opens `/dev/fd` and reads it before it runs its program, which is what the stuck child showed. **Hypothesis, unproven.** It waited on a lock that another thread of the daemon held at the fork, in `opendir` or in the library's own locks, which a copy of one thread cannot release. This line does not know which lock, and macOS's allocator takes its own locks around a fork, so the allocator alone may not be it. The stuck child had already opened the directory, so the stall may equally be in `readdir` or in a `close`. A stack of a stuck child, from `sample`, would settle it, and none has been read. **Change.** `dromon.spawn` now starts a child with `close_fds` off on macOS and does the equivalent in the parent. Inside the fork lock, immediately before the call that forks, and for the thread making the start, it lists `/dev/fd` in the parent, makes non-inheritable every descriptor above 2 that is inheritable and not to be passed, and makes the descriptors the start passes inheritable, then calls `Popen` with `close_fds=False`. It makes the passed descriptors non-inheritable again when the call returns or fails. The child then runs no enumeration, and `subprocess` may use `posix_spawn`, which runs none of the parent's code in the child. **Review of audit, findings 1 to 3.** The first version swept before the wait for the fork lock and released after the call, so another start that forked in between gave its child a passed descriptor, a start that stalled before its fork kept the descriptor inheritable until it ended, and a descriptor made inheritable during the wait reached the child. Doing both inside the lock removes the three, since no other fork can run while the lock is held, a start that has not forked has marked nothing, and the sweep runs after the wait. If the directory cannot be listed before the start, it falls back to the usual child-side closing, and if it cannot be listed inside the lock the start fails with an `OSError` and makes no child. **Review of audit, follow-up.** The sweep runs only in the fork lock, which only the wrapped fork call enters. A start therefore turns the child's closing off only when `install_fork_lock` reports the wrapper in place, and otherwise leaves the closing to the child and says so in the ledger. If a child was made and the sweep did not run, as when a Python reaches a fork call that is not wrapped, the child is killed and reaped and the start raises an `OSError`, so a child that lacks its passed descriptor, or that holds a stray one, is never run on. `DROMON_CHILD_CLOSES_FDS` set to `1` or `0` forces either setting on any platform, and the slow-start ledger now says which setting a slow start had and how many descriptors the sweep cleared. Linux keeps the usual setting, because its closing uses `close_range` or a read of the directory by system call, and its stalls have a different symptom. **Tests.** A descriptor made inheritable in the parent does not reach the child and is made non-inheritable, a passed descriptor reaches the child and no other does, a start that has not forked leaves its passed descriptor closed to another start's child, a descriptor made inheritable while a start waits for the lock is cleared, a failed fork leaves the passed descriptor non-inheritable, a passed descriptor that is not open fails the start, an unlistable directory falls back, and a listing that fails inside the lock makes no child. **Residual.** (1) It is not known that this removes the stall, and the stress test cannot tell, as it never reproduced the stall. (2) A descriptor made inheritable by another thread in the few instructions between the sweep and the fork would reach the child, and nothing in this repository makes one inheritable except this module. (3) Starts that do not go through `spawn.start`, the engine drivers and the relay on the event loop, the launcher and the tests that start children directly, still close descriptors in the child. (4) The sweep changes a flag of the daemon's own inherited descriptors for good, which nothing here relies on. (5) A Rust port sets close-on-exec on every descriptor it opens, so it needs no sweep.
+
+*The Linux logs of pull request 149 at `c7151e1`, read on 2026-11-11 at the operator's request.* **Facts.** On Python 3.12 and 3.15 the starts of `git` in `tests/test_stale_brief.py` took 8 to 99 seconds, with fork calls of 0.4 to 5.7 seconds in which the starting thread used 0.0 to 0.1 seconds of processor time, at a load of 1.0 to 1.3 with every pressure figure at zero and no steal or throttling, so the thread was not running while the call lasted. The only dump of all threads, the 3.12 timeout, shows the main thread running Python in `Scheduler._due_wakes` under `step`, the `dirty_state` worker and a diagnostic thread each inside `read_text` at the call of `open`, and no other thread. The 3.15 stall reports show the start thread inside `Thread.start` waiting in `_say`, and inside `open` of a `/proc` or cgroup file. Each is a call that returns from the operating system. In `tests/test_stale_brief.py` the scheduler is built with `tick_seconds=0`, and `Scheduler.run` then ends each step with `await asyncio.sleep(0)` for as long as a turn is running, so the main thread steps flat out, and each step copies the state several times through `_state`. **Inference.** A load of one with idle pressure fits one thread of the test process running without rest. A thread that is waiting to take the interpreter lock back after a call appears in a dump at that call, so the threads at `open`, at `Thread.start` and in the fork may be waiting for the lock and not for the operating system, which would fit no processor time. **Hypothesis, not tested.** The spinning main thread starves threads that make many short calls, such as a start. It is not explained why a switch interval of five milliseconds allows waits of a minute, and nothing here reproduces it, since a spinning event loop beside a worker that starts forty children slowed the starts on macOS by nothing measurable. **This is a different symptom from the macOS stuck child**, which had no processor time and was not running its program, so there may be two causes. **Change.** A start that runs longer than `SNAPSHOT_SECONDS`, five seconds, now records one line with every thread's name, processor time on Linux, and innermost three frames, the busiest first, to the log and to the slow-start ledger. The next slow start in continuous integration then shows which thread used the processor and what the others waited in. **Not done.** Any change to `Scheduler.run` or to the tests' `tick_seconds=0`, which is the owner's, core's, to decide, and a test of the starvation, which needs Linux.
+
+*A leaked matcher child, found by the sandbox gate.* **Fact.** The macOS sandbox gate on a loaded machine (load above 14) failed `test_the_child_is_killed_when_the_start_is_cancelled` with the child's return code unset, and a still-running subprocess at teardown. A probe that holds `spawn.start` for 0.5 seconds after the child exists, and cancels `runparams.match` inside that window, left the child running before the change and killed it after. **Cause.** `match` awaited the worker thread's start with no handle to the child, so a cancellation that arrived after the child was made and before the call returned dropped the only reference. **Change.** The start is shielded, and on cancellation `_end_late_start` waits for the worker, bounded by `START_SECONDS`, and kills and reaps the child and closes its pipes, which the gate showed as a resource warning when the first version did not. A start that failed made no child. **Review of round 16, finding 2.** A second cancellation during that wait used to end it early and leave the child running with its pipes open. `_until_done` now absorbs cancellations while the start and the reap finish, and the first is raised again afterwards, so the delay is the start's own bound. Removing the pipe closing, or letting a second cancellation end the wait, each fails a test. **Residual.** The same shape exists wherever a call on a worker thread returns a process to the loop, and only `runparams.match` was changed. **Inference, not shown.** This is a different defect from the stall, and it does not explain the Linux timeouts, whose children were all started by the start thread with a handle held. A Rust port needs the child owned by the task that starts it, so that a cancelled task drops it and the drop kills it.
+
+
+*Review of round 16, by the audit line.* **Facts, each shown by a test that a mutation fails.** (1) An allow entry that is a link, or sits under one, was given the link's target, so a writer line that re-linked its own reports directory could grant itself the target at its next engine build. Only the deny lists and the working directory now gain a real form, and `docs/protocol/SANDBOX.md` records the residual that remains. (2) is in the paragraph on the leaked matcher child above. (3) The slow-start line and the stall message were written on the start's thread before the outcome was handed over, so a standard error that blocks turned a good start of 2.2 seconds into `StartStalled` after 16. The slow-start line is now written after the handoff, and both lines go through `_say`, which uses one thread of its own, waits `LOG_WAIT_SECONDS` for it, and writes a slow-start line at most once in `LOG_INTERVAL_SECONDS`. **Follow-up 3, from the re-review.** It first dropped any line that arrived while another was being written, and a stall report was dropped behind a slow-start line. Lines are now queued, at most `MAX_LOG_PENDING`, and written in order by the one writer thread. When the queue is full the oldest rate-limited line goes first and an unlimited line, such as a stall report, only when every queued line is unlimited, and every drop is counted. A standard error that never accepts a line therefore costs one thread and sixteen lines, and a start still waits at most the bound. The ledger still keeps every slow start up to its bound. (4) A start on an event loop's own thread, as `asyncio.create_subprocess_exec` makes, took the fork lock and could wait the whole `FORK_LOCK_SECONDS` for another thread's stuck fork. It now waits `FORK_LOCK_LOOP_SECONDS` and ends in the same `StartStalled`. The lock is not reentrant, so a start made by the thread that holds it is refused at once as a `RuntimeError`, and a test runs every start path to show none nests. (5) The stall message and the refusal past the stranded cap name the program by its base name. **Follow-ups of the re-review.** (1) `test_the_fork_call_records_the_threads_own_processor_time` failed once at a load average near 9, since it needed 0.2 seconds of processor time in a 0.3 second spin. The spin now runs until the thread's own clock has advanced a fixed amount, with a sixty second bound against a hang, and the sleeper is compared with the spinner. (2) Nothing pinned the Linux `vfork` default, since a run on macOS never sees it change. The import-time rule is now `apply_vfork_setting(environment, platform)`, and tests name the platform, so a change that turns `vfork` off for everyone fails on any machine, and a source check shows that the import goes through it. (3) As above.
+**Residual.** The loop can still wait `FORK_LOCK_LOOP_SECONDS`, a mutex cannot be made not to delay it, and a Rust port avoids it by making the start the task's own. **Inference.** None of these explains the Linux timeouts.
+
 The start bound, `START_SECONDS`, is named once. A start past it fails at once with
 `StartStalled`, a `TimeoutError` and so an `OSError`, whose message names the program and
 the bound. The child is killed and reaped should it start later, and at most four stuck

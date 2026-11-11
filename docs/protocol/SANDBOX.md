@@ -90,6 +90,31 @@ read-only seats, findings 1 and 2. Dromon's `write_scratch` tool remains
 available for scratch files, under the line's own `tmp/lines/LINE`, as
 [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies.
 
+**Links in the path lists, round 16, item 5.** **Fact, reported by another project on a
+daemon about two weeks old.** A line's sandbox could not write its worktree when that
+directory was a link to another volume, because the sandbox follows the link to the real
+path before it matches a rule. **Change.** Where the sandbox is enabled, Dromon keeps
+each absolute or home-relative entry of the four lists as written, and for the two deny
+lists only adds its real path when that differs. It adds the real path of each protected
+directory and of each guarded path to the deny lists, and grants write access to the real
+path of the line's working directory when that is a link. **Review of round 16, finding
+1.** An allow entry is never given a real form, because a line that can write a link
+where an allow entry lives, such as its reports directory, could then point the link at a
+directory it may not write and have the grant follow at its next engine build. A real
+form in a deny list only denies more. The working directory is the one allow entry
+granted by its real path, since the operator chose it and a line does not write the link
+that names it. **Residual.** A line with write access to the directory that holds another
+line's working directory can still replace that working directory by a link, and the grant
+follows it. Placing worktrees where no line can write their parent is the operator's
+protection. A
+`denyWrite` entry for the working directory still wins over the grant, so a read line
+stays read only. **Failure modes.** The real path is read once, when the line's sandbox
+is built, so a link changed afterwards, or created below an entry, is not followed. A
+path that does not exist resolves as far as it can. A link to a directory the line must
+not write is a decision of the operator, since the grant follows where the link leads
+and the working directory's own path is what configures it. The check that refuses an
+entry inside a protected directory compares real paths and is unchanged.
+
 **A temporary directory and package cache, round 14, item 6.** Where a line's sandbox is
 enabled, Dromon also grants write access to two directories of the line's own outside
 its working directory, and sets `TMPDIR` and `UV_CACHE_DIR` to them. They are outside

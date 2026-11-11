@@ -1,8 +1,10 @@
 """Fixtures shared across the test suite."""
 
 import gc
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -442,8 +444,103 @@ def _no_real_process_table(
         monkeypatch.setattr(scheduler_module, "SystemProcesses", NoProcesses)
 
 
+def _worker_threads() -> list[threading.Thread]:
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "dromon-processes" and thread.is_alive()
+    ]
+
+
 @pytest.fixture(autouse=True)
-def _isolated_spawn_state(monkeypatch: pytest.MonkeyPatch) -> None:
+def _stopped_scheduler_workers(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Stop the process workers of every scheduler a test builds, when the test ends,
+    and fail the test if a worker thread it started is still alive. **Found on
+    2026-11-05.** A scheduler starts up to five ``dromon-processes`` threads on first
+    use and stops them only in ``stop_workers``, which the daemon calls and almost no
+    test did. In a run on a Linux runner a hang left 99 of them, idle, in one dump,
+    with ``faulthandler`` showing at most 100 threads, so the main thread was not in
+    it. Idle threads do no harm of themselves, but every child start copies a process
+    that holds them, a fork under a hundred threads is slower, and a dump that cannot
+    reach the main thread cannot be read. ``stop_workers`` is idempotent, so a test
+    that stops its own scheduler is not affected. **Porting note.** Python-only, since
+    a Rust worker would be dropped with its owner."""
+    before = set(_worker_threads())
+    built: list[scheduler_module.Scheduler] = []
+    original = scheduler_module.Scheduler.__init__
+
+    def record(self: scheduler_module.Scheduler, *args: Any, **kwargs: Any) -> None:  # noqa: ANN401
+        original(self, *args, **kwargs)
+        built.append(self)
+
+    monkeypatch.setattr(scheduler_module.Scheduler, "__init__", record)
+    yield
+    for each in built:
+        each.stop_workers()
+    left = [thread for thread in _worker_threads() if thread not in before]
+    for thread in left:
+        thread.join(2.0)
+    left = [thread for thread in left if thread.is_alive()]
+    assert not left, f"{len(left)} process worker threads outlived the test"
+
+
+SLOW_TEST_SECONDS = 5.0
+"""A test at least this long is named in the run's output, as it ends."""
+SLOW_STARTS_SEEN: list[str] = []
+"""Every start that took ``spawn.SLOW_START_SECONDS`` or more in any test, with the
+test's name. **Round 16.** The runs on Linux in continuous integration were slow and
+hung in places no one could see, and this list is printed at the end of a run, whether
+it passed or not, so the next run shows which starts were slow and how loaded the
+machine was."""
+
+
+STRESS_NOTES: list[str] = []
+"""One line for each run of ``tests/test_spawn_stress.py``, printed with the slow
+starts at the end of the run."""
+
+
+def pytest_terminal_summary(terminalreporter: Any) -> None:  # noqa: ANN401
+    if STRESS_NOTES:
+        terminalreporter.section("child start stress", sep="=")
+        for line in STRESS_NOTES:
+            terminalreporter.write_line(line)
+    if not SLOW_STARTS_SEEN:
+        return
+    terminalreporter.section("slow child starts and slow tests", sep="=")
+    for line in SLOW_STARTS_SEEN[:200]:
+        terminalreporter.write_line(line)
+    if len(SLOW_STARTS_SEEN) > 200:
+        terminalreporter.write_line(f"... and {len(SLOW_STARTS_SEEN) - 200} more")
+
+
+def _show_now(lines: list[str], request: pytest.FixtureRequest) -> None:
+    """Write ``lines`` to the real terminal at once, past pytest's capture, so that a
+    run that later hangs and is killed has already shown them, as its summary will
+    not. Never raises."""
+    if not lines:
+        return
+    try:
+        manager: Any = request.config.pluginmanager.getplugin("capturemanager")
+        with manager.global_and_fixture_disabled():
+            for line in lines[:5]:
+                print(line, file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
+def slow_test_line(current: str, took: float) -> str | None:
+    """The line that names a test that took ``SLOW_TEST_SECONDS`` or more, with the
+    load of the machine, or ``None`` for a quicker one."""
+    if took < SLOW_TEST_SECONDS:
+        return None
+    machine = spawn._machine_text()  # pyright: ignore[reportPrivateUsage]
+    return f"{current}: slow test, {took:.1f}s, {machine}"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_spawn_state(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Iterator[None]:
     """Every test starts with no stranded start, and the real list is put back when it
     ends. **Round 15.** ``dromon.spawn`` counts the starts that stalled past its bound
     in one list for the whole process. Under load a real ``git`` start can stall past
@@ -454,6 +551,32 @@ def _isolated_spawn_state(monkeypatch: pytest.MonkeyPatch) -> None:
     ``stalled_start`` or by patching ``MAX_STRANDED``. The list is replaced by name, as
     ``spawn`` reads it at each call, and ``monkeypatch`` puts the original back."""
     monkeypatch.setattr(spawn, "_stranded", [])
+    # Found on 2026-11-05. A real stall left its thread in the set of starts in flight,
+    # so every later test counted it, and the three that count the overlap failed. The
+    # stuck thread removes itself from whichever set is current when it ends.
+    monkeypatch.setattr(spawn, "_active", set[Any]())
+    monkeypatch.setattr(spawn, "_watched", set[Any]())
+    monkeypatch.setattr(spawn, "_armed", None)
+    # Round 16. The slow starts of this test, handed to the run's summary at its end.
+    own: list[str] = []
+    monkeypatch.setattr(spawn, "_slow_starts", own)
+    # Review of round 16, finding 3. The line writer and its rate limit are the test's
+    # own, so one test's line cannot suppress the next test's.
+    monkeypatch.setattr(spawn, "_log", spawn._Log())  # pyright: ignore[reportPrivateUsage]
+    current = os.environ.get("PYTEST_CURRENT_TEST", "a test").split(" ")[0]
+    began = time.monotonic()
+    yield
+    lines = [f"{current}: slow child start, {line}" for line in own]
+    # Round 16. A test that took long is named at once, past capture, because a run
+    # that is later killed by its timeout lists nothing at its end. On 2026-11-11 a
+    # Linux run spent three minutes in a file that takes under a second elsewhere, and
+    # the log could not say which test, since a file's line is written only when the
+    # next file begins.
+    slow = slow_test_line(current, time.monotonic() - began)
+    if slow is not None:
+        lines.append(slow)
+    SLOW_STARTS_SEEN.extend(lines)
+    _show_now(lines, request)
 
 
 class StalledStart:
@@ -477,14 +600,20 @@ class StalledStart:
             time.sleep(0.01)
 
     def until_reaped(self, seconds: float = 10.0) -> subprocess.Popen[Any]:
-        """The one child started, once its pipes are closed, which the late-start reap
-        does last. Fails the test when that takes longer than ``seconds``."""
+        """The one child started, once it has ended and its pipes are closed, which
+        the late-start reap does last. Fails the test when that takes longer than
+        ``seconds``."""
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             if self.started:
                 child = self.started[0]
                 pipes = [child.stdin, child.stdout, child.stderr]
-                if all(pipe is None or pipe.closed for pipe in pipes):
+                # Found on 2026-11-05. A child with no pipe has none to be closed, so
+                # the pipes alone said "reaped" before the late-start reap had
+                # killed it, and a test that then polled failed one run in six.
+                if child.poll() is not None and all(
+                    pipe is None or pipe.closed for pipe in pipes
+                ):
                     return child
             time.sleep(0.01)
         pytest.fail("the late child was not reaped in time")
