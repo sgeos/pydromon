@@ -2308,6 +2308,11 @@ class RunStarted:
     """The absolute directory the command of a commit run ran in, the daemon's
     detached checkout of ``commit``, given exactly when ``commit`` is. ``workdir``
     then holds only the output file."""
+    tree: str | None = None
+    """**Round 16, item 5.** The SHA-256 ``readiness.tree_digest`` gave for the
+    working directory as the run started, or ``None`` for a commit run, for a run
+    recorded before the field, or where the tree could not be read. A later digest
+    that differs says the run no longer covers the tree."""
     workdir_commit: str | None = None
     """**Round 16, item 3.** The commit ``HEAD`` named in the line's working
     directory when a run there started, read by the daemon from the checkout's own
@@ -2323,10 +2328,15 @@ class RunStarted:
     considered and does not help, since the line can create one exactly there. So
     the receipt says the commit is the worktree's own ``HEAD``, which the line can
     move, and a reader who must know what ran starts a commit run, whose ``commit``
-    the daemon checked out itself."""
+    the daemon checked out itself. It follows ``tree``, which main recorded first at
+    ``STATE_VERSION`` 4, and raised the version to 5."""
 
     def __post_init__(self) -> None:
         check_id("run_id", self.run_id)
+        if self.tree is not None and DIGEST_PATTERN.fullmatch(self.tree) is None:
+            raise InvalidField("tree must be null or a SHA-256 digest in hex")
+        if self.tree is not None and self.commit is not None:
+            raise InvalidField("a commit run records no tree")
         check_id("line_id", self.line_id)
         check_optional_id("role_id", self.role_id)
         check_optional_id("previous", self.previous)

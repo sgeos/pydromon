@@ -14,7 +14,8 @@ Type: Added
 - Round 16, item 3. `run_started` records `workdir_commit`, the commit a run in a
   worktree started on, and the run's one `Run ended` note, `run_status` and `dromon
   run status` name it. A test pins that a run's end sends one note and no other.
-  `STATE_VERSION` is raised to 4, and a daemon from before this change refuses a log
+  `STATE_VERSION` is raised to 5, after main's 4 for `run_started.tree`, and a daemon
+  from before this change refuses a log
   that holds the field. The note labels the commit as what the worktree's own `HEAD`
   says, which the line can move, since the line can write the files it is read from.
 - Round 16, item 4. Tests pin that a line waiting for a run with `wake_after` keeps

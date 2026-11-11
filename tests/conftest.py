@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from typing import Any, cast
 
-from dromon import hookpolicy, linetemp, priority, spawn
+from dromon import hookpolicy, linetemp, priority, readiness, spawn
 from dromon import scheduler as scheduler_module
 from dromon.processes import ProcessInfo
 from dromon.fleet import HOSTS_FILE_ENV
@@ -349,6 +349,9 @@ SCENARIO: tuple[Event, ...] = (
         4500,
         AT,
         AT,
+        None,
+        None,
+        "b" * 64,
     ),
     RunEnded("r-3", RunStatus.EXITED, 2, None, None, "", AT, "make: *** [all] Error 2"),
     CommitRunRefused("alpha", None, "build", "a" * 40, "no ref points at it", AT),
@@ -590,3 +593,25 @@ def short_runtime() -> Iterator[Path]:
     parent = Path(tempfile.mkdtemp(prefix="dr"))
     yield parent / "run"
     shutil.rmtree(parent, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_git_status(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Answer every test's ``git status`` from ``dromon.readiness`` as a clean tree,
+    without starting git, unless the test is marked ``real_git_status``. **Round 16,
+    item 1.** Bisecting runs put a rise in stalled starts in continuous integration
+    at the change that read the worktree's state on every ``set_brief`` and every
+    turn of a kept session, so most tests started git for an answer none of them
+    checked. Only the start is replaced. A directory outside any checkout is still
+    refused by the real check, as it is in the daemon. Disjoint from the spawn
+    fixtures above, which the runtime line owns."""
+    node = cast(pytest.Item, request.node)  # pyright: ignore[reportUnknownMemberType]
+    if node.get_closest_marker("real_git_status") is None:
+
+        def clean(worktree: Path) -> str:
+            del worktree
+            return ""
+
+        monkeypatch.setattr(readiness, "_run_git_status", clean)

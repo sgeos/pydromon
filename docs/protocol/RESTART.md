@@ -54,7 +54,27 @@ A turn asked to end whose restart was then abandoned, before the turn's report a
 leaves a note that says the restart was abandoned, which wakes the line in the same
 daemon after its cooldown.
 
-A turn that ended by itself during a drain leaves no note, since nothing was cut.
+**A turn asked to end whose report names another reason, or none.** **Round 16,
+item 3, and its review's finding 1.** The note follows the reason the turn's report
+names, and never the reason last recorded for the turn's redirect. Every engine keeps
+the first interrupt of a turn and ignores any later one, so priority mail or a change
+of access asked at a later safe point of the same turn had taken the note away from a
+turn the restart did end, and the line sat idle after the restart until it was
+mailed. Inference, not observed, is that this was the path in the field. A turn whose
+report names another reason was stopped by its driver or its engine before the
+restart's ask took effect, as a Pi turn past `max_turns` is, though a safe point the
+engine still dispatched recorded the ask. It leaves no note, so a line that was
+stopped for a reason of its own is not woken, and the engine's stop note, which does
+not wake, tells it why. A report that names no reason was not ended by the restart
+either, and leaves no note.
+
+A turn asked to end that failed or raised leaves no note. A failure holds the line and
+asks an operator, or leaves it failed where it mailed an operator in the turn, and a
+note, as new mail, would clear that failure and wake a broken engine again unseen. A
+turn an operator cancelled raises, and leaves no note either.
+
+A turn that ended by itself during a drain in the `wait` mode leaves no note, since
+nothing was asked of it.
 
 ## The successor
 

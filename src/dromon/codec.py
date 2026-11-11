@@ -280,6 +280,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "started_at",
         "commit",
         "checkout",
+        "tree",
         "workdir_commit",
     ),
     "run_ended": (
@@ -416,7 +417,7 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "lease_acquired": ("note",),
     "budget_stated": ("window",),
     "line_held": ("cause",),
-    "run_started": ("commit", "checkout", "workdir_commit"),
+    "run_started": ("commit", "checkout", "tree", "workdir_commit"),
     "run_ended": ("output_tail",),
     "line_configured": ("sealed",),
     "disclosure_checked": ("checked_bytes",),
@@ -445,10 +446,13 @@ that names one. ``reviews`` was added to ``role_declared`` in round 15, item 5, 
 is left out when empty, as ``sealed`` is, so a daemon that predates it still reads
 every role that reviews nothing. ``failure`` and ``failure_class`` were added to
 ``line_turn_ended`` in the round 15 follow-up of 2026-11-05, so a daemon that
-predates them still reads every turn that did not fail. ``workdir_commit`` was added
-to ``run_started`` in round 16, item 3, so a daemon that predates it still reads
-every run whose worktree commit could not be read, and refuses the log once a run
-in a worktree is recorded with its commit."""
+predates them still reads every turn that did not fail. ``tree`` was added to
+``run_started`` in round 16, item 5, so a daemon that predates it still reads every
+commit run and every run whose tree could not be read, and refuses the log once a
+run in a working directory records its tree. ``workdir_commit`` was added to
+``run_started`` in round 16, item 3, after ``tree``, so a daemon that predates it
+still reads every run whose worktree commit could not be read, and refuses the log
+once a run in a worktree is recorded with its commit."""
 
 
 def _without_nulls(kind: str, data: dict[str, object]) -> dict[str, object]:
@@ -810,6 +814,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "started_at": event.started_at,
                 "commit": event.commit,
                 "checkout": event.checkout,
+                "tree": event.tree,
                 "workdir_commit": event.workdir_commit,
             }
         case RunEnded():
@@ -1178,6 +1183,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "started_at"),
                 _optional_str(data, "commit"),
                 _optional_str(data, "checkout"),
+                _optional_str(data, "tree"),
                 _optional_str(data, "workdir_commit"),
             )
         case "run_ended":

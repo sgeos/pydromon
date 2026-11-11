@@ -434,6 +434,36 @@ with the rest of its receipt. Before this the operator read `run_ended` from the
 log by hand. The request reads the log and records nothing. It is bounded by the
 number of scopes, since each scope gives at most ten runs.
 
+**Whether a run still covers the tree.** **Round 16, item 5, core's request of round
+15.** A gate that passed was read as covering a tree whose tracked files had changed
+after it started. A run in the line's working directory now records `tree` in
+`run_started`, the SHA-256 that `readiness.tree_digest` gives as the run starts, read
+off the event loop before the supervisor is launched. The digest covers the commit at
+`HEAD`, the `git status` entry of each changed tracked path, and that path's size and
+modification time. `run_status` reads the digest again for the latest run and says
+that the tree is as it was, or in capitals that the run no longer covers the tree and
+should be run again before its result is reported for the current tree, or that its
+coverage is unknown, with the fixed word for why git could not be read. A run that
+recorded no tree, from before the field or where its tree could not be read, says its
+coverage is unknown. A commit run covers its commit, records no tree, and says
+nothing. The operator's `runs` view gives `tree` as recorded.
+
+- **Residuals.** Untracked paths are left out whole, since a run's own output in an
+  untracked directory that is not ignored would otherwise make every run read as no
+  longer covering its tree. A new test file is therefore not seen until it is added.
+  An edit that keeps a file's size and restores its modification time is not seen.
+  Only the latest run is compared, since each comparison starts git.
+- **Coverage that cannot be told.** **Round 16 review, findings 3 and 4.** A digest
+  that an edit could leave as it was is not given. More than 10000 changed tracked
+  paths, past which an edit was not hashed, or a changed tracked path that git does
+  not list as deleted and that cannot be stated, answer that whether the run covers
+  the tree is unknown, with the fixed word `too_many_paths` or `unstamped_path`, and
+  a run that starts so records no tree. The second covers a work tree that
+  `core.worktree` puts away from the `.git` entry, which is not followed, where each
+  changed path had stamped as absent and an edit inside one already changed was not
+  seen. A residual remains. Where `core.worktree` is set and a file of the same name
+  lies beside the `.git` entry, that file is stated instead.
+
 ## Events and rollback hazards
 
 `run_started`, `run_ended` and `run_cleared` are specified in
@@ -449,7 +479,8 @@ names the commits of these and every other one-way change. **Task of 2026-11-05,
 reads every end without a tail and refuses the log once a failed run's tail is
 recorded. **Round 15 review.** `disclosure_checked` gained `checked_bytes` the same
 way, so a daemon from before it refuses the log once a `check_disclosure` call is
-recorded.
+recorded. **Round 16, item 5.** `run_started` gained `tree` the same way, so a daemon
+from before it refuses the log once a run records its tree.
 
 ## Descendants in a session of their own
 

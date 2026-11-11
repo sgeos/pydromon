@@ -31,8 +31,9 @@ its ``interrupt`` mode each running turn is asked to end at its next safe point.
 the restart ended leaves the line a ``restart_noted`` note, so the restarted daemon
 wakes it.
 
-Cadence. While anything is in flight, ticks follow one another every ``tick_seconds``.
-When nothing is, the loop rests until a message arrives or a scheduled wake falls due.
+Cadence. Ticks wait for work events and timers. A positive ``tick_seconds`` bounds
+the wait. Zero disables periodic ticks. A running turn alone never keeps the loop
+spinning. Pending mail advances through its wake cadence after its cooldown.
 
 Scheduled wakes. A line's ``wake_after`` tool schedules one wake, recorded as
 ``wake_scheduled`` with its due time in Coordinated Universal Time and the identifier
@@ -2421,6 +2422,11 @@ def compose_prompt(
     return "\n".join(parts)
 
 
+TreeNow = str | readiness.ReadFailure | readiness.Uncovered
+"""A working directory's ``readiness.tree_digest``, or the fixed word for why git
+status could not be read, or for why the digest cannot tell a change."""
+
+
 class Scheduler:
     """Creates lines, accepts messages and wakes recipients. One per daemon."""
 
@@ -3928,6 +3934,38 @@ class Scheduler:
             "end_tasks": plan.end_tasks,
         }
 
+    def _restart_turn_ended(
+        self, line_id: str, report: TurnReport | None, *, asked: bool
+    ) -> None:
+        """Note the restart to ``line_id`` when a restart asked its turn to end, and
+        the turn's report names the restart as why it ended, and the turn did not
+        fail. Called once the turn's end is recorded, so the note is newer than it.
+
+        **Round 16, item 3.** A line whose turn a restart interrupted sat idle after
+        the restart until it was mailed. The note had been left only when the reason
+        last recorded for the turn's redirect was the restart's, so priority mail or
+        a change of access asked at a later safe point of the same turn, whose own
+        interrupt the engine ignores since it keeps the first reason, took the note
+        away. The gate is now the reason the report names. Inference, not observed,
+        that this was the path in the field.
+
+        **Round 16 review, finding 1.** Every engine records the first interrupt of
+        a turn and ignores any later one, so a report that names another reason,
+        such as a Pi turn past ``max_turns``, or none, was not ended by the restart,
+        though the ask was recorded at a safe point the engine still dispatched. Its
+        driver or the engine stopped it, and a note would wake a line that was
+        stopped for a reason of its own. The engine stop note, which does not wake,
+        tells it why. A turn that failed or raised gets no note either, since a note
+        would clear the failure, as any new mail does."""
+        if (
+            not asked
+            or report is None
+            or report.interrupted_for != restart.REASON
+            or line_id in self._failed
+        ):
+            return
+        self._note_restart(line_id)
+
     def _note_restart(self, line_id: str) -> None:
         """Leave ``line_id`` a note that a restart ended its turn, which wakes it once
         the restarted daemon runs, or in this daemon when the restart was abandoned."""
@@ -4999,6 +5037,13 @@ class Scheduler:
             else await self._make_checkout(line_id, command, run_id, commit)
         )
         command_dir = None if checkout is None else checkout.tree
+        # Round 16, item 5. Read before the launch, so a change made while the run
+        # starts is a change after the tree it covers.
+        tree = (
+            None
+            if commit is not None
+            else await asyncio.to_thread(_tree_or_none, workdir)
+        )
         # Round 16, item 3. The commit a run in a worktree ran, read before its
         # command starts, so the receipt names it. A file read, as line_status does,
         # and the worktree's own claim, as RunStarted.workdir_commit records.
@@ -5036,6 +5081,7 @@ class Scheduler:
                 format_due(self._wall_clock()),
                 commit,
                 None if command_dir is None else str(command_dir),
+                tree,
                 head,
             )
             try:
@@ -5175,12 +5221,17 @@ class Scheduler:
             lambda: runs.signal_run(latest.started, self._run_start_of)
         )
 
-    def run_status(self, line_id: str) -> str:
+    def run_status(self, line_id: str, tree_now: TreeNow | None = None) -> str:
         """The latest runs of ``line_id``'s scope, newest first, with their
         receipts, and the commands the project declares. **Round 14, item 2.** A
         failed run names the run that corrected it, and that run names each it
         corrected, as ``runs.corrections`` links them, read from every run of the
-        scope, so a link to a run older than those shown is still named."""
+        scope, so a link to a run older than those shown is still named.
+
+        **Round 16, item 5.** ``tree_now`` is the working directory's
+        ``readiness.tree_digest`` read now, or why it could not be read, or ``None``
+        when it was not read. The latest run then says whether it still covers the
+        tree, as ``_tree_text`` words it."""
         scope = self._scope_runs(line_id)
         found = scope[-MAX_RUNS_SHOWN:]
         declared = ", ".join(sorted(self._run_commands)) or "none"
@@ -5213,6 +5264,7 @@ class Scheduler:
         # reason is read with the receipt. Older tails stay in the log and in the
         # runs view.
         lines[0] += _run_tail(found[-1])
+        lines[0] += _tree_text(found[-1].started, tree_now)
         return (
             f"previous is {found[-1].started.run_id}. Declared commands: {declared}.\n"
             + "\n".join(lines)
@@ -5580,7 +5632,13 @@ class Scheduler:
             # recorded first, so a finished output is never shown as still running.
             if any(run.ended is None for run in self._scope_runs(line_id)):
                 await self.fresh_runs()
-            return _tool_text(self.run_status(line_id))
+            scope = self._scope_runs(line_id)
+            tree_now: TreeNow | None = None
+            if scope and scope[-1].started.tree is not None:
+                tree_now = await asyncio.to_thread(
+                    _tree_or_failure, Path(scope[-1].started.workdir)
+                )
+            return _tool_text(self.run_status(line_id, tree_now))
 
         async def stop(args: dict[str, Any]) -> dict[str, Any]:
             unexpected = _unexpected(args, STOP_RUN_SCHEMA)
@@ -5754,6 +5812,9 @@ class Scheduler:
             # Round 9 review, F1. The compaction is of the session the line no
             # longer resumes, so it says nothing of the session its next turn opens.
             return
+        # Round 16, item 7. A request made before this compaction is spent by it, as
+        # its wake is below. Kept, it compacted the session again in the next turn.
+        self._compact_requests.discard(line_id)
         if cause == "engine":
             # A compaction Dromon asked for came at the start of a turn whose prompt
             # already led with the brief. One the engine made by itself may have
@@ -6872,7 +6933,8 @@ class Scheduler:
         """The stated budget of the line's provider, or an entry that says it is
         unknown. **Round 14, item 4.** Never ``None``."""
         engine = ENGINE_OF.get(self.model_of(line_id))
-        return _budget_entry(engine, self._budget_of(line_id))
+        now = self._wall_clock()
+        return _budget_entry(engine, self._budget_of(line_id, now), now)
 
     def disclosure_status(self) -> dict[str, object]:
         """Whether the project has a disclosure list, so a line learns early that
@@ -8468,10 +8530,11 @@ class Scheduler:
             raise EventRejected(f"no role {role_id}")
         seats: list[dict[str, object]] = []
         usable = self.usable_seats(role_id)
+        now = self._wall_clock()
         for seat_id in seat_order(state, role_id):
             other = state.seats[seat_id]
             engine = ENGINE_OF.get(self.model_of(seat_id))
-            budget = self._budget_of(seat_id)
+            budget = self._budget_of(seat_id, now)
             seats.append(
                 {
                     "line_id": seat_id,
@@ -8484,7 +8547,7 @@ class Scheduler:
                     "waits_unconfined": self.waits_unconfined(seat_id),
                     "model": self.model_of(seat_id),
                     "provider": engine,
-                    "budget": _budget_entry(engine, budget),
+                    "budget": _budget_entry(engine, budget, now),
                     "cost_whole": self.whole_cost(seat_id),
                     "workdir_commit": self._workdir_commit(seat_id),
                     "recent_tasks": [
@@ -10028,7 +10091,7 @@ class Scheduler:
         self._log.append(event)
         return {
             "provider": provider,
-            **_budget_view(event),
+            **_budget_view(event, self._wall_clock()),
             "followed": self._budget_followed(event),
         }
 
@@ -10045,7 +10108,7 @@ class Scheduler:
             budgets.append(
                 {
                     "provider": provider,
-                    **_budget_view(budget),
+                    **_budget_view(budget, now),
                     "spent": budget_spent(budget, now),
                 }
             )
@@ -11529,8 +11592,8 @@ class Scheduler:
     def _may_wake(self, line_id: str) -> bool:
         """Whether the line has post office mail that may start its turn. Peer mail
         past its peer's turn allowance waits without keeping the loop ticking, and
-        the loop's rest, at most ``MAX_REST_SECONDS``, finds it once the hour
-        allows."""
+        bounded maintenance inspection finds it once the hour allows, even with
+        zero tick cadence."""
         messages = self.deliverable(line_id)
         return bool(messages) and self.peer_turns.may_wake(
             line_id, (message for _, message in messages)
@@ -11655,6 +11718,7 @@ class Scheduler:
         on, so the scheduler neither dies nor spins."""
         try:
             while not stop.is_set():
+                self._work.clear()
                 if self._work_waiting():
                     try:
                         self.step()
@@ -11669,35 +11733,52 @@ class Scheduler:
                                 stop.wait(),
                                 max(SECRETS_RETRY_SECONDS, self._tick_seconds),
                             )
-                    elif self._tick_seconds:
-                        with contextlib.suppress(TimeoutError):
-                            await asyncio.wait_for(stop.wait(), self._tick_seconds)
-                    else:
-                        await asyncio.sleep(0)
-                    continue
-                self._work.clear()
-                # Each rest, at most MAX_REST_SECONDS apart, also sweeps the launch
-                # records of launchers that exited between turns. Review N1.
-                try:
-                    with self._refusing_on_secrets("the sweep of left processes"):
-                        self.collect_left()
-                    self.note_stuck_starts()
-                except Exception as error:  # noqa: BLE001
-                    await self._fault_found(error, stop)
-                    continue
+                        continue
+                else:
+                    # A rest also sweeps records of launchers that exited between turns.
+                    try:
+                        with self._refusing_on_secrets("the sweep of left processes"):
+                            self.collect_left()
+                        self.note_stuck_starts()
+                    except Exception as error:  # noqa: BLE001
+                        await self._fault_found(error, stop)
+                        continue
+                until = self.seconds_until_next_wake()
+                timeouts = [] if until is None else [min(until, MAX_REST_SECONDS)]
+                if self._tick_seconds > 0:
+                    timeouts.append(min(self._tick_seconds, MAX_REST_SECONDS))
+                # Launch records and peer allowance expiry are maintenance work.
+                # Their bounded inspection remains due even with no periodic ticks.
+                if self._report_dir is not None or self._post_office:
+                    timeouts.append(MAX_REST_SECONDS)
+                # Mail already in the post office may need another tick to reach
+                # its wake cadence. Advance only while that mail can make progress.
+                for line_id in self._state().lines:
+                    if not (self._eligible(line_id) and self._may_wake(line_id)):
+                        continue
+                    ended = self._last_turn_end.get(line_id)
+                    remaining = (
+                        0.0
+                        if ended is None
+                        else self.limits_for(line_id).cooldown_seconds
+                        - (self._clock() - ended)
+                    )
+                    if remaining > 0 and not self._priority_waiting(line_id):
+                        timeouts.append(remaining)
+                    elif self._tick_seconds == 0:
+                        self._work.set()
                 worker = asyncio.create_task(self._work.wait())
                 stopping = asyncio.create_task(stop.wait())
-                # Rest until work arrives, or until the next scheduled wake falls due.
-                until = self.seconds_until_next_wake()
-                await asyncio.wait(
-                    {worker, stopping},
-                    timeout=MAX_REST_SECONDS
-                    if until is None
-                    else min(until, MAX_REST_SECONDS),
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                worker.cancel()
-                stopping.cancel()
+                try:
+                    await asyncio.wait(
+                        {worker, stopping},
+                        timeout=min(timeouts) if timeouts else None,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    worker.cancel()
+                    stopping.cancel()
+                    await asyncio.gather(worker, stopping, return_exceptions=True)
         finally:
             for watcher in list(self._pid_watchers.values()):
                 watcher.cancel()
@@ -12033,8 +12114,6 @@ class Scheduler:
             redirected = self._redirected.get(line_id)
             if redirected is not None and report.interrupted_for == redirected:
                 ending += f", ended at a safe point for {redirected}"
-                if redirected == restart.REASON:
-                    self._note_restart(line_id)
             elif report.interrupted_for is not None:
                 stop_cause = f"The driver interrupted it for {report.interrupted_for}."
                 ending += f", interrupted by its driver: {report.interrupted_for}"
@@ -12099,6 +12178,7 @@ class Scheduler:
             self._redirect_for.pop(line_id, None)
             self._redirected.pop(line_id, None)
             self._role_redirect.pop(line_id, None)
+            asked = line_id in self._restart_asked
             self._restart_asked.discard(line_id)
             # A compaction the engine did not report leaves no cause for a later one.
             self._compaction_cause.pop(line_id, None)
@@ -12120,6 +12200,7 @@ class Scheduler:
                 # reached the engine, as when it could not be composed, so the turn
                 # retires none of the notes delivered into it.
                 self._end_turn(line_id, report, failure)
+                self._restart_turn_ended(line_id, report, asked=asked)
             if stop_cause is not None and line is not None:
                 self._note_engine_stop(line_id, stop_cause)
             # A handoff asked for in the turn takes effect now that it has ended,
@@ -12545,7 +12626,13 @@ class Scheduler:
         and how, and not their contents, so a line's edits inside a file already
         dirty do not flag the brief, while a new dirty path, a path made clean, or
         work discarded does. A line whose own work flagged it clears the flag by
-        setting the brief again."""
+        setting the brief again.
+
+        **Round 16, item 4, at the review line's request.** Each notice names the
+        commit the brief was set at and the worktree's ``HEAD``, or says that one of
+        them is not known, so a line can read the log between them without first
+        finding either. A notice whose reason already names both does not repeat
+        them."""
         brief = self._state().briefs.get(line_id)
         if brief is None or self.effective_config(line_id).fresh_session_each_turn:
             return None
@@ -12580,20 +12667,43 @@ class Scheduler:
                 " possibly stale, and check it against git status yourself."
             )
         )
+        if not reasons and unknown is None:
+            return None
+        commits = (
+            ""
+            if moved and not led_brief
+            else f" {self._brief_commits(brief.workdir_commit, head)}"
+        )
         if not reasons:
-            if unknown is None:
-                return None
             return (
                 f"BRIEF CURRENCY UNKNOWN. Your standing brief was set at"
-                f" {brief.set_at}. {unknown}"
+                f" {brief.set_at}.{commits} {unknown}"
             )
         stale = (
             f"STALE BRIEF. Your standing brief, set at {brief.set_at}, was set before"
             f" {' and '.join(reasons)}, so it may not describe your current task."
-            " Check it against git log, git status and your mail before acting on"
-            " it, and set it again with set_brief, which clears this notice."
+            f"{commits} Check it against git log, git status and your mail before"
+            " acting on it, and set it again with set_brief, which clears this"
+            " notice."
         )
         return stale if unknown is None else f"{stale} {unknown}"
+
+    @staticmethod
+    def _brief_commits(named: str, head: str | None) -> str:
+        """One sentence naming the commit a brief was set at and the worktree's
+        ``HEAD``, each shortened as the notices shorten commits, or saying which is
+        not known. **Round 16, item 4.**"""
+        brief_at = (
+            f"was set at commit {named[:12]}"
+            if named
+            else "names no commit, since the daemon could not read one when it was set"
+        )
+        now = (
+            f"your worktree's HEAD is {head[:12]}"
+            if head is not None
+            else "your worktree's HEAD could not be read"
+        )
+        return f"The brief {brief_at}, and {now}."
 
     def _mail_since_brief(self, line_id: str, brief: BriefSet) -> str:
         """One sentence for the brief's lead when an operator mailed ``line_id``
@@ -13505,8 +13615,6 @@ class Scheduler:
                 redirected = self._redirected.get(line_id)
                 if redirected is not None and report.interrupted_for == redirected:
                     ending += f", ended at a safe point for {redirected}"
-                    if redirected == restart.REASON:
-                        self._note_restart(line_id)
                 elif report.interrupted_for is not None:
                     ending += f", interrupted by its driver: {report.interrupted_for}"
                 elif turn_outcome(report) == FAILED:
@@ -13550,6 +13658,7 @@ class Scheduler:
             self._redirect_for.pop(line_id, None)
             self._redirected.pop(line_id, None)
             self._role_redirect.pop(line_id, None)
+            asked = line_id in self._restart_asked
             self._restart_asked.discard(line_id)
             self.activity.record(line_id, ActivityKind.TURN_ENDED, ending)
             line = self._state().lines.get(line_id)
@@ -13562,6 +13671,7 @@ class Scheduler:
                 # Round 8 review, ON1, as in ``_turn``. An engine turn that failed or
                 # was cancelled before it reported retires none of its task notes.
                 self._end_turn(line_id, report, failure)
+                self._restart_turn_ended(line_id, report, asked=asked)
             self._settle_relinquish(line_id)
             self._work.set()
         self._apply_limits(line_id, TurnCause.AUTONOMOUS, True, report)
@@ -14774,11 +14884,18 @@ def _scheduled_summary(pending: ScheduledWake | None) -> dict[str, object] | Non
     return {"due": pending.due, "message_id": pending.message_id}
 
 
-def _budget_view(budget: BudgetStated) -> dict[str, object]:
+def _budget_view(budget: BudgetStated, now: datetime) -> dict[str, object]:
     """A provider's stated budget as ``role_status`` gives it, with its source and
     time, since it is a snapshot. A field the statement left out says ``unknown`` and
-    is never ``None``. **Round 14, item 4.**"""
+    is never ``None``. **Round 14, item 4.**
+
+    **Round 16, item 6, from another project's reports.** A figure carried forward
+    without its time could not be told from a fresh one, so beside the figure stand
+    ``observed_at``, the time it was stated or reported, and its age at ``now``, in
+    whole seconds and in words. ``stated_at`` is kept, with the same value, for the
+    clients that read it."""
     percent = budget.remaining_percent
+    seconds, words = _age_of(budget.stated_at, now)
     return {
         "status": "stated",
         "provider": budget.provider,
@@ -14787,17 +14904,50 @@ def _budget_view(budget: BudgetStated) -> dict[str, object]:
         "source": budget.source.value,
         "note": budget.note,
         "stated_at": budget.stated_at,
+        "observed_at": budget.stated_at,
+        "age_seconds": seconds,
+        "age": words,
     }
 
 
+def _age_of(observed_at: str, now: datetime) -> tuple[int | str, str]:
+    """How long before ``now`` the instant ``observed_at`` was, in whole seconds
+    and in words, or ``unknown`` for both when it cannot be read. **Round 16, item
+    6.** An instant after ``now``, as when the daemon's clock was set back, is not
+    given as an age of zero, which would read as fresh, and says so instead."""
+    try:
+        observed = parse_due(observed_at)
+    except InvalidField:
+        return UNKNOWN, UNKNOWN
+    seconds = int((now - observed).total_seconds())
+    if seconds < 0:
+        return (
+            seconds,
+            "observed after the daemon's current time, so its age is unknown",
+        )
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    parts = [
+        f"{count} {unit}{'' if count == 1 else 's'}"
+        for count, unit in ((days, "day"), (hours, "hour"), (minutes, "minute"))
+        if count
+    ]
+    return seconds, (
+        "observed less than a minute ago"
+        if not parts
+        else f"observed {' '.join(parts)} ago"
+    )
+
+
 def _budget_entry(
-    provider: str | None, budget: BudgetStated | None
+    provider: str | None, budget: BudgetStated | None, now: datetime
 ) -> dict[str, object]:
     """The budget entry for a provider: the statement, or a named entry that says no
     budget is known. Dromon takes no action on a budget it does not know, so a role
     never moves on it. **Round 14, item 4.**"""
     if budget is not None:
-        return _budget_view(budget)
+        return _budget_view(budget, now)
     return {
         "status": UNKNOWN,
         "provider": UNKNOWN if provider is None else provider,
@@ -14809,6 +14959,9 @@ def _budget_entry(
             " left and moves no role on it. dromon budget set states one"
         ),
         "stated_at": UNKNOWN,
+        "observed_at": UNKNOWN,
+        "age_seconds": UNKNOWN,
+        "age": UNKNOWN,
     }
 
 
@@ -15011,6 +15164,7 @@ def _run_view(
         "previous": started.previous,
         "commit": started.commit,
         "checkout": started.checkout,
+        "tree": started.tree,
         "workdir_commit": started.workdir_commit,
         "workdir": started.workdir,
         "output_file": started.output_file,
@@ -15029,6 +15183,71 @@ def _run_view(
         "corrects": list(corrects),
         "corrected_by": corrected_by,
     }
+
+
+def _tree_or_none(directory: Path) -> str | None:
+    """``readiness.tree_digest`` of ``directory``, or ``None`` where it cannot be
+    read, so a run starts whether or not its tree can be read. Blocking."""
+    found = _tree_or_failure(directory)
+    # A failure word is a ``StrEnum``, and so also a ``str``, so it is tested first.
+    return (
+        None
+        if isinstance(found, (readiness.ReadFailure, readiness.Uncovered))
+        else found
+    )
+
+
+def _tree_or_failure(directory: Path) -> TreeNow:
+    """``readiness.tree_digest`` of ``directory``, or the fixed word for why it
+    cannot be read or cannot tell a change. Blocking."""
+    try:
+        return readiness.tree_digest(directory)
+    except readiness.ReadinessUnknown as error:
+        return error.cause
+    except readiness.TreeUncovered as error:
+        return error.cause
+
+
+def _tree_text(started: RunStarted, tree_now: TreeNow | None) -> str:
+    """Whether the run ``started`` still covers its working directory, for the
+    latest run in ``run_status``, or nothing. **Round 16, item 5, core's request
+    of round 15.** A gate that passed was read as covering the tree after tracked
+    files had changed. A commit run covers its commit and says nothing here. A run
+    recorded with no tree, before the field or where the tree could not be read as
+    it started, says that its coverage is unknown. The comparison is as
+    ``readiness.tree_digest`` describes, with its residuals."""
+    if started.commit is not None:
+        return ""
+    if started.tree is None:
+        return (
+            ". It recorded no digest of the tree as it started, so whether it covers"
+            " the tree now is unknown"
+        )
+    if tree_now is None:
+        return ""
+    if isinstance(tree_now, readiness.ReadFailure):
+        return (
+            ". Whether it still covers the tree is unknown, since git status could"
+            f" not be read now, for the reason {tree_now.value}"
+        )
+    if isinstance(tree_now, readiness.Uncovered):
+        # Round 16 review, findings 3 and 4. A digest an edit could leave as it
+        # was is not compared, so the run is not read as covering the tree.
+        return (
+            ". Whether it still covers the tree is unknown, since the tree's changed"
+            " files cannot all be compared now, for the reason"
+            f" {tree_now.value}"
+        )
+    if tree_now == started.tree:
+        return (
+            ". The tree is as it was when it started, as far as HEAD and the status,"
+            " size and time of each changed tracked file show. Untracked files are"
+            " not compared"
+        )
+    return (
+        ". IT NO LONGER COVERS THE TREE, since HEAD or a tracked file changed after"
+        " it started. Run it again before reporting its result for the current tree"
+    )
 
 
 def _run_line(run: Run) -> str:

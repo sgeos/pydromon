@@ -503,6 +503,12 @@ def test_the_receipt_names_the_worktree_commit_and_is_sent_once(
         assert f"at commit {head}" in status
         (view,) = scheduler.runs_view(started.run_id)
         assert (view["workdir_commit"], view["commit"]) == (head, None)
+        # The merge of main at 48146cc. Main's tree and this branch's commit are
+        # both recorded on one run in a worktree, and both survive a reopened log.
+        assert started.tree is not None and view["tree"] == started.tree
+    with EventLog(project / "events.sqlite") as reopened:
+        (run,) = reopened.state.runs.values()
+        assert run.started == started
 
 
 def test_a_run_outside_a_checkout_names_no_commit(project: Path) -> None:
@@ -576,7 +582,7 @@ def test_a_run_start_refuses_a_bad_worktree_commit(
             AT,
             commit,
             None if commit is None else "/state/commit-runs/r-1",
-            workdir_commit,
+            workdir_commit=workdir_commit,
         )
 
 
