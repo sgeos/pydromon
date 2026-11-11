@@ -98,6 +98,7 @@ def test_settings_report_each_value_with_its_layer(paths: ProjectPaths) -> None:
             "claude-opus-5-5",
             HAIKU,
             "claude-fable-5-1",
+            "claude-fable-5-2",
             "claude-sonnet-5-5",
         ]
         effort = client.entry("line", "effort")

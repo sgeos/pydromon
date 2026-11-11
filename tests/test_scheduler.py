@@ -1702,6 +1702,7 @@ def test_a_line_switches_models_only_within_its_engine(make_world: MakeWorld) ->
         "claude-opus-5-5",
         "claude-haiku-5-5",
         "claude-fable-5-1",
+        "claude-fable-5-2",
         "claude-sonnet-5-5",
     )
     target.scheduler.override_line("alpha", "model", "claude-opus-5-5")
