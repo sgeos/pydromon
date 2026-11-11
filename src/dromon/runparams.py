@@ -274,13 +274,26 @@ async def match(prepared: Prepared, seconds: float = MATCH_SECONDS) -> tuple[str
         # exec-pipe read would stop the whole daemon. The start is made by
         # ``spawn.start`` on a worker thread, which bounds it, and the loop stays free
         # while the child matches.
-        child = await asyncio.to_thread(
-            spawn.start,
-            [sys.executable, "-I", "-c", MATCHER],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+        #
+        # Round 16. A cancellation that arrives while the worker thread is still
+        # starting the child, as when a line's turn ends, used to leave that child
+        # running, because the call had no handle to kill. The start is shielded, so
+        # the worker's result is awaited and the child it made is ended before the
+        # cancellation goes on. The wait is bounded by ``spawn.START_SECONDS``.
+        starting = asyncio.ensure_future(
+            asyncio.to_thread(
+                spawn.start,
+                [sys.executable, "-I", "-c", MATCHER],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
         )
+        try:
+            child = await asyncio.shield(starting)
+        except asyncio.CancelledError:
+            await _end_late_start(starting)
+            raise
     except (OSError, TimeoutError) as error:
         # A start that failed or stalled refuses, as a child that fails does, so a
         # broken start never lets a value through.
@@ -305,6 +318,24 @@ async def match(prepared: Prepared, seconds: float = MATCH_SECONDS) -> tuple[str
         await asyncio.to_thread(child.wait)
     _check_answers(prepared, output, child.returncode)
     return prepared.argv
+
+
+async def _end_late_start(starting: asyncio.Future[subprocess.Popen[bytes]]) -> None:
+    """Wait for a start that a cancellation did not stop, and kill and reap the child
+    it made. A start that failed or stalled made none. Failure mode, a second
+    cancellation while waiting leaves the worker to finish, and the child it made is
+    then not ended here. The window is the start's own bound."""
+    try:
+        child = await starting
+    except (OSError, TimeoutError):
+        return
+    if child.poll() is None:
+        child.kill()
+    await asyncio.to_thread(child.wait)
+    # ``communicate`` never ran, so nothing else closes the child's pipes.
+    for pipe in (child.stdin, child.stdout):
+        if pipe is not None:
+            pipe.close()
 
 
 def _check_answers(prepared: Prepared, output: bytes, code: int | None) -> None:

@@ -1,0 +1,4 @@
+Type: Fixed
+
+- A line whose working directory is a link to another volume can write it, because the sandbox settings now grant the real path of the working directory, and each path of the allow and deny lists, and each protected directory, is kept as written and given its real path too, since the sandbox follows a link before it matches a rule. A `denyWrite` entry still wins over the grant, so a read line stays read only. Expected paths that macOS's `/tmp` link changes are derived in the tests and not pinned.
+- A cancellation that arrives while a run parameter matcher is still starting its child no longer leaves that child running. `runparams.match` now waits for the start and kills and reaps the child, which a loaded gate run showed as one failed test and a child still running at teardown.

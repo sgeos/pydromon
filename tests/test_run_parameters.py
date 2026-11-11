@@ -296,6 +296,69 @@ def test_the_child_is_killed_when_the_start_is_cancelled(
     assert_killed(child)
 
 
+def test_the_child_is_killed_when_the_cancellation_comes_during_the_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 16. The gate on a loaded machine left a child running, because the
+    cancellation arrived after the child existed and before ``spawn.start`` returned,
+    when the call had no handle to kill. The start here is held for a moment after the
+    child is made, so the window is as wide as it ever is, and the cancellation is
+    sent inside it. The child must still be killed and reaped."""
+    monkeypatch.setattr(runparams, "MATCHER", SLOW_MATCHER)
+    real = cast(Any, spawn.start)
+    made: list[subprocess.Popen[bytes]] = []
+
+    def held(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        child = cast(subprocess.Popen[bytes], real(*args, **kwargs))
+        made.append(child)
+        time.sleep(0.3)
+        return child
+
+    monkeypatch.setattr(runparams.spawn, "start", held)
+    prepared = runparams.prepare(
+        ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(runparams.match(prepared))
+        for _ in range(1000):
+            if made:
+                break
+            await asyncio.sleep(0.01)
+        assert made, "the child was never started"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), 20))
+    assert_killed(made[0])
+
+
+def test_a_start_that_fails_during_a_cancellation_leaves_no_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The error path of the same window. A start that fails after the cancellation
+    made no child, so the cancellation goes on and nothing is raised in its place."""
+
+    def failing(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        time.sleep(0.2)
+        raise OSError("no such program")
+
+    monkeypatch.setattr(runparams.spawn, "start", failing)
+    prepared = runparams.prepare(
+        ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(runparams.match(prepared))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), 20))
+
+
 def test_a_child_that_fails_refuses_the_start(monkeypatch: pytest.MonkeyPatch) -> None:
     """A child that exits with an error, or prints anything but one answer for each
     value, refuses the start, so a broken matcher never lets a value through."""

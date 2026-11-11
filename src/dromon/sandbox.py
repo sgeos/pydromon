@@ -41,7 +41,7 @@ unchanged. Path resolution uses ``os.path``, which matches POSIX semantics only.
 import json
 import os
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, NoReturn, cast
@@ -345,6 +345,26 @@ def _resolve(path: str, root: Path) -> str:
     return os.path.normpath(root / path)
 
 
+def _with_real_forms(paths: Iterable[str]) -> list[str]:
+    """``paths`` sorted, and for each absolute or home-relative one that a symbolic
+    link makes differ from its real path, the real path as well. **Round 16, item 5.**
+    The sandbox follows a link to the real path before it matches a rule, so an
+    ``allowWrite`` entry for a worktree that is a link to another volume granted
+    nothing, and a ``denyWrite`` entry for such a path denied nothing. Both forms are
+    kept, so a rule that names the link still reads as the operator wrote it. **Failure
+    mode.** A link that is changed after the document is built, or created below an
+    entry, is not followed here, because the real path is read once, when the line's
+    sandbox is built. A path that does not exist resolves as far as it can, which is
+    ``os.path.realpath`` without ``strict``."""
+    forms: set[str] = set()
+    for path in paths:
+        forms.add(path)
+        expanded = os.path.expanduser(path)
+        if expanded.startswith("/"):
+            forms.add(os.path.realpath(expanded))
+    return sorted(forms)
+
+
 def _within(path: str, directory: Path) -> bool:
     """Whether ``path``, with a leading ``~`` expanded as Claude Code expands it, lies
     in ``directory``."""
@@ -381,7 +401,7 @@ def effective(
             for name in ("allowWrite", "denyWrite", "denyRead", "allowRead"):
                 if name in table:
                     paths = cast(list[str], table[name])
-                    table[name] = sorted({_resolve(p, root) for p in paths})
+                    table[name] = _with_real_forms(_resolve(p, root) for p in paths)
             if "allowUnixSockets" in table:
                 sockets = sorted(
                     {
@@ -407,12 +427,13 @@ def effective(
     guarded = [os.path.normpath(directory) for directory in protected]
     for name in ("denyRead", "denyWrite"):
         existing = cast(list[str], filesystem.get(name, []))
-        filesystem[name] = sorted({*existing, *guarded})
+        filesystem[name] = _with_real_forms({*existing, *guarded})
+    _grant_real_workdir(filesystem, root)
     # Denied even where an allowWrite entry grants the directory around them. A deny
     # entry winning over an allow entry was verified live on 2026-10-26, as
     # docs/protocol/SANDBOX.md records.
     written = cast(list[str], filesystem["denyWrite"])
-    filesystem["denyWrite"] = sorted(
+    filesystem["denyWrite"] = _with_real_forms(
         {*written, *(os.path.normpath(path) for path in guarded_writes)}
     )
     for name in ("allowRead", "allowWrite"):
@@ -424,6 +445,21 @@ def effective(
                         " directory Dromon protects"
                     )
     return document
+
+
+def _grant_real_workdir(filesystem: dict[str, object], root: Path) -> None:
+    """Write access to the real path of the line's working directory when that
+    directory is a symbolic link, **Round 16, item 5.** The engine grants the working
+    directory by the path it was given, and the sandbox then follows a link to another
+    volume and finds the grant does not cover the real path, so the line could not
+    write its own worktree. A working directory that is not a link adds nothing, and a
+    ``denyWrite`` entry still wins over this one, as it does over any ``allowWrite``."""
+    real = os.path.realpath(root)
+    if real == os.path.normpath(root):
+        return
+    granted = cast(list[str], filesystem.get("allowWrite", []))
+    if real not in granted:
+        filesystem["allowWrite"] = sorted({*granted, real})
 
 
 def blocks_unsandboxed(

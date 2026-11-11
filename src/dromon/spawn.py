@@ -121,7 +121,7 @@ are alive, and each child of the daemon, up to eight, with its process state, it
 program name, whether it has executed, and what it waits on. The children come from
 ``/proc`` on Linux and from ``libproc`` on macOS, which start no process, and from
 ``ps`` otherwise, on a thread of its own that is left behind after three seconds. It
-names no argument, shows only printable ASCII, and is at most 1200 characters. The stuck
+names no argument, shows only printable ASCII, and is at most 1600 characters. The stuck
 child is not killed by searching for it, since a search by parent and program could end
 an unrelated child that is about to execute.
 
@@ -225,7 +225,7 @@ DIAGNOSE_SECONDS: Final = 3.0
 on a thread of its own, since the start that stalled may have left the process unable to
 start another, and a read that does not end is left behind."""
 
-MAX_REPORT_CHARS: Final = 1200
+MAX_REPORT_CHARS: Final = 1600
 """The most of a stall report put in the error and the daemon's log, in characters."""
 
 MAX_CHILDREN_REPORTED: Final = 8
@@ -241,6 +241,12 @@ long is refused with ``StartStalled``, so that one stuck fork does not hold ever
 thread of the daemon, the event loop's among them."""
 
 WATCHDOG_MARGIN_SECONDS: Final = 5.0
+SLOW_START_SECONDS: Final = 2.0
+"""A start that takes this long is recorded, with where the time went. **Round 16.**
+A start of ``git`` takes about twenty milliseconds, so two seconds is a hundred times
+the usual and still far below the 30 second bound, which makes the starts that are
+slow without stalling visible."""
+MAX_SLOW_STARTS_KEPT: Final = 64
 """How long past a start's own bound the watchdog waits before it dumps the traceback
 of every thread. It is after the bound, so a start that stalls is already reported by
 ``StartStalled`` when the dump is written, and the dump is of the state the report
@@ -296,6 +302,25 @@ def stuck_text(count: int) -> str:
     )
 
 
+class _ForkTimes:
+    """When the thread of a start asked for the fork lock, got it and let it go, on
+    ``time.monotonic``'s clock, each ``0.0`` until it happens. **Round 16.** The lock is
+    held for the call that forks. With ``vfork`` that call does not return until the
+    child has run its program, and with ``fork`` it returns at once and the exec pipe
+    is read afterwards, so a stall report that says whether the lock is still held says
+    which of the two the thread is stuck in. Written by the one thread of the start and
+    read by others, a plain float each, which Python makes atomic."""
+
+    def __init__(self) -> None:
+        self.requested = 0.0
+        self.acquired = 0.0
+        self.released = 0.0
+
+
+_fork_slot = threading.local()
+"""``current`` is the ``_ForkTimes`` of the start the thread is making, if any."""
+
+
 class _Handoff:
     """The place a start's outcome goes, for the thread that made it and the caller that
     waits. Under ``lock`` the outcome is set once, and ``abandoned`` is set once, and
@@ -311,6 +336,8 @@ class _Handoff:
         self.began = time.monotonic()
         self.deadline = 0.0
         self.dumped = False
+        self.fork = _ForkTimes()
+        self.ended = 0.0
 
 
 _active: set[_Handoff] = set()
@@ -434,6 +461,9 @@ def forking() -> Generator[None]:
     start that waits ``FORK_LOCK_SECONDS`` for the lock raises ``StartStalled`` instead
     of waiting for a start that is stuck. It is also timed by the watchdog."""
     watched = _Handoff()
+    times: _ForkTimes | None = getattr(_fork_slot, "current", None)
+    if times is not None:
+        times.requested = time.monotonic()
     if not _fork_lock.acquire(timeout=FORK_LOCK_SECONDS):
         raise StartStalled(
             f"a child was not started: another start held the fork lock for"
@@ -442,11 +472,15 @@ def forking() -> Generator[None]:
     # Timed from here, since a wait for the lock is not a stall in the fork.
     watched.began = time.monotonic()
     watched.deadline = watched.began + FORK_LOCK_SECONDS + WATCHDOG_MARGIN_SECONDS
+    if times is not None:
+        times.acquired = watched.began
     _watch(watched)
     try:
         yield
     finally:
         _unwatch(watched)
+        if times is not None:
+            times.released = time.monotonic()
         _fork_lock.release()
 
 
@@ -521,6 +555,10 @@ class _Child:
     program: str
     execed: bool | None
     waiting: str | None
+    cpu: str | None = None
+    """What tells a child that waits from one that spins, the processor time it has
+    used and, where known, how many of its threads are running. **Round 16.** A state
+    letter alone does not, since macOS reports ``live`` for any process that exists."""
 
 
 def _clean(text: str, limit: int) -> str:
@@ -587,7 +625,8 @@ def _proc_children(
         if int(fields[1]) != parent:
             continue
         program = stat[open_ + 1 : close]
-        seen.append(_Child(int(name), fields[0], program, None, None))
+        cpu = _proc_cpu(fields)
+        seen.append(_Child(int(name), fields[0], program, None, None, cpu))
         here[0] = str(root / name / "exe")
         exe = _read_link(root / name / "exe")
         here[0] = str(root / name / "wchan")
@@ -598,10 +637,26 @@ def _proc_children(
             program,
             None if own is None or exe is None else exe != own,
             None if wait in (None, "", "0") else wait,
+            cpu,
         )
         if len(seen) >= MAX_CHILDREN_REPORTED:
             break
     return seen
+
+
+def _proc_cpu(fields: list[str]) -> str | None:
+    """Processor time of a child from the fields of its ``stat`` after the program
+    name, where ``utime`` and ``stime``, in clock ticks, are the twelfth and thirteenth.
+    **Round 16.** A child that waits has used almost none and one that spins has used
+    as much as it has lived."""
+    try:
+        ticks = int(fields[11]) + int(fields[12])
+        per_second = os.sysconf("SC_CLK_TCK")
+    except (IndexError, ValueError, OSError):
+        return None
+    if per_second <= 0:
+        return None
+    return f"cpu {ticks * 1000 // per_second}ms"
 
 
 def _proc_children_bounded(root: Path, parent: int) -> list[_Child] | str:
@@ -704,9 +759,42 @@ def _ps_table(parent: int, own: int) -> list[_Child] | str:
 
 
 _PROC_PIDTBSDINFO: Final = 3
-_PROC_STATES: Final = {1: "I", 2: "R", 3: "S", 4: "T", 5: "Z"}
-"""``pbi_status`` of macOS's ``proc_bsdinfo`` as the letters ``ps`` uses. ``I`` is a
-process being created, one forked and not yet running a program."""
+_PROC_TASKINFO: Final = 4
+_PROC_STATES: Final = {1: "I", 2: "live", 3: "S", 4: "T", 5: "Z"}
+"""``pbi_status`` of macOS's ``proc_bsdinfo``. ``I`` is a process being created, one
+forked and not yet running a program. **Round 16, a correction.** Status 2 is shown as
+``live`` and not as ``R``, because the kernel reports it for any process that exists.
+A plain ``sleep`` child showed ``R`` in a test, so it does not mean running, and an
+earlier reading of a stalled child as running was unfounded."""
+
+
+def _libproc_cpu(lib: Any, pid: int) -> str | None:  # noqa: ANN401
+    """Processor time and running threads of ``pid`` from ``proc_taskinfo``, whose
+    times are in units of ``mach_timebase_info``, or ``None`` where it cannot be read.
+    The layout is six unsigned 64-bit values and twelve signed 32-bit ones, 96 bytes,
+    which was checked on macOS by timing a spinning child and a sleeping one, so a
+    different size is refused and not guessed at."""
+    import ctypes  # noqa: PLC0415
+
+    raw = (ctypes.c_char * 96)()
+    if lib.proc_pidinfo(pid, _PROC_TASKINFO, 0, raw, 96) != 96:
+        return None
+    big = ctypes.cast(raw, ctypes.POINTER(ctypes.c_uint64))
+    small = ctypes.cast(ctypes.addressof(raw) + 48, ctypes.POINTER(ctypes.c_int32))
+    scale = (ctypes.c_uint32 * 2)()
+    system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    if system.mach_timebase_info(scale) != 0 or scale[1] == 0:
+        return None
+    nanos = (int(big[2]) + int(big[3])) * scale[0] // scale[1]
+    # Round 16. The counters that tell a child that waits for memory from one that
+    # waits for a lock, which are page faults, pages read in, copy-on-write faults,
+    # Unix system calls made and context switches, with the resident size in megabytes.
+    return (
+        f"cpu {nanos // 1_000_000}ms {int(small[10])}/{int(small[9])} threads running,"
+        f" resident {int(big[1]) // 1_000_000}MB, faults {int(small[1])}"
+        f" pageins {int(small[2])} cow {int(small[3])},"
+        f" unix syscalls {int(small[7])} switches {int(small[8])}"
+    )
 
 
 def _libproc_children(parent: int) -> list[_Child] | str:
@@ -750,6 +838,7 @@ def _libproc_children(parent: int) -> list[_Child] | str:
                     name.decode(errors="replace"),
                     None if not own or not has_path else path.value != own,
                     None,
+                    _libproc_cpu(lib, pid),
                 )
             )
         return found
@@ -767,6 +856,7 @@ def _children_text(table: list[_Child] | str) -> str:
         f" program {_clean(child.program, 40)}"
         + {None: "", True: " executed", False: " NOT executed"}[child.execed]
         + ("" if child.waiting is None else f" waiting {_clean(child.waiting, 24)}")
+        + ("" if child.cpu is None else f" {_clean(child.cpu, 40)}")
         for child in table
     )
     return f"children of the daemon {shown}"
@@ -816,8 +906,10 @@ def stall_report(
             f"the start thread is at {_where(thread)}",
             f"{now} starts in flight now and {most} at most during this one",
             f"{threading.active_count()} threads alive",
-            _descriptor_limit_text(),
+            _fork_text(handoff),
             _children_text(children),
+            _machine_text(),
+            _descriptor_limit_text(),
         ]
         return _clean("; ".join(parts), MAX_REPORT_CHARS)
     except Exception as error:  # noqa: BLE001
@@ -859,6 +951,113 @@ def _close_all(descriptors: Sequence[int]) -> None:
             os.close(descriptor)
 
 
+_slow_starts: list[str] = []
+_slow_lock = threading.Lock()
+
+
+def slow_starts() -> list[str]:
+    """The slow starts recorded in this process, at most ``MAX_SLOW_STARTS_KEPT``,
+    oldest first. **Round 16.**"""
+    with _slow_lock:
+        return list(_slow_starts)
+
+
+def clear_slow_starts() -> None:
+    with _slow_lock:
+        _slow_starts.clear()
+
+
+def _since(handoff: _Handoff, moment: float) -> str:
+    return "never" if moment == 0.0 else f"+{moment - handoff.began:.2f}s"
+
+
+def _fork_text(handoff: _Handoff) -> str:
+    """Where the start's thread is among the steps of a start, from when it asked for
+    the fork lock and let it go, which says whether it is in the call that forks or
+    waiting for the program after it. Times are since the start began."""
+    times = handoff.fork
+    if times.requested == 0.0:
+        return "the thread has not reached the fork"
+    taken = (
+        "the lock was not yet taken"
+        if times.acquired == 0.0
+        else (f"the lock was taken {_since(handoff, times.acquired)}")
+    )
+    if times.acquired != 0.0 and times.released == 0.0:
+        return (
+            f"asked for the fork lock {_since(handoff, times.requested)}, {taken},"
+            " and the fork call has not returned"
+        )
+    return (
+        f"asked for the fork lock {_since(handoff, times.requested)}, {taken}, and"
+        f" the fork call returned {_since(handoff, times.released)}"
+    )
+
+
+def _pressure(proc: Path, name: str) -> str | None:
+    """The ``some`` line of Linux's pressure stall information for ``name``, which
+    says how long tasks waited for the resource, as ``avg10`` percent."""
+    text = _read_text(proc / "pressure" / name)
+    if text is None:
+        return None
+    for line in text.splitlines():
+        if line.startswith("some "):
+            for field in line.split()[1:]:
+                if field.startswith("avg10="):
+                    return f"{name} wait {_clean(field[6:], 8)}%"
+    return None
+
+
+def _machine_text(proc: Path = Path("/proc")) -> str:
+    """The load of the machine, which tells a slow machine from a stuck child.
+    **Round 16.** The load averages from ``os.getloadavg`` and, where ``/proc`` has
+    them, the share of the last ten seconds that tasks waited for the processor, for
+    input and output and for memory. A runner that is starved shows it here."""
+    parts: list[str] = []
+    try:
+        one, five, fifteen = os.getloadavg()
+        parts.append(f"load {one:.1f} {five:.1f} {fifteen:.1f}")
+    except (OSError, AttributeError):
+        pass
+    for name in ("cpu", "io", "memory"):
+        found = _pressure(proc, name)
+        if found is not None:
+            parts.append(found)
+    return ", ".join(parts) if parts else "no load figures"
+
+
+def _note_slow_start(
+    handoff: _Handoff, name: str, outcome: subprocess.Popen[Any] | BaseException
+) -> None:
+    """Record, and write to the daemon's standard error, a start that took at least
+    ``SLOW_START_SECONDS``, whether it succeeded, failed or was abandoned, with where
+    the time went and how loaded the machine was. Called by the start's own thread,
+    after the call returned and before it ends, and never raises."""
+    try:
+        total = handoff.ended - handoff.began
+        if total < SLOW_START_SECONDS:
+            return
+        times = handoff.fork
+        waited = max(times.acquired - times.requested, 0.0) if times.acquired else 0.0
+        held = max(times.released - times.acquired, 0.0) if times.released else 0.0
+        rest = max(total - waited - held, 0.0)
+        kind = type(outcome).__name__ if isinstance(outcome, BaseException) else "ok"
+        text = _clean(
+            f"{Path(name).name} {kind} after {total:.1f}s, {waited:.1f}s waiting for"
+            f" the fork lock, {held:.1f}s in the fork call, {rest:.1f}s elsewhere,"
+            f" {handoff.overlap} starts overlapped, {threading.active_count()} threads,"
+            f" {_machine_text()}",
+            400,
+        )
+        with _slow_lock:
+            if len(_slow_starts) < MAX_SLOW_STARTS_KEPT:
+                _slow_starts.append(text)
+        print(f"dromond: slow start, {text}", file=sys.stderr)
+    except Exception:  # noqa: BLE001, S110
+        # A record must not disturb the start it describes.
+        pass
+
+
 def _begin(
     argv: _Argv,
     options: dict[str, Any],
@@ -884,13 +1083,17 @@ def _begin(
     def target() -> None:
         outcome: subprocess.Popen[Any] | BaseException
         _enter(handoff)
+        _fork_slot.current = handoff.fork
         try:
             outcome = subprocess.Popen(argv, **options)  # noqa: S603
         except BaseException as error:  # noqa: BLE001
             # Carried to the caller, which decides what it means.
             outcome = error
         finally:
+            _fork_slot.current = None
+            handoff.ended = time.monotonic()
             _leave(handoff)
+        _note_slow_start(handoff, name, outcome)
         # The descriptors are closed here, once the start has ended, not by a caller
         # that was told the start stalled, who would close them under a late start.
         _close_all(close_after)

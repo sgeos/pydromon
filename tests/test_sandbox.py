@@ -3,6 +3,7 @@
 import os
 import asyncio
 import json
+from collections.abc import Iterable
 from pathlib import Path
 from typing import cast
 
@@ -44,6 +45,20 @@ ROOT = Path("/work/project")
 STATE = ROOT / ".dromon"
 RUN = Path("/tmp/dr-run")  # noqa: S108
 PROTECTED = (STATE, RUN)
+
+
+def with_real(paths: Iterable[str]) -> list[str]:
+    """What ``effective`` gives for ``paths``, derived here and not pinned, since a
+    path such as macOS's ``/tmp`` is a link and gains its real form there and not on
+    Linux. Round 16, item 5."""
+    forms: set[str] = set()
+    for path in paths:
+        forms.add(path)
+        expanded = os.path.expanduser(path)
+        if expanded.startswith("/"):
+            forms.add(os.path.realpath(expanded))
+    return sorted(forms)
+
 
 FULL: dict[str, object] = {
     "enabled": True,
@@ -231,8 +246,8 @@ def test_an_enabled_sandbox_gets_unattended_defaults_and_protection() -> None:
         "allowUnsandboxedCommands": False,
         "network": {"strictAllowlist": True},
         "filesystem": {
-            "denyRead": sorted(str(p) for p in PROTECTED),
-            "denyWrite": sorted(str(p) for p in PROTECTED),
+            "denyRead": with_real(str(p) for p in PROTECTED),
+            "denyWrite": with_real(str(p) for p in PROTECTED),
         },
     }
 
@@ -255,11 +270,11 @@ def test_relative_paths_resolve_against_the_project_root() -> None:
     settings = effective(sandbox(FULL), ROOT, PROTECTED)
     assert settings is not None
     filesystem = cast(dict[str, list[str]], settings["filesystem"])
-    assert filesystem["denyWrite"] == sorted(
+    assert filesystem["denyWrite"] == with_real(
         [str(ROOT / "secret"), *(str(p) for p in PROTECTED)]
     )
-    assert filesystem["allowRead"] == [str(ROOT)]
-    assert filesystem["allowWrite"] == ["/tmp/build", "~/.kube"]  # noqa: S108
+    assert filesystem["allowRead"] == with_real([str(ROOT)])
+    assert filesystem["allowWrite"] == with_real(["/tmp/build", "~/.kube"])  # noqa: S108
 
 
 def test_a_disabled_sandbox_is_passed_without_defaults_or_protection() -> None:
@@ -592,3 +607,73 @@ def test_a_live_sandboxed_line_writes_in_the_project_but_not_at_home(
         assert not outside.exists(), "the sandbox let a command write at home"
     finally:
         outside.unlink(missing_ok=True)
+
+
+# Round 16, item 5. A worktree that is a link to another volume.
+
+
+def linked_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    """A real directory on one side and a link to it on the other, as a worktree kept
+    on another volume and reached through a link is."""
+    real = tmp_path / "volume" / "worktree"
+    real.mkdir(parents=True)
+    link = tmp_path / "project" / "worktree"
+    link.parent.mkdir()
+    link.symlink_to(real, target_is_directory=True)
+    return link, real.resolve()
+
+
+def test_a_working_directory_that_is_a_link_is_granted_by_its_real_path(
+    tmp_path: Path,
+) -> None:
+    link, real = linked_worktree(tmp_path)
+    settings = effective(sandbox({"enabled": True}), link, ())
+    assert settings is not None
+    filesystem = cast(dict[str, list[str]], settings["filesystem"])
+    assert filesystem["allowWrite"] == [str(real)]
+
+
+def test_a_working_directory_that_is_not_a_link_adds_no_grant(tmp_path: Path) -> None:
+    plain = tmp_path.resolve() / "plain"
+    plain.mkdir()
+    settings = effective(sandbox({"enabled": True}), plain, ())
+    assert settings is not None
+    assert "allowWrite" not in cast(dict[str, object], settings["filesystem"])
+
+
+def test_a_listed_path_that_is_a_link_keeps_both_forms(tmp_path: Path) -> None:
+    link, real = linked_worktree(tmp_path)
+    document = {
+        "enabled": True,
+        "filesystem": {"allowWrite": [str(link)], "denyWrite": [str(link / "keep")]},
+    }
+    settings = effective(sandbox(document), tmp_path.resolve(), ())
+    assert settings is not None
+    filesystem = cast(dict[str, list[str]], settings["filesystem"])
+    assert filesystem["allowWrite"] == sorted([str(link), str(real)])
+    # A deny keeps binding where the sandbox follows the link, even to a path that does
+    # not exist yet, which resolves as far as it can.
+    assert filesystem["denyWrite"] == sorted([str(link / "keep"), str(real / "keep")])
+
+
+def test_a_protected_directory_reached_through_a_link_is_denied_by_both_forms(
+    tmp_path: Path,
+) -> None:
+    link, real = linked_worktree(tmp_path)
+    settings = effective(sandbox({"enabled": True}), tmp_path.resolve(), (link,))
+    assert settings is not None
+    filesystem = cast(dict[str, list[str]], settings["filesystem"])
+    for name in ("denyRead", "denyWrite"):
+        assert filesystem[name] == sorted([str(link), str(real)])
+
+
+def test_a_deny_for_the_working_directory_still_wins_over_the_real_grant(
+    tmp_path: Path,
+) -> None:
+    link, real = linked_worktree(tmp_path)
+    document = {"enabled": True, "filesystem": {"denyWrite": [str(link)]}}
+    settings = effective(sandbox(document), link, ())
+    assert settings is not None
+    filesystem = cast(dict[str, list[str]], settings["filesystem"])
+    assert str(real) in filesystem["allowWrite"]
+    assert str(real) in filesystem["denyWrite"]

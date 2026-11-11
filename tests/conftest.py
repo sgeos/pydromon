@@ -1,8 +1,10 @@
 """Fixtures shared across the test suite."""
 
 import gc
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -482,8 +484,63 @@ def _stopped_scheduler_workers(monkeypatch: pytest.MonkeyPatch) -> Iterator[None
     assert not left, f"{len(left)} process worker threads outlived the test"
 
 
+SLOW_TEST_SECONDS = 5.0
+"""A test at least this long is named in the run's output, as it ends."""
+SLOW_STARTS_SEEN: list[str] = []
+"""Every start that took ``spawn.SLOW_START_SECONDS`` or more in any test, with the
+test's name. **Round 16.** The runs on Linux in continuous integration were slow and
+hung in places no one could see, and this list is printed at the end of a run, whether
+it passed or not, so the next run shows which starts were slow and how loaded the
+machine was."""
+
+
+STRESS_NOTES: list[str] = []
+"""One line for each run of ``tests/test_spawn_stress.py``, printed with the slow
+starts at the end of the run."""
+
+
+def pytest_terminal_summary(terminalreporter: Any) -> None:  # noqa: ANN401
+    if STRESS_NOTES:
+        terminalreporter.section("child start stress", sep="=")
+        for line in STRESS_NOTES:
+            terminalreporter.write_line(line)
+    if not SLOW_STARTS_SEEN:
+        return
+    terminalreporter.section("slow child starts", sep="=")
+    for line in SLOW_STARTS_SEEN[:200]:
+        terminalreporter.write_line(line)
+    if len(SLOW_STARTS_SEEN) > 200:
+        terminalreporter.write_line(f"... and {len(SLOW_STARTS_SEEN) - 200} more")
+
+
+def _show_now(lines: list[str], request: pytest.FixtureRequest) -> None:
+    """Write ``lines`` to the real terminal at once, past pytest's capture, so that a
+    run that later hangs and is killed has already shown them, as its summary will
+    not. Never raises."""
+    if not lines:
+        return
+    try:
+        manager: Any = request.config.pluginmanager.getplugin("capturemanager")
+        with manager.global_and_fixture_disabled():
+            for line in lines[:5]:
+                print(f"slow child start in {line}", file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
+def slow_test_line(current: str, took: float) -> str | None:
+    """The line that names a test that took ``SLOW_TEST_SECONDS`` or more, with the
+    load of the machine, or ``None`` for a quicker one."""
+    if took < SLOW_TEST_SECONDS:
+        return None
+    machine = spawn._machine_text()  # pyright: ignore[reportPrivateUsage]
+    return f"{current}: slow test, {took:.1f}s, {machine}"
+
+
 @pytest.fixture(autouse=True)
-def _isolated_spawn_state(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolated_spawn_state(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Iterator[None]:
     """Every test starts with no stranded start, and the real list is put back when it
     ends. **Round 15.** ``dromon.spawn`` counts the starts that stalled past its bound
     in one list for the whole process. Under load a real ``git`` start can stall past
@@ -500,6 +557,23 @@ def _isolated_spawn_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(spawn, "_active", set[Any]())
     monkeypatch.setattr(spawn, "_watched", set[Any]())
     monkeypatch.setattr(spawn, "_armed", None)
+    # Round 16. The slow starts of this test, handed to the run's summary at its end.
+    own: list[str] = []
+    monkeypatch.setattr(spawn, "_slow_starts", own)
+    current = os.environ.get("PYTEST_CURRENT_TEST", "a test").split(" ")[0]
+    began = time.monotonic()
+    yield
+    lines = [f"{current}: {line}" for line in own]
+    # Round 16. A test that took long is named at once, past capture, because a run
+    # that is later killed by its timeout lists nothing at its end. On 2026-11-11 a
+    # Linux run spent three minutes in a file that takes under a second elsewhere, and
+    # the log could not say which test, since a file's line is written only when the
+    # next file begins.
+    slow = slow_test_line(current, time.monotonic() - began)
+    if slow is not None:
+        lines.append(slow)
+    SLOW_STARTS_SEEN.extend(lines)
+    _show_now(lines, request)
 
 
 class StalledStart:

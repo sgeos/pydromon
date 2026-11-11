@@ -795,6 +795,147 @@ def test_importing_the_module_turns_vfork_off_on_linux() -> None:
         assert now == was, "nothing is changed where vfork is not used"
 
 
+def test_proc_children_give_their_processor_time(tmp_path: Path) -> None:
+    """The ``utime`` and ``stime`` of ``stat``, twelfth and thirteenth after the
+    program name, are shown in milliseconds, which tells a child that waits from one
+    that spins."""
+    make_proc(tmp_path, {"100": ("git", "S 50", "/usr/bin/git", None)})
+    tail = " ".join(["0"] * 9 + ["250", "150"] + ["0"] * 20)
+    (tmp_path / "100" / "stat").write_text(f"100 (git) S 50 {tail}")
+    per_second = os.sysconf("SC_CLK_TCK")
+    found = spawn._proc_children(tmp_path, 50)  # pyright: ignore[reportPrivateUsage]
+    assert [c.cpu for c in found] == [f"cpu {400 * 1000 // per_second}ms"]
+    assert f"cpu {400 * 1000 // per_second}ms" in spawn._children_text(found)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_stat_without_times_gives_no_processor_time(tmp_path: Path) -> None:
+    make_proc(tmp_path, {"100": ("git", "S 50", "/usr/bin/git", None)})
+    found = spawn._proc_children(tmp_path, 50)  # pyright: ignore[reportPrivateUsage]
+    assert [c.cpu for c in found] == [None]
+
+
+# The ledger of slow starts and the figures a stall report gives, round 16.
+
+
+def test_a_slow_start_is_recorded_with_where_the_time_went(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(spawn, "SLOW_START_SECONDS", 0.0)
+    child = spawn.start(TRUE)
+    child.wait(10)
+    notes = spawn.slow_starts()
+    assert len(notes) == 1
+    note = notes[0]
+    assert note.startswith("sh ok after ")
+    assert "waiting for the fork lock" in note and "in the fork call" in note
+    assert "starts overlapped" in note and "threads" in note
+    assert f"dromond: slow start, {note}" in capsys.readouterr().err
+    spawn.clear_slow_starts()
+    assert spawn.slow_starts() == []
+
+
+def test_a_start_under_the_slow_threshold_is_not_recorded() -> None:
+    spawn.start(TRUE).wait(10)
+    assert spawn.slow_starts() == []
+
+
+def test_a_slow_start_that_fails_is_recorded_as_the_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(spawn, "SLOW_START_SECONDS", 0.0)
+    with pytest.raises(FileNotFoundError):
+        spawn.start(["/nonexistent/program"])
+    assert [n.split(" after ")[0] for n in spawn.slow_starts()] == [
+        "program FileNotFoundError"
+    ]
+    spawn.clear_slow_starts()
+
+
+def test_the_ledger_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(spawn, "SLOW_START_SECONDS", 0.0)
+    monkeypatch.setattr(spawn, "MAX_SLOW_STARTS_KEPT", 3)
+    for _ in range(5):
+        spawn.start(TRUE).wait(10)
+    assert len(spawn.slow_starts()) == 3
+    spawn.clear_slow_starts()
+
+
+def test_a_ledger_that_fails_does_not_disturb_the_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(spawn, "SLOW_START_SECONDS", 0.0)
+
+    def broken(proc: Path = Path("/proc")) -> str:
+        raise RuntimeError("no figures")
+
+    monkeypatch.setattr(spawn, "_machine_text", broken)
+    assert spawn.start(TRUE).wait(10) == 0
+    assert spawn.slow_starts() == []
+
+
+def test_the_fork_text_says_whether_the_fork_call_has_returned() -> None:
+    handoff = spawn._Handoff()  # pyright: ignore[reportPrivateUsage]
+    text = spawn._fork_text  # pyright: ignore[reportPrivateUsage]
+    assert text(handoff) == "the thread has not reached the fork"
+    handoff.fork.requested = handoff.began + 0.5
+    assert "the lock was not yet taken" in text(handoff)
+    handoff.fork.acquired = handoff.began + 1.0
+    assert "the fork call has not returned" in text(handoff)
+    assert "+1.00s" in text(handoff)
+    handoff.fork.released = handoff.began + 2.5
+    assert "the fork call returned +2.50s" in text(handoff)
+
+
+def test_a_stall_before_the_fork_says_so(stalled: "StalledStart") -> None:
+    """The stand-in stalls before ``Popen`` forks, so the thread has not reached it."""
+    with pytest.raises(spawn.StartStalled) as caught:
+        spawn.start(SLEEP)
+    assert "the thread has not reached the fork" in str(caught.value)
+
+
+def test_a_real_fork_leaves_its_times_in_the_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[spawn._Handoff] = []  # pyright: ignore[reportPrivateUsage]
+    real = spawn._Handoff  # pyright: ignore[reportPrivateUsage]
+
+    def remember() -> spawn._Handoff:  # pyright: ignore[reportPrivateUsage]
+        made = real()
+        seen.append(made)
+        return made
+
+    monkeypatch.setattr(spawn, "_Handoff", remember)
+    spawn.start(TRUE).wait(10)
+    times = seen[0].fork
+    assert 0.0 < times.requested <= times.acquired <= times.released
+    assert seen[0].ended >= times.released
+
+
+def test_machine_text_gives_load_and_pressure_where_proc_has_them(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pressure").mkdir()
+    (tmp_path / "pressure" / "cpu").write_text(
+        "some avg10=1.50 avg60=0.00 avg300=0.00 total=1\n"
+    )
+    (tmp_path / "pressure" / "io").write_text(
+        "some avg10=42.25 avg60=9.00 avg300=1.00 total=9\n"
+        "full avg10=40.00 avg60=0.00 avg300=0.00 total=3\n"
+    )
+    text = spawn._machine_text(tmp_path)  # pyright: ignore[reportPrivateUsage]
+    assert "cpu wait 1.50%" in text and "io wait 42.25%" in text
+    assert "memory" not in text, "a file that is absent is left out"
+    assert text.startswith("load ") or text == "no load figures"
+
+
+def test_machine_text_survives_hostile_pressure_files(tmp_path: Path) -> None:
+    (tmp_path / "pressure").mkdir()
+    (tmp_path / "pressure" / "cpu").write_text("some avg10=\x1b[31m9\n")
+    (tmp_path / "pressure" / "io").write_text("garbage")
+    text = spawn._machine_text(tmp_path)  # pyright: ignore[reportPrivateUsage]
+    assert "\x1b" not in text and "io wait" not in text
+
+
 PS_TABLE = """\
     1     0 Ss   -      /sbin/launchd
   500     1 S    -      /opt/python3.15
@@ -902,10 +1043,44 @@ def test_the_real_libproc_shows_a_running_child_without_starting_a_process() -> 
         assert not isinstance(found, str), found
         mine = [c for c in found if c.pid == child.pid]
         assert mine and mine[0].program == "sleep" and mine[0].execed is True
-        assert mine[0].state in ("R", "S")
+        assert mine[0].state == "live", "a sleeping child is not shown as running"
+        assert mine[0].cpu is not None and "threads running" in mine[0].cpu
+        assert " pageins " in mine[0].cpu and " unix syscalls " in mine[0].cpu
+        assert " resident " in mine[0].cpu
     finally:
         child.kill()
         child.wait()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="needs macOS libproc")
+def test_libproc_tells_a_spinning_child_from_a_sleeping_one() -> None:
+    """**Round 16.** The state letter does not, as a plain sleeping child showed ``R``.
+    The processor time and the running threads do."""
+    spinner = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", "while True: pass"]
+    )
+    sleeper = spawn.start(SLEEP)
+    try:
+        # Both are read once the sleeper has settled, since a child that has just
+        # started is still running while it loads its program.
+        deadline = time.monotonic() + 10
+        by_pid: dict[int, spawn._Child] = {}  # pyright: ignore[reportPrivateUsage]
+        while time.monotonic() < deadline:
+            found = spawn._libproc_children(os.getpid())  # pyright: ignore[reportPrivateUsage]
+            assert not isinstance(found, str), found
+            by_pid = {c.pid: c for c in found}
+            if "0/1 threads running" in (
+                by_pid[sleeper.pid].cpu or ""
+            ) and "1/1 threads running" in (by_pid[spinner.pid].cpu or ""):
+                break
+            time.sleep(0.05)
+        assert "1/1 threads running" in (by_pid[spinner.pid].cpu or "")
+        assert "0/1 threads running" in (by_pid[sleeper.pid].cpu or "")
+    finally:
+        spinner.kill()
+        sleeper.kill()
+        spinner.wait()
+        sleeper.wait()
 
 
 def test_libproc_says_why_where_it_does_not_apply(
