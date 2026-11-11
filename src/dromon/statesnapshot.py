@@ -54,7 +54,7 @@ from dromon.model import Event, State
 FORMAT_VERSION: Final = 1
 """The version of the file's own layout."""
 
-STATE_VERSION: Final = 3
+STATE_VERSION: Final = 5
 """Raised by hand whenever applying an event comes to mean something else for a state
 of the same shape, since the shape digest cannot see that. **Review of 49236ad, item
 3.** ``tests/test_state_version.py`` fails when the types ``codec_digest`` covers, or

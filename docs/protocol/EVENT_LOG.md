@@ -835,3 +835,30 @@ with write access to the file, so the file's permissions are the security bounda
 - Compaction of long logs. Bounded start above builds a snapshot, which bounds the
   start's replay and not the memory the state holds, and the log is never compacted.
 - Migration between schema versions. Version 1 refuses every other version.
+
+## Round 16 closing diagnostics
+
+Fact. `line_turn_ended` may carry `closing_reason` beside its fixed failure cause
+and exception class. It is absent on older events and on non-exception failures.
+A failed event alone may carry it. Its maximum length is 240 characters with no
+ASCII control characters. Replay retains it in the latest failure status.
+
+Fact. The scheduler takes only the first exception line, masks credential patterns
+before truncating, replaces nonprinting characters, and applies the line disclosure
+screen and its budget before appending the event. A screening error, refusal or
+spent budget withholds the diagnostic and exception class. Ordinary and self-started exception paths
+use the same screen. Their activity and stderr failure notices no longer interpolate
+the original exception. The exception class retains its existing identifier bound and is screened together
+with the diagnostic. Snapshot state version 5 invalidates older snapshot caches.
+
+Limit. Credential masking recognizes documented patterns in `redact.py`. An unknown
+bare credential needs the project disclosure list to be withheld. The diagnostic
+is engine-originated data and grants no authority. Only the retained first line is
+screened. No later exception line or suffix beyond the bound is persisted in this
+field. Existing historical events and separate engine evidence files are unchanged.
+
+Rollback hazard. A daemon before this change refuses events carrying
+`closing_reason`. The first compatible commit is pending on
+`fix/r16-grok-continue`. The wire format version remains unchanged because this is
+an optional event field. A port must preserve the character bound and screening
+order rather than rely on Python exception formatting.

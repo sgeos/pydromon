@@ -43,6 +43,18 @@ PINS: tuple[tuple[int, str, str], ...] = (
         "1ed89a710b96536b115ace4a5ba7d4a40e54d561cbd6823c874af7bfbb946d46",
         "4c36dab8af2c877d5f0014b3e6cb484412012e63f49cfa53bef7cdbf0d13a746",
     ),
+    # Round 16 closing diagnostics and their latest-failure state.
+    (
+        4,
+        "0d981dc580b2ae31d6ef78463970ff3d361e88df8b426890f461e0941152aeb6",
+        "effad4f334ee47a1cd3ded3e2cb2ec7fd3e9a9ffa0ef707594ec68f8e092e93e",
+    ),
+    # Exercise a nonempty closing diagnostic in the replay scenario.
+    (
+        5,
+        "0d981dc580b2ae31d6ef78463970ff3d361e88df8b426890f461e0941152aeb6",
+        "b89dc47f8cd37f38962a4f1c9b5bd40c789ebfec2c97a6878ff3ad482f103d17",
+    ),
 )
 """Each ``STATE_VERSION`` with its ``codec_digest`` and its replay digest, oldest
 first, appended to and never edited."""

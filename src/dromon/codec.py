@@ -173,6 +173,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "failed",
         "failure",
         "failure_class",
+        "closing_reason",
     ),
     "task_noted": ("line_id", "message_id", "task_id", "status", "body"),
     "task_recorded": (
@@ -410,7 +411,13 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "message_sent": ("request", "asks_reply"),
     "message_acknowledged": ("reason",),
     "wake_scheduled": ("request",),
-    "line_turn_ended": ("unreported", "failed", "failure", "failure_class"),
+    "line_turn_ended": (
+        "unreported",
+        "failed",
+        "failure",
+        "failure_class",
+        "closing_reason",
+    ),
     "brief_set": ("workdir_dirty",),
     "lease_acquired": ("note",),
     "budget_stated": ("window",),
@@ -588,6 +595,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "failed": event.failed,
                 "failure": None if event.failure is None else event.failure.value,
                 "failure_class": event.failure_class,
+                "closing_reason": event.closing_reason,
             }
         case TaskRecorded():
             return "task_recorded", {
@@ -967,6 +975,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 if data["failure"] is None
                 else _member(data, "failure", FailureCause),
                 _optional_str(data, "failure_class"),
+                _optional_str(data, "closing_reason"),
             )
         case "task_recorded":
             return TaskRecorded(

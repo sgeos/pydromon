@@ -929,7 +929,17 @@ class LineTurnEnded:
     ``failure``, as ``check_failure_class`` bounds it, given only with ``failure``
     and only where one exists."""
 
+    closing_reason: str | None = None
+    """Credential-masked and disclosure-screened first exception line, at most
+    240 characters. Absent on old events or when screening withholds it."""
+
     def __post_init__(self) -> None:
+        if self.closing_reason is not None and (
+            self.failure is None
+            or len(self.closing_reason) > 240
+            or any(ord(char) < 32 or ord(char) == 127 for char in self.closing_reason)
+        ):
+            raise InvalidField("invalid closing_reason")
         check_id("line_id", self.line_id)
         if self.workdir_commit is not None:
             check_commit("workdir_commit", self.workdir_commit)
@@ -2564,6 +2574,7 @@ class Line:
     an operator can still ask why. **Round 15 follow-up of 2026-11-05.** ``None``
     when no turn failed, or when the latest failed one was logged before causes
     were, which ``line_status`` reads as unknown with ``failed``."""
+    last_closing_reason: str | None = None
     last_failure_class: str | None = None
     """The class behind ``last_failure``, where one was recorded."""
 
@@ -3515,6 +3526,7 @@ class State:
                         failed=True,
                         last_failure=event.failure,
                         last_failure_class=event.failure_class,
+                        last_closing_reason=event.closing_reason,
                     )
                 elif line.failed:
                     self.lines[event.line_id] = replace(line, failed=False)

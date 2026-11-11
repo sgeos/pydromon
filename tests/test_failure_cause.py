@@ -162,6 +162,7 @@ def assert_recorded(world: World, cause: FailureCause, error_class: str | None) 
     expected = {
         "cause": cause.value,
         "error_class": error_class,
+        "closing_reason": end.closing_reason,
         "current": world.log.state.lines["alpha"].failed,
     }
     assert world.status(detail=False)["last_failure"] == expected
@@ -206,6 +207,7 @@ def test_a_line_not_held_for_its_failure_shows_it_as_current(world: World) -> No
     assert world.status(detail=True)["last_failure"] == {
         "cause": "engine_error",
         "error_class": "RuntimeError",
+        "closing_reason": ENGINE_TEXT,
         "current": True,
     }
 
@@ -303,6 +305,7 @@ def test_the_failure_stays_shown_after_a_later_turn_clears_failed(
     assert world.status(detail=True)["last_failure"] == {
         "cause": "engine_closed",
         "error_class": "EngineClosed",
+        "closing_reason": ENGINE_TEXT,
         "current": False,
     }
 
@@ -329,6 +332,7 @@ def test_a_failure_logged_before_causes_reads_as_unknown(world: World) -> None:
     assert world.status(detail=True)["last_failure"] == {
         "cause": "unknown",
         "error_class": None,
+        "closing_reason": None,
         "current": True,
     }
 
@@ -432,3 +436,64 @@ def test_the_wire_refuses_a_cause_it_does_not_know() -> None:
     document["data"]["failure"] = "the engine's own words"
     with pytest.raises(DecodeError, match="failure has no value"):
         decode(json.dumps(document))
+
+
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ("transport vanished\nsecond line private", "transport vanished"),
+        ("x" * 240 + "hidden suffix", "x" * 240),
+        ("Authorization: Bearer abcdef123", "Authorization: *** ***"),
+        ("token=abcdef123", "token=***"),
+    ],
+)
+def test_closing_reason_is_bounded_and_masked(
+    world: World, message: str, expected: str
+) -> None:
+    world.actions["alpha"] = raising(EngineClosed(message))
+    world.turn()
+    end = last_end(world)
+    assert end.closing_reason == expected
+    assert decode(encode(end)) == end
+    assert "hidden suffix" not in encode(end)
+    assert "second line private" not in encode(end)
+    assert "abcdef123" not in encode(end)
+
+
+def test_closing_reason_withheld_when_screening_fails(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("screen unavailable")
+
+    monkeypatch.setattr(world.scheduler, "_screen_scratch", refuse)
+    world.actions["alpha"] = raising(EngineClosed("private diagnostic"))
+    world.turn()
+    assert last_end(world).closing_reason is None
+    assert "private diagnostic" not in encode(last_end(world))
+
+
+@pytest.mark.parametrize("text", ["x" * 241, "first\nsecond", "tab\there"])
+def test_closing_reason_contract(text: str) -> None:
+    with pytest.raises(InvalidField, match="closing_reason"):
+        LineTurnEnded(
+            "alpha", None, None, True, FailureCause.ENGINE_CLOSED, "EngineClosed", text
+        )
+
+
+def test_closing_reason_disclosure_is_withheld(world: World) -> None:
+    world.scheduler.set_disclosure_terms(("private diagnostic",))
+    world.actions["alpha"] = raising(EngineClosed("private diagnostic"))
+    world.turn()
+    assert last_end(world).closing_reason is None
+    assert "private diagnostic" not in encode(last_end(world))
+
+
+def test_exception_class_is_also_disclosure_screened(world: World) -> None:
+    world.scheduler.set_disclosure_terms(("engineclosed",))
+    world.actions["alpha"] = raising(EngineClosed("transport vanished"))
+    world.turn()
+    end = last_end(world)
+    assert end.closing_reason is None
+    assert end.failure_class is None
+    assert "EngineClosed" not in encode(end)

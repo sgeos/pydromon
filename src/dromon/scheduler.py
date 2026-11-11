@@ -11786,6 +11786,7 @@ class Scheduler:
         stop_cause: str | None = None
         engine: LineEngine | None = None
         started = False
+        closing_error: BaseException | None = None
         failure: tuple[FailureCause, str | None] | None = None
         mailed = self._operator_mail(line_id)
         sent = self._line_mail(line_id)
@@ -11880,8 +11881,9 @@ class Scheduler:
             self._failed.add(line_id)
             if isinstance(error, EngineRefused):
                 stop_cause = str(error)
-            ending = f"failed: {error}"
+            ending = "failed"
             failed = True
+            closing_error = error
             failure = raised_failure(
                 error,
                 started=started,
@@ -11889,7 +11891,7 @@ class Scheduler:
                 interrupted=line_id in self._interrupted,
             )
             breached = isinstance(error, ConfinementBreach)
-            print(f"dromond: line {line_id} turn failed: {error}", file=sys.stderr)
+            print(f"dromond: line {line_id} turn failed", file=sys.stderr)
         finally:
             self._end_token(line_id, engine)
             self.collect_left()
@@ -11920,7 +11922,7 @@ class Scheduler:
                 # Round 8 review, ON1. With no report the prompt may never have
                 # reached the engine, as when it could not be composed, so the turn
                 # retires none of the notes delivered into it.
-                self._end_turn(line_id, report, failure)
+                self._end_turn(line_id, report, failure, closing_error)
             if stop_cause is not None and line is not None:
                 self._note_engine_stop(line_id, stop_cause)
             # A handoff asked for in the turn takes effect now that it has ended,
@@ -11938,11 +11940,31 @@ class Scheduler:
             self._hold_failed(line_id, ending, breached)
         self.fail_over_if_unable(line_id)
 
+    def _closing_reason(self, line_id: str, error: BaseException | None) -> str | None:
+        """Keep only a bounded, screened diagnostic. Screening failure withholds it.
+
+        Screening uses the line disclosure budget so repeated failures cannot act
+        as an unmetered oracle. Mask before truncating to avoid partial credentials.
+        """
+        if error is None:
+            return None
+        try:
+            text = redact.mask(str(error).split("\n", 1)[0])
+            text = "".join(char if char.isprintable() else " " for char in text)[:240]
+            screened = type(error).__name__ + "\n" + text
+            self._screen_scratch(
+                line_id, "closing_reason", screened, len(screened.encode())
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        return text or None
+
     def _end_turn(
         self,
         line_id: str,
         report: TurnReport | None,
         failure: tuple[FailureCause, str | None] | None,
+        closing_error: BaseException | None = None,
     ) -> None:
         """Record ``line_turn_ended`` for a turn of ``line_id``, with the cause of its
         failure if it failed, and write that cause to the daemon log. **Round 15
@@ -11951,6 +11973,11 @@ class Scheduler:
         failed = line_id in self._failed
         if failed and failure is None:
             failure = (FailureCause.UNKNOWN, None)
+        closing_reason = (
+            self._closing_reason(line_id, closing_error) if failed else None
+        )
+        if closing_error is not None and closing_reason is None and failure is not None:
+            failure = (failure[0], None)
         self._log.append(
             LineTurnEnded(
                 line_id,
@@ -11959,6 +11986,7 @@ class Scheduler:
                 True if failed else None,
                 failure[0] if failed and failure is not None else None,
                 failure[1] if failed and failure is not None else None,
+                closing_reason,
             )
         )
         if failed and failure is not None:
@@ -13262,6 +13290,7 @@ class Scheduler:
         error: Exception | None = None
         ending = "cancelled"
         failed = False
+        closing_error: BaseException | None = None
         failure: tuple[FailureCause, str | None] | None = None
         engine = self._engines.get(line_id)
         try:
@@ -13283,7 +13312,8 @@ class Scheduler:
                 else:
                     self._failed.add(line_id)
                     failed = True
-                    ending = f"failed: {error}"
+                    ending = "failed"
+                    closing_error = error
                     failure = raised_failure(
                         error,
                         started=True,
@@ -13291,7 +13321,7 @@ class Scheduler:
                         interrupted=line_id in self._interrupted,
                     )
                     print(
-                        f"dromond: line {line_id} self-started turn failed: {error}",
+                        f"dromond: line {line_id} self-started turn failed",
                         file=sys.stderr,
                     )
             elif report is not None:
@@ -13331,7 +13361,8 @@ class Scheduler:
             error = unexpected
             self._failed.add(line_id)
             failed = True
-            ending = f"failed: {unexpected}"
+            ending = "failed"
+            closing_error = unexpected
             failure = raised_failure(
                 unexpected,
                 started=True,
@@ -13339,7 +13370,7 @@ class Scheduler:
                 interrupted=line_id in self._interrupted,
             )
             print(
-                f"dromond: line {line_id} self-started turn failed: {unexpected}",
+                f"dromond: line {line_id} self-started turn failed",
                 file=sys.stderr,
             )
         finally:
@@ -13362,7 +13393,7 @@ class Scheduler:
             if line is not None:
                 # Round 8 review, ON1, as in ``_turn``. An engine turn that failed or
                 # was cancelled before it reported retires none of its task notes.
-                self._end_turn(line_id, report, failure)
+                self._end_turn(line_id, report, failure, closing_error)
             self._settle_relinquish(line_id)
             self._work.set()
         self._apply_limits(line_id, TurnCause.AUTONOMOUS, True, report)
@@ -14121,6 +14152,7 @@ def failure_view(line: Line) -> dict[str, object] | None:
     return {
         "cause": (line.last_failure or FailureCause.UNKNOWN).value,
         "error_class": line.last_failure_class,
+        "closing_reason": line.last_closing_reason,
         "current": line.failed,
     }
 

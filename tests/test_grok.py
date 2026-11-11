@@ -1547,7 +1547,7 @@ def test_the_session_carries_dromons_tools_instructions_and_ask_mode(
     ]
     assert session["_meta"]["yoloMode"] is False
     assert session["_meta"]["autoMode"] is False
-    assert session["_meta"]["rules"] == "Contents of RULES.md:\n\nBe careful."
+    assert session["_meta"]["rules"].startswith("Contents of RULES.md:\n\nBe careful.")
 
 
 def test_the_next_turn_loads_the_session(project: tuple[Path, Path, Path]) -> None:
@@ -2990,7 +2990,7 @@ def test_a_grok_built_in_is_counted_as_the_line_tool_that_permits_it(
     assert run(line(server, project, config=given)).tool_uses == ("Read",)
 
 
-@pytest.mark.parametrize("name", ["read_file", "spawn_subagent", "ask_user_question"])
+@pytest.mark.parametrize("name", ["read_file", "ask_user_question"])
 def test_a_grok_tool_the_line_was_not_given_is_refused(
     project: tuple[Path, Path, Path], name: str
 ) -> None:
@@ -3702,7 +3702,7 @@ def test_unavailable_advertised_tool_is_denied_individually(
             chunk("continued"),
         ]
     )
-    if not_run:
+    if not_run or name in grok_module.HOOK_DENIED_TOOLS:
         report = run(line(server, project))
         assert report.text == "continued"
         assert report.tool_uses == ("dromon__send_message",)
@@ -3743,6 +3743,10 @@ def test_rejection_without_later_update_holds_and_names_tool(
     project: tuple[Path, Path, Path], name: str
 ) -> None:
     server = FakeGrok([grok_permission(_meta=grok_meta(name)), chunk("ended")])
+    if name in grok_module.HOOK_DENIED_TOOLS:
+        assert run(line(server, project)).text == "ended"
+        assert "session/cancel" not in server.methods()
+        return
     with pytest.raises(EngineRefused, match="rejected tool call did not run: " + name):
         run(line(server, project))
     assert server.methods().count("session/cancel") == 1
@@ -3802,7 +3806,7 @@ def test_refused_replacement_is_cached_before_a_successful_retry(
     project: tuple[Path, Path, Path], preflight: bool
 ) -> None:
     server = FakeGrok(
-        [grok_call("todo_write")], servers=None if preflight else DROMON_ONLY
+        [grok_call("web_fetch")], servers=None if preflight else DROMON_ONLY
     )
     target = line(server, project, session_id="old:rules-incorrect")
     with pytest.raises(EngineRefused):
@@ -3852,9 +3856,9 @@ def test_unconfirmed_rejection_is_named_when_prompt_fails(
                         }
                     )
 
-    server = FailsAfterRejection([grok_permission(_meta=grok_meta("todo_write"))])
+    server = FailsAfterRejection([grok_permission(_meta=grok_meta("web_fetch"))])
     with pytest.raises(
-        EngineRefused, match="rejected tool call did not run: todo_write"
+        EngineRefused, match="rejected tool call did not run: web_fetch"
     ):
         run(line(server, project))
 
@@ -4128,3 +4132,47 @@ def test_start_check_rejects_a_wrong_grok_model_without_a_prompt(
         asyncio.run(line(server, project).check_start())
     assert "session/prompt" not in server.methods()
     assert server.stops == 1
+
+
+@pytest.mark.parametrize("name", grok_module.HOOK_DENIED_TOOLS)
+@pytest.mark.parametrize("fields", [{}, {"status": "pending"}, {"status": "failed"}])
+def test_fixed_hook_notice_allows_following_model_output(
+    project: tuple[Path, Path, Path], name: str, fields: dict[str, object]
+) -> None:
+    server = FakeGrok([grok_call(name), call_update("t", **fields), chunk("continued")])
+    assert run(line(server, project)).text == "continued"
+    assert "session/cancel" not in server.methods()
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"status": "completed"},
+        {"status": "in_progress"},
+        {"rawOutput": "effect"},
+        {"content": [{"type": "text", "text": "effect"}]},
+    ],
+)
+@pytest.mark.parametrize("initial", [False, True])
+def test_fixed_hook_execution_evidence_cancels(
+    project: tuple[Path, Path, Path], fields: dict[str, object], initial: bool
+) -> None:
+    first = grok_call("monitor")
+    if initial:
+        first["params"]["update"].update(fields)
+        notices = [first]
+    else:
+        notices = [first, call_update("t", **fields)]
+    server = FakeGrok(notices)
+    with pytest.raises(EngineRefused, match="started a tool"):
+        run(line(server, project))
+    assert "session/cancel" in server.methods()
+
+
+def test_reports_instruction_uses_inline_scratch(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok()
+    run(line(server, project))
+    rules = server.params("session/new")["_meta"]["rules"]
+    assert "write_scratch called through use_tool with inline tool_input" in rules

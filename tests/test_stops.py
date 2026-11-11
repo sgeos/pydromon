@@ -734,8 +734,11 @@ def test_a_kill_all_turn_is_refused_where_the_table_cannot_be_walked(
     assert asked == [1]
     ending = activity(world)[-1]
     assert ending[0] is ActivityKind.TURN_ENDED
-    assert ending[1].startswith("failed: the line's stop policy is kill_all")
-    assert ending[1].endswith("ps cannot be run: denied")
+    assert ending[1] == "failed"
+    reason = world.log.state.lines["alpha"].last_closing_reason
+    assert reason is not None
+    assert reason.startswith("the line's stop policy is kill_all")
+    assert reason.endswith("ps cannot be run: denied")
 
 
 def test_a_leave_background_turn_needs_no_walk(
@@ -846,7 +849,9 @@ def test_a_failed_turn_without_operator_mail_is_held_with_its_cause(
     assert world.scheduler.condition("alpha") == "held"
     assert line.held_by is not None
     body = world.log.state.messages[line.held_by].body
-    assert "failed: the engine broke" in body
+    assert "failed" in body
+    assert "the engine broke" not in body
+    assert line.last_closing_reason == "the engine broke"
     assert "sent no operator mail during it" in body
 
 
@@ -872,7 +877,8 @@ def test_a_confinement_breach_holds_the_line_even_after_operator_mail(
     assert line.held_by is not None
     body = world.log.state.messages[line.held_by].body
     assert "confinement breach" in body
-    assert "a Read completed without the ViewImage hook" in body
+    assert "a Read completed without the ViewImage hook" not in body
+    assert line.last_closing_reason == "a Read completed without the ViewImage hook"
     assert "sent no operator mail" not in body
 
 
@@ -923,7 +929,8 @@ def test_a_failure_s_quoted_cause_is_cut(worlds: Callable[..., World]) -> None:
     held = world.log.state.lines["alpha"].held_by
     assert held is not None
     body = world.log.state.messages[held].body
-    assert "x" * (MAX_FAILURE_TEXT - 20) in body
+    assert "x" * 240 not in body
+    assert world.log.state.lines["alpha"].last_closing_reason == "x" * 240
     assert "x" * (MAX_FAILURE_TEXT + 1) not in body
 
 

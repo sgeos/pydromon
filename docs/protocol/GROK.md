@@ -1043,3 +1043,41 @@ Fact. `dromon check-engines` checks this home and launches Grok through its ordi
 startup path, then closes after a fresh session passes its model and server checks.
 No `session/prompt` is sent. Run this outside engine sandboxes after replacement
 and before restarting. A startup check does not verify a model response.
+
+## Round 16 hook continuation and report arguments
+
+Fact. The adapter now waits for the generated PreToolUse hook for exactly the
+names in its matcher. An initial announcement, pending notice or failed status
+for those names permits the turn to continue. A permission request is still
+rejected. These calls need no separate `toolNotRun` confirmation. A reported
+`in_progress` or `completed` status, or nonempty content or raw output, cancels
+the turn even if non-execution metadata is also present. Output may be a denial
+explanation, so this conservative check may still stop a denied call. Tools outside
+that matcher retain the existing cancellation and rejection-confirmation rules.
+Identity changes and malformed protocol exchanges retain their existing stops.
+
+Fact. The matcher and adapter share one list to prevent coverage drift. Scripted
+tests cover each matched tool, continuation, execution evidence on the first notice
+and later updates, and uncovered tools. The operator previously observed a fixed
+hook denial of `todo_write`. Continued model turns under this new adapter have not
+been verified live. Hook errors still fail open inside Grok. Inference. A completed
+call without any execution notice could escape detection. This adapter cannot undo
+effects that occur before a notice arrives.
+
+Fact. On 2026-11-11 the bundled user guides were checked again. Sections Tool
+Filtering and flags in `14-headless-mode.md` describe `--tools` and
+`--disallowed-tools` for headless and terminal modes. The agent options, Session
+config options and Session `_meta` options in `15-agent-mode.md` expose no tool
+list field. The latter documents `agentProfile` as a prompt and hook selection on
+the daemon route, without promising tool filtering. The `tools`, `toolset`, feature
+and agent entries in `26-config-reference.md`, and tool inheritance discussion in
+`16-subagents.md`, do not establish a per-session omission control for this ACP
+transport. Inference. There is no documented per-session tool omission control
+safe to use here. No new flag or metadata field is sent. Existing feature switches
+remain in use. This finding does not establish that an undocumented control is absent.
+
+Fact. Every Grok session receives a brief rule directing reports through
+`write_scratch`, called through `use_tool` with inline `tool_input` arguments.
+The session digest includes a report-rule version so existing sessions renew.
+File-backed arguments retain their existing refusal. No live engine or paid probe
+was run for this change.
