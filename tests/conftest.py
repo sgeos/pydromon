@@ -409,8 +409,39 @@ REOPEN_DEPTH = 6
 """How far below a directory ``reopen_directories`` looks."""
 
 
+def owned_by_running_pytest(base: Path) -> bool:
+    """Whether ``base``, a numbered directory of the pytest base, belongs to a pytest
+    that is still running. **Round 16 review, point 4.** Pytest writes its process
+    identifier to ``.lock`` in the directory it makes and removes it as it exits, so a
+    lock naming a live process is a running session, and one naming a process that is
+    gone, or no lock, is a session that is over. A process that cannot be signalled
+    for want of permission exists, and is kept as running. A lock that is not an
+    identifier names no process. Pytest's own lock is the evidence, and not an age,
+    since a gate can run for an hour."""
+    try:
+        text = (base / ".lock").read_text()
+    except OSError:
+        return False
+    try:
+        pid = int(text.strip())
+    except ValueError:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def reopen_directories(
-    root: Path, depth: int = REOPEN_DEPTH, skip: Path | None = None
+    root: Path,
+    depth: int = REOPEN_DEPTH,
+    skip: Path | None = None,
+    keep: Callable[[Path], bool] | None = None,
 ) -> int:
     """Give the owner full access to every directory of this user below ``root``, down
     to ``depth`` levels, and return how many were changed. **Round 16.** A test that
@@ -420,7 +451,9 @@ def reopen_directories(
     of 2026-11-04 in the worktree test of an unreadable directory, found on 2026-11-11.
     Symbolic links are neither followed nor changed, a path that
     cannot be changed is left, ``skip`` is not entered, and the walk is bounded by
-    ``depth``."""
+    ``depth``. A directory for which ``keep`` is true is neither changed nor entered,
+    so a parallel session's deliberately unreadable test directory is not restored
+    under it."""
     changed = 0
     pending = [(root, depth)]
     uid = os.getuid()
@@ -433,6 +466,8 @@ def reopen_directories(
         for entry in entries:
             try:
                 if not entry.is_dir(follow_symlinks=False):
+                    continue
+                if keep is not None and keep(Path(entry.path)):
                     continue
                 mode = entry.stat(follow_symlinks=False)
                 if mode.st_uid != uid:
@@ -452,9 +487,12 @@ def _reopen_old_temporary_directories(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
     """Repair what an earlier killed session left, before pytest deletes it at the
-    end of this one. The current session's own base is left alone."""
+    end of this one. The current session's own base is left alone, and so is the base of
+    any other pytest that is running, which a parallel gate of the same user is."""
     current = tmp_path_factory.getbasetemp()
-    reopen_directories(current.parent, REOPEN_DEPTH + 1, skip=current)
+    reopen_directories(
+        current.parent, REOPEN_DEPTH + 1, skip=current, keep=owned_by_running_pytest
+    )
 
 
 @pytest.fixture(autouse=True)

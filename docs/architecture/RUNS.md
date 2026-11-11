@@ -353,6 +353,13 @@ alone. **Why the split gives a line nothing new.** A line that prints a candidat
 its output chooses which part holds it, so which part was withheld is only what it
 placed there, and each probe still costs a failing check.
 
+**Round 16 review, point 5, the join.** A term can span the join of the note, or the
+notice, and the clean summary that follows it, which neither holds alone, and the
+recorded text then held it. The joined text is screened too, and a summary that completes
+a term in it is withheld as one that holds a term, with the same count. **Residual.** The
+join of the note and a withheld notice is not screened again, since the notice is fixed
+text and a listed term would have to be made of it.
+
 A withholding is the same answer a check gives, so it counts as a failing check of the
 line that started the run, which a line printing candidates in its output could
 otherwise use to test them outside the check's limit. A line that has spent its failing
@@ -401,11 +408,32 @@ treated as `elevated` and reported as what it is, so a monitor that stopped is s
 is not taken for a healthy machine. **Decision of the feature, for review.** Nothing is
 read unless `daemon.machine_status` is set, because a machine without the monitor would
 otherwise defer every run for ever. A status that is on and then lost defers runs until
-the monitor returns or the operator unsets the key. The file is the monitor's own and
+the monitor returns or the operator unsets the key. **Round 16 review, point 1.** A dead
+monitor therefore closes every gate, which is kept, and the cause is named where the
+deferral is. The refusal of a run, the note to the operator, the note to a line and the
+warning a turn proceeds with each say that the monitor looks stopped, since when, and how
+the gates are restored. A stale file is dated by its last sample. A missing or unreadable
+one is dated by the daemon's first sight of it in the spell, which is all the daemon can
+know and which a restart resets. The operator restores the gates by restarting the
+monitor, or by removing `daemon.machine_status` from the project file and reloading, which
+reads nothing and defers nothing. `line_status` gives the same sentence as `monitor`. The file is the monitor's own and
 its reasons are untrusted text. Each is cut to a printable line of at most 160
 characters, at most eight are kept, and a status whose sentence holds a term of the
 disclosure list is not shown. The file's path is never put in a note or in
-`line_status`.
+`line_status`. **Round 16 review, point 2.** Each reason and the problem that
+`line_status` gives are screened one by one, and one that holds a term is replaced by a
+placeholder.
+
+**Round 16 review, point 3. No line writes the file.** Anything that could write the
+status file could lift or force the deferrals. Each line's sandbox denies writes to the
+file and, unless that directory is, holds or lies in the line's working directory, to its
+directory, and the built-in file tools are denied the same paths, with a rule for the file
+itself. The real path of a link is denied too. The file is read at each build, so a reload
+that names another file guards it from the next turn. A Codex line has its write
+protection extended in the same way. **Residual.** A line whose sandbox is disabled runs
+its shell as the operator and can write whatever the operator can, as for every protected
+path, and the other engines take no sandbox or settings, so the guard does not reach
+them. The file is no more protected from the operator's own processes than any other.
 
 **What it does not do.** It runs no command, so a machine without the monitor's tool
 needs nothing, and makes no call that needs the network. It does not read `load1` or

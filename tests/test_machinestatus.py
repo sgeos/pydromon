@@ -637,6 +637,7 @@ def test_line_status_in_detail_gives_the_status_without_a_path(rig: Rig) -> None
         "age_seconds": 10,
         "reasons": ["swap use is 17000 MB"],
         "problem": None,
+        "monitor": None,
         "defers_runs": True,
         "defers_turns": False,
     }
@@ -828,3 +829,134 @@ def test_a_reload_applies_the_key_and_the_settings_show_it(
         ask("reload_project")
         assert scheduler.machine_status() is None
         assert scheduler.machine_decision() == NO_DECISION
+
+
+# Round 16 review, point 1. A monitor that stopped is named where the deferral is.
+
+RESTORE = "restarting the monitor"
+SETTING = "removing daemon.machine_status"
+
+
+def test_a_stale_status_names_the_stopped_monitor_and_its_last_sample(rig: Rig) -> None:
+    configured(rig)
+    rig.write("ok", "none", age=STALE_SECONDS + 60)
+    sampled = START - timedelta(seconds=STALE_SECONDS + 60)
+    with pytest.raises(runs.RunRefused, match="deferred") as caught:
+        rig.start_run()
+    refusal = str(caught.value)
+    assert "monitor looks stopped" in refusal and "is stale" in refusal
+    assert f"last sample at {sampled:%Y-%m-%dT%H:%M:%SZ}" in refusal
+    assert RESTORE in refusal and SETTING in refusal
+    (to_operator,) = rig.harness_notes("@ana")
+    assert "monitor looks stopped" in to_operator and RESTORE in to_operator
+    assert SETTING in to_operator
+
+
+def test_a_missing_status_is_dated_by_the_daemons_first_sight(rig: Rig) -> None:
+    configured(rig)
+    with pytest.raises(runs.RunRefused):
+        rig.start_run()
+    rig.clock.now += timedelta(seconds=600)
+    rig.forget()
+    with pytest.raises(runs.RunRefused) as caught:
+        rig.start_run()
+    first = f"first saw it so at {START:%Y-%m-%dT%H:%M:%SZ}"
+    assert "its file is missing" in str(caught.value) and first in str(caught.value)
+    assert rig.scheduler.machine_status_view()["monitor"] == (
+        rig.scheduler._monitor_trouble(  # pyright: ignore[reportPrivateUsage]
+            MachineStatus("missing", problem="no file is there")
+        )
+    )
+
+
+def test_an_unreadable_status_is_named_the_same_way(rig: Rig) -> None:
+    configured(rig)
+    rig.status.write_text("not a status file\n")
+    with pytest.raises(runs.RunRefused) as caught:
+        rig.start_run()
+    assert "its file is unreadable" in str(caught.value) and RESTORE in str(
+        caught.value
+    )
+
+
+@pytest.mark.parametrize(
+    ("level", "reasons"),
+    [("ok", "none"), ("elevated", "swap use is 17000 MB"), ("critical", "swap use")],
+)
+def test_a_fresh_status_names_no_stopped_monitor(
+    rig: Rig, level: str, reasons: str
+) -> None:
+    configured(rig)
+    rig.write(level, reasons)
+    rig.mail()
+    rig.drain()
+    everything = [
+        *rig.prompts(),
+        *rig.harness_notes("@ana"),
+        *rig.harness_notes("alpha"),
+    ]
+    assert not any("monitor looks stopped" in text for text in everything)
+    assert rig.scheduler.machine_status_view()["monitor"] is None
+
+
+def test_a_turn_that_proceeds_on_a_stale_status_names_the_monitor(
+    rig: Rig,
+) -> None:
+    """A stale file only warns a turn, so a deferred turn needs a critical status,
+    and the cause is then absent. The warning a turn proceeds with names it."""
+    configured(rig)
+    rig.write("ok", "none", age=STALE_SECONDS + 60)
+    rig.mail()
+    rig.drain()
+    (prompt,) = rig.prompts()
+    assert "monitor looks stopped" in prompt and RESTORE in prompt
+
+
+def test_the_cause_goes_when_the_monitor_writes_again(rig: Rig) -> None:
+    configured(rig)
+    assert rig.scheduler.machine_status_view()["monitor"] is not None
+    rig.write("ok", "none")
+    rig.forget()
+    assert rig.scheduler.machine_status_view()["monitor"] is None
+    rig.status.unlink()
+    rig.clock.now += timedelta(seconds=30)
+    rig.forget()
+    again = rig.scheduler.machine_status_view()["monitor"]
+    assert isinstance(again, str)
+    assert f"first saw it so at {rig.clock.now:%Y-%m-%dT%H:%M:%SZ}" in again
+
+
+# Round 16 review, point 2. The monitor's text is screened where a line reads it.
+
+
+def test_the_reasons_a_line_reads_in_line_status_are_screened(
+    rig: Rig, tmp_path: Path
+) -> None:
+    from dromon.disclosure import load_terms
+    from dromon.scheduler import MACHINE_WITHHELD
+
+    (tmp_path / "terms").write_text("secretword\n")
+    rig.scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
+    configured(rig)
+    rig.write("elevated", "swap use is 17000 MB; a SecretWord in this one")
+    view = rig.scheduler.line_status("alpha", detail=True, lists=False)
+    shown = cast(dict[str, Any], view["machine_status"])
+    assert shown["reasons"] == ["swap use is 17000 MB", MACHINE_WITHHELD]
+    assert "secretword" not in str(view).casefold()
+
+
+def test_a_problem_holding_a_listed_term_is_withheld_in_line_status(
+    rig: Rig, tmp_path: Path
+) -> None:
+    from dromon.disclosure import load_terms
+    from dromon.scheduler import MACHINE_WITHHELD
+
+    (tmp_path / "terms").write_text("secretword\n")
+    rig.scheduler.set_disclosure_terms(load_terms(tmp_path / "terms"))
+    configured(rig)
+    rig.scheduler._machine_reader = (  # pyright: ignore[reportPrivateUsage]
+        lambda _path, _now: MachineStatus("unreadable", problem="a secretword failed")
+    )
+    shown = rig.scheduler.machine_status_view()
+    assert shown["problem"] == MACHINE_WITHHELD
+    assert "secretword" not in str(shown).casefold()

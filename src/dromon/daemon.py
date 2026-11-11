@@ -110,7 +110,15 @@ from dromon.eventlog import (
 from dromon.statesnapshot import snapshot_path
 from dromon.sealed import SealedStore, store_path
 from dromon.limits import DEFAULT_LIMITS, Limits
-from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
+from dromon.mailbox import (
+    MAX_PAGE,
+    listing,
+    outcome,
+    replied_ids,
+    sent,
+    summary,
+    unread_outside,
+)
 from dromon.lineconfig import (
     DEFAULT_CONFIG,
     ConfigError,
@@ -1388,9 +1396,23 @@ class Daemon:
             raise InvalidField(str(error)) from error
         replied = replied_ids(self.log.state, owner)
         counts = summary(self.log.state, owner, 0)
+        # Round 16. The page is the oldest matches from the offset, so the unread
+        # mail before it and after it is counted, and a reader of one page learns
+        # that more waits beyond it.
+        unread_before, unread_after = unread_outside(
+            self.log.state,
+            owner,
+            unread_only=unread_only,
+            sender=None if sender is None else parse_any_address(sender),
+            issues_only=issues_only,
+            offset=offset,
+            limit=limit,
+        )
         return {
             "total": total,
             **counts.counts(),
+            "unread_before": unread_before,
+            "unread_after": unread_after,
             "messages": [
                 {
                     "message_id": message_id,
@@ -4056,6 +4078,11 @@ def run(
                     read_only_paths=config.read_only_paths,
                     extra_protected=registry_protected(
                         paths, config.federation, registry_dir
+                    ),
+                    # Read at each build, so a reload that names another file guards
+                    # it from the next turn. The name is bound just below.
+                    machine_status_file=lambda: (
+                        None if scheduler is None else scheduler.machine_status_file
                     ),
                 ),
                 limits=limits,

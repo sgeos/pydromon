@@ -487,3 +487,57 @@ def test_an_unknown_task_id_still_names_the_run_choice(project: Path) -> None:
             )
         )
         assert error and "an open run of your scope" in text
+
+
+def screened(scheduler: Scheduler, finding: runs.Finding) -> tuple[str, str | None]:
+    return scheduler._screened_output("alpha", finding)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("with_tail", [False, True])
+def test_a_term_spanning_the_join_of_the_note_and_the_summary_is_withheld(
+    project: Path, with_tail: bool
+) -> None:
+    """Round 16 review, point 5. Neither the note nor the clean summary holds the
+    listed term, which the recorded text holds across the join between them, so the
+    joined text is screened too. The check counts as a failing one."""
+    joint = "unchanged" if with_tail else "code 1"
+    lead = runs.note_withheld("exited with code 1", runs.TAIL_WITHHELD)
+    note = lead if with_tail else "exited with code 1"
+    term = f"{joint}. {runs.SUMMARY_LABEL.split(',')[0]}"
+    finding = runs.Finding(
+        "r-1",
+        RunStatus.EXITED,
+        1,
+        "exited with code 1",
+        None,
+        None,
+        "1 failed, 5 passed",
+        "a line about codename" if with_tail else None,
+    )
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        (project / "terms").write_text(f"{term.casefold()}\n")
+        scheduler.set_disclosure_terms(load_terms(project / "terms"))
+        # Premise, which the test derives and does not assume: the term is in the
+        # joined text, and in neither of its two parts alone.
+        assert scheduler.discloses(runs.note_with_summary(note, finding.summary))
+        assert not scheduler.discloses(note, finding.summary or "")
+        if with_tail:
+            (project / "terms").write_text(f"{term.casefold()}\ncodename\n")
+            scheduler.set_disclosure_terms(load_terms(project / "terms"))
+        text, tail = screened(scheduler, finding)
+        assert runs.SUMMARY_LABEL not in text and "1 failed" not in text
+        assert tail is None or "codename" not in tail
+        assert len(log.state.disclosure_checks["alpha"]) == 1
+
+
+def test_a_clean_join_keeps_the_summary(project: Path) -> None:
+    finding = runs.Finding(
+        "r-1", RunStatus.EXITED, 0, "exited", None, None, "5 passed", None
+    )
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        listed(scheduler, project)
+        text, tail = screened(scheduler, finding)
+        assert "5 passed" in text and runs.SUMMARY_LABEL in text and tail is None
+        assert "alpha" not in log.state.disclosure_checks

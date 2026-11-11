@@ -322,8 +322,10 @@ and suggests `detail: true, lists: false` to omit the lists.
 
 **Round 16, item 3. The machine's status.** Where the project names a status file with
 `daemon.machine_status`, `line_status` in detail gives `machine_status`, with `configured`,
-`level`, `acted_on_as`, `age_seconds`, `reasons`, `problem`, `defers_runs` and
-`defers_turns`, never the file's path. `level` is `ok`, `elevated` or `critical`, or
+`level`, `acted_on_as`, `age_seconds`, `reasons`, `problem`, `monitor`, `defers_runs` and
+`defers_turns`, never the file's path. `reasons` and `problem` are screened against the
+disclosure list one by one. `monitor` is a sentence saying that the monitor looks stopped, since
+when and how the operator restores the gates, or `null` while the file is fresh. `level` is `ok`, `elevated` or `critical`, or
 `stale`, `missing` or `unreadable`, which are acted on as `elevated`. A line is affected in
 three ways, as [`RUNS.md`](../architecture/RUNS.md) sets out. Its `start_run` is refused
 as deferred, saying nothing was started and that it should wait with `wake_after`, when the

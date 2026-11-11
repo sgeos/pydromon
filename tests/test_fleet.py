@@ -556,6 +556,8 @@ def test_fleet_mail_and_issues_name_each_message_by_project(
     out = capsys.readouterr().out
     assert "harbor:m-harbor from core, issue, unread" in out
     assert "tide:m-tide from core, issue, unread" in out
+    # Each daemon's page holds all of its one match, so no note of the page follows.
+    assert "showing matches" not in out and "unread after" not in out
     mail_args = [args for _, op, args in found.calls if op is Operation.MAIL]
     assert all(args.get("unread_only") is True for args in mail_args)
     found.calls.clear()

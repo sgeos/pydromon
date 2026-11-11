@@ -13,3 +13,10 @@ Type: Added
   The file is read on a worker thread and the loop waits for it at most half a second,
   so a file on a mount that hangs cannot block the daemon, and until the read returns the
   status is unreadable, which counts as elevated.
+  A stale, missing or unreadable status keeps deferring runs, and each deferral note, the
+  refusal and the turn warning now say that the monitor looks stopped, since when, and
+  that the operator restores gates by restarting the monitor or removing the setting.
+  The reasons `line_status` gives are screened, no line's sandbox or file tools may write
+  the file or its directory, and the repair of an unreadable test directory leaves the
+  base of any pytest that is still running. A term that spans the join of a run's note
+  and its clean summary is screened too.

@@ -1528,6 +1528,9 @@ class _MachineRead:
             self.finished.set()
 
 
+MACHINE_WITHHELD: Final = "withheld, since it holds a term of the disclosure list"
+"""What stands for a reason or a problem of the status file that holds a listed term."""
+
 _OVERRAN: Final = machinestatus.MachineStatus(
     "unreadable", problem="reading it is taking too long"
 )
@@ -1854,6 +1857,25 @@ def _claude_read_access_refusal(
     return None
 
 
+def claude_read_only_refusal(
+    config: LineConfig,
+    project_settings: SettingsConfig | None,
+    project_sandbox: SandboxConfig | None,
+) -> str | None:
+    """Why a Claude Code line with ``workdir_access = "read"`` and ``config`` is
+    refused at every turn, or ``None`` when it is not. **Round 16, at the operator's
+    request.** It is the refusal the engine builder raises, as one function, so that
+    ``dromon config`` can warn of it before any turn is tried and the two cannot
+    differ. Claude Code cannot confine a configured MCP server, an allow-all policy,
+    project settings, plugins or command hooks to a read-only directory, so a line
+    that has one and asks for read access failed every turn with a refusal that only
+    a turn showed."""
+    settings = engine_settings.merge([project_settings, config.settings])
+    return _claude_read_access_refusal(
+        config, settings
+    ) or _claude_read_sandbox_refusal([project_sandbox, config.sandbox])
+
+
 def _claude_read_sandbox_refusal(layers: Sequence[SandboxConfig | None]) -> str | None:
     """Reject a sandbox layer that would let a shell command leave the read sandbox.
 
@@ -1904,6 +1926,39 @@ def _read_only_path_rules(paths: Sequence[Path]) -> list[str]:
     return sorted(rules)
 
 
+def machine_status_guards(path: Path | None, workdir: Path) -> tuple[Path, ...]:
+    """The paths no line may write for the monitor's status file ``path``, or none
+    when no file is configured. **Round 16 review, point 3.** The file, by its name
+    and by its real path should a link lead elsewhere, and its directory, which would
+    stop the file being replaced by a rename into it. The directory is left out when
+    it is, holds or lies in ``workdir``, since the line legitimately writes there and
+    only the file is then denied. Nothing is read or created."""
+    if path is None:
+        return ()
+    named = Path(os.path.normpath(path))
+    paths = [named, Path(os.path.realpath(named))]
+    for directory in (
+        named.parent,
+        Path(os.path.realpath(named.parent)),
+        paths[1].parent,
+    ):
+        if not (
+            directory.is_relative_to(workdir)
+            or workdir.is_relative_to(directory)
+            or directory.is_relative_to(Path(os.path.realpath(workdir)))
+            or Path(os.path.realpath(workdir)).is_relative_to(directory)
+        ):
+            paths.append(directory)
+    return tuple(dict.fromkeys(paths))
+
+
+def machine_status_rules(guards: Sequence[Path]) -> list[str]:
+    """Deny rules for the built-in tools that write files, one for each path of
+    ``guards`` itself, which names the status file. Claude Code reads a path with two
+    leading slashes as absolute."""
+    return sorted({f"Edit(/{path})" for path in guards})
+
+
 def engine_factory(
     root: str,
     *,
@@ -1918,8 +1973,16 @@ def engine_factory(
     line_git_ssh: Mapping[str, GitSshAccess] | None = None,
     read_only_paths: Sequence[str] = (),
     extra_protected: Callable[[], Sequence[Path]] | None = None,
+    machine_status_file: Callable[[], Path | None] | None = None,
 ) -> EngineFactory:
     """The production factory: each line on its packaged driver's engine.
+
+    ``machine_status_file`` gives the machine monitor's status file, read at each
+    engine build, which no line may write, since a status a line could write could
+    lift or force the deferrals of runs and turns. **Round 16 review, point 3.**
+    The file, and its directory unless that is or holds the line's working directory,
+    are denied to writes in an enabled sandbox and to the built-in file tools, for a
+    Claude Code line and for a Codex one.
 
     ``extra_protected`` gives directories denied beside ``protected``, read at each
     engine build, which the daemon sets to every project of the open-federation
@@ -1984,6 +2047,9 @@ def engine_factory(
             *project_secret_paths(Path(root), workdir),
         )
         git_ssh = (line_git_ssh or {}).get(spec.line_id)
+        machine_guard = machine_status_guards(
+            None if machine_status_file is None else machine_status_file(), workdir
+        )
         if driver.settings.engine == codex.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
                 raise EngineRefused(
@@ -2007,7 +2073,7 @@ def engine_factory(
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
                 protected=engine_protected,
-                write_protected=read_only,
+                write_protected=(*read_only, *machine_guard),
                 observe=spec.observe,
                 mark=spec.mark,
                 task_ended=spec.task_ended,
@@ -2108,9 +2174,9 @@ def engine_factory(
         merged = merge([project_sandbox, spec.config.sandbox])
         settings = engine_settings.merge([project_settings, spec.config.settings])
         if spec.config.workdir_access is WorkdirAccess.READ:
-            refusal = _claude_read_access_refusal(
-                spec.config, settings
-            ) or _claude_read_sandbox_refusal([project_sandbox, spec.config.sandbox])
+            refusal = claude_read_only_refusal(
+                spec.config, project_settings, project_sandbox
+            )
             if refusal is not None:
                 raise EngineRefused(refusal)
             # Merged last, so no layer can turn these off. The refusal above names a
@@ -2163,11 +2229,11 @@ def engine_factory(
         if enabled and git_ssh is not None:
             merged = merge([merged, sandbox_layer(git_ssh)])
         guarded = git_write_guards(workdir) if enabled else ()
-        guarded = (*guarded, *read_only)
+        guarded = (*guarded, *read_only, *machine_guard)
         # A line that loads project settings or plugins must not write what it loads.
         claude_dir = (workdir / ".claude",) if spec.config.project_settings else ()
         plugin_dirs = tuple(resolve_plugin(path) for path in spec.config.plugins)
-        write_protected = (*claude_dir, *plugin_dirs)
+        write_protected = (*claude_dir, *plugin_dirs, *machine_guard)
         guarded = (*guarded, *write_protected)
         line_temp: LineTemp | None = None
         if enabled:
@@ -2210,6 +2276,17 @@ def engine_factory(
                     settings,
                     engine_settings.parse_settings(
                         {"permissions": {"deny": _read_only_path_rules(read_only)}}
+                    ),
+                ]
+            )
+        if machine_guard:
+            # A rule for the file itself, since the directory rules the protected
+            # paths give match what lies under a path and not the path.
+            settings = engine_settings.merge(
+                [
+                    settings,
+                    engine_settings.parse_settings(
+                        {"permissions": {"deny": machine_status_rules(machine_guard)}}
                     ),
                 ]
             )
@@ -2772,6 +2849,10 @@ class Scheduler:
             machinestatus.read
         )
         """What reads the file. A seam for tests, which makes a read that hangs."""
+        self._machine_untrusted_since: datetime | None = None
+        """When the monitor's file was first seen unusable in the present spell, a
+        stale one by its last sample, or ``None`` while the file is fresh or none is
+        configured. **Round 16 review, point 1.** In memory."""
         self._machine_noted: set[str] = set()
         """What has been told in the current deferral, the operator once as ``operator``
         and each line as its own identifier, or the run kind as ``run``, so a deferral
@@ -3270,6 +3351,11 @@ class Scheduler:
                 " it checks the file again, before resuming the line"
             )
 
+    @property
+    def machine_status_file(self) -> Path | None:
+        """The monitor's status file, or ``None``. **Round 16 review, point 3.**"""
+        return self._machine_path
+
     def set_machine_status(self, path: Path | None) -> None:
         """Read the machine monitor's status file at ``path`` before each run and turn
         starts, or read none for ``None``. Replaces the earlier path and forgets what
@@ -3277,10 +3363,25 @@ class Scheduler:
         self._machine_path = path
         self._machine_read = None
         self._machine_pending = None
+        self._machine_untrusted_since = None
         self._machine_noted.clear()
         self._machine_deferred.clear()
 
     def machine_status(self) -> machinestatus.MachineStatus | None:
+        """The machine's status, as ``_read_machine_status`` gives it, with the spell
+        in which the file cannot be relied on kept for the notes that name it."""
+        status = self._read_machine_status()
+        if status is None or status.level in machinestatus.KNOWN_LEVELS:
+            self._machine_untrusted_since = None
+        elif status.level == "stale" and status.age_seconds is not None:
+            self._machine_untrusted_since = self._wall_clock() - timedelta(
+                seconds=status.age_seconds
+            )
+        elif self._machine_untrusted_since is None:
+            self._machine_untrusted_since = self._wall_clock()
+        return status
+
+    def _read_machine_status(self) -> machinestatus.MachineStatus | None:
         """The machine's status, read at most once every ``MACHINE_READ_SECONDS``, or
         ``None`` when no status file is configured. A file that is missing, stale or
         unreadable is a status of its own, which counts as elevated, so a monitor
@@ -3337,13 +3438,21 @@ class Scheduler:
         if status is None:
             return {"configured": False}
         decision = machinestatus.decide(status)
+        # **Round 16 review, point 2.** The reasons and the problem are the monitor's
+        # text and reach a line here, so each is screened as a note is, and one that
+        # holds a listed term is withheld alone.
         return {
             "configured": True,
             "level": status.level,
             "acted_on_as": status.effective,
             "age_seconds": status.age_seconds,
-            "reasons": list(status.reasons),
-            "problem": status.problem,
+            "reasons": [self._machine_screened(reason) for reason in status.reasons],
+            "problem": (
+                None
+                if status.problem is None
+                else self._machine_screened(status.problem)
+            ),
+            "monitor": self._monitor_trouble(status),
             "defers_runs": decision.defer_runs,
             "defers_turns": decision.defer_turns,
         }
@@ -3370,6 +3479,44 @@ class Scheduler:
             "the machine status cannot be shown here" if self.discloses(text) else text
         )
 
+    def _machine_screened(self, text: str) -> str:
+        """``text`` of the monitor's file, or a placeholder when it holds a term of the
+        disclosure list."""
+        return MACHINE_WITHHELD if self.discloses(text) else text
+
+    def _monitor_trouble(self, status: machinestatus.MachineStatus) -> str | None:
+        """A sentence saying that the monitor looks stopped and how the operator
+        restores the gates, or ``None`` while the file is fresh. **Round 16 review,
+        point 1.** A file that is stale, missing or unreadable defers every run until
+        the monitor writes again, so a monitor that died closes every gate, and the
+        cause is named where the deferral is. A stale file is dated by its last
+        sample. A file first seen missing or unreadable is dated by the daemon's
+        first sight of it, since the daemon cannot know earlier."""
+        if status.level in machinestatus.KNOWN_LEVELS:
+            return None
+        since = self._machine_untrusted_since
+        when = (
+            "since a time it did not record"
+            if since is None
+            else (
+                f"since its last sample at {format_due(since)}"
+                if status.level == "stale"
+                else f"since the daemon first saw it so at {format_due(since)}"
+            )
+        )
+        return (
+            f"The machine monitor looks stopped or its file is {status.level}, {when}."
+            " Runs stay deferred until it writes a fresh status. The operator"
+            " restores them by restarting the monitor, or by removing"
+            " daemon.machine_status from the project file and reloading."
+        )
+
+    def _machine_cause(self, status: machinestatus.MachineStatus) -> str:
+        """The monitor's trouble as a sentence to append to a note, with a space first,
+        or nothing while the file is fresh."""
+        trouble = self._monitor_trouble(status)
+        return "" if trouble is None else f" {trouble}"
+
     def _machine_run_refusal(self, line_id: str) -> str | None:
         """Why a run of ``line_id`` is deferred by the machine's status, or ``None``.
         Tells the operator once for the deferral. Nothing has started or been recorded
@@ -3378,18 +3525,19 @@ class Scheduler:
         if status is None or not self.machine_decision().defer_runs:
             return None
         words = self._machine_words(status)
+        cause = self._machine_cause(status)
         if "run" not in self._machine_noted:
             self._machine_noted.add("run")
             self._tell_operator(
                 line_id,
                 f"Dromon deferred a run of {line_id}, since {words}. It starts"
                 " nothing heavy until the status is ok again, and the line was told"
-                " to wait and ask again.",
+                f" to wait and ask again.{cause}",
             )
         return (
             f"the run is deferred, since {words}. Nothing was started. This machine"
             " is shared, so wait with wake_after and start it again once"
-            " machine-status says ok, and say in your report that you waited"
+            f" machine-status says ok, and say in your report that you waited.{cause}"
         )
 
     def _note_turn_deferral(self, line_id: str) -> None:
@@ -3400,13 +3548,15 @@ class Scheduler:
         if status is None:
             return
         words = self._machine_words(status)
+        cause = self._machine_cause(status)
         self._machine_deferred.setdefault(line_id, self._wall_clock())
         if line_id not in self._machine_noted:
             self._machine_noted.add(line_id)
             self._harness_note(
                 LineAddress(line_id),
                 f"Dromon deferred your turn, since {words}. It starts when the"
-                " status is no longer critical, and your mail waits until then.",
+                " status is no longer critical, and your mail waits until then."
+                f"{cause}",
             )
         if "operator" not in self._machine_noted:
             self._machine_noted.add("operator")
@@ -3414,7 +3564,7 @@ class Scheduler:
                 line_id,
                 f"Dromon deferred the turns of lines with mail waiting, starting with"
                 f" {line_id}, since {words}. No turn starts until the status is no"
-                " longer critical.",
+                f" longer critical.{cause}",
             )
 
     def _machine_notice(self, line_id: str) -> str | None:
@@ -3433,6 +3583,7 @@ class Scheduler:
                 f"{words[:1].upper()}{words[1:]}. This machine is shared,"
                 " so start nothing heavy, such as a full gate, until it is ok, and"
                 " say so in your report if you wait. Your turn proceeds."
+                f"{self._machine_cause(status)}"
             )
         return "Dromon note: " + " ".join(parts) if parts else None
 
@@ -5646,6 +5797,17 @@ class Scheduler:
             return runs.note_withheld(finding.note, runs.OUTPUT_WITHHELD_SPENT), None
         summary_held = summary is not None and self.discloses(summary)
         tail_held = tail is not None and self.discloses(tail)
+        if summary is not None and not summary_held:
+            # **Round 16 review, point 5.** A term can span the join of the note,
+            # or the notice, and the clean summary, which neither holds alone. The
+            # text the end will record is screened as well, and a summary that
+            # completes a term in it is withheld as one that holds a term.
+            lead = (
+                runs.note_withheld(finding.note, runs.TAIL_WITHHELD)
+                if tail_held
+                else finding.note
+            )
+            summary_held = self.discloses(runs.note_with_summary(lead, summary))
         if not summary_held and not tail_held:
             return runs.note_with_summary(finding.note, summary), tail
         if known:
