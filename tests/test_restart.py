@@ -38,6 +38,7 @@ from dromon.model import (
     LineAddress,
     LineConfigured,
     LineCreated,
+    LineTurnEnded,
     OperatorAddress,
     OperatorRegistered,
     RestartNoted,
@@ -89,6 +90,12 @@ class Scripted:
         after = self.world.after.get(line_id, [])
         if after:
             await after.pop(0).wait()
+        if line_id in self.world.raising:
+            raise RuntimeError("the engine ended the turn without a result")
+        if line_id in self.world.unsaid:
+            # The engine was asked to end and reports the turn without saying why
+            # it ended, as one that finished just before its safe point does.
+            reason = None
         subtype = "success" if reason is None else "error_during_execution"
         return TurnReport(subtype, 1, "ok", (), reason, None, "session-1", None, None)
 
@@ -107,6 +114,10 @@ class World:
         self.prompts: dict[str, list[str]] = {}
         self.sessions: dict[str, list[str | None]] = {}
         self.reasons: dict[str, list[str | None]] = {}
+        self.raising: set[str] = set()
+        """Lines whose engine raises once it has reached its safe points."""
+        self.unsaid: set[str] = set()
+        """Lines whose engine reports no ``interrupted_for`` though it was asked."""
         self.log = EventLog(path)
         self.scheduler = self._scheduler()
         self.scheduler.ensure_operator("ana")
@@ -365,6 +376,89 @@ def test_a_turn_ended_for_a_restart_then_abandoned_is_told_so_and_woken(
     assert note.body == restart.ABANDONED_NOTE.format(operator="ana")
     assert len(world.prompts["alpha"]) == 2
     assert note.message_id in world.prompts["alpha"][1]
+
+
+def asked_to_end(target: World, abandon: bool = False) -> None:
+    """Run one turn of ``alpha`` that a restart in its interrupt mode asks to end,
+    abandoning the restart before the report arrives when ``abandon`` is set."""
+    gate = asyncio.Event()
+    after = asyncio.Event()
+    target.gates["alpha"] = [gate]
+    target.after["alpha"] = [after]
+
+    async def act() -> None:
+        target.scheduler.send(ANA, ALPHA, "work on it")
+        await until(lambda: target.scheduler.running_lines() == ["alpha"])
+        target.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60)
+        gate.set()
+        await until(lambda: "alpha" in target.reasons)
+        if abandon:
+            target.scheduler.abandon_restart("a test abandoned it")
+        after.set()
+        await until(lambda: not target.scheduler.running_lines())
+        target.monotonic = 10_000.0
+
+    run(target, act)
+    assert target.reasons["alpha"][0] == restart.REASON
+
+
+def test_a_turn_asked_to_end_that_does_not_say_why_it_ended_is_woken_after(
+    world: World,
+) -> None:
+    """**Round 16, item 3.** Such a line had no note, and sat idle after the
+    restart until it was mailed."""
+    world.unsaid.add("alpha")
+    asked_to_end(world)
+    assert world.endings("alpha") == ["success"]
+    (note,) = restart_notes(world)
+    assert note.body == restart.UNCONFIRMED_NOTE.format(operator="ana")
+    assert len(world.prompts["alpha"]) == 1
+    world.restart()
+    run(world, nothing)
+    assert len(world.prompts["alpha"]) == 2
+    assert note.message_id in world.prompts["alpha"][1]
+    assert world.sessions["alpha"] == [None, "session-1"]
+
+
+def test_an_unconfirmed_turn_of_an_abandoned_restart_is_told_so_and_woken(
+    world: World,
+) -> None:
+    world.unsaid.add("alpha")
+    asked_to_end(world, abandon=True)
+    (note,) = restart_notes(world)
+    assert note.body == restart.UNCONFIRMED_ABANDONED_NOTE.format(operator="ana")
+    assert len(world.prompts["alpha"]) == 2
+    assert note.message_id in world.prompts["alpha"][1]
+
+
+def test_a_turn_asked_to_end_that_fails_is_held_and_not_woken(world: World) -> None:
+    """A note would clear the failure, as any new mail does, so the failure stands,
+    holds the line and asks an operator."""
+    world.raising.add("alpha")
+    asked_to_end(world)
+    assert restart_notes(world) == []
+    assert world.endings("alpha")[-1].startswith("failed:")
+    line = world.log.state.lines["alpha"]
+    assert line.failed and line.held_by is not None
+    world.restart()
+    run(world, nothing)
+    assert len(world.prompts["alpha"]) == 1
+
+
+def test_the_note_of_a_restart_follows_the_turn_s_recorded_end(world: World) -> None:
+    """The note is newer than the turn's end, so a successor replaying the log
+    reads the line as reached by new mail."""
+    asked_to_end(world)
+    events = [entry.event for entry in read_entries(world.path)]
+    ended = max(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, LineTurnEnded) and event.line_id == "alpha"
+    )
+    noted = next(
+        index for index, event in enumerate(events) if isinstance(event, RestartNoted)
+    )
+    assert noted > ended
 
 
 def test_a_second_restart_is_refused_while_one_drains(world: World) -> None:

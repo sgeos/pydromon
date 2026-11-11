@@ -54,7 +54,25 @@ A turn asked to end whose restart was then abandoned, before the turn's report a
 leaves a note that says the restart was abandoned, which wakes the line in the same
 daemon after its cooldown.
 
-A turn that ended by itself during a drain leaves no note, since nothing was cut.
+**A turn asked to end that did not say why it ended.** **Round 16, item 3.** A line
+whose turn a restart interrupted sat idle after the restart until it was mailed. The
+note had been left only when the turn's report named the restart as why it ended, so
+a turn the engine ended without saying so, or one that ended by itself just before its
+safe point, left none. Any turn the restart asked to end that returns a report and does
+not fail now leaves a note, recorded after the turn's end, and one whose report did not
+name the restart says that the turn ended without saying whether it stopped at its safe
+point. Inference, not observed, is that this was the path in the field, since the line
+was idle and so had returned a report that did not fail. **Decided by core, for
+review.** A spurious wake costs one turn, and a missed one leaves a line idle with no
+bound.
+
+A turn asked to end that failed or raised leaves no note. A failure holds the line and
+asks an operator, or leaves it failed where it mailed an operator in the turn, and a
+note, as new mail, would clear that failure and wake a broken engine again unseen. A
+turn an operator cancelled raises, and leaves no note either.
+
+A turn that ended by itself during a drain in the `wait` mode leaves no note, since
+nothing was asked of it.
 
 ## The successor
 

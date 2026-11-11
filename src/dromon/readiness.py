@@ -22,7 +22,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
-from dromon import spawn
+from dromon import spawn, workdir
 
 GIT_STATUS_SECONDS: Final = 20.0
 """How long ``git status`` may run before the report is refused."""
@@ -43,10 +43,11 @@ class ReadFailure(StrEnum):
 
     ``TIMED_OUT``, git ran past ``GIT_STATUS_SECONDS``. ``NOT_STARTED``, git could not
     be started, or its start stalled past ``spawn.START_SECONDS``, since
-    ``spawn.StartStalled`` is an ``OSError``. ``FAILED``, git exited with an error, as
-    outside a repository. ``MALFORMED``, git's output was not in the porcelain form.
-    ``NOT_TEXT``, git's output could not be decoded. ``NO_WORKDIR``, the line's working
-    directory is not known or not allowed, so git was not run."""
+    ``spawn.StartStalled`` is an ``OSError``. ``FAILED``, git exited with an error,
+    or the directory is outside any checkout, where git is not started.
+    ``MALFORMED``, git's output was not in the porcelain form. ``NOT_TEXT``, git's
+    output could not be decoded. ``NO_WORKDIR``, the line's working directory is
+    not known or not allowed, so git was not run."""
 
     TIMED_OUT = "timed_out"
     NOT_STARTED = "not_started"
@@ -135,8 +136,104 @@ def dirty_digest(worktree: Path) -> tuple[str, int]:
     )
 
 
+MAX_TREE_PATHS: Final = 10_000
+"""The most changed tracked paths ``tree_digest`` reads the size and time of. The
+rest are counted and named only as git lists them."""
+
+
+def tree_digest(worktree: Path) -> str:
+    """The SHA-256 of the state of ``worktree`` that a run or a gate covered: the
+    commit at ``HEAD``, the ``git status`` entries of tracked paths, and the size and
+    modification time of each. **Round 16, item 5, at core's request of round 15.**
+    A run records it as it starts, and ``run_status`` compares it with the digest
+    now, so a gate that passed on a tree since changed is not read as covering it.
+    Raises ``ReadinessUnknown`` as ``dirty_paths`` does. Blocking.
+
+    **Covered.** A commit, a tracked path that becomes changed or clean, and an
+    edit inside a tracked path already changed, which moves its size or time.
+    **Not covered, a residual.** Untracked paths are left out whole, new ones and
+    edited ones alike, since a run's own output in an untracked directory that is
+    not ignored would otherwise make every run read as no longer covering its
+    tree. A new test file is therefore not seen until it is added. An edit that
+    keeps a file's size and restores its modification time is not seen either."""
+    output = _status(worktree)
+    head = workdir.read_head_commit(worktree) or ""
+    top = workdir.checkout_top(worktree)
+    digest = hashlib.sha256()
+    digest.update(head.encode("ascii", "replace") + b"\0")
+    entries = _tracked_changes(output)
+    digest.update(f"{len(entries)}\0".encode("ascii"))
+    for entry, path in entries[:MAX_TREE_PATHS]:
+        digest.update(entry.encode("utf-8", "surrogateescape") + b"\0")
+        digest.update(_path_stamp(top, path))
+    return digest.hexdigest()
+
+
+def _tracked_changes(output: str) -> list[tuple[str, str]]:
+    """Each ``git status --porcelain=v1 -z`` entry other than an untracked one, as
+    its status letters with its path and any origin, and the path it names now, in
+    git's order. Raises ``ReadinessUnknown`` for output not in that form, as
+    ``parse_porcelain`` does."""
+    parse_porcelain(output)
+    fields = output.split("\0")
+    found: list[tuple[str, str]] = []
+    index = 0
+    # Bounded by the number of fields, since each pass consumes one or two. The
+    # form was checked above, so each entry is at least four characters.
+    while index < len(fields):
+        field = fields[index]
+        index += 1
+        if not field:
+            continue
+        status, path = field[:2], field[3:]
+        entry = field
+        if status[0] in "RC" or status[1] in "RC":
+            entry = f"{field}\0{fields[index]}"
+            index += 1
+        if status != "??":
+            found.append((entry, path))
+    return found
+
+
+def _path_stamp(top: Path | None, path: str) -> bytes:
+    """The size and modification time of ``path`` under ``top``, as bytes for the
+    digest, or a fixed mark where it cannot be read, as for a deleted path."""
+    if top is None:
+        return b"unread\0"
+    try:
+        found = os.lstat(top / path)
+    except (OSError, ValueError):
+        return b"absent\0"
+    return f"{found.st_size} {found.st_mtime_ns}\0".encode("ascii")
+
+
 def _status(worktree: Path) -> str:
-    """The output of ``git status --porcelain=v1 -z`` in ``worktree``."""
+    """The output of ``git status --porcelain=v1 -z`` in ``worktree``.
+
+    **Round 16, item 1.** Bisecting runs put a rise in stalled starts in continuous
+    integration at the change that read this on every ``set_brief`` and on every
+    turn of a kept session. A directory the file system shows to be outside any
+    checkout is answered ``FAILED`` here, as git would answer it, without a start.
+
+    **Decided by core, for review.** The digest is not cached on ``HEAD``, the
+    index and the worktree's own modification time, as the task offered. An edit
+    in place of a tracked file below the top level changes none of the three, so a
+    cached digest would hide the very change the stale-brief notice reports. The
+    read stays lazy instead, made only for a brief that names a digest, and only
+    when a turn is about to show the notice or ``set_brief`` records one."""
+    if workdir.outside_checkout(worktree):
+        raise ReadinessUnknown(
+            f"{worktree} is not in a git checkout, so git status was not run",
+            ReadFailure.FAILED,
+        )
+    return _run_git_status(worktree)
+
+
+def _run_git_status(worktree: Path) -> str:
+    """Start ``git status`` in ``worktree`` and give its output. The one place this
+    module starts a child, so that the test suite can stand in for it. **Round 16,
+    item 1.** The suite's ``_no_real_git_status`` fixture answers a clean tree here
+    for every test not marked ``real_git_status``."""
     environment = {
         name: value for name, value in os.environ.items() if not name.startswith("GIT_")
     }

@@ -215,6 +215,36 @@ def git_directories(directory: Path) -> tuple[Path, Path] | None:
     return None if found is None else (found[0], found[1])
 
 
+def outside_checkout(directory: Path) -> bool:
+    """Whether ``directory`` is certainly outside any git checkout, read from the
+    file system without running git. **Round 16, item 1.** ``git status`` in such a
+    directory can only fail, so ``dromon.readiness`` skips starting it. A pointer
+    file that cannot be followed answers ``False``, so git runs and reports it.
+
+    **Residual.** Git can find a repository by means this walk does not follow,
+    such as ``GIT_DIR``, which ``dromon.readiness`` removes, or a ``.git`` that is
+    a symbolic link to a directory, which this walk does follow. A repository found
+    only past a file system boundary that git would not cross is answered as a
+    checkout, so git runs and fails, which costs a start and is never wrong."""
+    try:
+        return _git_dirs(directory) is None
+    except SandboxError:
+        return False
+
+
+def checkout_top(directory: Path) -> Path | None:
+    """The top directory of the checkout holding ``directory``, which holds its
+    ``.git``, as a real path, or ``None`` outside a checkout or where a pointer file
+    cannot be followed. **Round 16, item 5.** ``git status --porcelain`` names paths
+    from there, so ``dromon.readiness`` reads them against it. A worktree set by
+    ``core.worktree`` elsewhere is not followed, which is a residual."""
+    try:
+        found = _git_dirs(directory)
+    except SandboxError:
+        return None
+    return None if found is None else found[2].parent
+
+
 OBJECT_NAME: Final = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 """A commit's object name, SHA-1 or SHA-256, in lowercase hexadecimal."""
 

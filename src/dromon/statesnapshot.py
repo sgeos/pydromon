@@ -54,7 +54,7 @@ from dromon.model import Event, State
 FORMAT_VERSION: Final = 1
 """The version of the file's own layout."""
 
-STATE_VERSION: Final = 3
+STATE_VERSION: Final = 4
 """Raised by hand whenever applying an event comes to mean something else for a state
 of the same shape, since the shape digest cannot see that. **Review of 49236ad, item
 3.** ``tests/test_state_version.py`` fails when the types ``codec_digest`` covers, or
@@ -698,6 +698,13 @@ def read(
     return Loaded(
         seq, first_row, nth_row, cast(State, state), times, cast(str, claimed)
     )
+
+
+def read_bytes(path: Path) -> bytes:
+    """The snapshot file's bytes, read under the rules ``read`` applies to the file
+    itself, or ``SnapshotRefused``. **Round 16, item 2.** ``dromond --check`` holds
+    a copy read so before it copies the log. The contents are not checked here."""
+    return _read_file(path)
 
 
 def _read_file(path: Path) -> bytes:

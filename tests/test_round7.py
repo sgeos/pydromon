@@ -406,6 +406,51 @@ def test_a_compaction_the_engine_made_by_itself_withdraws_the_pending_compaction
     assert [event.message_id for event in withdrawn(world)] == [message_id]
 
 
+def test_a_compaction_the_engine_made_by_itself_spends_the_request(
+    world: World,
+) -> None:
+    """**Round 16, item 7.** The compaction withdrew the request's wake and left
+    the request, so the next turn compacted the session a second time."""
+    world.compact_wake()
+    world.scheduler.session_compacted(
+        "alpha", {"trigger": "auto", "before_tokens": 9, "after_tokens": 1}
+    )
+    assert world.status()["context"]["compaction_pending"] is False
+    world.run("work")
+    assert world.engine.reasons == []
+    assert len(world.engine.prompts) == 1
+
+
+def test_a_compaction_spends_a_request_made_behind_another_wake(world: World) -> None:
+    """A request made while another wake was pending scheduled no wake of its own,
+    and is spent by any compaction all the same. The other wake stays."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.scheduler._context["alpha"] = warning  # pyright: ignore[reportPrivateUsage]
+    world.call("wake_after", {"seconds": 600, "note": "check the run"})
+    other = world.log.state.scheduled["alpha"].message_id
+    world.call("compact_session", {})
+    world.scheduler.session_compacted(
+        "alpha", {"trigger": "auto", "before_tokens": warning, "after_tokens": 1}
+    )
+    assert world.log.state.scheduled["alpha"].message_id == other
+    world.run("work")
+    assert world.engine.reasons == []
+
+
+def test_a_request_made_after_a_compaction_still_compacts(world: World) -> None:
+    """Only a request made before a compaction is spent by it."""
+    warning = world.scheduler.effective_config("alpha").context_warn_tokens
+    world.scheduler.session_compacted(
+        "alpha", {"trigger": "auto", "before_tokens": warning, "after_tokens": 1}
+    )
+    world.scheduler._context_reported(  # pyright: ignore[reportPrivateUsage]
+        "alpha", warning, CONTEXT_FROM_CALL
+    )
+    world.call("compact_session", {})
+    world.run("work")
+    assert world.engine.reasons == ["at your request"]
+
+
 def test_a_compaction_that_reports_no_size_withdraws_the_context_warning_wake(
     world: World,
 ) -> None:

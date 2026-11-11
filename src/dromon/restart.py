@@ -10,7 +10,9 @@ the harness so that every line's session migrates to the latest installed versio
   turn to end at its next safe point, the same point that priority mail uses, as
   ``dromon.priority`` describes, so the engine reports the turn and keeps its session.
   A line whose turn the restart ended receives a ``restart_noted`` note, which wakes it
-  once the restarted daemon runs.
+  once the restarted daemon runs. **Round 16, item 3.** So does a line whose turn the
+  restart asked to end, which returned a report and did not fail, though the report
+  did not say it ended for the restart, with a note that says so.
 - Both are bounded by the request's wait. A turn still running at the bound is one
   whose interrupt could not be honoured, such as a turn in one long tool call, and the
   restart is then abandoned, so no turn is cut part way. The daemon starts turns again,
@@ -122,6 +124,24 @@ ABANDONED_NOTE: Final = (
     " stopped."
 )
 """The ``restart_noted`` body when the restart was abandoned as the turn ended."""
+
+UNCONFIRMED_NOTE: Final = (
+    "A daemon restart, which operator {operator} asked for so that the daemon runs"
+    " its newly installed code, asked your last turn to end at a safe point, and the"
+    " turn ended without saying whether it stopped there. Your engine session"
+    " resumes in this turn. Continue the work if it was not finished."
+)
+"""The ``restart_noted`` body for a turn a restart asked to end whose report did not
+name the restart as why it ended. **Round 16, item 3.**"""
+
+UNCONFIRMED_ABANDONED_NOTE: Final = (
+    "A daemon restart, which operator {operator} asked for and which was then"
+    " abandoned, so the daemon did not restart, asked your last turn to end at a"
+    " safe point, and the turn ended without saying whether it stopped there. Your"
+    " engine session resumes in this turn. Continue the work if it was not"
+    " finished."
+)
+"""As ``UNCONFIRMED_NOTE``, when the restart was abandoned as the turn ended."""
 
 
 class Mode(StrEnum):
