@@ -1033,15 +1033,7 @@ class Daemon:
                     (line_id,) = _text_args(request.args, ("line_id",))
                     result = self.scheduler.overview(line_id)
                 case Operation.START_CONTEXT:
-                    keys = ("nonce",) if "nonce" in request.args else ()
-                    given = _text_args(request.args, keys)
-                    nonce = given[0] if given else None
-                    if nonce is not None and not restart.NONCE_PATTERN.fullmatch(nonce):
-                        raise ProtocolError(
-                            ErrorCode.BAD_REQUEST,
-                            "nonce must be 32 to 128 lowercase hexadecimal digits",
-                        )
-                    result = start_context(os.environ, self.line_secrets, nonce)
+                    result = self._start_context(request.args)
                 case Operation.BUDGETS:
                     _text_args(request.args, ())
                     result = self.scheduler.budgets_view()
@@ -1100,6 +1092,30 @@ class Daemon:
                 error_message=str(error),
             )
         return Response(request.request_id, True, result=result)
+
+    def _start_context(self, args: dict[str, object]) -> dict[str, object]:
+        """The ``start_context`` request, with no arguments, or with ``nonce`` and
+        ``secrets`` together, the client's own digests to compare. **Review of
+        16de365.** A nonce or digest in another form is a bad request, never an
+        exception that drops the connection."""
+        if not args:
+            return start_context(os.environ, self.line_secrets)
+        if set(args) != {"nonce", "secrets"}:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST,
+                f"the arguments are {sorted(args)}, expected none or"
+                " ['nonce', 'secrets']",
+            )
+        nonce = args["nonce"]
+        if not isinstance(nonce, str) or restart.NONCE_PATTERN.fullmatch(nonce) is None:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, "nonce must be 64 lowercase hexadecimal digits"
+            )
+        try:
+            compared = restart.check_compared(args["secrets"])
+        except ValueError as error:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, str(error)) from error
+        return start_context(os.environ, self.line_secrets, (nonce, compared))
 
     def _create_line(self, args: dict[str, object]) -> dict[str, object]:
         texts = {
@@ -3117,24 +3133,29 @@ def tls_serving(daemon: Daemon) -> TlsServing:
 def start_context(
     environment: Mapping[str, str],
     granted: Mapping[str, Sequence[str]] | None = None,
-    nonce: str | None = None,
+    compared: tuple[str, Mapping[str, str | None]] | None = None,
 ) -> dict[str, object]:
     """What a restart's successor starts with that a client cannot see, its
     interpreter, which ``client.start`` runs, and ``restart.START_ENVIRONMENT`` as
     ``environment`` holds it, each value ``None`` when unset. **Round 14, item 6.**
 
-    **Round 16, item 6.** With ``nonce``, also ``secrets``, a keyed digest of each
-    name the project file as last loaded grants a line, ``granted``, so the client
-    can say which of them its own shell holds otherwise. Never a value."""
+    **Round 16, item 6, and the review of 16de365.** Also ``secret_names``, each name
+    the project file as last loaded grants a line, ``granted``. With ``compared``, a
+    client's nonce and its digest of each name, also ``secrets``, a verdict for each
+    name, ``same``, ``differs`` or ``not_granted``, as ``restart.compare_secrets``
+    gives. Never a value, and never a digest."""
+    allowed = granted or {}
     result: dict[str, object] = {
         "interpreter": sys.executable,
         "environment": {
             name: environment.get(name) for name in restart.START_ENVIRONMENT
         },
+        "secret_names": list(restart.secret_names(allowed)),
     }
-    if nonce is not None:
-        names = restart.secret_names(granted or {})
-        result["secrets"] = restart.secret_digests(names, environment, nonce)
+    if compared is not None:
+        nonce, theirs = compared
+        verdicts = restart.compare_secrets(theirs, allowed, environment, nonce)
+        result["secrets"] = {name: str(verdict) for name, verdict in verdicts.items()}
     return result
 
 

@@ -38,7 +38,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 from dromon.gitssh import AGENT_VARIABLE
 from dromon.registry import REGISTRY_DIR_ENV
@@ -178,26 +178,50 @@ def polls(wait_seconds: int) -> int:
 
 # Round 16, item 6. A restart keeps the running daemon's secrets.
 
-NONCE_PATTERN: Final = re.compile(r"[0-9a-f]{32,128}")
-"""The key a client gives ``start_context`` for the digests of the daemon's granted
-secrets, in lowercase hexadecimal, at least 128 bits."""
+NONCE_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
+"""The key a client gives ``start_context`` for its digests, 32 bytes as exactly 64
+lowercase hexadecimal digits. **Review of 16de365.** An earlier pattern allowed any
+length from 32 to 128 digits, so an odd length passed it and then failed in
+``bytes.fromhex``, which dropped the connection rather than refusing the request."""
+
+DIGEST_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
+"""A client's digest of one value, an HMAC with SHA-256 in lowercase hexadecimal."""
+
+SECRET_NAME_PATTERN: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+"""A name a comparison may carry, the form ``dromon.projectconfig`` accepts in a
+line's ``secrets``, so a name printed in a warning cannot hold a control
+character."""
 
 MAX_COMPARED_SECRETS: Final = 256
-"""The most granted names one ``start_context`` answer compares, taken in name
-order, so its answer is bounded."""
+"""The most names one comparison carries. The daemon lists at most this many granted
+names, in name order, and refuses a request that carries more, so both the request
+and its answer are bounded."""
+
+
+class SecretVerdict(StrEnum):
+    """The daemon's answer for one name a client compares. Nothing in it can be
+    compared with a guess offline."""
+
+    SAME = "same"
+    DIFFERS = "differs"
+    NOT_GRANTED = "not_granted"
 
 
 def secret_digest(nonce: str, value: str | None) -> str | None:
     """A keyed digest of one variable's value, or ``None`` when it is unset.
 
-    **Round 16, item 6.** A restart's successor inherits the running daemon's
-    environment, so a secret exported again in the operator's shell does not reach it.
-    The client and the daemon each digest their own value under a key the client
-    chose for that one request, and the client compares, so neither value crosses the
-    socket. HMAC with SHA-256 from the standard library, never a construction of our
-    own. **Assumption.** Whoever reads the answer holds the client socket, and so
-    operator authority, as ``docs/protocol/CLIENT.md`` gives, so a digest that lets
-    a guess be tested gives that holder nothing it could not already ask for."""
+    **Round 16, item 6, and the review of 16de365.** A restart's successor inherits
+    the running daemon's environment, so a secret exported again in the operator's
+    shell does not reach it. The client digests its own value under a key it chose
+    for that one request and sends the digest, and the daemon digests its own value
+    under the same key and answers only whether the two agree, as
+    ``compare_secrets`` gives. HMAC with SHA-256 from the standard library, never a
+    construction of our own. The first form had the daemon return its digests, which
+    let whoever held the client socket test guesses offline without limit, since the
+    holder chose the key. ``nonce`` must match ``NONCE_PATTERN``, and anything else
+    raises ``ValueError``."""
+    if NONCE_PATTERN.fullmatch(nonce) is None:
+        raise ValueError("nonce must be 64 lowercase hexadecimal digits")
     if value is None:
         return None
     raw = value.encode("utf-8", "surrogateescape")
@@ -206,7 +230,8 @@ def secret_digest(nonce: str, value: str | None) -> str | None:
 
 def secret_names(granted: Mapping[str, Sequence[str]]) -> tuple[str, ...]:
     """Every name a line is granted, once each, in name order, cut to
-    ``MAX_COMPARED_SECRETS``."""
+    ``MAX_COMPARED_SECRETS``. Names, never values, and the project file already
+    holds them."""
     found = {name for names in granted.values() for name in names}
     return tuple(sorted(found))[:MAX_COMPARED_SECRETS]
 
@@ -214,16 +239,60 @@ def secret_names(granted: Mapping[str, Sequence[str]]) -> tuple[str, ...]:
 def secret_digests(
     names: Sequence[str], environment: Mapping[str, str], nonce: str
 ) -> dict[str, str | None]:
-    """The digest of each of ``names`` as ``environment`` holds it."""
+    """The digest of each of ``names`` as ``environment`` holds it, which the client
+    sends."""
     return {name: secret_digest(nonce, environment.get(name)) for name in names}
 
 
-def differing_secrets(
-    theirs: Mapping[str, str | None], environment: Mapping[str, str], nonce: str
-) -> tuple[str, ...]:
-    """The names, in ``theirs``, whose value in ``environment`` digests otherwise, in
-    name order. A name set in one and unset in the other differs too."""
-    mine = secret_digests(tuple(theirs), environment, nonce)
-    return tuple(
-        sorted(name for name, digest in theirs.items() if mine[name] != digest)
-    )
+def check_compared(found: object) -> dict[str, str | None]:
+    """``found`` as a client's digests, each name in ``SECRET_NAME_PATTERN`` form with
+    a digest in ``DIGEST_PATTERN`` form or ``None`` for an unset value, at most
+    ``MAX_COMPARED_SECRETS`` of them. Raises ``ValueError`` for anything else, which
+    the daemon answers as a bad request."""
+    if not isinstance(found, dict):
+        raise ValueError("secrets must be an object")
+    entries = cast(dict[object, object], found)
+    if len(entries) > MAX_COMPARED_SECRETS:
+        raise ValueError(f"secrets may name at most {MAX_COMPARED_SECRETS} variables")
+    compared: dict[str, str | None] = {}
+    for name, digest in entries.items():
+        if not isinstance(name, str) or SECRET_NAME_PATTERN.fullmatch(name) is None:
+            raise ValueError("a name in secrets is not an environment variable name")
+        if digest is not None and (
+            not isinstance(digest, str) or DIGEST_PATTERN.fullmatch(digest) is None
+        ):
+            raise ValueError(f"the digest for {name} is not 64 hexadecimal digits")
+        compared[name] = digest
+    return compared
+
+
+def compare_secrets(
+    theirs: Mapping[str, str | None],
+    granted: Mapping[str, Sequence[str]],
+    environment: Mapping[str, str],
+    nonce: str,
+) -> dict[str, SecretVerdict]:
+    """The daemon's verdict on each name a client compares. A name no line is granted
+    is answered ``not_granted`` without its value being read, so a caller cannot
+    probe the rest of the daemon's environment. A granted name is ``same`` when both
+    sides are unset or both digests agree, compared in constant time, and ``differs``
+    otherwise, so a name set on one side only differs too.
+
+    **Residual.** Each request still tests one guess for each granted name, so a
+    socket holder could guess online, one request at a time. That holder already has
+    operator authority, as ``docs/protocol/CLIENT.md`` records, and no request rate is
+    limited."""
+    allowed = frozenset(name for names in granted.values() for name in names)
+    verdicts: dict[str, SecretVerdict] = {}
+    for name, digest in theirs.items():
+        if name not in allowed:
+            verdicts[name] = SecretVerdict.NOT_GRANTED
+            continue
+        mine = secret_digest(nonce, environment.get(name))
+        agree = (
+            mine is None and digest is None
+            if mine is None or digest is None
+            else hmac.compare_digest(mine, digest)
+        )
+        verdicts[name] = SecretVerdict.SAME if agree else SecretVerdict.DIFFERS
+    return verdicts

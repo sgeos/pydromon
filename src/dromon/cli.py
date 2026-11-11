@@ -54,7 +54,7 @@ from dromon.agents import LINE_TOKEN_ENV, TOKEN_ENV
 from dromon.lineconfig import EFFORTS, can_write_workdir
 from dromon.projectconfig import ProjectConfig
 from dromon.model import AgentAccess
-from dromon.protocol import ErrorCode, Operation, ProtocolError
+from dromon.protocol import Operation, ProtocolError
 from dromon.scheduler import LineSpec, engine_factory
 from dromon import settings as engine_settings
 from dromon.sandbox import (
@@ -544,22 +544,14 @@ def _ask_start_context(paths: ProjectPaths, command: str) -> StartContext | None
 
     **Round 16, item 6.** It also warns when a secret the project grants a line
     differs between the running daemon's environment and this shell's, since the
-    successor inherits the daemon's, as ``_warn_secrets`` gives. A daemon from before
-    this refuses the ``nonce``, and is then asked again without one."""
-    nonce = secrets.token_hex(32)
+    successor inherits the daemon's, as ``_compare_secrets`` gives."""
     try:
-        response = call(paths.socket, Operation.START_CONTEXT, args={"nonce": nonce})
-        if not response.ok and response.error_code is ErrorCode.BAD_REQUEST:
-            print(
-                f"dromon {command}: the daemon cannot compare its secrets with this"
-                " shell's, so a changed secret is not found"
-            )
-            response = call(paths.socket, Operation.START_CONTEXT)
+        response = call(paths.socket, Operation.START_CONTEXT)
     except (DaemonNotRunning, ProtocolError, TimeoutError, OSError) as error:
         print(f"dromon {command}: {error}", file=sys.stderr)
         return None
     if response.ok and response.result is not None:
-        _warn_secrets(command, response.result.get("secrets"), nonce)
+        _compare_secrets(paths, command, response.result.get("secret_names"))
     context = (
         _start_context(response.result)
         if response.ok and response.result is not None
@@ -573,10 +565,63 @@ def _ask_start_context(paths: ProjectPaths, command: str) -> StartContext | None
     return context
 
 
-def _warn_secrets(command: str, found: object, nonce: str) -> None:
-    """Say which secrets the running daemon holds otherwise than this shell.
+def _secret_names_of(found: object) -> tuple[str, ...] | None:
+    """The granted names a ``start_context`` answer lists, or ``None`` when it lists
+    none in the daemon's form, at most ``restart.MAX_COMPARED_SECRETS`` names each in
+    ``restart.SECRET_NAME_PATTERN`` form, so a name later printed holds no control
+    character."""
+    if not isinstance(found, list):
+        return None
+    names = cast(list[object], found)
+    if len(names) > restart.MAX_COMPARED_SECRETS:
+        return None
+    listed: list[str] = []
+    for name in names:
+        if not isinstance(name, str) or not restart.SECRET_NAME_PATTERN.fullmatch(name):
+            return None
+        listed.append(name)
+    return tuple(dict.fromkeys(listed))
 
-    **Round 16, item 6, decided here for the operator's review.** Another project
+
+def _compare_secrets(paths: ProjectPaths, command: str, found: object) -> None:
+    """Ask the daemon whether each secret it grants holds this shell's value, and warn
+    of each that does not.
+
+    **Round 16, item 6, and the review of 16de365.** The client digests its own value
+    of each granted name under a fresh nonce and sends the digests, and the daemon
+    answers only ``same``, ``differs`` or ``not_granted`` for each, so nothing that
+    could test a guess offline leaves the daemon, as ``restart.compare_secrets``
+    gives. A daemon from before this lists no names, and the client then says that a
+    changed secret is not found."""
+    names = _secret_names_of(found)
+    if names is None:
+        print(
+            f"dromon {command}: the daemon does not list the secrets it holds, so a"
+            " secret changed in this shell is not found"
+        )
+        return
+    if not names:
+        return
+    nonce = secrets.token_hex(32)
+    digests = restart.secret_digests(names, os.environ, nonce)
+    try:
+        response = call(
+            paths.socket,
+            Operation.START_CONTEXT,
+            args={"nonce": nonce, "secrets": digests},
+        )
+    except (DaemonNotRunning, ProtocolError, TimeoutError, OSError) as error:
+        print(f"dromon {command}: {error}", file=sys.stderr)
+        return
+    answer = response.result if response.ok else None
+    _warn_secrets(command, names, None if answer is None else answer.get("secrets"))
+
+
+def _warn_secrets(command: str, asked: tuple[str, ...], found: object) -> None:
+    """Say which of the names ``asked`` the running daemon holds otherwise than this
+    shell, from the daemon's verdicts ``found``.
+
+    **Round 16, item 6, decided here and accepted by the operator.** Another project
     exported a new value for a secret its project file refers to and restarted, and a
     line still presented the old one, because the successor inherits the running
     daemon's environment. The client warns rather than carrying its own values into
@@ -585,15 +630,18 @@ def _warn_secrets(command: str, found: object, nonce: str) -> None:
     which a shell that lacks a name would remove it. The warning names the variables
     and never a value, and the restart goes on, since the operator may mean to keep
     the daemon's values. Only stopping the daemon and starting it from the shell that
-    holds the new values replaces them. An answer in another form is ignored."""
+    holds the new values replaces them. Only names the client asked about are named,
+    and an answer in another form is said to have compared nothing."""
     if not isinstance(found, dict):
+        print(
+            f"dromon {command}: the daemon did not compare its secrets with this"
+            " shell's, so a changed secret is not found"
+        )
         return
-    theirs: dict[str, str | None] = {}
-    for name, digest in cast(dict[object, object], found).items():
-        if not isinstance(name, str) or not (digest is None or isinstance(digest, str)):
-            return
-        theirs[name] = digest
-    differing = restart.differing_secrets(theirs, os.environ, nonce)
+    verdicts = cast(dict[object, object], found)
+    differing = sorted(
+        name for name in asked if verdicts.get(name) == restart.SecretVerdict.DIFFERS
+    )
     if differing:
         print(
             f"dromon {command}: warning: the running daemon's environment differs"

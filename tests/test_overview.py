@@ -155,6 +155,21 @@ def test_the_task_is_the_lines_own_brief_cut_and_labelled(
     assert data == {"task": "t" * 400, "next_action": "next", "artifact_count": 1}
 
 
+def test_the_cut_is_in_bytes_as_the_sources_say(
+    scheduler: Scheduler, log: EventLog
+) -> None:
+    """Review of 16de365. The sources text once said characters where the cut is in
+    bytes, so a brief in a wide script kept fewer characters than it said."""
+    wide = "漢" * 300
+    log.append(BriefSet("alpha", wide, "keep", (), wide, "", "", AT))
+    task = cast(dict[str, Any], scheduler.overview("alpha")["task"])
+    data = task["untrusted_data"]
+    for field in ("task", "next_action"):
+        assert len(data[field].encode("utf-8")) <= 400 < len(wide.encode("utf-8"))
+        assert data[field] == "漢" * (400 // 3)
+    assert "400 bytes" in OVERVIEW_SOURCES and "characters" not in OVERVIEW_SOURCES
+
+
 def test_a_seat_sees_its_role_owner_and_newest_entry_without_its_body(
     scheduler: Scheduler, log: EventLog
 ) -> None:

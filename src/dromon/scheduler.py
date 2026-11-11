@@ -923,10 +923,15 @@ overview's bound."""
 MAX_OVERVIEW_BYTES: Final = 16384
 """The most an ``overview`` answer takes as JSON with an indent of two, which the
 tests check against the largest every field can be. **Round 16, item 1.**"""
+WORKDIR_HEAD_CLAIM: Final = "HEAD says, which the line can move"
+"""How a run's receipt labels ``workdir_commit``. **Review of 16de365.** The commit
+is read from files in the line's worktree, which the line can write, so it is the
+worktree's claim and not a commit the daemon checked out."""
 OVERVIEW_SOURCES: Final = (
     "Read only, and nothing is recorded. Built from what line_status, role_status"
     " and list_leases answer, which give the whole of each part. The task and next"
-    " action are the line's own brief, cut to 400 characters, and untrusted data."
+    " action are the line's own brief, each cut to 400 bytes of UTF-8, and"
+    " untrusted data."
 )
 OVERVIEW_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
@@ -4995,7 +5000,8 @@ class Scheduler:
         )
         command_dir = None if checkout is None else checkout.tree
         # Round 16, item 3. The commit a run in a worktree ran, read before its
-        # command starts, so the receipt names it. A file read, as line_status does.
+        # command starts, so the receipt names it. A file read, as line_status does,
+        # and the worktree's own claim, as RunStarted.workdir_commit records.
         head = None if commit is not None else read_head_commit(workdir)
         if head is not None and COMMIT_PATTERN.fullmatch(head) is None:
             head = None
@@ -15031,9 +15037,10 @@ def _run_line(run: Run) -> str:
     on = (
         f" on commit {started.commit}"
         if started.commit is not None
-        # Round 16, item 3. The receipt names the commit a worktree run ran.
-        else f" in its worktree at commit {started.workdir_commit} with any"
-        " uncommitted changes"
+        # Round 16, item 3. The receipt names the commit a worktree run ran, as
+        # the worktree's own claim after the review of 16de365.
+        else f" in its worktree at commit {started.workdir_commit}, as the"
+        f" worktree's own {WORKDIR_HEAD_CLAIM}, with any uncommitted changes"
         if started.workdir_commit is not None
         else ""
     )

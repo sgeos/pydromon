@@ -152,21 +152,33 @@ message and leaving the old daemon running.
   restart, of each name a line is granted whose value in the client's own shell
   differs from the running daemon's, an unset one included, and says that only
   `dromon stop` and `dromon start` from that shell use its values. The restart goes
-  on. To compare, the client sends `start_context` a fresh random key, the daemon
-  answers with the HMAC-SHA256 of each granted value under it, and the client
-  compares the digests of its own values, so no value crosses the socket.
-  **Decided for the operator's review, over carrying the client's values into the
-  successor.** Carrying would put secret values in a request and in the daemon's
+  on. To compare, the client asks `start_context` without arguments, which lists the
+  granted names in `secret_names`. It then sends a fresh random key of 32 bytes with
+  the HMAC-SHA256 of its own value of each name under it, the daemon digests its own
+  value under the same key, and answers only `same`, `differs` or `not_granted` for
+  each name. No value crosses the socket, and nothing comparable leaves the daemon.
+  **Review of 16de365.** The first form had the daemon return its own digests under a
+  key the caller chose, which let whoever held the client socket test guesses of a
+  value offline without limit. No request otherwise returns a granted value, so the
+  assumption that the holder could learn it anyway did not hold, and the exchange
+  was inverted. A key that is not exactly 64 lowercase hexadecimal digits, a name
+  not in the form a line's `secrets` takes, a digest in another form, or more than
+  256 names is a bad request, where an odd length once raised past the handler and
+  dropped the connection. A name no line is granted is answered `not_granted`
+  without its value being read, so no other variable can be probed.
+  **Decided here and accepted by the operator, over carrying the client's values
+  into the successor.** Carrying would put secret values in a request and in the daemon's
   restart plan, and would leave a daemon whose environment is two shells' mixed,
   in which a name the restarting shell lacks would either keep the old value or be
   removed, neither of which the operator asked for. **Residuals.** Only names the
   project file granted when the daemon last loaded it are compared, so a name
   granted since, which the successor reads from the same old environment, is not.
   `dromon reload` reads the project file again but not the environment, so it
-  keeps the daemon's values too, and gives no warning. A daemon from before round
-  16 refuses the key, and the client then says that it cannot compare. A digest
-  lets whoever holds the client socket test a guess of a value, which that holder,
-  holding operator authority, could learn otherwise.
+  keeps the daemon's values too, and gives no warning. A daemon from before this
+  lists no names, and the client then says that a changed secret is not found. Each
+  comparison still tests one guess for each granted name, so a holder of the client
+  socket could guess online, one request at a time. That holder has operator
+  authority, as [`CLIENT.md`](CLIENT.md) records, and no request rate is limited.
 - **The reason.** The client prints the check's lines that begin `dromond:`, which are
   the reasons a real start prints, or else its last line, as for code that does not
   import.

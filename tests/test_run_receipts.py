@@ -22,6 +22,8 @@ from dromon.codec import encode
 from dromon.disclosure import load_terms
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog, read_entries
+from dromon.lineconfig import LineConfig
+from dromon.workdir import read_head_commit
 from dromon.model import (
     HARNESS,
     MAX_DISCLOSURE_CHECKS,
@@ -35,6 +37,7 @@ from dromon.model import (
 )
 from dromon.scheduler import (
     RUN_STATUS_TOOL_NAME,
+    WORKDIR_HEAD_CLAIM,
     LineEngine,
     LineSpec,
     Scheduler,
@@ -488,7 +491,10 @@ def test_the_receipt_names_the_worktree_commit_and_is_sent_once(
         asyncio.run(scheduler.reconcile_runs())
         asyncio.run(scheduler.reconcile_runs())
         (note,) = harness_notes(log, "alpha")
-        assert f"in its worktree at commit {head} with any uncommitted changes" in note
+        assert (
+            f"in its worktree at commit {head}, as the worktree's own"
+            f" {WORKDIR_HEAD_CLAIM}, with any uncommitted changes"
+        ) in note
         assert "exited with exit code 0" in note
         assert f"This end cancels your wake {wake_id}" in note
         assert wake_id not in log.state.messages
@@ -508,6 +514,40 @@ def test_a_run_outside_a_checkout_names_no_commit(project: Path) -> None:
         asyncio.run(scheduler.reconcile_runs())
         (note,) = harness_notes(log, "alpha")
         assert "in its worktree at commit" not in note
+
+
+def test_a_planted_git_entry_is_named_only_as_the_worktree_s_claim(
+    project: Path,
+) -> None:
+    """Review of 16de365. A line working in a subdirectory of a checkout can create a
+    ``.git`` there naming any commit, and the nearest ``.git`` is read. Reading only
+    one at the declared directory's root would not help, since the planted one is
+    exactly there, as this shows. So the receipt names the commit as the worktree's
+    own claim, which the line can move, and never as the daemon's observation."""
+    head = checkout_at(project)
+    planted = project / "sub"
+    (planted / ".git").mkdir(parents=True)
+    forged = "f" * 40
+    (planted / ".git" / "HEAD").write_text(forged + "\n")
+    assert read_head_commit(project) == head
+    assert read_head_commit(planted) == forged
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        scheduler.create_line(
+            "beta", HAIKU, Strategy.SUBSCRIPTION, LineConfig(workdir="sub")
+        )
+        started = asyncio.run(scheduler.start_run("beta", "gate", "none"))
+        assert started.workdir_commit == forged
+        wait_for_supervisor(scheduler, started.run_id)
+        asyncio.run(scheduler.reconcile_runs())
+        (note,) = harness_notes(log, "beta")
+        assert f"at commit {forged}, as the worktree's own {WORKDIR_HEAD_CLAIM}," in (
+            note
+        )
+        assert "which the line can move" in WORKDIR_HEAD_CLAIM
+        assert f"at commit {forged}, as the worktree's own" in (
+            scheduler.run_status("beta")
+        )
 
 
 @pytest.mark.parametrize(

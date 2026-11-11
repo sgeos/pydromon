@@ -296,9 +296,17 @@ reconciliation, as after a restart, sends no second note. **The commit it ran.**
 commit run names its `commit`. A run in a worktree now names `workdir_commit`, the
 commit its worktree had checked out when the run started, which the daemon reads from
 the checkout's files before the command starts and records in `run_started`. The note
-says `in its worktree at commit C with any uncommitted changes`, since the command ran
-on the tree as the line left it, which a commit alone does not name. Where the commit
-cannot be read, as outside a checkout, nothing is said of it. **What it skipped.** This
+says `in its worktree at commit C, as the worktree's own HEAD says, which the line can
+move, with any uncommitted changes`, since the command ran on the tree as the line left
+it, which a commit alone does not name. Where the commit cannot be read, as outside a
+checkout, nothing is said of it. **The worktree's claim, after the review of 16de365.**
+The commit is read from the nearest `.git` at or above the working directory, and the
+line can write both. It can move `HEAD` with its own git where its sandbox lets it
+write the git directory, and in a subdirectory of a checkout it can create a `.git`
+naming any commit. Reading only a `.git` at the declared directory's root was
+considered and rejected, because the line can create one exactly there. So the note
+labels the commit as the worktree's claim, and a reader who must know what ran starts
+a commit run, whose `commit` the daemon checked out itself. **What it skipped.** This
 is what pytest's summary says, the skip reasons and the deselected count, as the
 paragraph below specifies. Tests a gate script leaves out by its own means, such as a
 marker expression, appear only as that count, and the run's command in the log names
