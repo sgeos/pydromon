@@ -56,7 +56,7 @@ def test_a_start_that_stalls_fails_within_its_bound_with_a_clear_message(
     # Derived from the bound, with a wide margin for a loaded runner.
     assert time.monotonic() - before < 25 * BOUND
     message = str(caught.value)
-    assert message.startswith(f"/bin/sleep did not start within {BOUND:g}s")
+    assert message.startswith(f"sleep did not start within {BOUND:g}s")
     assert "dromon.spawn" in message and "killed if it starts later" in message
     assert stalled.started == []
     assert spawn.stranded_count() == 1
@@ -286,7 +286,7 @@ def test_the_land_runner_reports_a_stall_as_its_own_status(
 ) -> None:
     done = land.run_command(SLEEP, tmp_path)
     assert done.code == land.STALLED
-    assert done.stderr.startswith(f"/bin/sleep did not start within {BOUND:g}s")
+    assert done.stderr.startswith(f"sleep did not start within {BOUND:g}s")
     stalled.stall = False
     stalled.gate.set()
     stalled.until_reaped()
@@ -578,7 +578,7 @@ def test_a_stalled_start_reports_where_its_thread_is_and_what_was_in_flight(
     with pytest.raises(spawn.StartStalled) as caught:
         spawn.start(SLEEP)
     message = str(caught.value)
-    assert message.startswith(f"/bin/sleep did not start within {BOUND:g}s")
+    assert message.startswith(f"sleep did not start within {BOUND:g}s")
     report = message.split(" Report, ", 1)[1]
     assert len(report) <= spawn.MAX_REPORT_CHARS
     # The thread is in the held ``Popen``, reached from ``spawn``'s own ``target``.
@@ -770,8 +770,9 @@ def test_vfork_off_is_harmless_where_the_names_are_absent(
     assert spawn.disable_vfork("linux") is False
 
 
-def test_importing_the_module_turns_vfork_off_on_linux() -> None:
-    """In a fresh interpreter, so that an earlier import does not decide it."""
+def import_and_report(environment: dict[str, str]) -> tuple[str, str]:
+    """``subprocess._USE_VFORK`` before and after ``dromon.spawn`` is imported, in a
+    fresh interpreter, so that an earlier import does not decide it."""
     done = subprocess.run(  # noqa: S603
         [
             sys.executable,
@@ -782,17 +783,39 @@ def test_importing_the_module_turns_vfork_off_on_linux() -> None:
             "import dromon.spawn\n"
             "print(was, getattr(subprocess, '_USE_VFORK', None))",
         ],
-        env={**os.environ, "PYTHONPATH": str(Path(spawn.__file__).parents[1])},
+        env={
+            **{k: v for k, v in os.environ.items() if k != "DROMON_NO_VFORK"},
+            **environment,
+            "PYTHONPATH": str(Path(spawn.__file__).parents[1]),
+        },
         capture_output=True,
         text=True,
         timeout=60,
         check=True,
     )
     was, now = done.stdout.split()
+    return was, now
+
+
+def test_importing_the_module_leaves_vfork_on_by_default() -> None:
+    """Round 16, the review of pull request 149. The experiment of turning vfork off
+    did not stop the stall on Linux, so the default is CPython's own."""
+    was, now = import_and_report({})
+    assert now == was
+
+
+def test_importing_the_module_turns_vfork_off_on_linux_when_asked() -> None:
+    was, now = import_and_report({"DROMON_NO_VFORK": "1"})
     if sys.platform.startswith("linux") and was != "None":
         assert now == "False"
     else:
         assert now == was, "nothing is changed where vfork is not used"
+
+
+def test_any_other_value_of_the_variable_leaves_vfork_on() -> None:
+    for value in ("0", "", "true", "yes"):
+        was, now = import_and_report({"DROMON_NO_VFORK": value})
+        assert now == was, value
 
 
 def test_proc_children_give_their_processor_time(tmp_path: Path) -> None:
@@ -1419,3 +1442,329 @@ def test_the_report_names_the_descriptor_limit_it_finds(
     assert spawn._descriptor_limit_text() == "descriptor limit unlimited"  # pyright: ignore[reportPrivateUsage]
     monkeypatch.setattr(resource, "getrlimit", refuses)
     assert spawn._descriptor_limit_text() == "descriptor limit unknown"  # pyright: ignore[reportPrivateUsage]
+
+
+# Review of round 16, finding 3. A standard error that blocks.
+
+
+class BlockedStderr:
+    """A diagnostic writer that does not return until released, as a write to a pipe
+    whose reader stopped does."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.lines: list[str] = []
+
+    def write(self, text: str) -> None:
+        self.lines.append(text)
+        self.release.wait(30)
+
+
+@pytest.fixture
+def blocked_stderr(monkeypatch: pytest.MonkeyPatch) -> Iterator[BlockedStderr]:
+    blocked = BlockedStderr()
+    monkeypatch.setattr(spawn, "_write_line", blocked.write)
+    monkeypatch.setattr(spawn, "LOG_WAIT_SECONDS", 0.5)
+    yield blocked
+    blocked.release.set()
+    writer = spawn._log.writer  # pyright: ignore[reportPrivateUsage]
+    if writer is not None:
+        writer.join(5)
+
+
+def test_a_blocked_standard_error_does_not_hold_a_start_that_succeeded(
+    monkeypatch: pytest.MonkeyPatch, blocked_stderr: BlockedStderr
+) -> None:
+    """The slow-start line used to be written before the outcome was handed over, so a
+    blocked standard error held a good start until the caller gave up on it. The line
+    is now written after the handoff, so the caller has its child at once. The wait
+    for the line is 0.5 seconds here, so a start that waited for it would take at least
+    that, and this one must return in well under it."""
+    monkeypatch.setattr(spawn, "SLOW_START_SECONDS", 0.0)
+    before = time.monotonic()
+    child = spawn.start(TRUE)
+    took = time.monotonic() - before
+    child.wait(10)
+    assert took < spawn.LOG_WAIT_SECONDS
+    assert spawn.stranded_count() == 0
+    spawn.clear_slow_starts()
+
+
+def test_a_blocked_standard_error_holds_at_most_one_writer_and_drops_the_rest(
+    monkeypatch: pytest.MonkeyPatch, blocked_stderr: BlockedStderr
+) -> None:
+    monkeypatch.setattr(spawn, "SLOW_START_SECONDS", 0.0)
+    monkeypatch.setattr(spawn, "LOG_INTERVAL_SECONDS", 0.0)
+    for _ in range(4):
+        spawn.start(TRUE).wait(10)
+    writers = [t for t in threading.enumerate() if t.name == "dromon-spawn-log"]
+    assert len(writers) == 1
+    assert len(blocked_stderr.lines) == 1
+    # Every start is still recorded, whether or not its line was written.
+    assert len(spawn.slow_starts()) == 4
+    spawn.clear_slow_starts()
+
+
+def test_the_slow_start_line_is_written_at_most_once_in_the_interval(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(spawn, "SLOW_START_SECONDS", 0.0)
+    monkeypatch.setattr(spawn, "LOG_INTERVAL_SECONDS", 60.0)
+    for _ in range(3):
+        spawn.start(TRUE).wait(10)
+    assert capsys.readouterr().err.count("dromond: slow start, ") == 1
+    assert len(spawn.slow_starts()) == 3
+    spawn.clear_slow_starts()
+
+
+def test_a_blocked_standard_error_does_not_hold_the_caller_of_a_stalled_start(
+    stalled: "StalledStart", blocked_stderr: BlockedStderr
+) -> None:
+    """The stall message is written by a thread of its own, so the caller is told of
+    the stall within its bound and the wait for the line, and not when the line is
+    written."""
+    before = time.monotonic()
+    with pytest.raises(spawn.StartStalled):
+        spawn.start(SLEEP)
+    assert time.monotonic() - before < BOUND + spawn.LOG_WAIT_SECONDS + 5
+    assert any("did not start within" in line for line in blocked_stderr.lines)
+
+
+def test_a_writer_that_raises_is_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The error path. A standard error that is closed fails each write, and the start
+    it describes goes on."""
+
+    class Closed:
+        def write(self, text: str) -> int:
+            raise ValueError("I/O operation on closed file")
+
+        def flush(self) -> None:
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(spawn, "SLOW_START_SECONDS", 0.0)
+    monkeypatch.setattr(sys, "stderr", Closed())
+    spawn.start(TRUE).wait(10)
+    assert len(spawn.slow_starts()) == 1
+    spawn.clear_slow_starts()
+
+
+# Review of round 16, finding 4. The fork lock and the event loop.
+
+
+def test_a_start_made_while_the_thread_is_starting_one_is_refused_at_once() -> None:
+    """The lock is not reentrant, so a nested start used to wait for itself for the
+    whole bound and report a stall. It is now refused at once, and the lock is free
+    afterwards, so the error leaves nothing held."""
+    before = time.monotonic()
+    with (
+        spawn.forking(),
+        pytest.raises(RuntimeError, match="already starting one"),
+        spawn.forking(),
+    ):
+        pytest.fail("a nested start must not enter")
+    assert time.monotonic() - before < 5
+    # The error did not leave the lock or the flag held.
+    with spawn.forking():
+        pass
+    spawn.start(TRUE).wait(10)
+
+
+def test_no_start_path_nests_a_start() -> None:
+    """Every way this process starts a child, one after another on one thread, none
+    nests a start inside another. A nested one raises the error above, so this fails
+    if any path of ``spawn``, ``subprocess``, ``os.posix_spawn`` or asyncio does."""
+    spawn.start(TRUE).wait(10)
+    subprocess.run(TRUE, check=True, timeout=30)  # noqa: S603
+    subprocess.Popen(TRUE).wait(10)  # noqa: S603
+    pid = os.posix_spawn("/bin/sh", ["sh", "-c", "exit 0"], os.environ)
+    os.waitpid(pid, 0)
+
+    async def scenario() -> None:
+        child = await asyncio.create_subprocess_exec(*TRUE)
+        await asyncio.wait_for(child.wait(), 30)
+
+    asyncio.run(scenario())
+
+
+def test_a_start_on_the_event_loop_waits_a_shorter_time_for_the_fork_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Another thread holds the lock, as a stuck fork does. A start on the loop's own
+    thread gives up after the loop bound, which here is 0.3 seconds against a bound of
+    30 for the worker threads, and ends in ``StartStalled``, an ``OSError`` the drivers
+    treat as a failed start. A start on a plain thread waits the longer bound."""
+    monkeypatch.setattr(spawn, "FORK_LOCK_LOOP_SECONDS", 0.3)
+    held = threading.Event()
+    release = threading.Event()
+
+    def holder() -> None:
+        with spawn.forking():
+            held.set()
+            release.wait(30)
+
+    thread = threading.Thread(target=holder, name="holds-the-fork-lock")
+    thread.start()
+    assert held.wait(10)
+    try:
+
+        async def scenario() -> float:
+            began = time.monotonic()
+            with pytest.raises(spawn.StartStalled, match="held the fork lock for 0.3s"):
+                await asyncio.create_subprocess_exec(*TRUE)
+            return time.monotonic() - began
+
+        took = asyncio.run(scenario())
+        assert took < 10
+    finally:
+        release.set()
+        thread.join(10)
+    assert not spawn._fork_lock.locked()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_plain_thread_start_waits_for_the_lock_and_succeeds_when_it_is_freed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other side of the same rule. A thread that is not a loop's waits for a
+    holder that ends soon, which the shorter loop bound would not allow."""
+    monkeypatch.setattr(spawn, "FORK_LOCK_LOOP_SECONDS", 0.05)
+    held = threading.Event()
+
+    def holder() -> None:
+        with spawn.forking():
+            held.set()
+            time.sleep(0.5)
+
+    thread = threading.Thread(target=holder, name="holds-the-fork-lock")
+    thread.start()
+    assert held.wait(10)
+    spawn.start(TRUE).wait(10)
+    thread.join(10)
+
+
+def test_the_stall_message_names_the_program_by_its_base_name_only(
+    stalled: "StalledStart",
+) -> None:
+    """Review of round 16, finding 5. The full path of a program under a home directory
+    reached the log and the ``StartStalled`` message. Only the base name does."""
+    with pytest.raises(spawn.StartStalled) as caught:
+        spawn.start(["/home/someone/private-dir/prog", "--flag"])
+    message = str(caught.value)
+    assert message.startswith(f"prog did not start within {BOUND:g}s")
+    assert "private-dir" not in message and "someone" not in message
+
+
+def test_the_refusal_past_the_stranded_cap_names_the_program_by_its_base_name_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(spawn, "MAX_STRANDED", 0)
+    with pytest.raises(spawn.StartStalled) as caught:
+        spawn.start(["/home/someone/private-dir/prog"])
+    message = str(caught.value)
+    assert message.startswith("prog was not started")
+    assert "private-dir" not in message
+
+
+# Round 16, from the CI logs of pull request 149. Every fork call is timed.
+
+
+def test_machine_text_gives_the_size_of_the_process_steal_and_throttling(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "self").mkdir()
+    (tmp_path / "self" / "status").write_text(
+        "Name:\tpython\nVmSize:\t  2097152 kB\nVmRSS:\t  307200 kB\nThreads:\t5\n"
+    )
+    (tmp_path / "stat").write_text("cpu  1 2 3 4 5 6 7 1234 0 0\ncpu0 1\n")
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "cpu.stat").write_text(
+        "usage_usec 9\nnr_periods 100\nnr_throttled 7\nthrottled_usec 2500000\n"
+    )
+    text = spawn._machine_text(tmp_path, cgroup)  # pyright: ignore[reportPrivateUsage]
+    assert "parent resident 300MB virtual 2048MB" in text
+    assert "cpu steal total 12.3s" in text
+    assert "cgroup throttled 7 times for 2.5s" in text
+
+
+def test_machine_text_survives_hostile_size_steal_and_throttle_files(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "self").mkdir()
+    (tmp_path / "self" / "status").write_text("VmRSS:\t\x1b[31m\nVmSize:\tmany kB\n")
+    (tmp_path / "stat").write_text("cpu  a b c\n")
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "cpu.stat").write_text("nr_throttled x\nthrottled_usec\n")
+    text = spawn._machine_text(tmp_path, cgroup)  # pyright: ignore[reportPrivateUsage]
+    assert "\x1b" not in text
+    assert "resident" not in text and "steal" not in text and "throttled" not in text
+
+
+def test_machine_text_without_proc_or_cgroup_gives_what_remains(
+    tmp_path: Path,
+) -> None:
+    text = spawn._machine_text(tmp_path / "none", tmp_path / "none")  # pyright: ignore[reportPrivateUsage]
+    assert "resident" not in text and "steal" not in text and "throttled" not in text
+
+
+def test_a_slow_fork_call_is_recorded_whoever_started_it(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ledger saw only ``spawn.start``, and the slow tests of pull request 149
+    started their children through ``asyncio`` and ``subprocess`` directly. The fork
+    call is timed where every start passes."""
+    monkeypatch.setattr(spawn, "SLOW_FORK_SECONDS", 0.0)
+
+    async def scenario() -> None:
+        child = await asyncio.create_subprocess_exec(*TRUE)
+        await asyncio.wait_for(child.wait(), 30)
+
+    asyncio.run(scenario())
+    notes = spawn.slow_starts()
+    assert notes, "an asyncio start was not recorded"
+    assert notes[0].startswith("fork call ")
+    assert "of its own processor time" in notes[0]
+    assert "waiting for the fork lock" in notes[0] and "thread " in notes[0]
+    assert "dromond: slow fork, " in capsys.readouterr().err
+    spawn.clear_slow_starts()
+    subprocess.run(TRUE, check=True, timeout=30)  # noqa: S603
+    assert len(spawn.slow_starts()) == 1, "a subprocess.run start was not recorded"
+    spawn.clear_slow_starts()
+
+
+def test_a_fork_call_under_the_threshold_is_not_recorded() -> None:
+    subprocess.run(TRUE, check=True, timeout=30)  # noqa: S603
+    assert spawn.slow_starts() == []
+
+
+def test_the_fork_call_records_the_threads_own_processor_time() -> None:
+    """Spinning inside the fork lock uses the thread's processor time and sleeping
+    inside it does not, so the figure tells a thread that worked from one that
+    waited, which the wall time cannot."""
+    busy, idle = spawn._ForkTimes(), spawn._ForkTimes()  # pyright: ignore[reportPrivateUsage]
+    spawn._fork_slot.current = busy  # pyright: ignore[reportPrivateUsage]
+    try:
+        with spawn.forking():
+            deadline = time.monotonic() + 0.3
+            while time.monotonic() < deadline:
+                pass
+        spawn._fork_slot.current = idle  # pyright: ignore[reportPrivateUsage]
+        with spawn.forking():
+            time.sleep(0.3)
+    finally:
+        spawn._fork_slot.current = None  # pyright: ignore[reportPrivateUsage]
+    assert busy.cpu >= 0.2
+    assert 0.0 <= idle.cpu < 0.1
+
+
+def test_a_slow_fork_note_does_not_wait_for_a_blocked_standard_error(
+    monkeypatch: pytest.MonkeyPatch, blocked_stderr: BlockedStderr
+) -> None:
+    """The caller may be the event loop, so the note is written without waiting."""
+    monkeypatch.setattr(spawn, "SLOW_FORK_SECONDS", 0.0)
+    before = time.monotonic()
+    subprocess.run(TRUE, check=True, timeout=30)  # noqa: S603
+    assert time.monotonic() - before < spawn.LOG_WAIT_SECONDS
+    spawn.clear_slow_starts()

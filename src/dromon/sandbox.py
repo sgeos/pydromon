@@ -355,7 +355,11 @@ def _with_real_forms(paths: Iterable[str]) -> list[str]:
     mode.** A link that is changed after the document is built, or created below an
     entry, is not followed here, because the real path is read once, when the line's
     sandbox is built. A path that does not exist resolves as far as it can, which is
-    ``os.path.realpath`` without ``strict``."""
+    ``os.path.realpath`` without ``strict``. Used for deny lists only. A real form
+    in an allow list would let a line that can re-link an allowed directory grant
+    itself the target, so ``_grant_real_workdir`` adds the one allow entry that is
+    needed, the working directory's, which the operator chose and a line does not
+    write."""
     forms: set[str] = set()
     for path in paths:
         forms.add(path)
@@ -401,7 +405,17 @@ def effective(
             for name in ("allowWrite", "denyWrite", "denyRead", "allowRead"):
                 if name in table:
                     paths = cast(list[str], table[name])
-                    table[name] = _with_real_forms(_resolve(p, root) for p in paths)
+                    resolved = (_resolve(p, root) for p in paths)
+                    # Review of round 16, finding 1. Only a deny entry gains its real
+                    # form. An allow entry keeps the form the operator wrote, because
+                    # a line that can write a link where an allow entry lives, such as
+                    # its reports directory, would otherwise grant itself the target
+                    # at its next engine build.
+                    table[name] = (
+                        _with_real_forms(resolved)
+                        if name in ("denyWrite", "denyRead")
+                        else sorted(set(resolved))
+                    )
             if "allowUnixSockets" in table:
                 sockets = sorted(
                     {

@@ -179,6 +179,7 @@ with ``posix_spawn`` and a working-directory file action, or reports exec failur
 another way, has no such read to bound, and the module reduces to its signatures.
 """
 
+import asyncio
 import contextlib
 import faulthandler
 import os
@@ -240,12 +241,39 @@ FORK_LOCK_SECONDS: Final = 30.0
 long is refused with ``StartStalled``, so that one stuck fork does not hold every other
 thread of the daemon, the event loop's among them."""
 
+FORK_LOCK_LOOP_SECONDS: Final = 5.0
+"""How long a start made on an event loop's own thread waits for the fork lock.
+**Review of round 16, finding 4.** The drivers that start children with
+``asyncio.create_subprocess_exec`` run ``Popen`` on the loop's thread, so a thread stuck
+in a fork held the loop for the whole of ``FORK_LOCK_SECONDS``, which is the stall that
+moving the other starts to worker threads was meant to prevent. The wait is shorter
+there and ends in the same ``StartStalled``, an ``OSError`` the drivers already treat as
+a failed start. **Residual.** The loop can still wait this long, and the lock is a plain
+mutex, so a long fork on another thread delays it."""
+
 WATCHDOG_MARGIN_SECONDS: Final = 5.0
 SLOW_START_SECONDS: Final = 2.0
 """A start that takes this long is recorded, with where the time went. **Round 16.**
 A start of ``git`` takes about twenty milliseconds, so two seconds is a hundred times
 the usual and still far below the 30 second bound, which makes the starts that are
 slow without stalling visible."""
+SLOW_FORK_SECONDS: Final = 1.0
+"""A call that forks which takes this long is recorded in the ledger of slow starts,
+whoever made it. **Round 16, from the CI logs of pull request 149.** The ledger of
+starts saw only ``spawn.start``, and the slow tests of that run started their children
+through ``asyncio`` and ``subprocess`` directly, which it did not see. The fork call is
+the one place every start passes, so it is timed there."""
+LOG_WAIT_SECONDS: Final = 1.0
+"""How long a start waits for its diagnostic line to be written to the daemon's
+standard error. **Review of round 16, finding 3.** A standard error that blocks, as a
+pipe whose reader stopped does, held a start's thread in the line it was printing, and
+a good start of 2.2 seconds was reported as stalled after 16. The line is written by a
+thread of its own and the start waits this long for it, so a blocked standard error
+costs a start at most this."""
+LOG_INTERVAL_SECONDS: Final = 1.0
+"""At most one slow-start line is written in this time. The ledger still records every
+slow start up to ``MAX_SLOW_STARTS_KEPT``, so a loaded host that is slow for every start
+does not fill the log."""
 MAX_SLOW_STARTS_KEPT: Final = 64
 """How long past a start's own bound the watchdog waits before it dumps the traceback
 of every thread. It is after the bound, so a start that stalls is already reported by
@@ -315,6 +343,13 @@ class _ForkTimes:
         self.requested = 0.0
         self.acquired = 0.0
         self.released = 0.0
+        self.cpu = -1.0
+        """The processor time the thread itself used in the fork call, in seconds, or
+        ``-1.0`` where not measured. **Round 16, from the CI logs of pull request
+        149.** A fork call of several seconds is either the kernel copying a large
+        address space, which uses the thread's processor time, or a thread or a machine
+        that was not running, which uses none. The wall time alone cannot tell them
+        apart."""
 
 
 _fork_slot = threading.local()
@@ -447,7 +482,28 @@ def _unwatch(handoff: _Handoff) -> None:
 
 
 _fork_lock = threading.Lock()
+
+
+def _on_a_loop() -> bool:
+    """Whether the calling thread is running an event loop, whose start must not wait
+    long for the fork lock."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
 _FORK_INSTALLED: list[bool] = [False]
+
+
+def _thread_cpu() -> float:
+    """The calling thread's processor time in seconds, or ``-1.0`` where the platform
+    does not give it."""
+    try:
+        return time.thread_time()
+    except (OSError, AttributeError):
+        return -1.0
 
 
 @contextlib.contextmanager
@@ -462,26 +518,47 @@ def forking() -> Generator[None]:
     of waiting for a start that is stuck. It is also timed by the watchdog."""
     watched = _Handoff()
     times: _ForkTimes | None = getattr(_fork_slot, "current", None)
-    if times is not None:
-        times.requested = time.monotonic()
-    if not _fork_lock.acquire(timeout=FORK_LOCK_SECONDS):
-        raise StartStalled(
-            f"a child was not started: another start held the fork lock for"
-            f" {FORK_LOCK_SECONDS:g}s"
+    if getattr(_fork_slot, "holding", False):
+        # Review of round 16, finding 4. The lock is not reentrant, so a start made by
+        # the thread that holds it would wait for itself for the whole bound and then
+        # report a stall that is not one. No caller nests, which a test asserts, so
+        # this is refused at once as the programming error it is.
+        raise RuntimeError(
+            "a child start was made while this thread was already starting one"
         )
+    requested = time.monotonic()
+    if times is not None:
+        times.requested = requested
+    wait = FORK_LOCK_LOOP_SECONDS if _on_a_loop() else FORK_LOCK_SECONDS
+    if not _fork_lock.acquire(timeout=wait):
+        raise StartStalled(
+            f"a child was not started: another start held the fork lock for {wait:g}s"
+        )
+    _fork_slot.holding = True
     # Timed from here, since a wait for the lock is not a stall in the fork.
     watched.began = time.monotonic()
     watched.deadline = watched.began + FORK_LOCK_SECONDS + WATCHDOG_MARGIN_SECONDS
     if times is not None:
         times.acquired = watched.began
     _watch(watched)
+    cpu_began = _thread_cpu()
     try:
         yield
     finally:
         _unwatch(watched)
+        released = time.monotonic()
+        cpu = _thread_cpu() - cpu_began if cpu_began >= 0.0 else -1.0
         if times is not None:
-            times.released = time.monotonic()
+            times.released = released
+            times.cpu = cpu
+        _fork_slot.holding = False
         _fork_lock.release()
+        _note_slow_fork(
+            wait=watched.began - requested,
+            held=released - watched.began,
+            cpu=cpu,
+            lock_wait=wait,
+        )
 
 
 def _serialized(call: Callable[..., Any]) -> Callable[..., Any]:
@@ -521,19 +598,24 @@ def install_fork_lock() -> bool:
 
 def disable_vfork(platform: str = sys.platform) -> bool:
     """On Linux, stop ``subprocess`` from starting children with ``vfork`` or
-    ``posix_spawn``, so that every start forks. **Round 15, an experiment.** A CI run on
-    Linux stalled a start of ``git``, and reading ``/proc`` for the report then blocked
-    for the rest of five minutes, which fits a child that is in the middle of ``vfork``,
-    where the parent thread is suspended and the child shares its memory until it runs
-    its program. CPython on Linux uses ``vfork`` since 3.10 through
-    ``subprocess._USE_VFORK``, and ``glibc``'s ``posix_spawn``, which Python 3.15 uses
-    when it can, makes the same kind of child, so both are turned off. If Linux CI
-    then stops stalling, ``vfork`` is the cause and this is the fix. If it does not, it
-    is not, and it should be taken out, since a fork copies the page tables of the
-    whole daemon and is slower. **Not known.** Whether it helps. It is not applied
-    elsewhere. ``os.posix_spawn`` calls made directly by this repository are not
-    changed. Returns whether it changed anything. **Porting hazard.** It sets private
-    names in the standard library, which only Python allows."""
+    ``posix_spawn``, so that every start forks. **Round 15, an experiment that did not
+    help, and is now off unless asked for.** A CI run on Linux stalled a start of
+    ``git``, and reading ``/proc`` for the report then blocked for the rest of five
+    minutes, which fits a child that is in the middle of ``vfork``. CPython on Linux
+    uses ``vfork`` since 3.10 through ``subprocess._USE_VFORK``, and ``glibc``'s
+    ``posix_spawn``, which Python 3.15 uses when it can, makes the same kind of child,
+    so both were turned off at import, from round 15 to the review of pull request 149.
+    **Result.** Linux CI went on timing out with it, on pull request 144's re-run and
+    on pull request 149, and the ledger then showed forks of 4.1 and 8.8 seconds in the
+    call itself at no pressure, which a fork that copies the page tables of the whole
+    daemon makes more likely and ``vfork`` avoids. Two other branches that did not
+    have it passed at the same hour, which is one observation and not an experiment.
+    It is therefore applied only when ``DROMON_NO_VFORK=1`` is set in the environment,
+    so that a run can be made with and without it. **Not known.** Whether either
+    setting changes the stall. ``os.posix_spawn`` calls made directly by this
+    repository are not changed. Returns whether it changed anything. **Porting
+    hazard.** It sets private names in the standard library, which only Python
+    allows."""
     if not platform.startswith("linux"):
         return False
     changed = False
@@ -955,6 +1037,50 @@ _slow_starts: list[str] = []
 _slow_lock = threading.Lock()
 
 
+class _Log:
+    """The state of the diagnostic lines, replaced by name in tests. ``writer`` is the
+    one thread that may be blocked in a write, and ``last`` the monotonic time of the
+    last slow-start line."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.writer: threading.Thread | None = None
+        self.last = -LOG_INTERVAL_SECONDS
+
+
+_log = _Log()
+
+
+def _write_line(text: str) -> None:
+    # A diagnostic line must not disturb the start it describes.
+    with contextlib.suppress(Exception):
+        print(text, file=sys.stderr)
+
+
+def _say(text: str, limited: bool, wait: float | None = None) -> None:
+    """Write ``text`` to the daemon's standard error from a thread of its own, and
+    wait for it at most ``LOG_WAIT_SECONDS``, or ``wait`` when given. **Review of
+    round 16, finding 3.** At most one such thread exists, so a standard error that
+    never accepts a line holds one thread and drops later lines, and is not a thread
+    for each start. ``limited`` also drops the line when one was written less than
+    ``LOG_INTERVAL_SECONDS`` ago. Never raises, and never waits past the bound."""
+    now = time.monotonic()
+    with _log.lock:
+        if _log.writer is not None and _log.writer.is_alive():
+            return
+        if limited and now - _log.last < LOG_INTERVAL_SECONDS:
+            return
+        _log.last = now
+        writer = threading.Thread(
+            target=_write_line, args=(text,), name="dromon-spawn-log", daemon=True
+        )
+        _log.writer = writer
+    # No thread could be made when this raises, and the line is dropped.
+    with contextlib.suppress(RuntimeError):
+        writer.start()
+        writer.join(LOG_WAIT_SECONDS if wait is None else wait)
+
+
 def slow_starts() -> list[str]:
     """The slow starts recorded in this process, at most ``MAX_SLOW_STARTS_KEPT``,
     oldest first. **Round 16.**"""
@@ -1008,7 +1134,67 @@ def _pressure(proc: Path, name: str) -> str | None:
     return None
 
 
-def _machine_text(proc: Path = Path("/proc")) -> str:
+def _status_kb(text: str, key: str) -> int | None:
+    """The number of kilobytes on the ``key`` line of a ``/proc/<pid>/status`` text."""
+    for line in text.splitlines():
+        if line.startswith(key + ":"):
+            fields = line.split()
+            if len(fields) >= 2 and fields[1].isdigit():
+                return int(fields[1])
+            return None
+    return None
+
+
+def _process_text(proc: Path) -> str | None:
+    """The size of this process, which a fork copies the page tables of, and how many
+    threads it has. **Round 16, from the CI logs of pull request 149.** The pull
+    request's reviewer inferred that a fork of seconds at no pressure is the copy of a
+    large address space, which this shows, with the processor time of the fork call."""
+    text = _read_text(proc / "self" / "status")
+    if text is None:
+        return None
+    resident, virtual = _status_kb(text, "VmRSS"), _status_kb(text, "VmSize")
+    if resident is None or virtual is None:
+        return None
+    return f"parent resident {resident // 1024}MB virtual {virtual // 1024}MB"
+
+
+def _steal_text(proc: Path) -> str | None:
+    """The processor time, in seconds since the machine started, that a virtual
+    machine's host took from it, the eighth figure of the first line of ``stat``. A
+    runner whose host is busy shows it here, as the load and the pressure figures do
+    not, and the difference between two lines is what happened between them."""
+    text = _read_text(proc / "stat")
+    if text is None:
+        return None
+    fields = text.splitlines()[0].split() if text else []
+    if len(fields) >= 9 and fields[0] == "cpu" and fields[8].isdigit():
+        return f"cpu steal total {int(fields[8]) / 100:.1f}s"
+    return None
+
+
+def _throttle_text(cgroup: Path) -> str | None:
+    """How often and how long the processor quota of this control group stopped the
+    process, from ``cpu.stat``, which the pressure figures do not show as waiting."""
+    text = _read_text(cgroup / "cpu.stat")
+    if text is None:
+        return None
+    found: dict[str, int] = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[1].isdigit():
+            found[fields[0]] = int(fields[1])
+    if "nr_throttled" not in found or "throttled_usec" not in found:
+        return None
+    return (
+        f"cgroup throttled {found['nr_throttled']} times for"
+        f" {found['throttled_usec'] / 1e6:.1f}s"
+    )
+
+
+def _machine_text(
+    proc: Path = Path("/proc"), cgroup: Path = Path("/sys/fs/cgroup")
+) -> str:
     """The load of the machine, which tells a slow machine from a stuck child.
     **Round 16.** The load averages from ``os.getloadavg`` and, where ``/proc`` has
     them, the share of the last ten seconds that tasks waited for the processor, for
@@ -1023,20 +1209,26 @@ def _machine_text(proc: Path = Path("/proc")) -> str:
         found = _pressure(proc, name)
         if found is not None:
             parts.append(found)
+    for extra in (_process_text(proc), _steal_text(proc), _throttle_text(cgroup)):
+        if extra is not None:
+            parts.append(extra)
     return ", ".join(parts) if parts else "no load figures"
 
 
 def _note_slow_start(
     handoff: _Handoff, name: str, outcome: subprocess.Popen[Any] | BaseException
-) -> None:
-    """Record, and write to the daemon's standard error, a start that took at least
-    ``SLOW_START_SECONDS``, whether it succeeded, failed or was abandoned, with where
-    the time went and how loaded the machine was. Called by the start's own thread,
-    after the call returned and before it ends, and never raises."""
+) -> str | None:
+    """Record a start that took at least ``SLOW_START_SECONDS``, whether it succeeded,
+    failed or was abandoned, with where the time went and how loaded the machine was,
+    and return the line to write, or ``None``. Called by the start's own thread, after
+    the call returned. **Review of round 16, finding 3.** The line is not written here,
+    since the caller of this function writes it after the outcome is handed over, so a
+    standard error that blocks cannot hold a start that has already succeeded. Never
+    raises."""
     try:
         total = handoff.ended - handoff.began
         if total < SLOW_START_SECONDS:
-            return
+            return None
         times = handoff.fork
         waited = max(times.acquired - times.requested, 0.0) if times.acquired else 0.0
         held = max(times.released - times.acquired, 0.0) if times.released else 0.0
@@ -1047,12 +1239,41 @@ def _note_slow_start(
             f" the fork lock, {held:.1f}s in the fork call, {rest:.1f}s elsewhere,"
             f" {handoff.overlap} starts overlapped, {threading.active_count()} threads,"
             f" {_machine_text()}",
-            400,
+            700,
         )
         with _slow_lock:
             if len(_slow_starts) < MAX_SLOW_STARTS_KEPT:
                 _slow_starts.append(text)
-        print(f"dromond: slow start, {text}", file=sys.stderr)
+        return f"dromond: slow start, {text}"
+    except Exception:  # noqa: BLE001, S110
+        # A record must not disturb the start it describes.
+        pass
+    return None
+
+
+def _note_slow_fork(*, wait: float, held: float, cpu: float, lock_wait: float) -> None:
+    """Record, and write once in a while, a call that forks which took at least
+    ``SLOW_FORK_SECONDS``, whoever made the start. **Round 16, from the CI logs of
+    pull request 149.** It says how long the call took, how much of that was the
+    thread's own processor time, how long the thread waited for the fork lock, and the
+    size and load of the machine. The thread did not use its time when the processor
+    time is near zero, and the kernel copied a large process when it is near the
+    whole. Called after the lock is released, so nothing here holds a fork. Writes
+    without waiting, since the caller may be the event loop. Never raises."""
+    try:
+        if held < SLOW_FORK_SECONDS:
+            return
+        used = "not measured" if cpu < 0.0 else f"{cpu:.1f}s of its own processor time"
+        text = _clean(
+            f"fork call {held:.1f}s, {used}, {wait:.1f}s waiting for the fork lock"
+            f" (bound {lock_wait:g}s), thread {threading.current_thread().name},"
+            f" {threading.active_count()} threads, {_machine_text()}",
+            700,
+        )
+        with _slow_lock:
+            if len(_slow_starts) < MAX_SLOW_STARTS_KEPT:
+                _slow_starts.append(text)
+        _say(f"dromond: slow fork, {text}", limited=True, wait=0.0)
     except Exception:  # noqa: BLE001, S110
         # A record must not disturb the start it describes.
         pass
@@ -1067,6 +1288,10 @@ def _begin(
 ) -> subprocess.Popen[Any]:
     bound = START_SECONDS if start_seconds is None else start_seconds
     name = os.fspath(argv[0]) if argv else "(no program)"
+    # Review of round 16, finding 5. Messages show the program's base name only, since
+    # the full path of a program under a home directory would reach the log and a
+    # ``StartStalled`` message that a caller may pass on.
+    shown = Path(name).name or name
     if not bound > 0:
         _close_all(close_after)
         raise ValueError(f"the start bound must be above 0, not {bound:g}")
@@ -1074,7 +1299,7 @@ def _begin(
     if stranded_count() >= limit:
         _close_all(close_after)
         raise StartStalled(
-            f"{name} was not started: {limit} earlier starts are still stuck, and a"
+            f"{shown} was not started: {limit} earlier starts are still stuck, and a"
             " stuck start ends only when its thread does or the daemon restarts"
         )
     handoff = _Handoff()
@@ -1093,7 +1318,7 @@ def _begin(
             _fork_slot.current = None
             handoff.ended = time.monotonic()
             _leave(handoff)
-        _note_slow_start(handoff, name, outcome)
+        slow = _note_slow_start(handoff, name, outcome)
         # The descriptors are closed here, once the start has ended, not by a caller
         # that was told the start stalled, who would close them under a late start.
         _close_all(close_after)
@@ -1103,6 +1328,8 @@ def _begin(
         handoff.done.set()
         if abandoned and isinstance(outcome, subprocess.Popen):
             _reap(outcome)
+        if slow is not None:
+            _say(slow, limited=True)
 
     thread = threading.Thread(target=target, name="dromon-spawn", daemon=True)
     thread.start()
@@ -1116,12 +1343,12 @@ def _begin(
             _stranded.append(thread)
         report = stall_report(thread, handoff)
         message = (
-            f"{name} did not start within {bound:g}s, as its start stalled before the"
+            f"{shown} did not start within {bound:g}s, as its start stalled before the"
             " program ran, a known intermittent stall in subprocess that"
             " dromon.spawn describes. It is killed if it starts later."
             f" Report, {report}"
         )
-        print(f"dromond: {message}", file=sys.stderr)
+        _say(f"dromond: {message}", limited=False)
         raise StartStalled(message)
     if isinstance(outcome, BaseException):
         raise outcome
@@ -1390,4 +1617,5 @@ def run(
 
 
 install_fork_lock()
-disable_vfork()
+if os.environ.get("DROMON_NO_VFORK") == "1":
+    disable_vfork()

@@ -273,8 +273,9 @@ def test_relative_paths_resolve_against_the_project_root() -> None:
     assert filesystem["denyWrite"] == with_real(
         [str(ROOT / "secret"), *(str(p) for p in PROTECTED)]
     )
-    assert filesystem["allowRead"] == with_real([str(ROOT)])
-    assert filesystem["allowWrite"] == with_real(["/tmp/build", "~/.kube"])  # noqa: S108
+    # An allow entry is never given a real form, review of round 16, finding 1.
+    assert filesystem["allowRead"] == [str(ROOT)]
+    assert filesystem["allowWrite"] == sorted(["/tmp/build", "~/.kube"])  # noqa: S108
 
 
 def test_a_disabled_sandbox_is_passed_without_defaults_or_protection() -> None:
@@ -641,7 +642,9 @@ def test_a_working_directory_that_is_not_a_link_adds_no_grant(tmp_path: Path) ->
     assert "allowWrite" not in cast(dict[str, object], settings["filesystem"])
 
 
-def test_a_listed_path_that_is_a_link_keeps_both_forms(tmp_path: Path) -> None:
+def test_a_deny_path_that_is_a_link_keeps_both_forms_and_an_allow_path_does_not(
+    tmp_path: Path,
+) -> None:
     link, real = linked_worktree(tmp_path)
     document = {
         "enabled": True,
@@ -650,7 +653,7 @@ def test_a_listed_path_that_is_a_link_keeps_both_forms(tmp_path: Path) -> None:
     settings = effective(sandbox(document), tmp_path.resolve(), ())
     assert settings is not None
     filesystem = cast(dict[str, list[str]], settings["filesystem"])
-    assert filesystem["allowWrite"] == sorted([str(link), str(real)])
+    assert filesystem["allowWrite"] == [str(link)]
     # A deny keeps binding where the sandbox follows the link, even to a path that does
     # not exist yet, which resolves as far as it can.
     assert filesystem["denyWrite"] == sorted([str(link / "keep"), str(real / "keep")])
@@ -677,3 +680,31 @@ def test_a_deny_for_the_working_directory_still_wins_over_the_real_grant(
     filesystem = cast(dict[str, list[str]], settings["filesystem"])
     assert str(real) in filesystem["allowWrite"]
     assert str(real) in filesystem["denyWrite"]
+
+
+def test_a_line_that_re_links_an_allowed_directory_gains_nothing(
+    tmp_path: Path,
+) -> None:
+    """Review of round 16, finding 1. An allow entry for a directory inside the working
+    directory, such as the reports directory, was given the real form of the link a
+    writer line had put there, so the line granted itself the link's target at its next
+    engine build. The target must reach neither allow list, and the entry must stay as
+    the operator wrote it, for each of allowWrite and allowRead and for the entry as a
+    link and as a directory below a link."""
+    work = tmp_path.resolve() / "work"
+    outside = tmp_path.resolve() / "operator-home"
+    (work / "tmp").mkdir(parents=True)
+    outside.mkdir()
+    (work / "tmp" / "reports").symlink_to(outside, target_is_directory=True)
+    for entry in (work / "tmp" / "reports", work / "tmp" / "reports" / "keep"):
+        document = {
+            "enabled": True,
+            "filesystem": {"allowWrite": [str(entry)], "allowRead": [str(entry)]},
+        }
+        settings = effective(sandbox(document), work, ())
+        assert settings is not None
+        filesystem = cast(dict[str, list[str]], settings["filesystem"])
+        assert filesystem["allowWrite"] == [str(entry)]
+        assert filesystem["allowRead"] == [str(entry)]
+        for name in ("allowWrite", "allowRead"):
+            assert not any(str(outside) in path for path in filesystem[name])

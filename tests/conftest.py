@@ -506,7 +506,7 @@ def pytest_terminal_summary(terminalreporter: Any) -> None:  # noqa: ANN401
             terminalreporter.write_line(line)
     if not SLOW_STARTS_SEEN:
         return
-    terminalreporter.section("slow child starts", sep="=")
+    terminalreporter.section("slow child starts and slow tests", sep="=")
     for line in SLOW_STARTS_SEEN[:200]:
         terminalreporter.write_line(line)
     if len(SLOW_STARTS_SEEN) > 200:
@@ -523,7 +523,7 @@ def _show_now(lines: list[str], request: pytest.FixtureRequest) -> None:
         manager: Any = request.config.pluginmanager.getplugin("capturemanager")
         with manager.global_and_fixture_disabled():
             for line in lines[:5]:
-                print(f"slow child start in {line}", file=sys.stderr, flush=True)
+                print(line, file=sys.stderr, flush=True)
     except Exception:  # noqa: BLE001, S110
         pass
 
@@ -560,10 +560,13 @@ def _isolated_spawn_state(
     # Round 16. The slow starts of this test, handed to the run's summary at its end.
     own: list[str] = []
     monkeypatch.setattr(spawn, "_slow_starts", own)
+    # Review of round 16, finding 3. The line writer and its rate limit are the test's
+    # own, so one test's line cannot suppress the next test's.
+    monkeypatch.setattr(spawn, "_log", spawn._Log())  # pyright: ignore[reportPrivateUsage]
     current = os.environ.get("PYTEST_CURRENT_TEST", "a test").split(" ")[0]
     began = time.monotonic()
     yield
-    lines = [f"{current}: {line}" for line in own]
+    lines = [f"{current}: slow child start, {line}" for line in own]
     # Round 16. A test that took long is named at once, past capture, because a run
     # that is later killed by its timeout lists nothing at its end. On 2026-11-11 a
     # Linux run spent three minutes in a file that takes under a second elsewhere, and

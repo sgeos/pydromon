@@ -248,6 +248,13 @@ def assert_killed(child: subprocess.Popen[bytes]) -> None:
         os.kill(child.pid, 0)
 
 
+def assert_pipes_closed(child: subprocess.Popen[bytes]) -> None:
+    """Both of the child's pipes are closed, as ``communicate`` leaves them. A pipe
+    left open is a descriptor lost for each cancelled start."""
+    assert child.stdin is not None and child.stdin.closed, "stdin was left open"
+    assert child.stdout is not None and child.stdout.closed, "stdout was left open"
+
+
 def test_the_child_is_killed_at_the_default_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -332,6 +339,74 @@ def test_the_child_is_killed_when_the_cancellation_comes_during_the_start(
 
     asyncio.run(asyncio.wait_for(scenario(), 20))
     assert_killed(made[0])
+    assert_pipes_closed(made[0])
+
+
+def test_a_second_cancellation_during_the_start_still_ends_the_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of round 16, finding 2. A second cancellation, as a daemon's shutdown
+    sends after a turn's, ended the wait early and left the child the start made
+    running with its pipes open. Three cancellations are sent inside the window. The
+    task still ends cancelled, the child is killed and reaped, and both pipes are
+    closed, which the earlier test checks for one cancellation only."""
+    monkeypatch.setattr(runparams, "MATCHER", SLOW_MATCHER)
+    real = cast(Any, spawn.start)
+    made: list[subprocess.Popen[bytes]] = []
+
+    def held(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        child = cast(subprocess.Popen[bytes], real(*args, **kwargs))
+        made.append(child)
+        time.sleep(0.5)
+        return child
+
+    monkeypatch.setattr(runparams.spawn, "start", held)
+    prepared = runparams.prepare(
+        ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(runparams.match(prepared))
+        for _ in range(1000):
+            if made:
+                break
+            await asyncio.sleep(0.01)
+        assert made, "the child was never started"
+        for _ in range(3):
+            task.cancel()
+            await asyncio.sleep(0.05)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), 20))
+    assert_killed(made[0])
+    assert_pipes_closed(made[0])
+
+
+def test_a_start_that_fails_oddly_during_a_cancellation_still_cancels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of round 16, finding 2, minor. An exception of a kind other than
+    ``OSError`` or ``TimeoutError`` from the start replaced the cancellation the caller
+    expects. It is read and dropped, and the cancellation goes on."""
+
+    def failing(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        time.sleep(0.2)
+        raise ValueError("odd")
+
+    monkeypatch.setattr(runparams.spawn, "start", failing)
+    prepared = runparams.prepare(
+        ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(runparams.match(prepared))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), 20))
 
 
 def test_a_start_that_fails_during_a_cancellation_leaves_no_child(

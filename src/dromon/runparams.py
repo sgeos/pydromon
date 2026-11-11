@@ -320,22 +320,46 @@ async def match(prepared: Prepared, seconds: float = MATCH_SECONDS) -> tuple[str
     return prepared.argv
 
 
-async def _end_late_start(starting: asyncio.Future[subprocess.Popen[bytes]]) -> None:
-    """Wait for a start that a cancellation did not stop, and kill and reap the child
-    it made. A start that failed or stalled made none. Failure mode, a second
-    cancellation while waiting leaves the worker to finish, and the child it made is
-    then not ended here. The window is the start's own bound."""
-    try:
-        child = await starting
-    except (OSError, TimeoutError):
-        return
+async def _until_done[T](future: asyncio.Future[T]) -> None:
+    """Wait for ``future`` to finish, however many times the caller is cancelled while
+    it waits. Review of round 16, finding 2. A second cancellation used to end the
+    wait early and leave the child the start made running with its pipes open. The
+    cancellations are not lost, since the caller raises the first again afterwards, so
+    they delay the end by at most the wait for ``future``, which ``spawn.START_SECONDS``
+    bounds for a start and a kill bounds for a reap. The loop ends when ``future`` is
+    done, and each pass that does not end it consumed one cancellation."""
+    while not future.done():
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            continue
+        except Exception:  # noqa: BLE001, the caller reads the outcome from ``future``
+            return
+
+
+def _reap(child: subprocess.Popen[bytes]) -> None:
+    """Kill ``child`` if it still runs, wait for it, and close its pipes, which
+    ``communicate`` would have closed had it run."""
     if child.poll() is None:
         child.kill()
-    await asyncio.to_thread(child.wait)
-    # ``communicate`` never ran, so nothing else closes the child's pipes.
+    child.wait()
     for pipe in (child.stdin, child.stdout):
         if pipe is not None:
             pipe.close()
+
+
+async def _end_late_start(starting: asyncio.Future[subprocess.Popen[bytes]]) -> None:
+    """Wait for a start that a cancellation did not stop, and kill and reap the child
+    it made. A start that failed, stalled or was itself cancelled made none, and any
+    other exception it raised is read here, so it replaces neither the cancellation the
+    caller expects nor goes unretrieved. A second cancellation does not end the wait,
+    nor the reap, as ``_until_done`` describes."""
+    await _until_done(starting)
+    if starting.cancelled() or starting.exception() is not None:
+        return
+    await _until_done(
+        asyncio.ensure_future(asyncio.to_thread(_reap, starting.result()))
+    )
 
 
 def _check_answers(prepared: Prepared, output: bytes, code: int | None) -> None:
