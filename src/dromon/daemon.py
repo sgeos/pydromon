@@ -102,6 +102,8 @@ from dromon.eventlog import (
     LogError,
     RestoreMismatch,
     check_snapshot,
+    hold_snapshot,
+    snapshot_since_held,
     read_entries,
     snapshot,
     utc_now,
@@ -3805,6 +3807,10 @@ def check_private_dirs(paths: ProjectPaths) -> None:
 CHECK_PASSED: Final = "dromond: the start checks pass, and nothing was started"
 """What ``dromond --check`` says when a start would get past its checks."""
 
+HELD_SNAPSHOT: Final = "held-snapshot.json"
+"""The name of the copy of the live snapshot ``--check`` holds in its private
+directory, read before the log is copied. **Round 16, item 2.**"""
+
 
 def check_scratch(paths: ProjectPaths) -> Path:
     """A new private directory under the runtime directory for a check's copy of
@@ -4009,13 +4015,22 @@ def run(
     successor: list[str] | None = None
     scheduler: Scheduler | None = None
     scratch: Path | None = None
+    held: Path | None = None
+    held_refusal: str | None = None
+    copied_through = 0
     daemon_commit = read_head_commit(Path(__file__).parent)
     try:
         log_path = paths.event_log
         if check_only:
             scratch = check_scratch(paths)
             log_path = scratch / paths.event_log.name
-            snapshot(paths.event_log, log_path)
+            # Round 16, item 2. The snapshot is held before the log is copied, so
+            # it names an event within the copy, and the copy's bound is kept, so
+            # the check's own events past it are never compared with a snapshot.
+            # Named apart from the copy's own snapshot path, which is the log's.
+            held = scratch / HELD_SNAPSHOT
+            held_refusal = hold_snapshot(snapshot_path(paths.event_log), held)
+            copied_through = snapshot(paths.event_log, log_path)
             if launch_checks:
                 launcher.configure(scratch / "left")
         with EventLog(log_path, snapshots=not check_only) as log:
@@ -4116,8 +4131,14 @@ def run(
                 # start before any socket is made.
                 daemon.relay_routes(config)
                 if check_only:
-                    agrees, said = check_snapshot(
-                        snapshot_path(paths.event_log), log_path
+                    if held is None:
+                        raise LogError(
+                            "the snapshot check requires a private directory"
+                        )
+                    agrees, said = (
+                        (True, held_refusal)
+                        if held_refusal is not None
+                        else check_snapshot(held, log_path, through=copied_through)
                     )
                     print(f"dromond: {said}", file=sys.stderr)
                     if not agrees:
@@ -4129,6 +4150,10 @@ def run(
                             check_engine_launches(daemon, scratch / "lines.sock")
                         ):
                             return exits.FAILURE
+                    # Round 16 review, finding 2. Read last, after the engine
+                    # checks, so it is as near the stop as the check comes.
+                    since = snapshot_since_held(snapshot_path(paths.event_log), held)
+                    print(f"dromond: {since}", file=sys.stderr)
                     print(CHECK_PASSED, file=sys.stderr)
                     return exits.OK
                 entry = open_registration(

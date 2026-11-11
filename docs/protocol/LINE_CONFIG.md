@@ -326,7 +326,14 @@ fact is unknown, so no reader mistakes a missing value for a fact. `provider_bud
 the stated budget of the line's provider, with `status` `stated` or `unknown`, `provider`,
 `remaining_percent`, `resets_at`, `source`, `note` and `stated_at`, each `unknown`
 where the statement left it out or none exists. `role_status` gives each seat's
-`budget` in the same form. Dromon moves no role and holds no line on a budget it does
+`budget` in the same form. **Round 16, item 6, from another project's reports.** A
+figure carried forward could not be told from a fresh one, so beside it stand
+`observed_at`, the time it was stated or reported, the same as `stated_at`,
+`age_seconds`, its age in whole seconds at the daemon's time, and `age`, the same in
+words, such as `observed 2 hours 5 minutes ago`. An observation after the daemon's
+time, as when the clock was set back, gives a negative `age_seconds` and says its age
+is unknown, so an old figure never reads as fresh. Each is `unknown` where no budget
+is stated. Dromon moves no role and holds no line on a budget it does
 not know. `disclosure` says whether the project has a disclosure list, `list` being
 `configured` or `none`, with a `note`, so a line learns early that `check_disclosure`
 can neither pass nor fail without one. It names no path, term, count of terms or line
@@ -1642,6 +1649,23 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
     while a new dirty path, a path made clean, or discarded work does. A line's own
     new file flags its brief until it sets the brief again, which is the intended
     prompt to keep the brief current.
+  - **Both commits in every notice.** **Round 16, item 4, at the review line's
+    request.** Each `STALE BRIEF.` and `BRIEF CURRENCY UNKNOWN.` notice names the
+    commit the brief was set at and the worktree's `HEAD`, or says that the brief
+    names no commit or that `HEAD` could not be read, so a line can read the log
+    between them without first finding either. A notice whose reason already names
+    both, the commit move on a turn not led with the brief, does not repeat them.
+  - **Fewer starts of git, from round 16, item 1.** Bisecting runs put a rise in
+    stalled starts in continuous integration at the change that read `git status` on
+    every `set_brief` and every kept turn. A working directory the file system shows
+    to be outside any checkout is answered `failed` without starting git. The read
+    stays lazy, made only for a brief that names a digest, and only as a turn is
+    about to show the notice or `set_brief` records one. **Decided by core, for
+    review.** The digest is not cached on `HEAD`, the index and the worktree's own
+    modification time, since an edit in place of a tracked file below the top level
+    changes none of the three, and a cached digest would hide the change the notice
+    reports. In the test suite only the tests marked `real_git_status` start git
+    there, and every other test is answered a clean tree.
 - **Mail since the brief.** **Required by the operator on 2026-10-30.** The review
   line's brief was stale after a compaction, since its task had changed in mail since
   the brief was set. When an operator has mailed the line since its latest
@@ -1912,6 +1936,11 @@ report, which found that about 2,000,000 cached tokens re-read in one turn set i
     wake that falls due while the turn that took its request is still compacting is
     held back until that turn reports the compaction, which withdraws it, or ends,
     which lets it fire on the next tick. The hold is bounded by the turn.
+    **Round 16, item 7.** The request itself is spent by the same report. A request
+    made before a compaction the engine reported for another cause, such as one the
+    engine made by itself in the same turn, had its wake withdrawn and stayed
+    pending, so the next turn compacted the session a second time. A request made
+    after the compaction is reported still stands.
     **Review, F1 to F4.** A withdrawn identifier is kept in the state, and a later
     `wake_scheduled`, `message_sent` or `task_noted` that takes it is refused, so a
     reply reference to it cannot reach another message. The compaction is recorded

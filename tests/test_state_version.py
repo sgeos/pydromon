@@ -43,6 +43,12 @@ PINS: tuple[tuple[int, str, str], ...] = (
         "1ed89a710b96536b115ace4a5ba7d4a40e54d561cbd6823c874af7bfbb946d46",
         "4c36dab8af2c877d5f0014b3e6cb484412012e63f49cfa53bef7cdbf0d13a746",
     ),
+    # Round 16, item 5, run_started's tree.
+    (
+        4,
+        "887a1d0509c9a28fe313f449f590ac7334912ed59f8a8e17d8e129e5660df930",
+        "9b1e3ce54ffee8fca67591835a4913c90466c2b68d22d362344c02097d2b57dc",
+    ),
 )
 """Each ``STATE_VERSION`` with its ``codec_digest`` and its replay digest, oldest
 first, appended to and never edited."""

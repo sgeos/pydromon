@@ -10,7 +10,9 @@ the harness so that every line's session migrates to the latest installed versio
   turn to end at its next safe point, the same point that priority mail uses, as
   ``dromon.priority`` describes, so the engine reports the turn and keeps its session.
   A line whose turn the restart ended receives a ``restart_noted`` note, which wakes it
-  once the restarted daemon runs.
+  once the restarted daemon runs. **Round 16, item 3, and its review's finding 1.**
+  The note follows the reason the turn's report names, so a turn whose report names
+  another stop, or none, is not woken.
 - Both are bounded by the request's wait. A turn still running at the bound is one
   whose interrupt could not be honoured, such as a turn in one long tool call, and the
   restart is then abandoned, so no turn is cut part way. The daemon starts turns again,
