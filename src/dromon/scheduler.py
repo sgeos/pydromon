@@ -173,7 +173,7 @@ from dromon.security_paths import project_secret_paths
 from dromon.handoff import Handoff
 from dromon.handoff import select as select_handoff
 from dromon import requestkeys
-from dromon import commitruns, runparams, runs
+from dromon import commitruns, machinestatus, runparams, runs
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon.requestkeys import (
     REQUEST_KEY,
@@ -1487,6 +1487,52 @@ swept at least this often while the daemon is idle. **Fourth live run of N1,
 2026-10-26.** The rest was unbounded when no wake was pending, so an idle daemon never
 swept a kept connection's dead launcher."""
 
+MACHINE_READ_SECONDS: Final = 15.0
+"""How long one read of the machine status file is kept before it is read again, so
+the loop's ticks, which may come every half second, read a small file at most this
+often. **Round 16, item 3.** The monitor samples once a minute, so a read this old
+loses nothing that the status's own age does not already say."""
+
+MACHINE_WAIT_SECONDS: Final = 0.5
+"""The longest the loop waits for one read of the status file, which a worker thread
+makes. **Round 16, item 3, at the operator's request.** A local file is read in
+microseconds, so the wait is never reached on a healthy machine. A file on a mount
+that hangs holds the worker and not the loop, and the status is ``unreadable`` until
+the read returns. At most one worker is ever outstanding."""
+
+
+class _MachineRead:
+    """One read of the status file, made on a worker thread. ``status`` is set before
+    ``finished``, so a reader that sees ``finished`` sees the status. A reader that
+    raises, which ``machinestatus.read`` does not, leaves ``unreadable``."""
+
+    def __init__(self) -> None:
+        self.finished = threading.Event()
+        self.status = machinestatus.MachineStatus(
+            "unreadable", problem="the read did not complete"
+        )
+
+    def run(
+        self,
+        reader: Callable[[Path, float], machinestatus.MachineStatus],
+        path: Path,
+        now_epoch: float,
+    ) -> None:
+        try:
+            self.status = reader(path, now_epoch)
+        except Exception:  # noqa: BLE001 - a read that fails is a status that cannot be relied on
+            self.status = machinestatus.MachineStatus(
+                "unreadable", problem="the read failed"
+            )
+        finally:
+            self.finished.set()
+
+
+_OVERRAN: Final = machinestatus.MachineStatus(
+    "unreadable", problem="reading it is taking too long"
+)
+"""The status while a read of the file has not returned."""
+
 
 def _never_registered(_name: str) -> bool:
     return False
@@ -2714,6 +2760,25 @@ class Scheduler:
         self._repeats: dict[str, str] = {}
         """Each undelivered message to a line that repeats an earlier one, and that
         earlier message, until the repeat is delivered."""
+        self._machine_path: Path | None = None
+        """The machine monitor's status file, or ``None`` to read none. **Round 16,
+        item 3.**"""
+        self._machine_read: tuple[float, machinestatus.MachineStatus] | None = None
+        """The latest read and when it was made, on the monotonic clock."""
+        self._machine_pending: _MachineRead | None = None
+        """The read a worker thread is making and has not finished, if any. A worker
+        that never returns stays here, so no second one is started."""
+        self._machine_reader: Callable[[Path, float], machinestatus.MachineStatus] = (
+            machinestatus.read
+        )
+        """What reads the file. A seam for tests, which makes a read that hangs."""
+        self._machine_noted: set[str] = set()
+        """What has been told in the current deferral, the operator once as ``operator``
+        and each line as its own identifier, or the run kind as ``run``, so a deferral
+        notes once and not at every tick. Emptied when nothing defers. In memory."""
+        self._machine_deferred: dict[str, datetime] = {}
+        """When each line's turn was first deferred in the current deferral, for the
+        note its next prompt leads with."""
         self._disclosure: tuple[str, ...] = ()
         self._disclosure_accepted: dict[str, tuple[str, ...]] = {}
         """The project's disclosure terms, case folded. Never logged or returned."""
@@ -3204,6 +3269,172 @@ class Scheduler:
                 " operator's own. Restore the file, or restart the daemon so that"
                 " it checks the file again, before resuming the line"
             )
+
+    def set_machine_status(self, path: Path | None) -> None:
+        """Read the machine monitor's status file at ``path`` before each run and turn
+        starts, or read none for ``None``. Replaces the earlier path and forgets what
+        was read. **Round 16, item 3.**"""
+        self._machine_path = path
+        self._machine_read = None
+        self._machine_pending = None
+        self._machine_noted.clear()
+        self._machine_deferred.clear()
+
+    def machine_status(self) -> machinestatus.MachineStatus | None:
+        """The machine's status, read at most once every ``MACHINE_READ_SECONDS``, or
+        ``None`` when no status file is configured. A file that is missing, stale or
+        unreadable is a status of its own, which counts as elevated, so a monitor
+        that stopped is seen and not mistaken for a healthy machine.
+
+        The read is made by a worker thread and the loop waits at most
+        ``MACHINE_WAIT_SECONDS`` for it, so a file on a mount that hangs cannot hold
+        the loop. Until a read that overran returns, the status is ``unreadable``,
+        and no second worker is started. **Porting note.** A Rust port makes the
+        read on a blocking task with a timeout, and a Keleusma one in a stream
+        processor of its own."""
+        if self._machine_path is None:
+            return None
+        now = self._clock()
+        pending = self._machine_pending
+        if pending is not None:
+            if not pending.finished.is_set():
+                kept = self._machine_read
+                return kept[1] if kept is not None else _OVERRAN
+            return self._take_machine_read(now, pending)
+        kept = self._machine_read
+        if kept is not None and 0 <= now - kept[0] < MACHINE_READ_SECONDS:
+            return kept[1]
+        pending = _MachineRead()
+        threading.Thread(
+            target=pending.run,
+            args=(
+                self._machine_reader,
+                self._machine_path,
+                self._wall_clock().timestamp(),
+            ),
+            name="machine-status",
+            daemon=True,
+        ).start()
+        self._machine_pending = pending
+        if pending.finished.wait(MACHINE_WAIT_SECONDS):
+            return self._take_machine_read(now, pending)
+        self._machine_read = (now, _OVERRAN)
+        return _OVERRAN
+
+    def _take_machine_read(
+        self, now: float, pending: "_MachineRead"
+    ) -> machinestatus.MachineStatus:
+        """The finished read, kept as the latest, with no read outstanding."""
+        status = pending.status
+        self._machine_pending = None
+        self._machine_read = (now, status)
+        return status
+
+    def machine_status_view(self) -> dict[str, object]:
+        """The machine's status as ``line_status`` gives it in detail, never the
+        file's path. **Round 16, item 3.**"""
+        status = self.machine_status()
+        if status is None:
+            return {"configured": False}
+        decision = machinestatus.decide(status)
+        return {
+            "configured": True,
+            "level": status.level,
+            "acted_on_as": status.effective,
+            "age_seconds": status.age_seconds,
+            "reasons": list(status.reasons),
+            "problem": status.problem,
+            "defers_runs": decision.defer_runs,
+            "defers_turns": decision.defer_turns,
+        }
+
+    def machine_decision(self) -> machinestatus.Decision:
+        """What the machine's status allows now, which is everything when none is
+        configured. Forgets what a deferral told once nothing defers any more."""
+        status = self.machine_status()
+        decision = (
+            machinestatus.NO_DECISION
+            if status is None
+            else machinestatus.decide(status)
+        )
+        if not decision.defer_runs and not decision.defer_turns:
+            self._machine_noted.clear()
+        return decision
+
+    def _machine_words(self, status: machinestatus.MachineStatus) -> str:
+        """``status`` in a sentence, with its reasons withheld should one hold a term
+        of the disclosure list, since the file is the monitor's and its text is not
+        the project's own."""
+        text = status.describe()
+        return (
+            "the machine status cannot be shown here" if self.discloses(text) else text
+        )
+
+    def _machine_run_refusal(self, line_id: str) -> str | None:
+        """Why a run of ``line_id`` is deferred by the machine's status, or ``None``.
+        Tells the operator once for the deferral. Nothing has started or been recorded
+        when it returns text."""
+        status = self.machine_status()
+        if status is None or not self.machine_decision().defer_runs:
+            return None
+        words = self._machine_words(status)
+        if "run" not in self._machine_noted:
+            self._machine_noted.add("run")
+            self._tell_operator(
+                line_id,
+                f"Dromon deferred a run of {line_id}, since {words}. It starts"
+                " nothing heavy until the status is ok again, and the line was told"
+                " to wait and ask again.",
+            )
+        return (
+            f"the run is deferred, since {words}. Nothing was started. This machine"
+            " is shared, so wait with wake_after and start it again once"
+            " machine-status says ok, and say in your report that you waited"
+        )
+
+    def _note_turn_deferral(self, line_id: str) -> None:
+        """Tell the line and the operator, once each for the deferral, that a turn
+        waits on the machine's status. The line's note leads its next prompt's mail
+        and the line learns how long it waited from the prompt."""
+        status = self.machine_status()
+        if status is None:
+            return
+        words = self._machine_words(status)
+        self._machine_deferred.setdefault(line_id, self._wall_clock())
+        if line_id not in self._machine_noted:
+            self._machine_noted.add(line_id)
+            self._harness_note(
+                LineAddress(line_id),
+                f"Dromon deferred your turn, since {words}. It starts when the"
+                " status is no longer critical, and your mail waits until then.",
+            )
+        if "operator" not in self._machine_noted:
+            self._machine_noted.add("operator")
+            self._tell_operator(
+                line_id,
+                f"Dromon deferred the turns of lines with mail waiting, starting with"
+                f" {line_id}, since {words}. No turn starts until the status is no"
+                " longer critical.",
+            )
+
+    def _machine_notice(self, line_id: str) -> str | None:
+        """What a turn that proceeds is told of the machine's status, or ``None``. A
+        warning when the status is elevated, with the advice of the shared machine
+        rule, and how long the turn was deferred, when it was."""
+        status = self.machine_status()
+        deferred = self._machine_deferred.pop(line_id, None)
+        parts: list[str] = []
+        if deferred is not None:
+            waited = int((self._wall_clock() - deferred).total_seconds())
+            parts.append(f"Your turn was deferred for {waited} seconds by the status.")
+        if status is not None and machinestatus.decide(status).warn:
+            words = self._machine_words(status)
+            parts.append(
+                f"{words[:1].upper()}{words[1:]}. This machine is shared,"
+                " so start nothing heavy, such as a full gate, until it is ok, and"
+                " say so in your report if you wait. Your turn proceeds."
+            )
+        return "Dromon note: " + " ".join(parts) if parts else None
 
     def set_disclosure_accepted(self, entries: Mapping[str, tuple[str, ...]]) -> None:
         """Replace operator accepted occurrences on startup and reload."""
@@ -4866,6 +5097,9 @@ class Scheduler:
                 f"previous must name the latest run, so you start one only after"
                 f" reading its record. The latest is {seen}"
             )
+        deferred = self._machine_run_refusal(line_id)
+        if deferred is not None:
+            raise runs.RunRefused(deferred)
         if self._report_dir is None:
             raise runs.RunRefused("this daemon has no report directory for receipts")
         directory = self._report_dir
@@ -5391,12 +5625,15 @@ class Scheduler:
     ) -> tuple[str, str | None]:
         """The note and tail a run's end records, with its output's summary and tail
         screened against the disclosure list first. **Round 15 review, R1, the
-        operator's decision.** Either holding a term withholds both, and counts as a
-        failing check of ``line_id``, which started the run, as a tool's refusal
-        does, so a line cannot print candidates in a run's output to test them
-        outside the check's limit. A line that has spent its failing checks has both
-        withheld whatever they hold, so the withholding tells it nothing. A run of a
-        line no longer known is screened and nothing is counted."""
+        operator's decision.** Either holding a term counts as a failing check of
+        ``line_id``, which started the run, as a tool's refusal does, so a line cannot
+        print candidates in a run's output to test them outside the check's limit.
+        **Round 16, item 2.** Only the part that holds a term is withheld, so a clean
+        summary survives a tail whose traceback names paths under a user directory,
+        and both are withheld only when both hold one. A line that has spent its
+        failing checks has both withheld whatever they hold, so the withholding tells
+        it nothing. A run of a line no longer known is screened and nothing is
+        counted."""
         summary, tail = finding.summary, finding.tail
         if summary is None and tail is None:
             return finding.note, None
@@ -5407,12 +5644,15 @@ class Scheduler:
             or self._disclosure_reopens(line_id, now) is not None
         ):
             return runs.note_withheld(finding.note, runs.OUTPUT_WITHHELD_SPENT), None
-        texts = tuple(text for text in (summary, tail) if text is not None)
-        if not self.discloses(*texts):
+        summary_held = summary is not None and self.discloses(summary)
+        tail_held = tail is not None and self.discloses(tail)
+        if not summary_held and not tail_held:
             return runs.note_with_summary(finding.note, summary), tail
         if known:
             matched = sum(
-                disclosure.matching_lines(self._disclosure, text) for text in texts
+                disclosure.matching_lines(self._disclosure, text)
+                for text, held in ((summary, summary_held), (tail, tail_held))
+                if text is not None and held
             )
             self._log.append(
                 DisclosureChecked(
@@ -5421,7 +5661,14 @@ class Scheduler:
                     min(max(matched, 1), MAX_DISCLOSURE_MATCHES),
                 )
             )
-        return runs.note_withheld(finding.note, runs.OUTPUT_WITHHELD), None
+        if summary_held and tail_held:
+            return runs.note_withheld(finding.note, runs.OUTPUT_WITHHELD), None
+        if summary_held:
+            return runs.note_withheld(finding.note, runs.SUMMARY_WITHHELD), tail
+        # Only the tail holds a term. Its notice leads, so a long summary after it
+        # cannot cut the notice off at the note's bound.
+        notice = runs.note_withheld(finding.note, runs.TAIL_WITHHELD)
+        return runs.note_with_summary(notice, summary), None
 
     def _withdraw_run_wakes(self, run_id: str) -> dict[str, str]:
         """Withdraw each pending wake that waits for the run ``run_id``, and return
@@ -6342,6 +6589,7 @@ class Scheduler:
             "cost_usd": self.cost_status(line_id),
             "provider_budget": self.provider_budget_status(line_id),
             "disclosure": self.disclosure_status(),
+            "machine_status": self.machine_status_view(),
             "leases": self.leases_of(line_id),
             "scheduled_wake": _scheduled_summary(pending),
             **summary(state, LineAddress(line_id), 0).counts(),
@@ -11322,10 +11570,19 @@ class Scheduler:
             self._ensure_context_compaction_wake(line_id)
         if self._running or self._sent or self._due_wakes():
             return True
+        deferring = self.machine_decision().defer_turns
         return any(
-            self._eligible(line_id) and self._may_wake(line_id)
+            self._eligible(line_id)
+            and self._may_wake(line_id)
+            and not (deferring and self._turn_deferral_told(line_id))
             for line_id in self._state().lines
         )
+
+    def _turn_deferral_told(self, line_id: str) -> bool:
+        """Whether the current deferral has told ``line_id`` and the operator, so a
+        deferred line no longer keeps the loop ticking. The loop's rest, at most
+        ``MAX_REST_SECONDS``, then reads the status again. **Round 16, item 3.**"""
+        return line_id in self._machine_noted and "operator" in self._machine_noted
 
     def _may_wake(self, line_id: str) -> bool:
         """Whether the line has post office mail that may start its turn. Peer mail
@@ -11447,6 +11704,9 @@ class Scheduler:
             return
         if self._nothing_new(line_id, messages):
             self._deliver_without_turn(messages)
+            return
+        if self.machine_decision().defer_turns:
+            self._note_turn_deferral(line_id)
             return
         self._begin_turn(line_id, messages)
 
@@ -11717,6 +11977,9 @@ class Scheduler:
             behind = self._behind_notice(line_id)
             if behind is not None:
                 prompt = f"{behind}\n\n{prompt}"
+            machine = self._machine_notice(line_id)
+            if machine is not None:
+                prompt = f"{machine}\n\n{prompt}"
             moved = self._head_notice(line_id)
             if moved is not None:
                 prompt = f"{moved}\n\n{prompt}"

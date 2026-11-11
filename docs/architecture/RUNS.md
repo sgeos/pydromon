@@ -324,10 +324,36 @@ file could not already read, since the file is in the scope's working directory.
 summary enter the event log and every copy of it, such as the one `dromond --check`
 makes, where a term of the disclosure list, a token in a URL or a value a traceback
 printed would stay in clear. So both are screened against the disclosure list before
-the end is recorded, and when either holds a term both are withheld, and the note says
-`The output's test summary and last lines are withheld from this record, since they
-hold a term from the project's disclosure list`. The output file is unchanged. A
-withholding is the same answer a check gives, so it counts as a failing check of the
+the end is recorded, and the note says what was withheld, `The output's test summary and
+last lines are withheld from this record, since they hold a term from the project's
+disclosure list` when both hold one. The output file is unchanged.
+
+**Round 16, item 2, which part matched.** The first rule withheld both whenever either
+held a term. A failed run's tail is its last 20 lines, and a traceback
+names paths under the user's home directory.
+
+**Fact, from counts by the disclosure check, which never printed a term.** The runs of
+this machine's worktrees held 77 distinct summaries and 186 distinct lines of failed
+runs' tails. No summary matched. None of the 174 tail lines that name no path under a
+user directory matched, and all 12 that do matched. The first part of a home
+directory's path on macOS matched by itself, and the rest of such a path did not.
+**Inference.** The list holds a term that every path under a home directory
+contains, so the summary, which holds only counts and skip reasons, was withheld with a
+tail that could never pass on this machine, whatever the run printed.
+
+Each part is now screened on its own and only the part that holds a term is withheld,
+with a note naming it, `The output's test summary is withheld` or `The output's last
+lines are withheld`. Each match is one failing check, as before, and the notice leads the
+summary so that the note's bound cannot cut it off. **Residual.** A tail naming such a
+path is still withheld whole, so a failed run on this machine keeps its summary and not
+its traceback, which almost always names one, and the operator reads the traceback in
+the output file. A rewrite of the home directory in a tail would keep it, and was not
+made, since it would edit text the command wrote, which the screen exists to leave
+alone. **Why the split gives a line nothing new.** A line that prints a candidate term in
+its output chooses which part holds it, so which part was withheld is only what it
+placed there, and each probe still costs a failing check.
+
+A withholding is the same answer a check gives, so it counts as a failing check of the
 line that started the run, which a line printing candidates in its output could
 otherwise use to test them outside the check's limit. A line that has spent its failing
 checks has both withheld whatever they hold, with a note naming that reason, so the
@@ -335,6 +361,72 @@ withholding tells it nothing. **Residual.** A tail that passes is not counted ag
 the pass limit, as a tool's passing text is not, so a line can test a tail of up to
 2,048 bytes for each run it can start, at most one at a time in its scope. Text that is
 no listed term, such as a credential the list does not name, is kept as before.
+
+## The machine's status
+
+**Round 16, item 3, at the admin session's suggestion.** The machine is shared by many
+sessions. A monitor outside every sandbox samples it once a minute and writes a status
+file, with a `level` of `ok`, `elevated` or `critical`, its `reasons` and an `epoch`.
+`daemon.machine_status` in the project file names that file, as
+[`PROJECT_CONFIG.md`](../protocol/PROJECT_CONFIG.md) says, and Dromon reads it before it
+starts a supervised run, a commit run or a line's turn. `dromon.machinestatus` is the
+reader and the decision, and is a pure function of the file's text and the time.
+
+| Status | A run, supervised or commit | A line's turn |
+|---|---|---|
+| `ok` | starts | starts |
+| `elevated`, for memory, swap, load or a reason Dromon does not know | deferred | starts, with a warning in its prompt |
+| `elevated`, raised only by free disk space | starts | starts, with a warning |
+| `critical` | deferred, unless only disk raised it | deferred |
+| stale, missing or unreadable | deferred, as an unknown reason | starts, with a warning |
+
+**A deferral.** A run's start is refused with `RunRefused`, naming the status and saying
+that nothing was started and that the line should wait with `wake_after` and start it
+again, so the line is told by its own tool's answer. The operator is told once for the
+deferral, by a note from the harness, and again only after a status that deferred nothing
+has intervened. A turn is not started and the line's mail waits. The line is told once by
+a harness note, which it reads with the mail that waited, and the operator once for the
+deferral, however many lines wait. The line's next prompt says how long its turn waited.
+A deferral keeps nothing ticking, since once both are told the loop rests and reads the
+status again at its next rest, at most 60 seconds on, and at most once every 15 seconds
+in all. Only starts are deferred. A run or a turn that is under way is never stopped by
+the status, since stopping work is the operator's decision. A malformed request is
+refused for itself and not deferred, since the check comes after the request's own.
+Mail the line has already answered is still delivered without a turn, since that costs
+the machine nothing.
+
+**Stale, missing, unreadable.** A sample older than three minutes, a file that is not
+there, is not a regular file, is over 64 KiB, or names no level or time Dromon knows, is
+treated as `elevated` and reported as what it is, so a monitor that stopped is seen and
+is not taken for a healthy machine. **Decision of the feature, for review.** Nothing is
+read unless `daemon.machine_status` is set, because a machine without the monitor would
+otherwise defer every run for ever. A status that is on and then lost defers runs until
+the monitor returns or the operator unsets the key. The file is the monitor's own and
+its reasons are untrusted text. Each is cut to a printable line of at most 160
+characters, at most eight are kept, and a status whose sentence holds a term of the
+disclosure list is not shown. The file's path is never put in a note or in
+`line_status`.
+
+**What it does not do.** It runs no command, so a machine without the monitor's tool
+needs nothing, and makes no call that needs the network. It does not read `load1` or
+the other numbers, only the level and the reasons the monitor chose, so Dromon and the
+monitor cannot disagree about a threshold. It does not defer a line's tool calls, a
+running turn or the engines' own work. **Interpretation, for review.** The operator's
+text lets a `critical` raised only by disk defer a turn or not. The stricter reading is
+taken, a turn is deferred and a run is not, and `machinestatus.decide` is the one line
+that changes it. **Residual.** The status is as old as 180 seconds, so a start it
+allowed can land on a machine that has just failed. **Bounded read, at the operator's
+request.** A worker thread reads the file and the loop waits for it at most half a
+second, `scheduler.MACHINE_WAIT_SECONDS`, so a file on a mount that hangs holds the
+worker and not the loop. Until that read returns the status is `unreadable`, which is
+acted on as `elevated` and says that reading it is taking too long, and no second
+worker is started, so a hang costs one thread and never more. A read that returns late
+is taken at the next call. A reader that raises is `unreadable` as well. **Residual.**
+The one worker stays blocked as long as the mount does, and Python cannot interrupt it,
+so a port should read on a task with a timeout that it can cancel. `line_status`
+gives the status in detail, as [`LINE_CONFIG.md`](../protocol/LINE_CONFIG.md) says. The
+deferral's record is the harness notes, since the daemon's memory of what it told is not
+in the event log, and a restart tells once again.
 
 ## A lost run
 

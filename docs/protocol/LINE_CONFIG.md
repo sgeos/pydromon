@@ -320,6 +320,24 @@ bounded to 8,192 UTF-8 bytes. If a response exceeds that bound, it returns a sma
 object with `status_truncated`. A truncated list response also sets `lists_truncated`
 and suggests `detail: true, lists: false` to omit the lists.
 
+**Round 16, item 3. The machine's status.** Where the project names a status file with
+`daemon.machine_status`, `line_status` in detail gives `machine_status`, with `configured`,
+`level`, `acted_on_as`, `age_seconds`, `reasons`, `problem`, `defers_runs` and
+`defers_turns`, never the file's path. `level` is `ok`, `elevated` or `critical`, or
+`stale`, `missing` or `unreadable`, which are acted on as `elevated`. A line is affected in
+three ways, as [`RUNS.md`](../architecture/RUNS.md) sets out. Its `start_run` is refused
+as deferred, saying nothing was started and that it should wait with `wake_after`, when the
+status is `elevated` for memory, swap, load or an unknown reason, `critical`, or not to be
+relied on, and not when only free disk space raised it, since a gate uses processor and
+memory and not disk. A turn proceeds at `elevated` with a note leading its prompt, which
+says the machine is shared and asks the line to start nothing heavy, such as a full gate,
+and to say so in its report if it waits. A turn is not started at `critical`, and the
+line's mail waits. The line is told once by a note from the harness and the operator is
+told once, and the line's next prompt says how long its turn waited. A running turn and a
+running run are never stopped by the status. The file is read on a worker thread that the
+loop waits for at most half a second, so a file on a mount that hangs gives `unreadable`,
+with `problem` saying that reading it is taking too long, and never holds the loop.
+
 **Round 14, items 3 and 4. Unknown is a named entry, never null.** The compact answer
 and the detailed one also give three entries, each of which says `unknown` where a
 fact is unknown, so no reader mistakes a missing value for a fact. `provider_budget` is

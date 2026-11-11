@@ -1737,6 +1737,7 @@ class Daemon:
         )
         self.scheduler.set_disclosure_terms(terms)
         self.scheduler.set_disclosure_accepted(config.disclosure_accepted)
+        self.scheduler.set_machine_status(machine_status_path(config, self.paths))
         self.scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
         self.scheduler.set_runs(
             config.run_commands,
@@ -3496,6 +3497,17 @@ def check_lines_sandboxed(
         )
 
 
+def machine_status_path(config: ProjectConfig, paths: ProjectPaths) -> Path | None:
+    """The machine monitor's status file the project names, with a leading ``~`` the
+    home directory and a relative path relative to the project root, or ``None`` when
+    it names none. Only the path is made here, and nothing is read, so a file that is
+    missing is the scheduler's to report. **Round 16, item 3.**"""
+    if config.machine_status is None:
+        return None
+    named = Path(config.machine_status).expanduser()
+    return named if named.is_absolute() else paths.root / named
+
+
 def project_terms(config: ProjectConfig, paths: ProjectPaths) -> tuple[str, ...]:
     """The project's disclosure terms, or none when it names no list. Raises
     ``DisclosureError`` for a list that cannot be read, naming the file only."""
@@ -4070,6 +4082,7 @@ def run(
             scheduler.record_walk_gap(launcher.walk_gap())
             scheduler.set_disclosure_terms(terms)
             scheduler.set_disclosure_accepted(config.disclosure_accepted)
+            scheduler.set_machine_status(machine_status_path(config, paths))
             scheduler.set_git_ssh(line_git_ssh)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
             scheduler.set_runs(
