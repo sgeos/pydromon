@@ -211,7 +211,9 @@ class Launched:
         if filter_environment:
             environment[launcher.FILTER_ENVIRONMENT_VARIABLE] = "1"
         environment.update(extra_environment or {})
-        self.process = subprocess.Popen(  # noqa: S603
+        # Round 16. Through spawn.start, so a start that stalls on macOS fails in its
+        # bound with a report of the child, and not at the five minute timeout.
+        self.process = spawn.start(
             launcher_command(),
             env=environment,
             stdin=stdin,
@@ -771,7 +773,7 @@ def test_a_dead_daemon_is_noticed_and_everything_ended(tmp_path: Path) -> None:
     script = tmp_path / "harness"
     script.write_text(f"#!{sys.executable}\n{HARNESS}time.sleep(60)\n")
     script.chmod(0o755)
-    daemon = subprocess.run(  # noqa: S603
+    daemon = spawn.run(
         [sys.executable, "-c", STAND_IN],
         env={
             "PATH": "/bin:/usr/bin",
@@ -827,7 +829,7 @@ def test_a_stop_under_leave_background_ends_the_harness_alone(
 
 
 def test_a_launcher_without_a_target_refuses_to_start() -> None:
-    finished = subprocess.run(  # noqa: S603
+    finished = spawn.run(
         launcher_command(),
         env={"PATH": "/bin"},
         capture_output=True,
@@ -839,7 +841,7 @@ def test_a_launcher_without_a_target_refuses_to_start() -> None:
 
 
 def test_a_target_that_cannot_start_is_reported() -> None:
-    finished = subprocess.run(  # noqa: S603
+    finished = spawn.run(
         launcher_command(),
         env={"PATH": "/bin", TARGET_VARIABLE: "/no/such/harness"},
         capture_output=True,
@@ -1097,7 +1099,7 @@ def test_ps_failing_is_a_reason_and_not_a_tree(monkeypatch: pytest.MonkeyPatch) 
 
 def test_a_launcher_is_signalled_by_pid_as_well_as_by_group() -> None:
     """F3. A launcher that has not yet made its own group is still reached."""
-    sleeper = subprocess.Popen(["/bin/sleep", "60"])  # noqa: S603
+    sleeper = spawn.start(["/bin/sleep", "60"])
     try:
         # The sleeper is in the test's own group, so its pid names no group.
         launcher.signal_launch(sleeper.pid, signal.SIGTERM, StopPolicy.KILL_ALL)
@@ -1151,7 +1153,7 @@ def test_ending_a_launcher_that_survives_its_kill_is_bounded(
 def test_an_exit_is_seen_without_reaping_the_harness() -> None:
     """F4. The harness stays unreaped, so its pid and group cannot be reused, until
     the launcher reaps it last."""
-    child = subprocess.Popen(["/bin/sh", "-c", "exit 3"])  # noqa: S603
+    child = spawn.start(["/bin/sh", "-c", "exit 3"])
     watched = ExitWatch(child.pid)
     try:
         for _ in range(200):
@@ -1168,7 +1170,7 @@ def test_an_exit_is_seen_without_reaping_the_harness() -> None:
 
 
 def test_an_exit_watch_on_a_reaped_child_sees_it_exited() -> None:
-    child = subprocess.Popen(["/bin/sh", "-c", "exit 0"])  # noqa: S603
+    child = spawn.start(["/bin/sh", "-c", "exit 0"])
     child.wait(timeout=10)
     watched = ExitWatch(child.pid)
     try:
@@ -1516,9 +1518,7 @@ def orphan_group() -> tuple[int, int]:
         f"subprocess.Popen([sys.executable, '-I', '-c', {ORPHAN!r}],"
         " start_new_session=True)\n"
     )
-    outer = subprocess.Popen(  # noqa: S603
-        [sys.executable, "-I", "-c", starter], stdout=subprocess.PIPE
-    )
+    outer = spawn.start([sys.executable, "-I", "-c", starter], stdout=subprocess.PIPE)
     assert outer.stdout is not None
     line = outer.stdout.readline()
     outer.stdout.close()

@@ -379,6 +379,7 @@ class _Handoff:
         self.dumped = False
         self.fork = _ForkTimes()
         self.ended = 0.0
+        self.closing = "the child closes descriptors"
 
 
 _active: set[_Handoff] = set()
@@ -644,6 +645,121 @@ def apply_vfork_setting(
     if chosen.get("DROMON_NO_VFORK") != "1":
         return False
     return disable_vfork(platform)
+
+
+CHILD_CLOSES_ENV: Final = "DROMON_CHILD_CLOSES_FDS"
+"""``1`` makes every start close descriptors in the child as ``subprocess`` does, ``0``
+makes every start leave that to the parent, as ``children_close_descriptors`` says. Any
+other value, or none, leaves the platform's default. It exists so that a run can be made
+with each setting, as ``DROMON_NO_VFORK`` does."""
+
+_inherit_lock = threading.Lock()
+_inheriting: dict[int, int] = {}
+"""The descriptors that starts now in progress pass on purpose, each with the number of
+starts passing it, under ``_inherit_lock``. The sweep of one start leaves them alone."""
+_cleared_total: list[int] = [0]
+"""How many inheritable descriptors the sweeps have made non-inheritable, under
+``_inherit_lock``. Read by ``cleared_descriptors``."""
+
+
+def children_close_descriptors(
+    environment: Mapping[str, str] | None = None, platform: str = sys.platform
+) -> bool:
+    """Whether a start leaves the closing of descriptors to the child, as
+    ``subprocess`` does by default, or does it in the parent. **Round 16, after the
+    stuck child of 2026-11-11.** **Facts.** On macOS the child that ``subprocess``
+    forks with ``close_fds`` set enumerates ``/dev/fd`` with ``opendir`` and
+    ``readdir`` before it runs its program, as the symbols of the Python 3.12.12 and
+    3.15.1 builds show, since macOS has no ``close_range``, and the stuck child seen
+    from outside during a gate had no processor time and had ``/dev/fd`` open as a
+    directory, with its capture pipes already duplicated. **Inference.** It stalled in
+    that closing step. **Hypothesis, not confirmed.** The step takes a lock that a
+    thread of the daemon held at the fork, since ``opendir`` allocates, and the
+    child, a copy of one thread only, can never see it released. That fits zero
+    processor time and the stress test's idle threads never reproducing it. So on
+    macOS the default is ``False``, and ``spawn`` clears, in the parent, every
+    descriptor above 2 that is inheritable and is not passed on purpose, then starts
+    the child with ``close_fds`` off, which makes the child skip the enumeration and
+    lets ``subprocess`` use ``posix_spawn`` where it can. Python makes every
+    descriptor it opens non-inheritable, so the sweep finds only descriptors inherited
+    from the daemon's own parent and any a library made inheritable. Elsewhere the
+    default is ``True``, because Linux closes by ``close_range`` or a read of the
+    directory with a system call, which allocates nothing, and the Linux stalls
+    differ. **Not known.** Whether it removes the stall, which is one hypothesis among
+    several in this module. **Porting hazard.** A Rust port sets close-on-exec on every
+    descriptor it opens, which is the same rule, and needs no sweep."""
+    chosen = os.environ if environment is None else environment
+    setting = chosen.get(CHILD_CLOSES_ENV)
+    if setting == "1":
+        return True
+    if setting == "0":
+        return False
+    return not platform.startswith("darwin")
+
+
+def _open_descriptors() -> list[int] | None:
+    """The numbers of this process's open descriptors from the directory the platform
+    shows them in, or ``None`` when neither is readable. The descriptor of the
+    directory read is in the list and no longer open by the time it is used, which the
+    callers allow for. Done in the parent, where allocating is safe."""
+    for directory in ("/dev/fd", "/proc/self/fd"):
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        return sorted(int(name) for name in names if name.isdigit())
+    return None
+
+
+def _sweep_inheritable(passing: Sequence[int]) -> int | None:
+    """Make every descriptor above 2 non-inheritable that is not passed on purpose,
+    and register ``passing``, made inheritable, for the start in progress. Returns how
+    many it cleared, or ``None`` when the open descriptors cannot be listed, in which
+    case it changes nothing and the start lets the child close descriptors as usual.
+    Under ``_inherit_lock``, so that a start's own passed descriptor is never cleared
+    by another start's sweep before the first has forked. A descriptor that is not
+    open, such as that of the listing itself, is skipped. Raises ``OSError`` when a
+    descriptor to pass is not open, which is what a start with such a descriptor
+    reports."""
+    with _inherit_lock:
+        listing = _open_descriptors()
+        if listing is None:
+            return None
+        for descriptor in passing:
+            os.set_inheritable(descriptor, True)
+            _inheriting[descriptor] = _inheriting.get(descriptor, 0) + 1
+        cleared = 0
+        for descriptor in listing:
+            if descriptor <= 2 or descriptor in _inheriting:
+                continue
+            try:
+                if os.get_inheritable(descriptor):
+                    os.set_inheritable(descriptor, False)
+                    cleared += 1
+            except OSError:
+                continue
+        _cleared_total[0] += cleared
+        return cleared
+
+
+def _release_inheritable(passing: Sequence[int]) -> None:
+    """End the registration of ``passing`` once a start has forked or failed, and make
+    them non-inheritable again where they are still open. Never raises."""
+    with _inherit_lock:
+        for descriptor in passing:
+            count = _inheriting.get(descriptor, 0) - 1
+            if count > 0:
+                _inheriting[descriptor] = count
+                continue
+            _inheriting.pop(descriptor, None)
+            with contextlib.suppress(OSError):
+                os.set_inheritable(descriptor, False)
+
+
+def cleared_descriptors() -> int:
+    """How many inheritable descriptors the sweeps have cleared in this process."""
+    with _inherit_lock:
+        return _cleared_total[0]
 
 
 @dataclass(frozen=True)
@@ -1317,7 +1433,7 @@ def _note_slow_start(
             f"{Path(name).name} {kind} after {total:.1f}s, {waited:.1f}s waiting for"
             f" the fork lock, {held:.1f}s in the fork call, {rest:.1f}s elsewhere,"
             f" {handoff.overlap} starts overlapped, {threading.active_count()} threads,"
-            f" {_machine_text()}",
+            f" {handoff.closing}, {_machine_text()}",
             700,
         )
         with _slow_lock:
@@ -1388,8 +1504,19 @@ def _begin(
         outcome: subprocess.Popen[Any] | BaseException
         _enter(handoff)
         _fork_slot.current = handoff.fork
+        passing: tuple[int, ...] = ()
         try:
-            outcome = subprocess.Popen(argv, **options)  # noqa: S603
+            chosen: dict[str, Any] = options
+            if not children_close_descriptors():
+                passing = tuple(options["pass_fds"])
+                cleared = _sweep_inheritable(passing)
+                if cleared is None:
+                    passing = ()
+                    handoff.closing = "the child closes descriptors, none listed"
+                else:
+                    chosen = {**options, "close_fds": False, "pass_fds": ()}
+                    handoff.closing = f"{cleared} descriptors cleared in the parent"
+            outcome = subprocess.Popen(argv, **chosen)  # noqa: S603
         except BaseException as error:  # noqa: BLE001
             # Carried to the caller, which decides what it means.
             outcome = error
@@ -1397,6 +1524,7 @@ def _begin(
             _fork_slot.current = None
             handoff.ended = time.monotonic()
             _leave(handoff)
+            _release_inheritable(passing)
         slow = _note_slow_start(handoff, name, outcome)
         # The descriptors are closed here, once the start has ended, not by a caller
         # that was told the start stalled, who would close them under a late start.

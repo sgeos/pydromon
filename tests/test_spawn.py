@@ -773,7 +773,7 @@ def test_vfork_off_is_harmless_where_the_names_are_absent(
 def import_and_report(environment: dict[str, str]) -> tuple[str, str]:
     """``subprocess._USE_VFORK`` before and after ``dromon.spawn`` is imported, in a
     fresh interpreter, so that an earlier import does not decide it."""
-    done = subprocess.run(  # noqa: S603
+    done = spawn.run(
         [
             sys.executable,
             "-I",
@@ -1144,9 +1144,7 @@ def test_the_real_libproc_shows_a_running_child_without_starting_a_process() -> 
 def test_libproc_tells_a_spinning_child_from_a_sleeping_one() -> None:
     """**Round 16.** The state letter does not, as a plain sleeping child showed ``R``.
     The processor time and the running threads do."""
-    spinner = subprocess.Popen(  # noqa: S603
-        [sys.executable, "-c", "while True: pass"]
-    )
+    spinner = spawn.start([sys.executable, "-c", "while True: pass"])
     sleeper = spawn.start(SLEEP)
     try:
         # Both are read once the sleeper has settled, since a child that has just
@@ -1373,7 +1371,7 @@ def test_importing_the_module_installs_the_lock_around_every_way_a_child_starts(
         "assert dromon.spawn.install_fork_lock() is True\n"
         "assert subprocess._fork_exec is inner\n"
     )
-    done = subprocess.run(  # noqa: S603
+    done = spawn.run(
         [sys.executable, "-I", "-c", code],
         capture_output=True,
         text=True,
@@ -1716,8 +1714,8 @@ def test_no_start_path_nests_a_start() -> None:
     nests a start inside another. A nested one raises the error above, so this fails
     if any path of ``spawn``, ``subprocess``, ``os.posix_spawn`` or asyncio does."""
     spawn.start(TRUE).wait(10)
-    subprocess.run(TRUE, check=True, timeout=30)  # noqa: S603
-    subprocess.Popen(TRUE).wait(10)  # noqa: S603
+    subprocess.run(TRUE, check=True, timeout=30)  # noqa: S603  # direct on purpose
+    subprocess.Popen(TRUE).wait(10)  # noqa: S603  # direct on purpose
     pid = os.posix_spawn("/bin/sh", ["sh", "-c", "exit 0"], os.environ)
     os.waitpid(pid, 0)
 
@@ -1869,13 +1867,62 @@ def test_a_slow_fork_call_is_recorded_whoever_started_it(
     assert "waiting for the fork lock" in notes[0] and "thread " in notes[0]
     assert "dromond: slow fork, " in capsys.readouterr().err
     spawn.clear_slow_starts()
-    subprocess.run(TRUE, check=True, timeout=30)  # noqa: S603
+    subprocess.run(TRUE, check=True, timeout=30)  # noqa: S603  # direct on purpose
     assert len(spawn.slow_starts()) == 1, "a subprocess.run start was not recorded"
     spawn.clear_slow_starts()
 
 
+BOUNDED_TEST_FILES = ("test_launcher.py", "test_spawn.py", "test_spawn_stress.py")
+"""Test files whose own child starts go through ``spawn.start`` and ``spawn.run``.
+**Round 16, at the operator's instruction.** A start that stalls on macOS in a call
+made straight to ``subprocess`` takes the whole five minute timeout with no report,
+which a gate showed on 2026-11-11. Scripts inside string literals are not calls and
+are not examined. A call that is meant to be direct, because the test is about what
+``subprocess`` does under the fork lock, carries the comment ``# direct on purpose``.
+Other files, such as ``test_operator_relay.py``, are not yet moved."""
+
+
+def direct_subprocess_calls(source: str) -> list[int]:
+    """The line numbers of calls to ``subprocess.Popen``, ``run``, ``call``,
+    ``check_call`` and ``check_output`` in ``source``, in code and not in strings, and
+    not marked ``# direct on purpose``."""
+    names = {"Popen", "run", "call", "check_call", "check_output"}
+    lines = source.splitlines()
+    found: list[int] = []
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in names
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "subprocess"
+            and "# direct on purpose" not in lines[node.lineno - 1]
+        ):
+            found.append(node.lineno)
+    return sorted(found)
+
+
+def test_the_checker_finds_a_direct_call_and_ignores_a_string_and_spawn() -> None:
+    source = (
+        "import subprocess\n"
+        "script = 'subprocess.Popen([1])'\n"
+        "subprocess.Popen(['a'])\n"
+        "x = subprocess.run(['b'])\n"
+        "spawn.run(['c'], timeout=1)\n"
+        "subprocess.PIPE\n"
+        "subprocess.run(['d'])  # direct on purpose\n"
+    )
+    assert direct_subprocess_calls(source) == [3, 4]
+
+
+@pytest.mark.parametrize("name", BOUNDED_TEST_FILES)
+def test_the_listed_test_files_start_children_only_through_spawn(name: str) -> None:
+    source = (Path(__file__).parent / name).read_text(encoding="utf-8")
+    assert direct_subprocess_calls(source) == [], name
+
+
 def test_a_fork_call_under_the_threshold_is_not_recorded() -> None:
-    subprocess.run(TRUE, check=True, timeout=30)  # noqa: S603
+    subprocess.run(TRUE, check=True, timeout=30)  # noqa: S603  # direct on purpose
     assert spawn.slow_starts() == []
 
 
@@ -1910,6 +1957,211 @@ def test_a_slow_fork_note_does_not_wait_for_a_blocked_standard_error(
     """The caller may be the event loop, so the note is written without waiting."""
     monkeypatch.setattr(spawn, "SLOW_FORK_SECONDS", 0.0)
     before = time.monotonic()
-    subprocess.run(TRUE, check=True, timeout=30)  # noqa: S603
+    subprocess.run(TRUE, check=True, timeout=30)  # noqa: S603  # direct on purpose
     assert time.monotonic() - before < spawn.LOG_WAIT_SECONDS
+    spawn.clear_slow_starts()
+
+
+# Round 16. The child does not enumerate descriptors on macOS.
+
+LISTER = (
+    "import os\n"
+    "names = sorted(int(n) for n in os.listdir('/dev/fd' if os.path.isdir('/dev/fd')"
+    " else '/proc/self/fd'))\n"
+    "open_ones = []\n"
+    "for n in names:\n"
+    "    try:\n"
+    "        os.fstat(n)\n"
+    "    except OSError:\n"
+    "        continue\n"
+    "    open_ones.append(n)\n"
+    "print(open_ones)\n"
+)
+"""A program that prints the descriptors it has open. The one that lists the directory
+is closed by the time it is tested, so it is not reported."""
+
+
+@pytest.fixture
+def hygiene(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Starts that leave the closing of descriptors to the parent, on any platform."""
+    monkeypatch.setenv(spawn.CHILD_CLOSES_ENV, "0")
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    [("darwin", False), ("linux", True), ("freebsd14", True), ("win32", True)],
+)
+def test_only_macos_leaves_the_closing_to_the_parent_by_default(
+    platform: str, expected: bool
+) -> None:
+    assert spawn.children_close_descriptors({}, platform) is expected
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_the_variable_forces_either_setting_and_other_values_change_nothing(
+    platform: str,
+) -> None:
+    default = spawn.children_close_descriptors({}, platform)
+    assert spawn.children_close_descriptors({spawn.CHILD_CLOSES_ENV: "1"}, platform)
+    assert not spawn.children_close_descriptors({spawn.CHILD_CLOSES_ENV: "0"}, platform)
+    for other in ("", "true", "01", "yes", " 1"):
+        assert (
+            spawn.children_close_descriptors({spawn.CHILD_CLOSES_ENV: other}, platform)
+            is default
+        )
+
+
+def test_a_start_without_child_side_closing_passes_close_fds_off(
+    hygiene: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[dict[str, object]] = []
+    real = spawn._REAL_POPEN  # pyright: ignore[reportPrivateUsage]
+
+    def record(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        seen.append(dict(kwargs))
+        return real(*args, **kwargs)  # type: ignore[arg-type]  # noqa: S603  # direct on purpose
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", record)
+    child = spawn.start(["/usr/bin/true"])
+    assert child.wait(timeout=30) == 0
+    assert seen[0]["close_fds"] is False
+    assert seen[0]["pass_fds"] == ()
+
+
+def test_a_start_with_child_side_closing_leaves_close_fds_to_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(spawn.CHILD_CLOSES_ENV, "1")
+    seen: list[dict[str, object]] = []
+    real = spawn._REAL_POPEN  # pyright: ignore[reportPrivateUsage]
+
+    def record(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        seen.append(dict(kwargs))
+        return real(*args, **kwargs)  # type: ignore[arg-type]  # noqa: S603  # direct on purpose
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", record)
+    child = spawn.start(["/usr/bin/true"], pass_fds=())
+    assert child.wait(timeout=30) == 0
+    assert "close_fds" not in seen[0]
+
+
+def _descriptors_seen_by(child: subprocess.Popen[str]) -> list[int]:
+    out, _ = child.communicate(timeout=30)
+    assert child.returncode == 0
+    return list(ast.literal_eval(out.strip()))
+
+
+def test_an_inheritable_descriptor_does_not_reach_a_child_and_is_cleared(
+    hygiene: None,
+) -> None:
+    """The check that nothing else leaks, as the operator asked on 2026-11-11."""
+    leaked_read, leaked_write = os.pipe()
+    try:
+        os.set_inheritable(leaked_read, True)
+        os.set_inheritable(leaked_write, True)
+        before = spawn.cleared_descriptors()
+        child = spawn.start(
+            [sys.executable, "-I", "-c", LISTER], stdout=subprocess.PIPE, text=True
+        )
+        seen = _descriptors_seen_by(child)
+        assert leaked_read not in seen and leaked_write not in seen
+        assert [n for n in seen if n > 2] == []
+        assert spawn.cleared_descriptors() >= before + 2
+        assert not os.get_inheritable(leaked_read)
+        assert not os.get_inheritable(leaked_write)
+    finally:
+        os.close(leaked_read)
+        os.close(leaked_write)
+
+
+def test_a_passed_descriptor_reaches_the_child_and_nothing_else_does(
+    hygiene: None,
+) -> None:
+    passed_read, passed_write = os.pipe()
+    other_read, other_write = os.pipe()
+    try:
+        os.set_inheritable(other_read, True)
+        program = "import os, sys\nos.write(int(sys.argv[1]), b'hello')\n" + LISTER
+        child = spawn.start(
+            [sys.executable, "-I", "-c", program, str(passed_write)],
+            stdout=subprocess.PIPE,
+            text=True,
+            pass_fds=(passed_write,),
+        )
+        seen = _descriptors_seen_by(child)
+        assert passed_write in seen
+        assert other_read not in seen and passed_read not in seen
+        assert os.read(passed_read, 5) == b"hello"
+        assert not os.get_inheritable(passed_write)
+        assert spawn._inheriting == {}  # pyright: ignore[reportPrivateUsage]
+    finally:
+        for descriptor in (passed_read, passed_write, other_read, other_write):
+            os.close(descriptor)
+
+
+def test_one_starts_sweep_leaves_another_starts_passed_descriptor_alone(
+    hygiene: None,
+) -> None:
+    read, write = os.pipe()
+    try:
+        assert spawn._sweep_inheritable((write,)) is not None  # pyright: ignore[reportPrivateUsage]
+        assert spawn._sweep_inheritable(()) is not None  # pyright: ignore[reportPrivateUsage]
+        assert os.get_inheritable(write)
+        spawn._release_inheritable((write,))  # pyright: ignore[reportPrivateUsage]
+        assert not os.get_inheritable(write)
+        assert spawn._inheriting == {}  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(read)
+        os.close(write)
+
+
+def test_a_passed_descriptor_that_is_not_open_fails_the_start_and_leaves_no_trace(
+    hygiene: None,
+) -> None:
+    read, write = os.pipe()
+    os.close(read)
+    os.close(write)
+    with pytest.raises(OSError):  # noqa: PT011
+        spawn.start(["/usr/bin/true"], pass_fds=(write,))
+    assert spawn._inheriting == {}  # pyright: ignore[reportPrivateUsage]
+
+
+def test_where_descriptors_cannot_be_listed_the_child_closes_them_as_usual(
+    hygiene: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(spawn, "_open_descriptors", lambda: None)
+    seen: list[dict[str, object]] = []
+    real = spawn._REAL_POPEN  # pyright: ignore[reportPrivateUsage]
+
+    def record(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+        seen.append(dict(kwargs))
+        return real(*args, **kwargs)  # type: ignore[arg-type]  # noqa: S603  # direct on purpose
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", record)
+    read, write = os.pipe()
+    try:
+        program = "import os, sys\nos.write(int(sys.argv[1]), b'ok')\n"
+        child = spawn.start(
+            [sys.executable, "-I", "-c", program, str(write)], pass_fds=(write,)
+        )
+        assert child.wait(timeout=30) == 0
+        assert os.read(read, 2) == b"ok"
+    finally:
+        os.close(read)
+        os.close(write)
+    assert "close_fds" not in seen[0]
+    assert seen[0]["pass_fds"] == (write,)
+    assert spawn._inheriting == {}  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_slow_start_ledger_says_who_closed_the_descriptors(
+    hygiene: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(spawn, "SLOW_START_SECONDS", 0.0)
+    spawn.clear_slow_starts()
+    child = spawn.start(["/usr/bin/true"])
+    assert child.wait(timeout=30) == 0
+    assert any(
+        "descriptors cleared in the parent" in line for line in spawn.slow_starts()
+    )
     spawn.clear_slow_starts()
