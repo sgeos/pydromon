@@ -1046,23 +1046,32 @@ and before restarting. A startup check does not verify a model response.
 
 ## Round 16 hook continuation and report arguments
 
-Fact. The adapter now waits for the generated PreToolUse hook for exactly the
-names in its matcher. An initial announcement, pending notice or failed status
-for those names permits the turn to continue. A permission request is still
-rejected. These calls need no separate `toolNotRun` confirmation. A reported
-`in_progress` or `completed` status, or nonempty content or raw output, cancels
-the turn even if non-execution metadata is also present. Output may be a denial
-explanation, so this conservative check may still stop a denied call. Tools outside
-that matcher retain the existing cancellation and rejection-confirmation rules.
-Identity changes and malformed protocol exchanges retain their existing stops.
+Fact. The operator captured a live `todo_write` denial on Grok 1.0.70 on
+2026-11-11. Grok first announced the call without status or content. It then sent
+`hook_run_started`, a `hook_execution` for `pre_tool_use` with the same tool name
+and a failed run marked `blocked` true, and a hook annotation. Finally it sent a
+failed update for the original call identifier with a nested text block beginning
+`Hook denied: `, and continued to the end of the turn. The hook notices carry no
+call identifier.
 
-Fact. The matcher and adapter share one list to prevent coverage drift. Scripted
-tests cover each matched tool, continuation, execution evidence on the first notice
-and later updates, and uncovered tools. The operator previously observed a fixed
-hook denial of `todo_write`. Continued model turns under this new adapter have not
-been verified live. Hook errors still fail open inside Grok. Inference. A completed
-call without any execution notice could escape detection. This adapter cannot undo
-effects that occur before a notice arrives.
+Fact. The adapter keeps a covered announcement unresolved until positive evidence
+arrives. A blocked hook execution must match exactly one unresolved covered call
+by its tool name. That evidence must precede the failed denial update for that
+call identifier. The update must carry only the observed denial text shape and no
+raw output. Explicit `toolNotRun` metadata without conflicting execution evidence
+is also accepted. Ambiguous matches, other output, model continuation, another
+permitted call or a turn ending with unresolved calls refuse the turn. Permission
+requests are still rejected. Every later call update needs positive evidence too.
+Tools outside the matcher and identity or protocol validation retain their rules.
+
+Fact. Scripted tests reproduce the recorded sequence for each matched name and
+exercise missing, mismatched, malformed, conflicting and ambiguous evidence.
+Inference. The observed denial shape may apply to the other matcher names, but
+only `todo_write` was observed live. The revised adapter itself remains unverified
+live. Hook errors fail open inside Grok, and this adapter cannot undo effects before
+a notice arrives. Reports are trusted engine assertions, not independent proof of
+no side effects. An unresolved announcement pauses acceptance of subsequent model
+output while the hook runs, rather than granting execution.
 
 Fact. On 2026-11-11 the bundled user guides were checked again. Sections Tool
 Filtering and flags in `14-headless-mode.md` describe `--tools` and

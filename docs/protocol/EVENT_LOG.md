@@ -199,6 +199,7 @@ branch's merge.
 
 | Change | First commit | Floor on `main` | Branch |
 |---|---|---|---|
+| `line_turn_ended.closing_reason` | `b73c57d` | Pending | `fix/r16-grok-continue` |
 | `operator_registered`, operator addresses, `note` and `question` kinds | `4d9b3ff` | `621d6db` | `feat/operator-addresses`, #5 |
 | `line_configured` | `7040c16` | `2d04603` | `feat/ticks-and-line-tools`, #11 |
 | `line_session` | `885540c` | `2e413c8` | `feat/operator-questions`, #12 |
@@ -843,22 +844,26 @@ and exception class. It is absent on older events and on non-exception failures.
 A failed event alone may carry it. Its maximum length is 240 characters with no
 ASCII control characters. Replay retains it in the latest failure status.
 
-Fact. The scheduler takes only the first exception line, masks credential patterns
-before truncating, replaces nonprinting characters, and applies the line disclosure
-screen and its budget before appending the event. A screening error, refusal or
-spent budget withholds the diagnostic and exception class. Ordinary and self-started exception paths
-use the same screen. Their activity and stderr failure notices no longer interpolate
-the original exception. The exception class retains its existing identifier bound and is screened together
-with the diagnostic. Snapshot state version 5 invalidates older snapshot caches.
+Fact. The scheduler masks the full first exception line, replaces nonprinting
+characters, and screens that entire line and the exception class before cutting
+the reason to 240 characters. Screening errors or disclosure matches withhold both.
+Automatic diagnostic screening does not spend the line scratch screening budget.
+The scheduler uses the event log credential source to scrub literal values before
+truncation. The event log also scrubs `closing_reason` on append, as it does for
+other free text. Activity and stderr notices omit the original exception.
 
-Limit. Credential masking recognizes documented patterns in `redact.py`. An unknown
-bare credential needs the project disclosure list to be withheld. The diagnostic
-is engine-originated data and grants no authority. Only the retained first line is
-screened. No later exception line or suffix beyond the bound is persisted in this
-field. Existing historical events and separate engine evidence files are unchanged.
+Fact. Snapshot version 5 retains the two appended pins introduced on this branch.
+Version 4 added closing diagnostics and their latest failure state. Before this
+branch was committed, the replay scenario was extended to exercise a nonempty
+reason, changing its replay digest. The append-only pin rule required version 5
+rather than rewriting pin 4. No version 4 was released on main. This is cache
+invalidation only, and the event wire format version is unchanged.
 
-Rollback hazard. A daemon before this change refuses events carrying
-`closing_reason`. The first compatible commit is pending on
-`fix/r16-grok-continue`. The wire format version remains unchanged because this is
-an optional event field. A port must preserve the character bound and screening
-order rather than rely on Python exception formatting.
+Limit. Pattern masking and literal credential scrubbing cover recognized patterns
+and values supplied to the event log. Other private text requires the disclosure
+list. No later exception line is persisted in this field. Historical events and
+separate engine evidence files are unchanged.
+
+Rollback hazard. Older daemons refuse events carrying `closing_reason`. The floor
+table above records the first compatible commit and its pending main floor. Ports
+must preserve the character bound and screening order.

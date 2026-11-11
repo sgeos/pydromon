@@ -3702,7 +3702,7 @@ def test_unavailable_advertised_tool_is_denied_individually(
             chunk("continued"),
         ]
     )
-    if not_run or name in grok_module.HOOK_DENIED_TOOLS:
+    if not_run:
         report = run(line(server, project))
         assert report.text == "continued"
         assert report.tool_uses == ("dromon__send_message",)
@@ -3743,10 +3743,6 @@ def test_rejection_without_later_update_holds_and_names_tool(
     project: tuple[Path, Path, Path], name: str
 ) -> None:
     server = FakeGrok([grok_permission(_meta=grok_meta(name)), chunk("ended")])
-    if name in grok_module.HOOK_DENIED_TOOLS:
-        assert run(line(server, project)).text == "ended"
-        assert "session/cancel" not in server.methods()
-        return
     with pytest.raises(EngineRefused, match="rejected tool call did not run: " + name):
         run(line(server, project))
     assert server.methods().count("session/cancel") == 1
@@ -4136,10 +4132,30 @@ def test_start_check_rejects_a_wrong_grok_model_without_a_prompt(
 
 @pytest.mark.parametrize("name", grok_module.HOOK_DENIED_TOOLS)
 @pytest.mark.parametrize("fields", [{}, {"status": "pending"}, {"status": "failed"}])
-def test_fixed_hook_notice_allows_following_model_output(
+def test_fixed_hook_notice_requires_nonexecution_evidence(
     project: tuple[Path, Path, Path], name: str, fields: dict[str, object]
 ) -> None:
-    server = FakeGrok([grok_call(name), call_update("t", **fields), chunk("continued")])
+    first = grok_call(name)
+    first["params"]["update"].update(fields)
+    server = FakeGrok([first, chunk("continued")])
+    with pytest.raises(EngineRefused):
+        run(line(server, project))
+    assert "session/cancel" in server.methods()
+
+
+@pytest.mark.parametrize("name", grok_module.HOOK_DENIED_TOOLS)
+def test_fixed_hook_positive_nonexecution_allows_continuation(
+    project: tuple[Path, Path, Path], name: str
+) -> None:
+    first = grok_call(name)
+    first["params"]["update"]["_meta"]["toolNotRun"] = True
+    server = FakeGrok(
+        [
+            first,
+            call_update("t", status="failed", _meta={"toolNotRun": True}),
+            chunk("continued"),
+        ]
+    )
     assert run(line(server, project)).text == "continued"
     assert "session/cancel" not in server.methods()
 
@@ -4158,6 +4174,7 @@ def test_fixed_hook_execution_evidence_cancels(
     project: tuple[Path, Path, Path], fields: dict[str, object], initial: bool
 ) -> None:
     first = grok_call("monitor")
+    first["params"]["update"]["_meta"]["toolNotRun"] = True
     if initial:
         first["params"]["update"].update(fields)
         notices = [first]
@@ -4176,3 +4193,145 @@ def test_reports_instruction_uses_inline_scratch(
     run(line(server, project))
     rules = server.params("session/new")["_meta"]["rules"]
     assert "write_scratch called through use_tool with inline tool_input" in rules
+
+
+def recorded_hook_denial(name: str = "todo_write") -> list[dict[str, Any]]:
+    # Minimal shape from the operator's live Grok 1.0.70 trace of 2026-11-11.
+    return [
+        grok_call(name),
+        note(
+            {
+                "sessionUpdate": "hook_run_started",
+                "event_name": "pre_tool_use",
+                "tool_name": name,
+                "count": 1,
+            }
+        ),
+        note(
+            {
+                "sessionUpdate": "hook_execution",
+                "event_name": "pre_tool_use",
+                "tool_name": name,
+                "runs": [
+                    {
+                        "name": "user:pre_tool_use[0].hooks[0]",
+                        "status": {
+                            "status": "failed",
+                            "blocked": True,
+                            "error": "denied: Dromon does not grant this tool",
+                        },
+                    }
+                ],
+            }
+        ),
+        note(
+            {
+                "sessionUpdate": "hook_annotation",
+                "kind": "tool_outcome",
+                "message": "blocked by a user hook",
+            }
+        ),
+        call_update(
+            "t",
+            status="failed",
+            content=[
+                {
+                    "type": "content",
+                    "content": {
+                        "type": "text",
+                        "text": "Hook denied: Dromon does not grant this tool",
+                    },
+                }
+            ],
+        ),
+        chunk("continued"),
+    ]
+
+
+@pytest.mark.parametrize("name", grok_module.HOOK_DENIED_TOOLS)
+def test_recorded_hook_denial_allows_continuation(
+    project: tuple[Path, Path, Path], name: str
+) -> None:
+    server = FakeGrok(recorded_hook_denial(name))
+    report = run(line(server, project))
+    assert report.text == "continued"
+    assert report.tool_uses == ()
+    assert "session/cancel" not in server.methods()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_execution",
+        "wrong_name",
+        "wrong_event",
+        "unblocked",
+        "successful",
+        "empty_runs",
+        "malformed_runs",
+        "missing_denial",
+        "wrong_status",
+        "other_output",
+        "extra_content",
+        "ambiguous",
+        "late_proof",
+        "no_final_update",
+    ],
+)
+def test_hook_denial_requires_unambiguous_positive_evidence(
+    project: tuple[Path, Path, Path], fault: str
+) -> None:
+    notices = recorded_hook_denial()
+    hook = notices[2]["params"]["update"]
+    final = notices[4]["params"]["update"]
+    if fault == "missing_execution":
+        del notices[2]
+    elif fault == "wrong_name":
+        hook["tool_name"] = "monitor"
+    elif fault == "wrong_event":
+        hook["event_name"] = "post_tool_use"
+    elif fault == "unblocked":
+        hook["runs"][0]["status"]["blocked"] = False
+    elif fault == "successful":
+        hook["runs"][0]["status"]["status"] = "success"
+    elif fault == "empty_runs":
+        hook["runs"] = []
+    elif fault == "malformed_runs":
+        hook["runs"] = [{"status": True}]
+    elif fault == "missing_denial":
+        final["content"] = []
+    elif fault == "wrong_status":
+        final["status"] = "completed"
+    elif fault == "other_output":
+        final["rawOutput"] = "effect"
+    elif fault == "extra_content":
+        final["content"].append({"type": "text", "text": "effect"})
+    elif fault == "ambiguous":
+        notices.insert(1, grok_call("todo_write", ident="second"))
+    elif fault == "late_proof":
+        notices.insert(1, chunk("premature continuation"))
+    elif fault == "no_final_update":
+        del notices[4]
+    server = FakeGrok(notices)
+    with pytest.raises(EngineRefused):
+        run(line(server, project))
+    assert "session/cancel" in server.methods()
+
+
+def test_hook_confirmation_cannot_be_reused_for_a_later_call(
+    project: tuple[Path, Path, Path],
+) -> None:
+    notices = recorded_hook_denial()[:-1]
+    notices += [
+        grok_call("todo_write", ident="second"),
+        call_update(
+            "second",
+            status="failed",
+            content=notices[-1]["params"]["update"]["content"],
+        ),
+        chunk("unconfirmed"),
+    ]
+    server = FakeGrok(notices)
+    with pytest.raises(EngineRefused):
+        run(line(server, project))
+    assert "session/cancel" in server.methods()

@@ -1431,6 +1431,8 @@ class _Turn:
     announced_calls: set[str] = field(default_factory=set[str])
     """Identifiers first announced by a ``tool_call`` update."""
     hook_calls: set[str] = field(default_factory=set[str])
+    hook_blocked: set[str] = field(default_factory=set[str])
+    hook_confirmed: set[str] = field(default_factory=set[str])
     blocked_calls: set[str] = field(default_factory=set[str])
     rejected_calls: set[str] = field(default_factory=set[str])
     confirmed_rejections: set[str] = field(default_factory=set[str])
@@ -1453,7 +1455,16 @@ class _Turn:
     """Whether the opened session was confirmed to use the driver's model."""
 
     def unconfirmed_refusal(self) -> str | None:
-        unconfirmed = self.rejected_calls - self.confirmed_rejections - self.hook_calls
+        pending_hooks = self.hook_calls - self.hook_confirmed
+        if pending_hooks:
+            names = sorted(
+                str(self.calls[item].get(GROK_TOOL_META, "covered tool"))
+                for item in pending_hooks
+            )
+            return acp.REJECTION_UNCONFIRMED + ": " + ", ".join(names)
+        unconfirmed = (
+            self.rejected_calls - self.confirmed_rejections - self.hook_confirmed
+        )
         if not unconfirmed:
             return None
         names = sorted(self.rejected_labels[item] for item in unconfirmed)
@@ -2032,6 +2043,38 @@ class GrokLine:
 
     async def _update(self, update: dict[str, Any], turn: _Turn) -> None:
         kind = update.get("sessionUpdate")
+        if kind == "hook_execution":
+            name = update.get("tool_name")
+            pending = [
+                item
+                for item in turn.hook_calls - turn.hook_confirmed
+                if turn.calls[item].get(GROK_TOOL_META) == name
+            ]
+            runs = update.get("runs")
+            blocked = (
+                isinstance(runs, list)
+                and bool(cast(list[object], runs))
+                and all(
+                    isinstance(run, dict)
+                    and isinstance(cast(dict[str, Any], run).get("status"), dict)
+                    and cast(dict[str, Any], run)["status"].get("status") == "failed"
+                    and cast(dict[str, Any], run)["status"].get("blocked") is True
+                    for run in cast(list[object], runs)
+                )
+            )
+            if update.get("event_name") == "pre_tool_use" and blocked:
+                if len(pending) != 1:
+                    await self._cancel(turn, "ambiguous hook denial")
+                else:
+                    turn.hook_blocked.add(pending[0])
+            return
+        if kind in ("agent_message_chunk", "agent_thought_chunk") and (
+            turn.hook_calls - turn.hook_confirmed
+        ):
+            await self._cancel(
+                turn, turn.unconfirmed_refusal() or acp.REJECTION_UNCONFIRMED
+            )
+            return
         if kind == "agent_message_chunk":
             content = cast(dict[str, Any], update.get("content") or {})
             text = str(content.get("text") or "")
@@ -2104,9 +2147,37 @@ class GrokLine:
         permission request for it has passed ``acp.identity_refusal``, so it is the
         call already judged."""
         if identifier in turn.hook_calls:
-            if hook_execution_reported(fields):
+            content = fields.get("content")
+            denial = (
+                identifier in turn.hook_blocked
+                and fields.get("status") == "failed"
+                and fields.get("rawOutput") in (None, [])
+                and isinstance(content, list)
+                and len(cast(list[object], content)) == 1
+                and isinstance(cast(list[object], content)[0], dict)
+                and cast(list[dict[str, Any]], content)[0].get("type") == "content"
+                and isinstance(
+                    cast(list[dict[str, Any]], content)[0].get("content"), dict
+                )
+                and cast(list[dict[str, Any]], content)[0]["content"].get("type")
+                == "text"
+                and isinstance(
+                    cast(list[dict[str, Any]], content)[0]["content"].get("text"), str
+                )
+                and cast(list[dict[str, Any]], content)[0]["content"][
+                    "text"
+                ].startswith("Hook denied: ")
+            )
+            if denial or (
+                acp.rejected_call_not_run(fields)
+                and not hook_execution_reported(fields)
+            ):
+                turn.hook_confirmed.add(identifier)
+            else:
                 await self._cancel(
-                    turn, "the engine started a tool the line was not given"
+                    turn,
+                    "the engine started a tool the line was not given; "
+                    + acp.REJECTION_UNCONFIRMED,
                 )
             return
         if identifier in turn.calls:
@@ -2136,7 +2207,13 @@ class GrokLine:
             turn.blocked_calls.add(identifier)
             if (grok_name or fields.get("toolName")) in HOOK_DENIED_TOOLS:
                 turn.hook_calls.add(identifier)
-                if hook_execution_reported(fields):
+                if acp.rejected_call_not_run(fields) and not hook_execution_reported(
+                    fields
+                ):
+                    turn.hook_confirmed.add(identifier)
+                elif (
+                    hook_execution_reported(fields) or fields.get("status") == "failed"
+                ):
                     await self._cancel(
                         turn, "the engine started a tool the line was not given"
                     )
@@ -2147,6 +2224,11 @@ class GrokLine:
                 turn,
                 f"the engine used a tool the line was not given: {name}"
                 + use_tool_advice(fields),
+            )
+            return
+        if turn.hook_calls - turn.hook_confirmed:
+            await self._cancel(
+                turn, turn.unconfirmed_refusal() or acp.REJECTION_UNCONFIRMED
             )
             return
         turn.tool_uses.append(name)

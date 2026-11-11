@@ -361,6 +361,14 @@ class EventLog:
                 f" ({type(error).__name__}), so this event was not stored. Try again"
             ) from None
 
+    def scrub_text(self, text: str) -> str:
+        """Mask credentials before a caller bounds text for an event.
+
+        Scrubbing only after a cut could retain a prefix of a literal secret.
+        A missing credential source fails closed as it does during append.
+        """
+        return credentials.scrub_text(text, self._secret_values())
+
     def append(self, event: Event) -> Entry:
         """Check ``event`` against the current state, store it, then apply it. Its
         free text is first masked by ``credentials.scrub_event``, so the stored event

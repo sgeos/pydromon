@@ -260,7 +260,6 @@ def test_every_event_class_is_classified_as_scrubbed_or_without_free_text() -> N
         "LineSession": "an engine's session identifier",
         "LineSessionCleared": "an identifier",
         "LineStateChanged": "an enumeration",
-        "LineTurnEnded": "a commit name",
         "MessageCorrelated": "an identifier",
         "MessageDelivered": "an identifier",
         "MessagePrioritized": "an identifier",
@@ -506,3 +505,25 @@ def test_each_kind_of_note_and_summary_is_masked_by_its_field() -> None:
         found = scrub_event(event)
         assert getattr(found, name) == getattr(event, name).replace(token, MASK)
         assert token not in getattr(found, name)
+
+
+def test_closing_reason_scrubs_literal_credentials_before_persistence() -> None:
+    literal = "opaque" + "privatevalue"
+    event = model.LineTurnEnded(
+        "alpha",
+        None,
+        None,
+        True,
+        model.FailureCause.ENGINE_CLOSED,
+        "EngineClosed",
+        "transport " + literal,
+    )
+    scrubbed = scrub_event(event, (literal,))
+    assert credentials.has_text(event)
+    assert isinstance(scrubbed, model.LineTurnEnded)
+    assert scrubbed.closing_reason == "transport " + MASK
+    assert event.closing_reason == "transport " + literal
+
+
+def test_turn_completion_without_a_diagnostic_needs_no_credential_source() -> None:
+    assert not credentials.has_text(model.LineTurnEnded("alpha", None))

@@ -466,7 +466,7 @@ def test_closing_reason_withheld_when_screening_fails(
     def refuse(*args: object, **kwargs: object) -> None:
         raise RuntimeError("screen unavailable")
 
-    monkeypatch.setattr(world.scheduler, "_screen_scratch", refuse)
+    monkeypatch.setattr(world.scheduler, "discloses", refuse)
     world.actions["alpha"] = raising(EngineClosed("private diagnostic"))
     world.turn()
     assert last_end(world).closing_reason is None
@@ -497,3 +497,35 @@ def test_exception_class_is_also_disclosure_screened(world: World) -> None:
     assert end.closing_reason is None
     assert end.failure_class is None
     assert "EngineClosed" not in encode(end)
+
+
+def test_disclosure_crossing_the_reason_cut_is_withheld(world: World) -> None:
+    term = "private diagnostic across boundary"
+    world.scheduler.set_disclosure_terms((term,))
+    world.actions["alpha"] = raising(EngineClosed("x" * 230 + term))
+    world.turn()
+    assert last_end(world).closing_reason is None
+    assert last_end(world).failure_class is None
+
+
+def test_closing_reason_does_not_use_scratch_screening(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("automatic diagnostic spent scratch budget")
+
+    monkeypatch.setattr(world.scheduler, "_screen_scratch", refuse)
+    world.scheduler.set_disclosure_terms(("unrelated term",))
+    world.actions["alpha"] = raising(EngineClosed("transport vanished"))
+    world.turn()
+    assert last_end(world).closing_reason == "transport vanished"
+
+
+def test_literal_credential_crossing_reason_cut_is_masked(world: World) -> None:
+    literal = "opaquevalue" * 3
+    world.log.secrets = lambda: (literal,)
+    world.actions["alpha"] = raising(EngineClosed("x" * 230 + literal))
+    world.turn()
+    end = last_end(world)
+    assert end.closing_reason == "x" * 230 + "***"
+    assert literal[:10] not in encode(end)

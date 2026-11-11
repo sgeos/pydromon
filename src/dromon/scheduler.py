@@ -11943,21 +11943,20 @@ class Scheduler:
     def _closing_reason(self, line_id: str, error: BaseException | None) -> str | None:
         """Keep only a bounded, screened diagnostic. Screening failure withholds it.
 
-        Screening uses the line disclosure budget so repeated failures cannot act
-        as an unmetered oracle. Mask before truncating to avoid partial credentials.
+        Screen the complete masked first line before truncating, so neither a
+        credential nor a disclosure term can survive as a cut prefix. Automatic
+        diagnostics do not consume the line's scratch screening allowance.
         """
         if error is None:
             return None
         try:
-            text = redact.mask(str(error).split("\n", 1)[0])
-            text = "".join(char if char.isprintable() else " " for char in text)[:240]
-            screened = type(error).__name__ + "\n" + text
-            self._screen_scratch(
-                line_id, "closing_reason", screened, len(screened.encode())
-            )
+            text = redact.mask(self._log.scrub_text(str(error).split("\n", 1)[0]))
+            text = "".join(char if char.isprintable() else " " for char in text)
+            if self.discloses(type(error).__name__, text):
+                return None
         except Exception:  # noqa: BLE001
             return None
-        return text or None
+        return text[:240] or None
 
     def _end_turn(
         self,
