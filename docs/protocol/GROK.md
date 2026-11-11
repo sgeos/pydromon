@@ -1052,25 +1052,41 @@ Fact. The operator captured a live `todo_write` denial on Grok 1.0.70 on
 and a failed run marked `blocked` true, and a hook annotation. Finally it sent a
 failed update for the original call identifier with a nested text block beginning
 `Hook denied: `, and continued to the end of the turn. The hook notices carry no
-call identifier.
+call identifier. The three hook notices use method
+`_x.ai/session_notification`, while the call, failed update and model text use
+`session/update`. The adapter routes those hook notifications to its denial
+evidence handler. The fixture preserves these recorded methods and update payloads,
+normalizes session and call identifiers, and omits transport metadata.
 
 Fact. The adapter keeps a covered announcement unresolved until positive evidence
 arrives. A blocked hook execution must match exactly one unresolved covered call
 by its tool name. That evidence must precede the failed denial update for that
 call identifier. The update must carry only the observed denial text shape and no
-raw output. Explicit `toolNotRun` metadata without conflicting execution evidence
-is also accepted. Ambiguous matches, other output, model continuation, another
+raw output.
+
+Fact. A separate confirmation route accepts Boolean `_meta.toolNotRun` true on
+the initial announcement or a later update, with status absent, pending or failed
+and no conflicting execution status, content or raw output. This route requires
+no hook execution evidence. It preserves the explicit engine protocol assertion
+of non-execution and is not the denial shape observed in the operator capture.
+Whether Grok emits this metadata for covered hook denials remains unverified.
+
+Fact. Ambiguous matches, other output, model continuation, another
 permitted call or a turn ending with unresolved calls refuse the turn. Permission
 requests are still rejected. Every later call update needs positive evidence too.
 Tools outside the matcher and identity or protocol validation retain their rules.
 
-Fact. Scripted tests reproduce the recorded sequence for each matched name and
+Fact. Scripted tests replay a sanitized fixture derived from the operator recording
+through dispatch with the exact recorded methods for each matched name and
 exercise missing, mismatched, malformed, conflicting and ambiguous evidence.
 Inference. The observed denial shape may apply to the other matcher names, but
 only `todo_write` was observed live. The revised adapter itself remains unverified
 live. Hook errors fail open inside Grok, and this adapter cannot undo effects before
-a notice arrives. Reports are trusted engine assertions, not independent proof of
-no side effects. An unresolved announcement pauses acceptance of subsequent model
+a notice arrives. Both the hook evidence and the explicit `toolNotRun` assertion
+come from the same engine that reports the call. Acceptance assumes that engine
+reports are truthful. A faulty or malicious engine can report a denial or
+non-execution after an effect. Dromon has no independent proof of no side effects.
+An unresolved announcement pauses acceptance of subsequent model
 output while the hook runs, rather than granting execution.
 
 Fact. On 2026-11-11 the bundled user guides were checked again. Sections Tool

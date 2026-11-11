@@ -4196,65 +4196,37 @@ def test_reports_instruction_uses_inline_scratch(
 
 
 def recorded_hook_denial(name: str = "todo_write") -> list[dict[str, Any]]:
-    # Minimal shape from the operator's live Grok 1.0.70 trace of 2026-11-11.
-    return [
-        grok_call(name),
-        note(
-            {
-                "sessionUpdate": "hook_run_started",
-                "event_name": "pre_tool_use",
-                "tool_name": name,
-                "count": 1,
-            }
-        ),
-        note(
-            {
-                "sessionUpdate": "hook_execution",
-                "event_name": "pre_tool_use",
-                "tool_name": name,
-                "runs": [
-                    {
-                        "name": "user:pre_tool_use[0].hooks[0]",
-                        "status": {
-                            "status": "failed",
-                            "blocked": True,
-                            "error": "denied: Dromon does not grant this tool",
-                        },
-                    }
-                ],
-            }
-        ),
-        note(
-            {
-                "sessionUpdate": "hook_annotation",
-                "kind": "tool_outcome",
-                "message": "blocked by a user hook",
-            }
-        ),
-        call_update(
-            "t",
-            status="failed",
-            content=[
-                {
-                    "type": "content",
-                    "content": {
-                        "type": "text",
-                        "text": "Hook denied: Dromon does not grant this tool",
-                    },
-                }
-            ],
-        ),
-        chunk("continued"),
+    # Operator trace of 2026-11-11. The fixture retains the recorded methods and
+    # update payloads, normalizes identifiers and removes transport metadata.
+    fixture = Path(__file__).parent / "fixtures" / "grok-hook-denial.jsonl"
+    notices: list[dict[str, Any]] = [
+        json.loads(row) for row in fixture.read_text().splitlines()
     ]
+    if name != "todo_write":
+        first = notices[0]["params"]["update"]
+        first["title"] = name
+        first["_meta"]["x.ai/tool"]["name"] = name
+        for index in (1, 2):
+            notices[index]["params"]["update"]["tool_name"] = name
+    return notices
 
 
 @pytest.mark.parametrize("name", grok_module.HOOK_DENIED_TOOLS)
 def test_recorded_hook_denial_allows_continuation(
     project: tuple[Path, Path, Path], name: str
 ) -> None:
-    server = FakeGrok(recorded_hook_denial(name))
+    notices = recorded_hook_denial(name)
+    assert [notice["method"] for notice in notices] == [
+        "session/update",
+        "_x.ai/session_notification",
+        "_x.ai/session_notification",
+        "_x.ai/session_notification",
+        "session/update",
+        "session/update",
+    ]
+    server = FakeGrok(notices)
     report = run(line(server, project))
-    assert report.text == "continued"
+    assert report.text == "done"
     assert report.tool_uses == ()
     assert "session/cancel" not in server.methods()
 
@@ -4263,6 +4235,7 @@ def test_recorded_hook_denial_allows_continuation(
     "fault",
     [
         "missing_execution",
+        "wrong_method",
         "wrong_name",
         "wrong_event",
         "unblocked",
@@ -4286,6 +4259,8 @@ def test_hook_denial_requires_unambiguous_positive_evidence(
     final = notices[4]["params"]["update"]
     if fault == "missing_execution":
         del notices[2]
+    elif fault == "wrong_method":
+        notices[2]["method"] = "unrecognized/session_notification"
     elif fault == "wrong_name":
         hook["tool_name"] = "monitor"
     elif fault == "wrong_event":

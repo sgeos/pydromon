@@ -1727,6 +1727,16 @@ class GrokLine:
             refusal = self._notice_refusal(extension_method(method), params, turn)
             if refusal is not None:
                 await self._cancel(turn, refusal)
+            elif extension_method(method) == SESSION_NOTIFICATION:
+                update = params.get("update")
+                if isinstance(update, dict):
+                    notice = cast(dict[str, Any], update)
+                    if notice.get("sessionUpdate") in (
+                        "hook_run_started",
+                        "hook_execution",
+                        "hook_annotation",
+                    ):
+                        await self._update(notice, turn)
 
     def _allowed_servers(self) -> frozenset[str]:
         return frozenset(
