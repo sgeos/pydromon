@@ -21,3 +21,6 @@ Type: Fixed
   engine reports after it, as its wake already was, so a compaction the engine made
   by itself in the same turn no longer leaves the request to compact the session
   again in the next turn.
+- Scheduler ticks wait for work events and due timers when the tick cadence is
+  zero, so a blocked turn does not keep the main thread polling state. Positive
+  cadence retains periodic inspection and stop requests interrupt either wait.

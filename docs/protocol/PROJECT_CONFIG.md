@@ -109,7 +109,7 @@ relay = "tail"          # the route of operator ana's mail
 |---|---|---|---|
 | `version` | integer | required | Must be 1 |
 | `daemon.operator` | identifier | `operator` | The default operator. It also declares that operator, whom a peer may reach before that operator has sent anything, as decision 25 of [`FEDERATION.md`](../architecture/FEDERATION.md) specifies. The built-in default declares no one |
-| `daemon.tick_seconds` | number in [0, 60] | 1 | The tick cadence |
+| `daemon.tick_seconds` | number in [0, 60] | 1 | The maximum tick wait in seconds. Zero waits for events and due timers |
 | `daemon.require_sandbox` | boolean | `false` | Whether every Claude Code line must run with an enabled sandbox, as below |
 | `daemon.disclosure_terms` | path | none | The project's disclosure list, relative to the project root, as below |
 | `read_only_paths` | list of relative paths | empty | Existing files or directories denied writes under every line's resolved workdir. Symbolic links are resolved and targets must remain inside that workdir |
@@ -660,3 +660,16 @@ numbers or line ranges are returned to a line. File and line locations were decl
 they would let a line narrow its own text to a listed term. Aggregate counts and
 the hourly limit remain diagnostic safeguards, not protection against a malicious
 agent. The gate reads the same project acceptance table.
+
+## Waiting between ticks
+
+A positive `daemon.tick_seconds` bounds the wait between work events. Zero disables
+periodic ticks. A running turn alone does not require another tick. Messages, turn
+completion and configuration changes wake the loop. Scheduled wakes and mail whose
+cooldown expires retain their timers. Mail awaiting a wake cadence advances only
+while a tick can make progress. Stop requests interrupt the wait.
+
+Launch record inspection and pending peer mail retain bounded maintenance timers,
+even with zero cadence. Tests that advance an injected clock must also provide an
+event to notify the scheduler of that change.
+This avoids spending processor time polling a clock that cannot advance itself.

@@ -31,8 +31,9 @@ its ``interrupt`` mode each running turn is asked to end at its next safe point.
 the restart ended leaves the line a ``restart_noted`` note, so the restarted daemon
 wakes it.
 
-Cadence. While anything is in flight, ticks follow one another every ``tick_seconds``.
-When nothing is, the loop rests until a message arrives or a scheduled wake falls due.
+Cadence. Ticks wait for work events and timers. A positive ``tick_seconds`` bounds
+the wait. Zero disables periodic ticks. A running turn alone never keeps the loop
+spinning. Pending mail advances through its wake cadence after its cooldown.
 
 Scheduled wakes. A line's ``wake_after`` tool schedules one wake, recorded as
 ``wake_scheduled`` with its due time in Coordinated Universal Time and the identifier
@@ -11392,8 +11393,8 @@ class Scheduler:
     def _may_wake(self, line_id: str) -> bool:
         """Whether the line has post office mail that may start its turn. Peer mail
         past its peer's turn allowance waits without keeping the loop ticking, and
-        the loop's rest, at most ``MAX_REST_SECONDS``, finds it once the hour
-        allows."""
+        bounded maintenance inspection finds it once the hour allows, even with
+        zero tick cadence."""
         messages = self.deliverable(line_id)
         return bool(messages) and self.peer_turns.may_wake(
             line_id, (message for _, message in messages)
@@ -11518,6 +11519,7 @@ class Scheduler:
         on, so the scheduler neither dies nor spins."""
         try:
             while not stop.is_set():
+                self._work.clear()
                 if self._work_waiting():
                     try:
                         self.step()
@@ -11532,35 +11534,52 @@ class Scheduler:
                                 stop.wait(),
                                 max(SECRETS_RETRY_SECONDS, self._tick_seconds),
                             )
-                    elif self._tick_seconds:
-                        with contextlib.suppress(TimeoutError):
-                            await asyncio.wait_for(stop.wait(), self._tick_seconds)
-                    else:
-                        await asyncio.sleep(0)
-                    continue
-                self._work.clear()
-                # Each rest, at most MAX_REST_SECONDS apart, also sweeps the launch
-                # records of launchers that exited between turns. Review N1.
-                try:
-                    with self._refusing_on_secrets("the sweep of left processes"):
-                        self.collect_left()
-                    self.note_stuck_starts()
-                except Exception as error:  # noqa: BLE001
-                    await self._fault_found(error, stop)
-                    continue
+                        continue
+                else:
+                    # A rest also sweeps records of launchers that exited between turns.
+                    try:
+                        with self._refusing_on_secrets("the sweep of left processes"):
+                            self.collect_left()
+                        self.note_stuck_starts()
+                    except Exception as error:  # noqa: BLE001
+                        await self._fault_found(error, stop)
+                        continue
+                until = self.seconds_until_next_wake()
+                timeouts = [] if until is None else [min(until, MAX_REST_SECONDS)]
+                if self._tick_seconds > 0:
+                    timeouts.append(min(self._tick_seconds, MAX_REST_SECONDS))
+                # Launch records and peer allowance expiry are maintenance work.
+                # Their bounded inspection remains due even with no periodic ticks.
+                if self._report_dir is not None or self._post_office:
+                    timeouts.append(MAX_REST_SECONDS)
+                # Mail already in the post office may need another tick to reach
+                # its wake cadence. Advance only while that mail can make progress.
+                for line_id in self._state().lines:
+                    if not (self._eligible(line_id) and self._may_wake(line_id)):
+                        continue
+                    ended = self._last_turn_end.get(line_id)
+                    remaining = (
+                        0.0
+                        if ended is None
+                        else self.limits_for(line_id).cooldown_seconds
+                        - (self._clock() - ended)
+                    )
+                    if remaining > 0 and not self._priority_waiting(line_id):
+                        timeouts.append(remaining)
+                    elif self._tick_seconds == 0:
+                        self._work.set()
                 worker = asyncio.create_task(self._work.wait())
                 stopping = asyncio.create_task(stop.wait())
-                # Rest until work arrives, or until the next scheduled wake falls due.
-                until = self.seconds_until_next_wake()
-                await asyncio.wait(
-                    {worker, stopping},
-                    timeout=MAX_REST_SECONDS
-                    if until is None
-                    else min(until, MAX_REST_SECONDS),
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                worker.cancel()
-                stopping.cancel()
+                try:
+                    await asyncio.wait(
+                        {worker, stopping},
+                        timeout=min(timeouts) if timeouts else None,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    worker.cancel()
+                    stopping.cancel()
+                    await asyncio.gather(worker, stopping, return_exceptions=True)
         finally:
             for watcher in list(self._pid_watchers.values()):
                 watcher.cancel()
