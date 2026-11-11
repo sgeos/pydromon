@@ -1576,7 +1576,12 @@ def _begin(
         try:
             chosen: dict[str, Any] = options
             if not children_close_descriptors():
-                if _open_descriptors() is None:
+                # Review of round 16, follow-up. The sweep runs in ``forking``, which
+                # only the wrapped fork call enters, so without the wrapper the child
+                # would be told not to close and nothing would clear or pass a thing.
+                if not _FORK_INSTALLED[0]:
+                    handoff.closing = "the child closes descriptors, no fork lock"
+                elif _open_descriptors() is None:
                     handoff.closing = "the child closes descriptors, none listed"
                 else:
                     # Done by ``forking``, inside the fork lock, just before the fork.
@@ -1584,6 +1589,15 @@ def _begin(
                     _fork_slot.sweep = sweep
                     chosen = {**options, "close_fds": False, "pass_fds": ()}
             outcome = subprocess.Popen(argv, **chosen)  # noqa: S603
+            if sweep is not None and sweep.cleared is None:
+                # The child exists but was not given its descriptors, or was given
+                # strays, because the call that forked did not enter ``forking``.
+                # Refused as a failed start, never run on.
+                _reap(outcome)
+                raise OSError(
+                    f"{shown} was not started: the descriptor sweep did not run"
+                    " before the fork"
+                )
         except BaseException as error:  # noqa: BLE001
             # Carried to the caller, which decides what it means.
             outcome = error

@@ -2259,6 +2259,68 @@ def test_where_descriptors_cannot_be_listed_the_child_closes_them_as_usual(
     assert seen[0]["pass_fds"] == (write,)
 
 
+def test_without_the_fork_lock_the_child_closes_descriptors_as_usual(
+    hygiene: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of round 16, follow-up. The sweep runs only in ``forking``, so where the
+    wrapper is not installed the start must not turn the child's closing off."""
+    monkeypatch.setattr(spawn, "_FORK_INSTALLED", [False])
+    seen: list[dict[str, object]] = []
+    real = spawn._REAL_POPEN  # pyright: ignore[reportPrivateUsage]
+
+    def record(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+        seen.append(dict(kwargs))
+        return real(*args, **kwargs)  # type: ignore[arg-type]  # noqa: S603  # direct on purpose
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", record)
+    stray_read, stray_write = os.pipe()
+    passed_read, passed_write = os.pipe()
+    try:
+        os.set_inheritable(stray_read, True)
+        before = spawn.cleared_descriptors()
+        program = "import os, sys\nos.write(int(sys.argv[1]), b'ok')\n" + LISTER
+        child = spawn.start(
+            [sys.executable, "-I", "-c", program, str(passed_write)],
+            stdout=subprocess.PIPE,
+            text=True,
+            pass_fds=(passed_write,),
+        )
+        seen_by_child = _descriptors_seen_by(child)
+        assert os.read(passed_read, 2) == b"ok"
+        assert stray_read not in seen_by_child
+        assert spawn.cleared_descriptors() == before
+    finally:
+        for descriptor in (stray_read, stray_write, passed_read, passed_write):
+            os.close(descriptor)
+    assert "close_fds" not in seen[0]
+    assert seen[0]["pass_fds"] == (passed_write,)
+
+
+def test_a_start_whose_sweep_did_not_run_fails_and_leaves_no_child(
+    hygiene: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fork call was not the wrapped one, so the child was made without its
+    descriptors. It is killed and the start raises, never run on."""
+
+    def skip(sweep: object) -> None:
+        del sweep
+
+    monkeypatch.setattr(spawn, "_sweep_inheritable", skip)
+    made: list[subprocess.Popen[str]] = []
+    real = spawn._REAL_POPEN  # pyright: ignore[reportPrivateUsage]
+
+    def record(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+        child = real(*args, **kwargs)  # type: ignore[arg-type]  # noqa: S603  # direct on purpose
+        made.append(child)
+        return child
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", record)
+    with pytest.raises(OSError, match="sweep did not run"):
+        spawn.start([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
+    assert len(made) == 1
+    assert made[0].poll() is not None
+
+
 def test_the_slow_start_ledger_says_who_closed_the_descriptors(
     hygiene: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

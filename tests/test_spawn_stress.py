@@ -173,6 +173,9 @@ def _without_the_fork_lock(
         yield
 
     monkeypatch.setattr(spawn, "forking", nothing)
+    # The descriptor sweep runs in ``forking``, so without it the child must close
+    # descriptors itself, as a start does where the lock is not installed.
+    monkeypatch.setenv(spawn.CHILD_CLOSES_ENV, "1")
     yield
 
 
