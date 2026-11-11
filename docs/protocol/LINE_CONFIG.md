@@ -340,6 +340,21 @@ running run are never stopped by the status. The file is read on a worker thread
 loop waits for at most half a second, so a file on a mount that hangs gives `unreadable`,
 with `problem` saying that reading it is taking too long, and never holds the loop.
 
+**Round 16, the status file is guarded, and its stated limits.** No line's sandbox or
+built-in file tools may write the status file, as [`RUNS.md`](../architecture/RUNS.md)
+sets out. Three limits are stated and not built around, since a line without a sandbox can
+already write whatever the operator can. First, with a line's sandbox off, nothing stops
+its shell from writing the file, and only the built-in file tools are denied. Second, the
+status file's directory is not denied when it is, holds or lies in the line's working
+directory, and the sandbox that would confine the line to its working directory is the
+only thing that then keeps it from writing an ancestor, so with the sandbox off the
+ancestor is writable too. Third, a Codex line has the guard as `read` entries of the
+profile Dromon writes, for each path that exists when the profile is made. **Fact, by
+reading and by a test.** The adapter writes those entries. **Not verified.** That Codex
+enforces a `read` entry for a file, which no test of this project can check, and a status
+file the monitor has not yet written is left out, since it does not exist. Another engine
+takes no sandbox or settings and has no guard.
+
 **Round 14, items 3 and 4. Unknown is a named entry, never null.** The compact answer
 and the detailed one also give three entries, each of which says `unknown` where a
 fact is unknown, so no reader mistakes a missing value for a fact. `provider_budget` is

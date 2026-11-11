@@ -3,6 +3,7 @@
 
 import os
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -176,3 +177,32 @@ def test_the_fixture_keeps_the_running_base_of_a_parallel_session(
         for closed, base in ((running, sibling_running), (dead, sibling_dead)):
             closed.chmod(0o700)
             shutil.rmtree(base)
+
+
+def ignore_registration(function: Callable[..., object], *arguments: object) -> None:
+    """Stands in for pytest's registration of cleanups, which a test does not want."""
+
+
+def test_the_installed_pytest_writes_its_process_identifier_to_the_lock(
+    tmp_path: Path,
+) -> None:
+    """Round 16 follow-up review, point 4. ``owned_by_running_pytest`` rests on a fact
+    about pytest, so it is checked against the installed one, which the project pins
+    exactly. A base made as the session makes its own holds ``.lock`` with the
+    identifier of this process and nothing else, and is then seen as running."""
+    from _pytest.pathlib import make_numbered_dir_with_cleanup
+
+    from conftest import owned_by_running_pytest
+
+    base = make_numbered_dir_with_cleanup(
+        root=tmp_path,
+        prefix="pytest-",
+        mode=0o700,
+        keep=3,
+        lock_timeout=3600,
+        register=ignore_registration,
+    )
+    assert (base / ".lock").read_text() == str(os.getpid())
+    assert owned_by_running_pytest(base)
+    (base / ".lock").unlink()
+    assert not owned_by_running_pytest(base)

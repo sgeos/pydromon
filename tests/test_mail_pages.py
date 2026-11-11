@@ -217,3 +217,58 @@ def test_dromon_mail_prints_the_notes_after_the_page(
     assert "showing matches 1 to 10 of 25, oldest first" in out
     assert "15 unread after this page, the newest of them among them." in out
     assert "--offset 10 shows them" in out
+
+
+# Round 16 follow-up review, point 3. The counts describe the mailbox the request
+# names, so no line may reach the request with another owner.
+
+
+def line_daemon(paths: ProjectPaths, log: EventLog) -> Daemon:
+    scheduler = Scheduler(log, no_engine, hold_wakes=True)
+    scheduler.ensure_operator("ana")
+    scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+    return Daemon(paths, log, "2026-10-25T00:00:00Z", scheduler)
+
+
+@pytest.mark.parametrize("operation", ["mail", "replies", "read", "ack", "sent"])
+def test_the_line_socket_never_serves_the_operators_mail_request(
+    paths: ProjectPaths, operation: str
+) -> None:
+    import asyncio
+
+    paths.state_dir.mkdir(mode=0o700, exist_ok=True)
+    with EventLog(paths.event_log) as log:
+        daemon = line_daemon(paths, log)
+        token = daemon.line_tokens.issue("alpha")
+        args = {"operator": "ana", "line": "alpha", "token": token}
+        request = json.dumps({"id": "r", "op": operation, "v": 1, "args": args})
+        for responder in (daemon.respond_line, daemon.respond_agent):
+            response = asyncio.run(responder((request + "\n").encode()))
+            assert not response.ok
+            assert response.result is None or "unread_after" not in response.result
+
+
+def test_no_tool_of_a_line_names_another_operators_mailbox(paths: ProjectPaths) -> None:
+    """The tools a line is given take no operator or owner to read a mailbox for, so the
+    only way to the daemon's ``mail`` request, which does, is the operator's socket."""
+    paths.state_dir.mkdir(mode=0o700, exist_ok=True)
+    with EventLog(paths.event_log) as log:
+        daemon = line_daemon(paths, log)
+        tools = daemon.line_tools("alpha")
+        assert tools
+        for tool in tools:
+            schema = cast(dict[str, Any], tool.input_schema)
+            properties = cast(dict[str, Any], schema.get("properties", {}))
+            assert not {
+                "operator",
+                "owner",
+                "mailbox",
+                "line",
+                "recipient_mailbox",
+            } & set(properties), tool.name
+        # A line reads its own mailbox, with no counts of a page, by name.
+        assert not any(
+            "unread_after" in str(tool.input_schema)
+            or "unread_before" in str(tool.description)
+            for tool in tools
+        )

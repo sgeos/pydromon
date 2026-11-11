@@ -430,7 +430,11 @@ file and, unless that directory is, holds or lies in the line's working director
 directory, and the built-in file tools are denied the same paths, with a rule for the file
 itself. The real path of a link is denied too. The file is read at each build, so a reload
 that names another file guards it from the next turn. A Codex line has its write
-protection extended in the same way. **Residual.** A line whose sandbox is disabled runs
+protection extended in the same way, as `read` entries of its profile for each path that
+exists when it is made, so a file the monitor has not yet written is left out. Whether
+Codex enforces such an entry for a file is not verified. The limits are stated in
+[`LINE_CONFIG.md`](../protocol/LINE_CONFIG.md), including that the directory, when it is
+an ancestor of the workdir, is guarded only by the sandbox. **Residual.** A line whose sandbox is disabled runs
 its shell as the operator and can write whatever the operator can, as for every protected
 path, and the other engines take no sandbox or settings, so the guard does not reach
 them. The file is no more protected from the operator's own processes than any other.

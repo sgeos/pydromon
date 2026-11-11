@@ -177,3 +177,48 @@ def test_the_scheduler_names_the_file_it_reads(tmp_path: Path) -> None:
         assert scheduler.machine_status_file == tmp_path / "status"
         scheduler.set_machine_status(None)
         assert scheduler.machine_status_file is None
+
+
+def test_the_codex_profile_makes_an_existing_status_file_and_directory_read_only(
+    layout: tuple[Path, Path],
+) -> None:
+    """Round 16 follow-up review, finding 1. The profile Dromon hands Codex lists each
+    ``write_protected`` path that exists as ``read``, so the adapter honours it when it
+    writes the profile. That Codex then enforces the entry is not checked here, since
+    no test runs Codex. A path that does not exist when the profile is made is left out
+    of it, so a status file the monitor has not yet written is not guarded."""
+    import tomllib
+
+    from dromon.codex import server_arguments
+
+    root, status = layout
+    entry = next(
+        argument
+        for argument in server_arguments(
+            [],
+            LineConfig(builtin_tools=("Bash", "Edit")),
+            (),
+            write_protected=machine_status_guards(status, root),
+        )
+        if argument.startswith("permissions.dromon-line=")
+    )
+    absent = tomllib.loads(f"profile = {entry.split('=', 1)[1]}")["profile"][
+        "filesystem"
+    ]
+    assert real(status) not in absent, "the file does not exist yet"
+    assert absent[real(status.parent)] == "read"
+    status.write_text("x")
+    entry = next(
+        argument
+        for argument in server_arguments(
+            [],
+            LineConfig(builtin_tools=("Bash", "Edit")),
+            (),
+            write_protected=machine_status_guards(status, root),
+        )
+        if argument.startswith("permissions.dromon-line=")
+    )
+    present = tomllib.loads(f"profile = {entry.split('=', 1)[1]}")["profile"][
+        "filesystem"
+    ]
+    assert present[real(status)] == "read" and present[real(status.parent)] == "read"

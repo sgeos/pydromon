@@ -417,7 +417,13 @@ def owned_by_running_pytest(base: Path) -> bool:
     gone, or no lock, is a session that is over. A process that cannot be signalled
     for want of permission exists, and is kept as running. A lock that is not an
     identifier names no process. Pytest's own lock is the evidence, and not an age,
-    since a gate can run for an hour."""
+    since a gate can run for an hour. **Checked** against the pinned pytest 9.1.1,
+    whose ``create_cleanup_lock`` writes ``str(os.getpid())`` to ``.lock``, with no
+    newline, after it makes the directory, and whose exit hook removes it. A test pins
+    this. **Race.** The lock is made just after the directory, so a scan in that window
+    sees no lock, which can only repair a base that holds nothing yet, since no test has
+    run in it. A process identifier that a later process reuses keeps a dead session's
+    base unrepaired, which fails safe."""
     try:
         text = (base / ".lock").read_text()
     except OSError:
