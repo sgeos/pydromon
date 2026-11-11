@@ -143,6 +143,30 @@ message and leaving the old daemon running.
   environment, as before, which the client says. **Assumption.** No other variable
   changes what a start's checks decide, since `HOME` is the same user's and the
   runtime directory is passed on the command line.
+- **A secret exported again does not reach the successor.** **Round 16, item 6.**
+  Another project replaced a secret its project file refers to, exported it and
+  restarted, and a line still presented the old value. Only a stop and a start
+  picked up the new one. The cause is the bullet above. The successor inherits the
+  running daemon's environment, and the engine expands each `${NAME}` from the
+  daemon's environment at each turn. The client now warns, before it asks for the
+  restart, of each name a line is granted whose value in the client's own shell
+  differs from the running daemon's, an unset one included, and says that only
+  `dromon stop` and `dromon start` from that shell use its values. The restart goes
+  on. To compare, the client sends `start_context` a fresh random key, the daemon
+  answers with the HMAC-SHA256 of each granted value under it, and the client
+  compares the digests of its own values, so no value crosses the socket.
+  **Decided for the operator's review, over carrying the client's values into the
+  successor.** Carrying would put secret values in a request and in the daemon's
+  restart plan, and would leave a daemon whose environment is two shells' mixed,
+  in which a name the restarting shell lacks would either keep the old value or be
+  removed, neither of which the operator asked for. **Residuals.** Only names the
+  project file granted when the daemon last loaded it are compared, so a name
+  granted since, which the successor reads from the same old environment, is not.
+  `dromon reload` reads the project file again but not the environment, so it
+  keeps the daemon's values too, and gives no warning. A daemon from before round
+  16 refuses the key, and the client then says that it cannot compare. A digest
+  lets whoever holds the client socket test a guess of a value, which that holder,
+  holding operator authority, could learn otherwise.
 - **The reason.** The client prints the check's lines that begin `dromond:`, which are
   the reasons a real start prints, or else its last line, as for code that does not
   import.
@@ -169,7 +193,7 @@ message and leaving the old daemon running.
 | Recovery, the survivor scan and the process-table probe | They run in `serve`, or touch the process table, which the check does not |
 | Model responses and post-prompt checks | Startup checks send no prompt and cannot verify a model response or checks requiring one |
 | What the drain records | The copy is taken before the request, so mail, lines or roles recorded during the drain are not checked. A line created during a drain can still make the successor refuse |
-| The rest of the daemon's environment | From round 14, item 6, the check takes the daemon's `SSH_AUTH_SOCK` and `DROMON_REGISTRY_DIR`, but any other variable is the client's, so a refusal that depended on one would differ. None is known to |
+| The rest of the daemon's environment | From round 14, item 6, the check takes the daemon's `SSH_AUTH_SOCK` and `DROMON_REGISTRY_DIR`, but any other variable is the client's, so a refusal that depended on one would differ. None is known to. From round 16, item 6, a granted secret that differs is warned of, but the successor still runs with the daemon's value |
 | An installed checkout that moves after the check | The successor loads what is installed when it starts |
 | Another interpreter's installed code, with an older daemon | From round 14, item 6, the check runs on the daemon's own interpreter. A daemon from before that does not name it, and the check then runs on the client's |
 

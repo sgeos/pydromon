@@ -2308,6 +2308,12 @@ class RunStarted:
     """The absolute directory the command of a commit run ran in, the daemon's
     detached checkout of ``commit``, given exactly when ``commit`` is. ``workdir``
     then holds only the output file."""
+    workdir_commit: str | None = None
+    """**Round 16, item 3.** The commit ``HEAD`` named in the line's working
+    directory when a run there started, read by the daemon from the checkout's own
+    files and never claimed by the line, or ``None`` for a commit run, whose
+    ``commit`` names what ran, and where it could not be read. It says nothing of
+    uncommitted changes, which the command also ran with."""
 
     def __post_init__(self) -> None:
         check_id("run_id", self.run_id)
@@ -2316,6 +2322,14 @@ class RunStarted:
         check_optional_id("previous", self.previous)
         if self.commit is not None and COMMIT_PATTERN.fullmatch(self.commit) is None:
             raise InvalidField("commit must be null or a full hexadecimal commit")
+        if self.workdir_commit is not None and (
+            COMMIT_PATTERN.fullmatch(self.workdir_commit) is None
+        ):
+            raise InvalidField(
+                "workdir_commit must be null or a full hexadecimal commit"
+            )
+        if self.workdir_commit is not None and self.commit is not None:
+            raise InvalidField("workdir_commit is given only for a run in a worktree")
         if (self.commit is None) != (self.checkout is None):
             raise InvalidField("checkout is given exactly when commit is")
         if self.checkout is not None:

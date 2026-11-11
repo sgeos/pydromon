@@ -43,6 +43,12 @@ PINS: tuple[tuple[int, str, str], ...] = (
         "1ed89a710b96536b115ace4a5ba7d4a40e54d561cbd6823c874af7bfbb946d46",
         "4c36dab8af2c877d5f0014b3e6cb484412012e63f49cfa53bef7cdbf0d13a746",
     ),
+    # Round 16, item 3, run_started's workdir_commit.
+    (
+        4,
+        "62b1cf5f7c4f454877281837d58503115fd4bc031930171200a7fd97e620776b",
+        "4ef0b2f9a3fd046894cedd1ebc30028c12f4ebc24f0ca989ed257bada1652209",
+    ),
 )
 """Each ``STATE_VERSION`` with its ``codec_digest`` and its replay digest, oldest
 first, appended to and never edited."""

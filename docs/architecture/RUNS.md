@@ -283,6 +283,29 @@ Each end records `run_ended` with the digest and size of the output file, read w
 end is recorded, then removes the receipt, and sends a note from the harness to the
 scope's present holder, the role's owner or else the line that started it.
 
+**One receipt, round 16, item 3.** The engines line asked in round 15 for one
+authoritative completion receipt per run, since it had polled `run_status` with timed
+wakes and waited for an exit after the output already showed the summary. The `Run
+ended` note is that receipt. It is sent once, when the end is recorded, to the holder
+and to each line whose wake waited for the run, and it gives the run, its command, its
+line, the commit it ran, its start, how it ended with the exit code, the output's size
+and digest, the test summary with what pytest skipped and how many it deselected, the
+tail of a failed run, and the wake it cancelled. Nothing else is sent at the end. The
+wake is withdrawn, so no wake note follows, and an end is recorded once, so a later
+reconciliation, as after a restart, sends no second note. **The commit it ran.** A
+commit run names its `commit`. A run in a worktree now names `workdir_commit`, the
+commit its worktree had checked out when the run started, which the daemon reads from
+the checkout's files before the command starts and records in `run_started`. The note
+says `in its worktree at commit C with any uncommitted changes`, since the command ran
+on the tree as the line left it, which a commit alone does not name. Where the commit
+cannot be read, as outside a checkout, nothing is said of it. **What it skipped.** This
+is what pytest's summary says, the skip reasons and the deselected count, as the
+paragraph below specifies. Tests a gate script leaves out by its own means, such as a
+marker expression, appear only as that count, and the run's command in the log names
+the expression. **Inference.** The second note the engines line saw was the timed wake
+it scheduled to poll, which round 15's wake on a run replaced. No path that sends two
+notes for one end was found, and a test pins one.
+
 **The test summary, round 14, item 2.** The same reconciliation reads the last 64 KiB
 of the output, opened as the digest is, and finds pytest's final line, such as `5162
 passed, 10 skipped, 48 deselected in 231.52s`, with the skip reasons of the short
@@ -876,6 +899,45 @@ run whose output was complete as still running for up to a minute. Item 2 fixed 
 The flow found nothing else to fix. **Not covered.** The test runs a stand-in gate, not
 `scripts/check.sh`, whose `uv sync` in the checkout needs the network and a fresh
 home's cache, so the cost of the real gate in a commit run is not measured here.
+
+## Waiting for a long suite
+
+**Round 16, item 4, the audit line's request.** The audit line ran a long suite in
+its own turn and lost it twice. **Fact, from its round 15 report.** A daemon restart
+ended its turn while two background pytest tasks ran, which were marked stopped with
+no completion record, and a suite run in the foreground had to fit the shell tool's
+own time limit. **What ends such a wait today.** A wait held inside a turn ends with
+the turn. A restart ends every turn in flight and the engine process with it, and so
+the background tasks of that turn, and the shell tool bounds a foreground command,
+which Dromon does not set. A hold at the turn or cost limit starts no next turn, so a
+line that meant to come back to its own background task does not.
+
+**What survives.** A suite started as a declared run and awaited with `wake_after`
+on the run holds no turn open. The line starts the run, names it in `wake_after`, and
+ends its turn. Each part outlives a restart and a hold.
+
+- The run's supervisor is its own process, which a restart does not end, and the
+  restarted daemon finds it by its identifier and start time, as above.
+- The wake is `wake_scheduled` in the log, so a restart keeps it with its run.
+- A hold at the turn or cost limit withdraws no wake. The run's end withdraws it and
+  records the `Run ended` note, which waits in the held line's mailbox, and the
+  operator's release leaves it to start the line's next turn.
+
+Tests pin each of these, a wait across a restart and a wait across a hold at either
+limit. **Inference.** Nothing ended this wait before this round either. The change is
+that it is now tested and written down. **What is not fixed.**
+
+- A reading line, such as the review or audit line, can start only `review-gate`, on
+  a commit the operator has pushed. Its suite on an extracted tree is not a declared
+  run, so it still waits inside a turn. An operator who wants it can declare a
+  command with a parameter for the tree, as the parameters section above allows. That
+  is project configuration and not code.
+- The operator's stop of a line withdraws its wake on purpose, so a stopped line is
+  not woken by the run's end. It finds the run with `run_status` once released.
+- A wake waits at most 86,400 seconds. A run that outlives it lets the wake fire, and
+  the end then reaches the holder as a note without a wake to cancel.
+- A held line's turn starts only after an operator releases it, so the wait ends in a
+  turn only when the operator chooses.
 
 ## Not implemented
 

@@ -317,6 +317,7 @@ SCENARIO: tuple[Event, ...] = (
         4321,
         AT,
         AT,
+        workdir_commit="b" * 40,
     ),
     RunEnded("r-1", RunStatus.EXITED, 0, "0" * 64, 2048, "", AT),
     RunStarted(

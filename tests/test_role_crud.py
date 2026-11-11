@@ -421,7 +421,7 @@ def test_a_deleted_role_keeps_its_journal_and_its_seats_keep_their_leases(
     assert dromon("role", "delete", "core")[0] == exits.OK
     # The lease is the line's, for a resource of the project, so it outlives the role.
     assert desk.scheduler.leases_of("gamma") == [
-        {"name": "full-gate", "expires": expires}
+        {"name": "full-gate", "expires": expires, "seconds": 600}
     ]
     status, out, _ = dromon("role", "entry", "e1")
     assert status == exits.OK and "entry e1 of role core" in out and "ready" in out

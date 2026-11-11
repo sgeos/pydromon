@@ -27,10 +27,14 @@ watch is a poll bounded by a count derived from the wait, so both map onto a sta
 machine in a port.
 """
 
+import hashlib
+import hmac
 import math
+import re
 import shutil
 import stat
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -170,3 +174,56 @@ def polls(wait_seconds: int) -> int:
     """How many polls the daemon's watch makes at most, enough to pass the deadline
     of a plan with ``wait_seconds``, so its loop is bounded."""
     return math.ceil(wait_seconds / POLL_SECONDS) + 2
+
+
+# Round 16, item 6. A restart keeps the running daemon's secrets.
+
+NONCE_PATTERN: Final = re.compile(r"[0-9a-f]{32,128}")
+"""The key a client gives ``start_context`` for the digests of the daemon's granted
+secrets, in lowercase hexadecimal, at least 128 bits."""
+
+MAX_COMPARED_SECRETS: Final = 256
+"""The most granted names one ``start_context`` answer compares, taken in name
+order, so its answer is bounded."""
+
+
+def secret_digest(nonce: str, value: str | None) -> str | None:
+    """A keyed digest of one variable's value, or ``None`` when it is unset.
+
+    **Round 16, item 6.** A restart's successor inherits the running daemon's
+    environment, so a secret exported again in the operator's shell does not reach it.
+    The client and the daemon each digest their own value under a key the client
+    chose for that one request, and the client compares, so neither value crosses the
+    socket. HMAC with SHA-256 from the standard library, never a construction of our
+    own. **Assumption.** Whoever reads the answer holds the client socket, and so
+    operator authority, as ``docs/protocol/CLIENT.md`` gives, so a digest that lets
+    a guess be tested gives that holder nothing it could not already ask for."""
+    if value is None:
+        return None
+    raw = value.encode("utf-8", "surrogateescape")
+    return hmac.new(bytes.fromhex(nonce), raw, hashlib.sha256).hexdigest()
+
+
+def secret_names(granted: Mapping[str, Sequence[str]]) -> tuple[str, ...]:
+    """Every name a line is granted, once each, in name order, cut to
+    ``MAX_COMPARED_SECRETS``."""
+    found = {name for names in granted.values() for name in names}
+    return tuple(sorted(found))[:MAX_COMPARED_SECRETS]
+
+
+def secret_digests(
+    names: Sequence[str], environment: Mapping[str, str], nonce: str
+) -> dict[str, str | None]:
+    """The digest of each of ``names`` as ``environment`` holds it."""
+    return {name: secret_digest(nonce, environment.get(name)) for name in names}
+
+
+def differing_secrets(
+    theirs: Mapping[str, str | None], environment: Mapping[str, str], nonce: str
+) -> tuple[str, ...]:
+    """The names, in ``theirs``, whose value in ``environment`` digests otherwise, in
+    name order. A name set in one and unset in the other differs too."""
+    mine = secret_digests(tuple(theirs), environment, nonce)
+    return tuple(
+        sorted(name for name, digest in theirs.items() if mine[name] != digest)
+    )

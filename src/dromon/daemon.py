@@ -872,6 +872,7 @@ class Daemon:
                 | Operation.RUN_CLEAR
                 | Operation.SCRATCH_PLACE
                 | Operation.RUNS
+                | Operation.OVERVIEW
                 | Operation.START_CONTEXT
                 | Operation.BUDGETS
                 | Operation.BUDGET_SET
@@ -1027,9 +1028,20 @@ class Daemon:
                     values = _text_args(request.args, names)
                     found = self.scheduler.runs_view(values[0] if values else None)
                     result = {"runs": cast(object, found)}
+                case Operation.OVERVIEW:
+                    # Round 16, item 1. The line's own view, read only.
+                    (line_id,) = _text_args(request.args, ("line_id",))
+                    result = self.scheduler.overview(line_id)
                 case Operation.START_CONTEXT:
-                    _text_args(request.args, ())
-                    result = start_context(os.environ)
+                    keys = ("nonce",) if "nonce" in request.args else ()
+                    given = _text_args(request.args, keys)
+                    nonce = given[0] if given else None
+                    if nonce is not None and not restart.NONCE_PATTERN.fullmatch(nonce):
+                        raise ProtocolError(
+                            ErrorCode.BAD_REQUEST,
+                            "nonce must be 32 to 128 lowercase hexadecimal digits",
+                        )
+                    result = start_context(os.environ, self.line_secrets, nonce)
                 case Operation.BUDGETS:
                     _text_args(request.args, ())
                     result = self.scheduler.budgets_view()
@@ -1933,7 +1945,11 @@ class Daemon:
         reply, as a line's ``send_message`` does. **Follow-up of 2026-11-01.** Omitted,
         the daemon's rule decides, so a note asks a reply unless it is itself a reply,
         and an operator's note that asks nothing no longer has to stay in a line's
-        unanswered count until the line acknowledges it."""
+        unanswered count until the line acknowledges it.
+
+        ``operator``, optional from round 16, item 7, is the sender. Omitted, the
+        sender is the operator ``@operator`` names, ``Scheduler.default_sender``, and
+        the result's ``operator`` says which."""
         urgent = args.get("priority", False)
         if not isinstance(urgent, bool):
             raise ProtocolError(ErrorCode.BAD_REQUEST, "priority is not a boolean")
@@ -1945,11 +1961,13 @@ class Daemon:
             for key, value in args.items()
             if key not in ("priority", "asks_reply")
         }
+        named = ("operator",) if "operator" in texts else ()
         optional = ("reply_to",) if "reply_to" in texts else ()
-        values = _text_args(texts, ("recipient", "body", "operator", *optional))
-        recipient, body, operator = values[:3]
-        reply_to = values[3] if optional else None
-        sender = OperatorAddress(operator)
+        values = _text_args(texts, ("recipient", "body", *named, *optional))
+        recipient, body = values[:2]
+        rest = values[2:]
+        sender = OperatorAddress(rest[0]) if named else self.scheduler.default_sender()
+        reply_to = rest[-1] if optional else None
         address = parse_any_address(recipient)
         if urgent and not isinstance(address, RemoteAddress):
             # Checked before the operator is registered, so a refusal records nothing.
@@ -1958,7 +1976,11 @@ class Daemon:
         message_id = self.scheduler.send(
             sender, address, body, reply_to, priority=urgent, asks_reply=asks
         )
-        return {"message_id": message_id, "priority": urgent}
+        return {
+            "message_id": message_id,
+            "priority": urgent,
+            "operator": sender.operator_id,
+        }
 
     def _restart(self, args: dict[str, object]) -> dict[str, object]:
         """Begin a restart for ``operator``. ``mode`` is ``wait``, the default, or
@@ -3092,16 +3114,28 @@ def tls_serving(daemon: Daemon) -> TlsServing:
     return pinned_serving
 
 
-def start_context(environment: Mapping[str, str]) -> dict[str, object]:
+def start_context(
+    environment: Mapping[str, str],
+    granted: Mapping[str, Sequence[str]] | None = None,
+    nonce: str | None = None,
+) -> dict[str, object]:
     """What a restart's successor starts with that a client cannot see, its
     interpreter, which ``client.start`` runs, and ``restart.START_ENVIRONMENT`` as
-    ``environment`` holds it, each value ``None`` when unset. **Round 14, item 6.**"""
-    return {
+    ``environment`` holds it, each value ``None`` when unset. **Round 14, item 6.**
+
+    **Round 16, item 6.** With ``nonce``, also ``secrets``, a keyed digest of each
+    name the project file as last loaded grants a line, ``granted``, so the client
+    can say which of them its own shell holds otherwise. Never a value."""
+    result: dict[str, object] = {
         "interpreter": sys.executable,
         "environment": {
             name: environment.get(name) for name in restart.START_ENVIRONMENT
         },
     }
+    if nonce is not None:
+        names = restart.secret_names(granted or {})
+        result["secrets"] = restart.secret_digests(names, environment, nonce)
+    return result
 
 
 def successor_args(overrides: Overrides, hold_wakes: bool) -> list[str]:
