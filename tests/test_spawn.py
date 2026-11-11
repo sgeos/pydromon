@@ -818,6 +818,71 @@ def test_any_other_value_of_the_variable_leaves_vfork_on() -> None:
         assert now == was, value
 
 
+@pytest.fixture
+def vfork_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(subprocess, "_USE_VFORK", True, raising=False)
+    monkeypatch.setattr(subprocess, "_USE_POSIX_SPAWN", True, raising=False)
+
+
+def vfork_flags() -> tuple[object, object]:
+    return (
+        getattr(subprocess, "_USE_VFORK"),  # noqa: B009
+        getattr(subprocess, "_USE_POSIX_SPAWN"),  # noqa: B009
+    )
+
+
+@pytest.mark.usefixtures("vfork_on")
+def test_the_linux_default_leaves_vfork_on() -> None:
+    """Review of round 16, follow-up 2. With a platform named, the default on Linux is
+    checked on every machine, and a change that turns vfork off for everyone, which a
+    run on macOS never sees, fails here."""
+    assert spawn.apply_vfork_setting({}, "linux") is False
+    assert vfork_flags() == (True, True)
+    assert spawn.apply_vfork_setting({"PATH": "/usr/bin"}, "linux") is False
+    assert vfork_flags() == (True, True)
+
+
+@pytest.mark.usefixtures("vfork_on")
+def test_only_the_exact_value_one_turns_vfork_off_on_linux() -> None:
+    for value in ("0", "", "true", "yes", "1 ", "01"):
+        assert spawn.apply_vfork_setting({"DROMON_NO_VFORK": value}, "linux") is False
+        assert vfork_flags() == (True, True), repr(value)
+    assert spawn.apply_vfork_setting({"DROMON_NO_VFORK": "1"}, "linux") is True
+    assert vfork_flags() == (False, False)
+
+
+@pytest.mark.usefixtures("vfork_on")
+def test_the_variable_changes_nothing_off_linux() -> None:
+    assert spawn.apply_vfork_setting({"DROMON_NO_VFORK": "1"}, "darwin") is False
+    assert vfork_flags() == (True, True)
+
+
+def test_the_import_applies_the_setting_and_does_not_turn_vfork_off_itself() -> None:
+    """The module's last statements go through ``apply_vfork_setting``, which reads
+    the environment, so an unconditional ``disable_vfork()`` at import is caught on a
+    machine where the fresh-interpreter test cannot see it."""
+    tree = ast.parse(Path(spawn.__file__).read_text(encoding="utf-8"))
+    calls = [
+        node.value.func.id
+        for node in tree.body
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+    ]
+    assert "apply_vfork_setting" in calls
+    assert "disable_vfork" not in calls
+    assert not any(
+        isinstance(node, ast.If)
+        and any(
+            isinstance(inner, ast.Expr)
+            and isinstance(inner.value, ast.Call)
+            and getattr(inner.value.func, "id", "") == "disable_vfork"
+            for inner in node.body
+        )
+        for node in tree.body
+    ), "an import-time branch turns vfork off outside apply_vfork_setting"
+
+
 def test_proc_children_give_their_processor_time(tmp_path: Path) -> None:
     """The ``utime`` and ``stime`` of ``stat``, twelfth and thirteenth after the
     program name, are shown in milliseconds, which tells a child that waits from one
@@ -1490,7 +1555,7 @@ def test_a_blocked_standard_error_does_not_hold_a_start_that_succeeded(
     spawn.clear_slow_starts()
 
 
-def test_a_blocked_standard_error_holds_at_most_one_writer_and_drops_the_rest(
+def test_a_blocked_standard_error_holds_at_most_one_writer_and_queues_the_rest(
     monkeypatch: pytest.MonkeyPatch, blocked_stderr: BlockedStderr
 ) -> None:
     monkeypatch.setattr(spawn, "SLOW_START_SECONDS", 0.0)
@@ -1503,6 +1568,81 @@ def test_a_blocked_standard_error_holds_at_most_one_writer_and_drops_the_rest(
     # Every start is still recorded, whether or not its line was written.
     assert len(spawn.slow_starts()) == 4
     spawn.clear_slow_starts()
+
+
+def test_a_stall_report_is_not_dropped_behind_a_slow_start_line(
+    monkeypatch: pytest.MonkeyPatch, blocked_stderr: BlockedStderr
+) -> None:
+    """Review of round 16, follow-up 3. A line that arrives while another is being
+    written is queued and written afterwards, in order, and is not dropped."""
+    spawn._say("dromond: slow start, one", limited=True, wait=0.1)  # pyright: ignore[reportPrivateUsage]
+    spawn._say("dromond: sleep did not start within 30s", limited=False, wait=0.1)  # pyright: ignore[reportPrivateUsage]
+    assert blocked_stderr.lines == ["dromond: slow start, one"]
+    blocked_stderr.release.set()
+    writer = spawn._log.writer  # pyright: ignore[reportPrivateUsage]
+    if writer is not None:
+        writer.join(10)
+    assert blocked_stderr.lines == [
+        "dromond: slow start, one",
+        "dromond: sleep did not start within 30s",
+    ]
+    assert spawn._log.writer is None  # pyright: ignore[reportPrivateUsage]
+    assert spawn._log.pending == []  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_queue_is_bounded_and_drops_limited_lines_first(
+    blocked_stderr: BlockedStderr,
+) -> None:
+    """The writer is held on the first line. Unlimited lines then fill the queue, and a
+    limited line that finds it full is dropped, while an unlimited line that finds only
+    unlimited lines drops the oldest. Every drop is counted."""
+    log = spawn._log  # pyright: ignore[reportPrivateUsage]
+    spawn._say("first", limited=False, wait=0.1)  # pyright: ignore[reportPrivateUsage]
+    for number in range(spawn.MAX_LOG_PENDING):
+        spawn._say(f"u{number}", limited=False, wait=0.0)  # pyright: ignore[reportPrivateUsage]
+    assert len(log.pending) == spawn.MAX_LOG_PENDING
+    spawn._say("limited", limited=True, wait=0.0)  # pyright: ignore[reportPrivateUsage]
+    assert ("limited", True) not in log.pending
+    assert log.dropped == 1
+    spawn._say("newest", limited=False, wait=0.0)  # pyright: ignore[reportPrivateUsage]
+    assert len(log.pending) == spawn.MAX_LOG_PENDING
+    assert log.pending[0][0] == "u1" and log.pending[-1][0] == "newest"
+    assert log.dropped == 2
+
+
+def test_a_queued_limited_line_goes_before_an_unlimited_one_when_full() -> None:
+    log = spawn._Log()  # pyright: ignore[reportPrivateUsage]
+    queue = spawn._queue_line  # pyright: ignore[reportPrivateUsage]
+    for number in range(spawn.MAX_LOG_PENDING):
+        assert queue(log, f"n{number}", number == 3, 100.0 + number * 10) is True
+    assert queue(log, "report", False, 1000.0) is True
+    texts = [text for text, _ in log.pending]
+    assert "n3" not in texts and texts[-1] == "report"
+    assert len(texts) == spawn.MAX_LOG_PENDING and log.dropped == 1
+
+
+def test_a_limited_line_inside_the_interval_is_refused_and_not_counted() -> None:
+    log = spawn._Log()  # pyright: ignore[reportPrivateUsage]
+    queue = spawn._queue_line  # pyright: ignore[reportPrivateUsage]
+    assert queue(log, "a", True, 100.0) is True
+    assert queue(log, "b", True, 100.0 + spawn.LOG_INTERVAL_SECONDS / 2) is False
+    assert queue(log, "c", False, 100.0) is True
+    assert [t for t, _ in log.pending] == ["a", "c"] and log.dropped == 0
+
+
+def test_a_line_queued_as_the_writer_ends_is_still_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The writer decides that it is finished under the lock, so a line queued after
+    that starts a new writer and is not stranded."""
+    written: list[str] = []
+    monkeypatch.setattr(spawn, "_write_line", written.append)
+    for number in range(20):
+        spawn._say(f"line {number}", limited=False, wait=5.0)  # pyright: ignore[reportPrivateUsage]
+    deadline = time.monotonic() + 10
+    while len(written) < 20 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert written == [f"line {number}" for number in range(20)]
 
 
 def test_the_slow_start_line_is_written_at_most_once_in_the_interval(
@@ -1742,21 +1882,26 @@ def test_a_fork_call_under_the_threshold_is_not_recorded() -> None:
 def test_the_fork_call_records_the_threads_own_processor_time() -> None:
     """Spinning inside the fork lock uses the thread's processor time and sleeping
     inside it does not, so the figure tells a thread that worked from one that
-    waited, which the wall time cannot."""
+    waited, which the wall time cannot. **Review of round 16, follow-up 1.** The spin
+    runs until the thread's own clock has advanced by a fixed amount, with a long wall
+    bound only against a hang, so a loaded machine slows the test and cannot fail it.
+    The sleeper is compared with the spinner and not with a constant."""
+    wanted = 0.05
     busy, idle = spawn._ForkTimes(), spawn._ForkTimes()  # pyright: ignore[reportPrivateUsage]
     spawn._fork_slot.current = busy  # pyright: ignore[reportPrivateUsage]
     try:
         with spawn.forking():
-            deadline = time.monotonic() + 0.3
-            while time.monotonic() < deadline:
+            began = time.thread_time()
+            bound = time.monotonic() + 60.0
+            while time.thread_time() - began < wanted and time.monotonic() < bound:
                 pass
         spawn._fork_slot.current = idle  # pyright: ignore[reportPrivateUsage]
         with spawn.forking():
-            time.sleep(0.3)
+            time.sleep(0.2)
     finally:
         spawn._fork_slot.current = None  # pyright: ignore[reportPrivateUsage]
-    assert busy.cpu >= 0.2
-    assert 0.0 <= idle.cpu < 0.1
+    assert busy.cpu >= wanted
+    assert 0.0 <= idle.cpu < busy.cpu
 
 
 def test_a_slow_fork_note_does_not_wait_for_a_blocked_standard_error(

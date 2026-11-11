@@ -274,6 +274,12 @@ LOG_INTERVAL_SECONDS: Final = 1.0
 """At most one slow-start line is written in this time. The ledger still records every
 slow start up to ``MAX_SLOW_STARTS_KEPT``, so a loaded host that is slow for every start
 does not fill the log."""
+MAX_LOG_PENDING: Final = 16
+"""The most diagnostic lines queued for a standard error that has not accepted the one
+before. **Review of round 16, follow-up 3.** A bound, so that a standard error that
+never accepts a line costs a few kilobytes and not the memory of the daemon."""
+LOG_DRAIN_LIMIT: Final = 1000
+"""The most lines one writer thread writes before it ends, a bound on its loop."""
 MAX_SLOW_STARTS_KEPT: Final = 64
 """How long past a start's own bound the watchdog waits before it dumps the traceback
 of every thread. It is after the bound, so a start that stalls is already reported by
@@ -624,6 +630,20 @@ def disable_vfork(platform: str = sys.platform) -> bool:
             setattr(subprocess, name, False)
             changed = True
     return changed
+
+
+def apply_vfork_setting(
+    environment: Mapping[str, str] | None = None, platform: str = sys.platform
+) -> bool:
+    """The rule applied at import. ``vfork`` is left as CPython has it unless the
+    environment holds ``DROMON_NO_VFORK=1`` exactly. **Review of round 16, follow-up
+    2.** It is a function so that a test can pin the Linux default with a platform it
+    names, since a test run elsewhere never sees ``vfork`` change. Returns whether it
+    changed anything."""
+    chosen = os.environ if environment is None else environment
+    if chosen.get("DROMON_NO_VFORK") != "1":
+        return False
+    return disable_vfork(platform)
 
 
 @dataclass(frozen=True)
@@ -1038,14 +1058,17 @@ _slow_lock = threading.Lock()
 
 
 class _Log:
-    """The state of the diagnostic lines, replaced by name in tests. ``writer`` is the
-    one thread that may be blocked in a write, and ``last`` the monotonic time of the
-    last slow-start line."""
+    """The state of the diagnostic lines, replaced by name in tests. ``pending`` holds
+    the lines not yet written, each with whether it is ``limited``, ``writer`` is the
+    one thread that drains it, and ``last`` is the monotonic time of the last limited
+    line accepted."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
+        self.pending: list[tuple[str, bool]] = []
         self.writer: threading.Thread | None = None
         self.last = -LOG_INTERVAL_SECONDS
+        self.dropped = 0
 
 
 _log = _Log()
@@ -1057,28 +1080,84 @@ def _write_line(text: str) -> None:
         print(text, file=sys.stderr)
 
 
+def _queue_line(log: _Log, text: str, limited: bool, now: float) -> bool:
+    """Add a line to ``log.pending``, with ``log.lock`` held, and say whether it was
+    kept. A limited line closer than ``LOG_INTERVAL_SECONDS`` to the last is refused.
+    When the queue is full a limited line is dropped first, the oldest of them, and an
+    unlimited line only when every queued line is unlimited, so a stall report is not
+    lost behind slow-start lines. Every drop is counted."""
+    if limited:
+        if now - log.last < LOG_INTERVAL_SECONDS:
+            return False
+        log.last = now
+    if len(log.pending) >= MAX_LOG_PENDING:
+        for index, (_, was_limited) in enumerate(log.pending):
+            if was_limited:
+                del log.pending[index]
+                log.dropped += 1
+                break
+        else:
+            if limited:
+                log.dropped += 1
+                return False
+            del log.pending[0]
+            log.dropped += 1
+    log.pending.append((text, limited))
+    return True
+
+
+def _drain_log(log: _Log) -> None:
+    """The writer thread. It writes the queued lines in order and ends when none are
+    left, deciding that under the lock so that a line queued as it ends starts a new
+    writer. It handles at most ``LOG_DRAIN_LIMIT`` lines and then ends, and a later
+    line starts another."""
+    for _ in range(LOG_DRAIN_LIMIT):
+        with log.lock:
+            if not log.pending:
+                log.writer = None
+                return
+            text, _limited = log.pending.pop(0)
+        _write_line(text)
+    with log.lock:
+        log.writer = None
+
+
 def _say(text: str, limited: bool, wait: float | None = None) -> None:
-    """Write ``text`` to the daemon's standard error from a thread of its own, and
-    wait for it at most ``LOG_WAIT_SECONDS``, or ``wait`` when given. **Review of
-    round 16, finding 3.** At most one such thread exists, so a standard error that
-    never accepts a line holds one thread and drops later lines, and is not a thread
-    for each start. ``limited`` also drops the line when one was written less than
-    ``LOG_INTERVAL_SECONDS`` ago. Never raises, and never waits past the bound."""
+    """Queue ``text`` for the daemon's standard error and wait for the writer thread at
+    most ``LOG_WAIT_SECONDS``, or ``wait`` when given. **Review of round 16, finding
+    3.** At most one writer thread exists, so a standard error that never accepts a
+    line holds one thread and is not a thread for each start. **Follow-up 3.** A line
+    that arrives while another is being written is queued, up to ``MAX_LOG_PENDING``,
+    and is not dropped, because a stall report was lost behind a slow-start line. When
+    the queue is full a limited line goes first, see ``_queue_line``. ``limited`` also
+    refuses the line when one was accepted less than ``LOG_INTERVAL_SECONDS`` ago. Never
+    raises, and never waits past the bound."""
     now = time.monotonic()
-    with _log.lock:
-        if _log.writer is not None and _log.writer.is_alive():
+    log = _log
+    with log.lock:
+        if not _queue_line(log, text, limited, now):
             return
-        if limited and now - _log.last < LOG_INTERVAL_SECONDS:
-            return
-        _log.last = now
-        writer = threading.Thread(
-            target=_write_line, args=(text,), name="dromon-spawn-log", daemon=True
-        )
-        _log.writer = writer
-    # No thread could be made when this raises, and the line is dropped.
-    with contextlib.suppress(RuntimeError):
-        writer.start()
+        writer = log.writer
+        if writer is None:
+            writer = threading.Thread(
+                target=_drain_log, args=(log,), name="dromon-spawn-log", daemon=True
+            )
+            log.writer = writer
+            starting = True
+        else:
+            starting = False
+    try:
+        if starting:
+            writer.start()
         writer.join(LOG_WAIT_SECONDS if wait is None else wait)
+    except RuntimeError:
+        # No thread could be made. The line stays queued for the next writer, and the
+        # slot is freed here, since ``writer`` is set before it starts so that two
+        # callers cannot make two.
+        if starting:
+            with log.lock:
+                if log.writer is writer:
+                    log.writer = None
 
 
 def slow_starts() -> list[str]:
@@ -1617,5 +1696,4 @@ def run(
 
 
 install_fork_lock()
-if os.environ.get("DROMON_NO_VFORK") == "1":
-    disable_vfork()
+apply_vfork_setting()
