@@ -54,17 +54,19 @@ A turn asked to end whose restart was then abandoned, before the turn's report a
 leaves a note that says the restart was abandoned, which wakes the line in the same
 daemon after its cooldown.
 
-**A turn asked to end that did not say why it ended.** **Round 16, item 3.** A line
-whose turn a restart interrupted sat idle after the restart until it was mailed. The
-note had been left only when the turn's report named the restart as why it ended, so
-a turn the engine ended without saying so, or one that ended by itself just before its
-safe point, left none. Any turn the restart asked to end that returns a report and does
-not fail now leaves a note, recorded after the turn's end, and one whose report did not
-name the restart says that the turn ended without saying whether it stopped at its safe
-point. Inference, not observed, is that this was the path in the field, since the line
-was idle and so had returned a report that did not fail. **Decided by core, for
-review.** A spurious wake costs one turn, and a missed one leaves a line idle with no
-bound.
+**A turn asked to end whose report names another reason, or none.** **Round 16,
+item 3, and its review's finding 1.** The note follows the reason the turn's report
+names, and never the reason last recorded for the turn's redirect. Every engine keeps
+the first interrupt of a turn and ignores any later one, so priority mail or a change
+of access asked at a later safe point of the same turn had taken the note away from a
+turn the restart did end, and the line sat idle after the restart until it was
+mailed. Inference, not observed, is that this was the path in the field. A turn whose
+report names another reason was stopped by its driver or its engine before the
+restart's ask took effect, as a Pi turn past `max_turns` is, though a safe point the
+engine still dispatched recorded the ask. It leaves no note, so a line that was
+stopped for a reason of its own is not woken, and the engine's stop note, which does
+not wake, tells it why. A report that names no reason was not ended by the restart
+either, and leaves no note.
 
 A turn asked to end that failed or raised leaves no note. A failure holds the line and
 asks an operator, or leaves it failed where it mailed an operator in the turn, and a

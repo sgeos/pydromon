@@ -237,7 +237,8 @@ def checkout_top(directory: Path) -> Path | None:
     ``.git``, as a real path, or ``None`` outside a checkout or where a pointer file
     cannot be followed. **Round 16, item 5.** ``git status --porcelain`` names paths
     from there, so ``dromon.readiness`` reads them against it. A worktree set by
-    ``core.worktree`` elsewhere is not followed, which is a residual."""
+    ``core.worktree`` elsewhere is not followed. ``dromon.readiness`` answers a
+    changed path it cannot state there as a tree whose coverage cannot be told."""
     try:
         found = _git_dirs(directory)
     except SandboxError:

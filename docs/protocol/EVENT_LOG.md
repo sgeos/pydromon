@@ -723,6 +723,16 @@ resumes.
      code reading found no other path from the timing to a refusal, so whether this was
      the cause is a hypothesis, and the refusal's text would settle it. Each answer now
      names the snapshot's `N` and the copy's bound.
+   - **The snapshot a successor restores.** **Round 16 review, finding 2.** The live
+     daemon may write a later snapshot after the check holds one, and that later one is
+     the snapshot a successor restores. It names an event past the copy, so the check
+     cannot replay to it. The check therefore reads the live snapshot again as it ends,
+     after its engine checks, and says whether it is still the one held and compared,
+     whether the daemon wrote a later one that it did not compare, or whether there is
+     no snapshot a start would use. A later snapshot does not fail the check, since a
+     busy daemon writes one during most checks. **Decided by core, for review.** It is
+     still compared, by the check after every start from a snapshot below, which holds
+     every line on a mismatch, though after the stop rather than before it.
    - **After every start from a snapshot.** **Review of `49236ad`, item 1, required by
      the operator.** A snapshot whose digests are valid and whose state is not a replay
      of the log passed every check of item 4 and was restored. A start that restored

@@ -16,7 +16,14 @@ import pytest
 
 from dromon import eventlog, statesnapshot
 from dromon.daemon import report_start
-from dromon.eventlog import EventLog, LogError, check_snapshot, hold_snapshot, snapshot
+from dromon.eventlog import (
+    EventLog,
+    LogError,
+    check_snapshot,
+    hold_snapshot,
+    snapshot,
+    snapshot_since_held,
+)
 from dromon.model import (
     Event,
     LineCreated,
@@ -449,6 +456,44 @@ def test_a_snapshot_that_cannot_be_held_is_not_used_and_says_why(path: Path) -> 
     said = hold_snapshot(statesnapshot.snapshot_path(path), held)
     assert said is not None and "readable by others than its owner" in said
     assert not held.exists()
+
+
+def test_the_check_says_whether_the_live_snapshot_is_the_one_it_held(
+    path: Path,
+) -> None:
+    """**Round 16 review, finding 2.** The check compares only the held snapshot,
+    so as it ends it says whether the daemon wrote a later one, which a successor
+    restores and the check did not compare."""
+    seeded(path)
+    live = statesnapshot.snapshot_path(path)
+    held = path.with_name("held.json")
+    assert hold_snapshot(live, held) is None
+    assert snapshot_since_held(live, held) == (
+        "the live snapshot is the one this check held as it began"
+    )
+    with EventLog(path, snapshots=True) as log:
+        log.restore_checked(None)
+        for event in events(2, start=100):
+            log.append(event)
+    assert statesnapshot.read_bytes(live) != held.read_bytes()
+    said = snapshot_since_held(live, held)
+    assert "wrote a snapshot after the one this check held" in said
+    assert "did not compare" in said and "holds every line" in said
+    loosen(path)
+    said = snapshot_since_held(live, held)
+    assert "a start would not use it now" in said and "replays the whole log" in said
+
+
+def test_the_check_says_when_there_is_still_no_snapshot(path: Path) -> None:
+    live = statesnapshot.snapshot_path(path)
+    held = path.with_name("held.json")
+    assert hold_snapshot(live, held) is not None
+    assert not held.exists()
+    said = snapshot_since_held(live, held)
+    assert said.startswith("there is still no snapshot a start would use")
+    seeded(path)
+    said = snapshot_since_held(live, held)
+    assert "wrote a snapshot after the one this check held" in said
 
 
 def test_a_held_copy_never_replaces_a_file(path: Path) -> None:

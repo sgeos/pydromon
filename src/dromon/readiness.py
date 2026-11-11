@@ -137,8 +137,32 @@ def dirty_digest(worktree: Path) -> tuple[str, int]:
 
 
 MAX_TREE_PATHS: Final = 10_000
-"""The most changed tracked paths ``tree_digest`` reads the size and time of. The
-rest are counted and named only as git lists them."""
+"""The most changed tracked paths ``tree_digest`` reads the size and time of. A
+tree with more is answered as one whose coverage cannot be told."""
+
+
+class Uncovered(StrEnum):
+    """Why ``tree_digest`` read ``git status`` and still cannot say whether a tree
+    changed, in one fixed word. **Round 16 review, findings 3 and 4.**
+
+    ``TOO_MANY_PATHS``, more than ``MAX_TREE_PATHS`` tracked paths are changed, and
+    an edit past the cap would not move the digest. ``UNSTAMPED_PATH``, a changed
+    tracked path that git does not list as deleted could not be stated, as where
+    ``core.worktree`` puts the work tree away from the ``.git`` entry, so an edit
+    inside it would not move the digest."""
+
+    TOO_MANY_PATHS = "too_many_paths"
+    UNSTAMPED_PATH = "unstamped_path"
+
+
+class TreeUncovered(RuntimeError):
+    """``tree_digest`` cannot give a digest that would move with every edit it
+    covers. ``cause`` says why in a fixed word, apart from the message, which may
+    name a path."""
+
+    def __init__(self, message: str, cause: Uncovered) -> None:
+        super().__init__(message)
+        self.cause = cause
 
 
 def tree_digest(worktree: Path) -> str:
@@ -155,17 +179,32 @@ def tree_digest(worktree: Path) -> str:
     edited ones alike, since a run's own output in an untracked directory that is
     not ignored would otherwise make every run read as no longer covering its
     tree. A new test file is therefore not seen until it is added. An edit that
-    keeps a file's size and restores its modification time is not seen either."""
+    keeps a file's size and restores its modification time is not seen either.
+
+    **Round 16 review, findings 3 and 4.** A digest that an edit could leave as it
+    was is not given. Past ``MAX_TREE_PATHS`` changed tracked paths, or where a
+    changed tracked path that git does not list as deleted cannot be stated, this
+    raises ``TreeUncovered``, and the run's coverage reads as unknown. The second
+    covers a work tree that ``core.worktree`` puts elsewhere, which ``checkout_top``
+    does not follow, and a path deleted between the status and the stat. **A
+    residual.** Where ``core.worktree`` is set and a file of the same name happens
+    to lie beside the ``.git`` entry, that file is stated instead."""
     output = _status(worktree)
     head = workdir.read_head_commit(worktree) or ""
     top = workdir.checkout_top(worktree)
+    entries = _tracked_changes(output)
+    if len(entries) > MAX_TREE_PATHS:
+        raise TreeUncovered(
+            f"{len(entries)} tracked paths are changed in {worktree}, more than"
+            f" {MAX_TREE_PATHS}",
+            Uncovered.TOO_MANY_PATHS,
+        )
     digest = hashlib.sha256()
     digest.update(head.encode("ascii", "replace") + b"\0")
-    entries = _tracked_changes(output)
     digest.update(f"{len(entries)}\0".encode("ascii"))
-    for entry, path in entries[:MAX_TREE_PATHS]:
+    for entry, path in entries:
         digest.update(entry.encode("utf-8", "surrogateescape") + b"\0")
-        digest.update(_path_stamp(top, path))
+        digest.update(_path_stamp(top, entry[:2], path))
     return digest.hexdigest()
 
 
@@ -195,16 +234,24 @@ def _tracked_changes(output: str) -> list[tuple[str, str]]:
     return found
 
 
-def _path_stamp(top: Path | None, path: str) -> bytes:
+def _path_stamp(top: Path | None, status: str, path: str) -> bytes:
     """The size and modification time of ``path`` under ``top``, as bytes for the
-    digest, or a fixed mark where it cannot be read, as for a deleted path."""
-    if top is None:
-        return b"unread\0"
-    try:
-        found = os.lstat(top / path)
-    except (OSError, ValueError):
-        return b"absent\0"
-    return f"{found.st_size} {found.st_mtime_ns}\0".encode("ascii")
+    digest, or a fixed mark for a path whose ``status`` letters name a deletion and
+    which is absent. Raises ``TreeUncovered`` for any other path that cannot be
+    stated, since a fixed mark there would not move with an edit."""
+    if top is not None:
+        try:
+            found = os.lstat(top / path)
+        except (OSError, ValueError):
+            pass
+        else:
+            return f"{found.st_size} {found.st_mtime_ns}\0".encode("ascii")
+        if "D" in status:
+            return b"absent\0"
+    raise TreeUncovered(
+        f"the changed path {path!r} could not be stated under the checkout's top",
+        Uncovered.UNSTAMPED_PATH,
+    )
 
 
 def _status(worktree: Path) -> str:

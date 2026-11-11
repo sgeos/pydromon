@@ -103,6 +103,7 @@ from dromon.eventlog import (
     RestoreMismatch,
     check_snapshot,
     hold_snapshot,
+    snapshot_since_held,
     read_entries,
     snapshot,
     utc_now,
@@ -3804,11 +3805,11 @@ def check_private_dirs(paths: ProjectPaths) -> None:
 
 
 CHECK_PASSED: Final = "dromond: the start checks pass, and nothing was started"
+"""What ``dromond --check`` says when a start would get past its checks."""
 
 HELD_SNAPSHOT: Final = "held-snapshot.json"
 """The name of the copy of the live snapshot ``--check`` holds in its private
 directory, read before the log is copied. **Round 16, item 2.**"""
-"""What ``dromond --check`` says when a start would get past its checks."""
 
 
 def check_scratch(paths: ProjectPaths) -> Path:
@@ -4149,6 +4150,10 @@ def run(
                             check_engine_launches(daemon, scratch / "lines.sock")
                         ):
                             return exits.FAILURE
+                    # Round 16 review, finding 2. Read last, after the engine
+                    # checks, so it is as near the stop as the check comes.
+                    since = snapshot_since_held(snapshot_path(paths.event_log), held)
+                    print(f"dromond: {since}", file=sys.stderr)
                     print(CHECK_PASSED, file=sys.stderr)
                     return exits.OK
                 entry = open_registration(

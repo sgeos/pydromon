@@ -143,6 +143,55 @@ def test_the_tree_digest_of_a_subdirectory_reads_paths_from_the_top(
     assert len({before, first, readiness.tree_digest(below)}) == 3
 
 
+@pytest.mark.real_git_status
+def test_a_tree_past_the_cap_cannot_be_told(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**Round 16 review, finding 3.** An edit past the cap left the digest as it
+    was, so a run read as covering a tree that had changed."""
+    worktree = repository(tmp_path / "w")
+    (worktree / "kept.txt").write_text("changed\n")
+    (worktree / ".gitignore").write_text("/*\n")
+    monkeypatch.setattr(readiness, "MAX_TREE_PATHS", 2)
+    readiness.tree_digest(worktree)
+    monkeypatch.setattr(readiness, "MAX_TREE_PATHS", 1)
+    with pytest.raises(readiness.TreeUncovered) as raised:
+        readiness.tree_digest(worktree)
+    assert raised.value.cause is readiness.Uncovered.TOO_MANY_PATHS
+
+
+@pytest.mark.real_git_status
+def test_a_deleted_path_is_stamped_absent_and_moves_the_digest(tmp_path: Path) -> None:
+    worktree = repository(tmp_path / "w")
+    clean = readiness.tree_digest(worktree)
+    (worktree / "kept.txt").unlink()
+    deleted = readiness.tree_digest(worktree)
+    assert deleted != clean
+    assert readiness.tree_digest(worktree) == deleted
+
+
+@pytest.mark.real_git_status
+def test_a_work_tree_set_elsewhere_cannot_be_told_once_a_file_changes(
+    tmp_path: Path,
+) -> None:
+    """**Round 16 review, finding 4.** ``checkout_top`` does not follow
+    ``core.worktree``, so each changed path stamped absent, and an edit inside a
+    file already changed left the digest as it was."""
+    meta = tmp_path / "meta"
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    git(tmp_path, "init", "-q", str(meta))
+    git(meta, "config", "core.worktree", str(tree))
+    (tree / "kept.txt").write_text("kept\n")
+    git(meta, "add", "kept.txt")
+    git(meta, "commit", "-q", "-m", "first")
+    readiness.tree_digest(meta)
+    (tree / "kept.txt").write_text("changed\n")
+    with pytest.raises(readiness.TreeUncovered) as raised:
+        readiness.tree_digest(meta)
+    assert raised.value.cause is readiness.Uncovered.UNSTAMPED_PATH
+
+
 def test_the_tree_digest_outside_a_checkout_is_unknown(tmp_path: Path) -> None:
     with pytest.raises(readiness.ReadinessUnknown) as raised:
         readiness.tree_digest(tmp_path)
@@ -277,6 +326,32 @@ def test_a_tree_that_cannot_be_read_now_is_unknown_not_covered(
             text = await runner.call(RUN_STATUS_TOOL_NAME, {})
             assert "Whether it still covers the tree is unknown" in text
             assert "for the reason timed_out" in text
+            assert "The tree is as it was" not in text
+
+        asyncio.run(scenario())
+
+
+def test_a_tree_whose_changes_cannot_be_compared_is_unknown_not_covered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = repository(tmp_path / "project")
+    with EventLog(project / "events.sqlite") as log:
+        runner = Runner(project, log)
+
+        async def scenario() -> None:
+            run = await runner.run_once()
+            assert run.tree is not None
+
+            def too_many(worktree: Path) -> str:
+                raise readiness.TreeUncovered(
+                    f"too many in {worktree.name}",
+                    readiness.Uncovered.TOO_MANY_PATHS,
+                )
+
+            monkeypatch.setattr(readiness, "tree_digest", too_many)
+            text = await runner.call(RUN_STATUS_TOOL_NAME, {})
+            assert "Whether it still covers the tree is unknown" in text
+            assert "for the reason too_many_paths" in text
             assert "The tree is as it was" not in text
 
         asyncio.run(scenario())

@@ -2389,6 +2389,11 @@ def compose_prompt(
     return "\n".join(parts)
 
 
+TreeNow = str | readiness.ReadFailure | readiness.Uncovered
+"""A working directory's ``readiness.tree_digest``, or the fixed word for why git
+status could not be read, or for why the digest cannot tell a change."""
+
+
 class Scheduler:
     """Creates lines, accepts messages and wakes recipients. One per daemon."""
 
@@ -3899,42 +3904,39 @@ class Scheduler:
     def _restart_turn_ended(
         self, line_id: str, report: TurnReport | None, *, asked: bool
     ) -> None:
-        """Note the restart to ``line_id`` when a restart asked its turn to end and
-        the turn returned a report and did not fail, however the report says it
-        ended. Called once the turn's end is recorded, so the note is newer than it.
+        """Note the restart to ``line_id`` when a restart asked its turn to end, and
+        the turn's report names the restart as why it ended, and the turn did not
+        fail. Called once the turn's end is recorded, so the note is newer than it.
 
         **Round 16, item 3.** A line whose turn a restart interrupted sat idle after
-        the restart until it was mailed. The note had been left only when the report
-        said the turn ended for the restart, so a turn the engine ended without
-        saying so, or ended by itself just before its safe point, left no note, and
-        nothing woke the line. Inference, not observed, that this was the path in the
-        field, since an idle line had returned a report that did not fail.
+        the restart until it was mailed. The note had been left only when the reason
+        last recorded for the turn's redirect was the restart's, so priority mail or
+        a change of access asked at a later safe point of the same turn, whose own
+        interrupt the engine ignores since it keeps the first reason, took the note
+        away. The gate is now the reason the report names. Inference, not observed,
+        that this was the path in the field.
 
-        **Decided by core, for review.** A turn that failed or raised gets no note.
-        A failure holds the line and asks an operator, or leaves it failed when it
-        mailed an operator in the turn, and a note would clear that failure, as any
-        new mail does, so a broken engine would be woken again unseen. A turn an
-        operator cancelled gets none either, since it raises. A spurious wake costs
-        one turn, and a missed one leaves a line idle with no bound, so a report
-        that does not say why it ended is woken with a note that says so."""
-        if not asked or report is None or line_id in self._failed:
+        **Round 16 review, finding 1.** Every engine records the first interrupt of
+        a turn and ignores any later one, so a report that names another reason,
+        such as a Pi turn past ``max_turns``, or none, was not ended by the restart,
+        though the ask was recorded at a safe point the engine still dispatched. Its
+        driver or the engine stopped it, and a note would wake a line that was
+        stopped for a reason of its own. The engine stop note, which does not wake,
+        tells it why. A turn that failed or raised gets no note either, since a note
+        would clear the failure, as any new mail does."""
+        if (
+            not asked
+            or report is None
+            or report.interrupted_for != restart.REASON
+            or line_id in self._failed
+        ):
             return
-        self._note_restart(line_id, confirmed=report.interrupted_for == restart.REASON)
+        self._note_restart(line_id)
 
-    def _note_restart(self, line_id: str, *, confirmed: bool = True) -> None:
+    def _note_restart(self, line_id: str) -> None:
         """Leave ``line_id`` a note that a restart ended its turn, which wakes it once
-        the restarted daemon runs, or in this daemon when the restart was abandoned.
-        ``confirmed`` says the turn's report named the restart as why it ended."""
-        if confirmed:
-            template = (
-                restart.NOTE if self._restart is not None else restart.ABANDONED_NOTE
-            )
-        else:
-            template = (
-                restart.UNCONFIRMED_NOTE
-                if self._restart is not None
-                else restart.UNCONFIRMED_ABANDONED_NOTE
-            )
+        the restarted daemon runs, or in this daemon when the restart was abandoned."""
+        template = restart.NOTE if self._restart is not None else restart.ABANDONED_NOTE
         body = template.format(operator=self._restart_by)
         message_id = new_id("m")
         if not self._append_or_say(
@@ -5142,9 +5144,7 @@ class Scheduler:
             lambda: runs.signal_run(latest.started, self._run_start_of)
         )
 
-    def run_status(
-        self, line_id: str, tree_now: str | readiness.ReadFailure | None = None
-    ) -> str:
+    def run_status(self, line_id: str, tree_now: TreeNow | None = None) -> str:
         """The latest runs of ``line_id``'s scope, newest first, with their
         receipts, and the commands the project declares. **Round 14, item 2.** A
         failed run names the run that corrected it, and that run names each it
@@ -5556,7 +5556,7 @@ class Scheduler:
             if any(run.ended is None for run in self._scope_runs(line_id)):
                 await self.fresh_runs()
             scope = self._scope_runs(line_id)
-            tree_now: str | readiness.ReadFailure | None = None
+            tree_now: TreeNow | None = None
             if scope and scope[-1].started.tree is not None:
                 tree_now = await asyncio.to_thread(
                     _tree_or_failure, Path(scope[-1].started.workdir)
@@ -14934,21 +14934,25 @@ def _tree_or_none(directory: Path) -> str | None:
     read, so a run starts whether or not its tree can be read. Blocking."""
     found = _tree_or_failure(directory)
     # A failure word is a ``StrEnum``, and so also a ``str``, so it is tested first.
-    return None if isinstance(found, readiness.ReadFailure) else found
+    return (
+        None
+        if isinstance(found, (readiness.ReadFailure, readiness.Uncovered))
+        else found
+    )
 
 
-def _tree_or_failure(directory: Path) -> str | readiness.ReadFailure:
+def _tree_or_failure(directory: Path) -> TreeNow:
     """``readiness.tree_digest`` of ``directory``, or the fixed word for why it
-    cannot be read. Blocking."""
+    cannot be read or cannot tell a change. Blocking."""
     try:
         return readiness.tree_digest(directory)
     except readiness.ReadinessUnknown as error:
         return error.cause
+    except readiness.TreeUncovered as error:
+        return error.cause
 
 
-def _tree_text(
-    started: RunStarted, tree_now: str | readiness.ReadFailure | None
-) -> str:
+def _tree_text(started: RunStarted, tree_now: TreeNow | None) -> str:
     """Whether the run ``started`` still covers its working directory, for the
     latest run in ``run_status``, or nothing. **Round 16, item 5, core's request
     of round 15.** A gate that passed was read as covering the tree after tracked
@@ -14969,6 +14973,14 @@ def _tree_text(
         return (
             ". Whether it still covers the tree is unknown, since git status could"
             f" not be read now, for the reason {tree_now.value}"
+        )
+    if isinstance(tree_now, readiness.Uncovered):
+        # Round 16 review, findings 3 and 4. A digest an edit could leave as it
+        # was is not compared, so the run is not read as covering the tree.
+        return (
+            ". Whether it still covers the tree is unknown, since the tree's changed"
+            " files cannot all be compared now, for the reason"
+            f" {tree_now.value}"
         )
     if tree_now == started.tree:
         return (

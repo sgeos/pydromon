@@ -92,10 +92,10 @@ class Scripted:
             await after.pop(0).wait()
         if line_id in self.world.raising:
             raise RuntimeError("the engine ended the turn without a result")
-        if line_id in self.world.unsaid:
-            # The engine was asked to end and reports the turn without saying why
-            # it ended, as one that finished just before its safe point does.
-            reason = None
+        if line_id in self.world.stopped_for:
+            # The engine was asked to end and reports the reason it kept, as one
+            # already stopped for another reason keeps that one.
+            reason = self.world.stopped_for[line_id]
         subtype = "success" if reason is None else "error_during_execution"
         return TurnReport(subtype, 1, "ok", (), reason, None, "session-1", None, None)
 
@@ -116,8 +116,8 @@ class World:
         self.reasons: dict[str, list[str | None]] = {}
         self.raising: set[str] = set()
         """Lines whose engine raises once it has reached its safe points."""
-        self.unsaid: set[str] = set()
-        """Lines whose engine reports no ``interrupted_for`` though it was asked."""
+        self.stopped_for: dict[str, str | None] = {}
+        """Lines whose engine reports this ``interrupted_for`` though it was asked."""
         self.log = EventLog(path)
         self.scheduler = self._scheduler()
         self.scheduler.ensure_operator("ana")
@@ -402,33 +402,41 @@ def asked_to_end(target: World, abandon: bool = False) -> None:
     assert target.reasons["alpha"][0] == restart.REASON
 
 
-def test_a_turn_asked_to_end_that_does_not_say_why_it_ended_is_woken_after(
-    world: World,
+@pytest.mark.parametrize("abandon", [False, True])
+def test_a_turn_whose_report_names_another_stop_is_not_woken(
+    world: World, abandon: bool
 ) -> None:
-    """**Round 16, item 3.** Such a line had no note, and sat idle after the
-    restart until it was mailed."""
-    world.unsaid.add("alpha")
-    asked_to_end(world)
-    assert world.endings("alpha") == ["success"]
-    (note,) = restart_notes(world)
-    assert note.body == restart.UNCONFIRMED_NOTE.format(operator="ana")
-    assert len(world.prompts["alpha"]) == 1
-    world.restart()
+    """**Round 16 review, finding 1.** A Pi turn past ``max_turns`` is aborted, and
+    a safe point dispatched after the abort records the restart's ask while the
+    report keeps ``max_turns``. A note would wake a line its driver stopped."""
+    world.stopped_for["alpha"] = "max_turns"
+    asked_to_end(world, abandon=abandon)
+    assert world.endings("alpha") == [
+        "error_during_execution, interrupted by its driver: max_turns"
+    ]
+    assert restart_notes(world) == []
+    line = world.log.state.lines["alpha"]
+    assert not line.failed and line.held_by is None
+    if not abandon:
+        world.restart()
     run(world, nothing)
-    assert len(world.prompts["alpha"]) == 2
-    assert note.message_id in world.prompts["alpha"][1]
-    assert world.sessions["alpha"] == [None, "session-1"]
+    assert len(world.prompts["alpha"]) == 1
 
 
-def test_an_unconfirmed_turn_of_an_abandoned_restart_is_told_so_and_woken(
-    world: World,
+@pytest.mark.parametrize("abandon", [False, True])
+def test_a_turn_asked_to_end_whose_report_names_no_stop_is_not_woken(
+    world: World, abandon: bool
 ) -> None:
-    world.unsaid.add("alpha")
-    asked_to_end(world, abandon=True)
-    (note,) = restart_notes(world)
-    assert note.body == restart.UNCONFIRMED_ABANDONED_NOTE.format(operator="ana")
-    assert len(world.prompts["alpha"]) == 2
-    assert note.message_id in world.prompts["alpha"][1]
+    """Every engine records the restart's interrupt when it keeps none before it, so
+    a report that names none was not ended by the restart."""
+    world.stopped_for["alpha"] = None
+    asked_to_end(world, abandon=abandon)
+    assert world.endings("alpha") == ["success"]
+    assert restart_notes(world) == []
+    if not abandon:
+        world.restart()
+    run(world, nothing)
+    assert len(world.prompts["alpha"]) == 1
 
 
 def test_a_turn_asked_to_end_that_fails_is_held_and_not_woken(world: World) -> None:
@@ -1423,7 +1431,11 @@ def test_the_check_passes_and_leaves_the_log_as_it_was(
     config_path(paths.state_dir).write_text(AGREEING)
     before = digest(paths.event_log)
     assert daemon.run(paths, check_only=True) == exits.OK
-    assert daemon.CHECK_PASSED in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert daemon.CHECK_PASSED in err
+    # Round 16 review, finding 2. As it ends, the check says whether the live
+    # snapshot is still the one it held, and this log has none.
+    assert "dromond: there is still no snapshot a start would use" in err
     assert digest(paths.event_log) == before
     assert "gamma" not in replay(paths.event_log).lines
     assert leftovers(paths) == []

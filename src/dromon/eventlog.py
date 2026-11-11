@@ -664,6 +664,47 @@ def hold_snapshot(snapshot_file: Path, held: Path) -> str | None:
     return None
 
 
+def snapshot_since_held(snapshot_file: Path, held: Path) -> str:
+    """A sentence saying whether the snapshot at ``snapshot_file`` is still the one
+    ``hold_snapshot`` copied to ``held``, read as a start reads it. Blocking.
+
+    **Round 16 review, finding 2.** ``dromond --check`` compares only the held
+    snapshot, and the live daemon may write a later one before it stops, which is
+    the one a successor restores. That one names an event past the copy, so the
+    check cannot replay to it, and copying the log again would race the daemon the
+    same way. **Decided by core, for review.** The check therefore reads the live
+    snapshot again as it ends and says whether it is the one compared. A later one
+    does not fail the check, since a busy daemon writes one in most checks. The
+    successor compares a snapshot it restores with a full replay of the log as it
+    starts, and holds every line when they differ, so a later snapshot is still
+    checked, though after the stop rather than before it."""
+    try:
+        now: bytes | None = statesnapshot.read_bytes(snapshot_file)
+    except statesnapshot.SnapshotRefused:
+        now = None
+    try:
+        before: bytes | None = held.read_bytes()
+    except FileNotFoundError:
+        before = None
+    if now == before:
+        if now is None:
+            return (
+                "there is still no snapshot a start would use, so a successor"
+                " replays the whole log"
+            )
+        return "the live snapshot is the one this check held as it began"
+    if now is None:
+        return (
+            "the live snapshot changed after this check held one, and a start would"
+            " not use it now, so a successor replays the whole log"
+        )
+    return (
+        "the daemon wrote a snapshot after the one this check held, which this check"
+        " did not compare, and a successor that restores it compares it with a full"
+        " replay of the log as it starts and holds every line if they differ"
+    )
+
+
 def verify_restored(
     log_path: Path, copy_path: Path, restored: Restored
 ) -> tuple[RestoreMismatch, str | None] | None:

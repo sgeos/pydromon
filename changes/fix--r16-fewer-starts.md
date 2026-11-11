@@ -10,11 +10,13 @@ Type: Fixed
 - Round 16, item 2. `dromond --check` holds the live snapshot before it copies the
   event log and compares only within the copy's bound, so a snapshot the daemon
   writes during the copy is never read against the check's own appended rows. Each
-  answer names the snapshot's event and the bound.
-- Round 16, item 3. A line whose turn a restart asked to end, and which returned a
-  report and did not fail, is now noted and woken after the restart however its
-  report says the turn ended, so it no longer sits idle until it is mailed. A
-  failed or cancelled turn still gets no note, so its failure stands.
+  answer names the snapshot's event and the bound, and as it ends the check says
+  whether the live snapshot, which a successor restores, is still the one compared.
+- Round 16, item 3. A line whose turn a restart ended is noted and woken when the
+  turn's report names the restart, even where priority mail or a change of access
+  asked at a later safe point of the same turn, which had taken the note away. A
+  report that names another stop, such as a Pi turn past `max_turns`, or none, is
+  not woken, nor is a failed or cancelled turn.
 - Round 16, item 7. A `compact_session` request is spent by any compaction the
   engine reports after it, as its wake already was, so a compaction the engine made
   by itself in the same turn no longer leaves the request to compact the session
