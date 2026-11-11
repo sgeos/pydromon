@@ -280,6 +280,17 @@ before. **Review of round 16, follow-up 3.** A bound, so that a standard error t
 never accepts a line costs a few kilobytes and not the memory of the daemon."""
 LOG_DRAIN_LIMIT: Final = 1000
 """The most lines one writer thread writes before it ends, a bound on its loop."""
+SNAPSHOT_SECONDS: Final = 5.0
+"""How long a start runs before the thread that waits for it records where every thread
+of the process is and what processor time each has used. **Round 16, on the operator's
+request of 2026-11-11.** The logs of pull request 149 show starts of 19 to 99 seconds
+that took almost no processor time in the fork call, at a load of one, and the one dump
+there is shows the main thread running Python in the scheduler while three others wait
+in system calls. Which thread holds the interpreter lock is then the question, and a
+start that ends well before the 30 second bound leaves no dump. A start with a bound of
+``SNAPSHOT_SECONDS`` or less takes no snapshot."""
+MAX_SNAPSHOT_THREADS: Final = 12
+"""The most threads a snapshot lists, the busiest first where the time is known."""
 MAX_SLOW_STARTS_KEPT: Final = 64
 """How long past a start's own bound the watchdog waits before it dumps the traceback
 of every thread. It is after the bound, so a start that stalls is already reported by
@@ -359,7 +370,9 @@ class _ForkTimes:
 
 
 _fork_slot = threading.local()
-"""``current`` is the ``_ForkTimes`` of the start the thread is making, if any."""
+"""``current`` is the ``_ForkTimes`` of the start the thread is making, if any, and
+``sweep`` is its ``_Sweep`` when the start leaves the closing of descriptors to the
+parent."""
 
 
 class _Handoff:
@@ -380,6 +393,7 @@ class _Handoff:
         self.fork = _ForkTimes()
         self.ended = 0.0
         self.closing = "the child closes descriptors"
+        self.snapshot: str | None = None
 
 
 _active: set[_Handoff] = set()
@@ -549,9 +563,14 @@ def forking() -> Generator[None]:
         times.acquired = watched.began
     _watch(watched)
     cpu_began = _thread_cpu()
+    sweep: _Sweep | None = getattr(_fork_slot, "sweep", None)
     try:
+        if sweep is not None:
+            _sweep_inheritable(sweep)
         yield
     finally:
+        if sweep is not None:
+            _unmark_inheritable(sweep)
         _unwatch(watched)
         released = time.monotonic()
         cpu = _thread_cpu() - cpu_began if cpu_began >= 0.0 else -1.0
@@ -653,13 +672,19 @@ makes every start leave that to the parent, as ``children_close_descriptors`` sa
 other value, or none, leaves the platform's default. It exists so that a run can be made
 with each setting, as ``DROMON_NO_VFORK`` does."""
 
-_inherit_lock = threading.Lock()
-_inheriting: dict[int, int] = {}
-"""The descriptors that starts now in progress pass on purpose, each with the number of
-starts passing it, under ``_inherit_lock``. The sweep of one start leaves them alone."""
 _cleared_total: list[int] = [0]
-"""How many inheritable descriptors the sweeps have made non-inheritable, under
-``_inherit_lock``. Read by ``cleared_descriptors``."""
+"""How many inheritable descriptors the sweeps have made non-inheritable. Written only
+inside the fork lock, where the sweeps run, and read by ``cleared_descriptors``."""
+
+
+class _Sweep:
+    """What a start asks of ``forking``, kept in ``_fork_slot.sweep`` for the thread
+    that makes the start. ``passing`` are the descriptors the child is to inherit and
+    ``cleared`` is set by the sweep, which runs inside the fork lock."""
+
+    def __init__(self, passing: Sequence[int]) -> None:
+        self.passing = tuple(passing)
+        self.cleared: int | None = None
 
 
 def children_close_descriptors(
@@ -711,55 +736,49 @@ def _open_descriptors() -> list[int] | None:
     return None
 
 
-def _sweep_inheritable(passing: Sequence[int]) -> int | None:
-    """Make every descriptor above 2 non-inheritable that is not passed on purpose,
-    and register ``passing``, made inheritable, for the start in progress. Returns how
-    many it cleared, or ``None`` when the open descriptors cannot be listed, in which
-    case it changes nothing and the start lets the child close descriptors as usual.
-    Under ``_inherit_lock``, so that a start's own passed descriptor is never cleared
-    by another start's sweep before the first has forked. A descriptor that is not
-    open, such as that of the listing itself, is skipped. Raises ``OSError`` when a
-    descriptor to pass is not open, which is what a start with such a descriptor
-    reports."""
-    with _inherit_lock:
-        listing = _open_descriptors()
-        if listing is None:
-            return None
-        for descriptor in passing:
-            os.set_inheritable(descriptor, True)
-            _inheriting[descriptor] = _inheriting.get(descriptor, 0) + 1
-        cleared = 0
-        for descriptor in listing:
-            if descriptor <= 2 or descriptor in _inheriting:
-                continue
-            try:
-                if os.get_inheritable(descriptor):
-                    os.set_inheritable(descriptor, False)
-                    cleared += 1
-            except OSError:
-                continue
-        _cleared_total[0] += cleared
-        return cleared
-
-
-def _release_inheritable(passing: Sequence[int]) -> None:
-    """End the registration of ``passing`` once a start has forked or failed, and make
-    them non-inheritable again where they are still open. Never raises."""
-    with _inherit_lock:
-        for descriptor in passing:
-            count = _inheriting.get(descriptor, 0) - 1
-            if count > 0:
-                _inheriting[descriptor] = count
-                continue
-            _inheriting.pop(descriptor, None)
-            with contextlib.suppress(OSError):
+def _sweep_inheritable(sweep: _Sweep) -> None:
+    """Make every descriptor above 2 non-inheritable that is not to be passed, and
+    make those to be passed inheritable. **Review of round 16, audit finding 1, 2 and
+    3.** It runs only inside ``forking``, with the fork lock held, immediately before
+    the call that forks and for the thread that makes the call, so no other start can
+    fork while a passed descriptor is inheritable, a start that stalls before its fork
+    leaves nothing inheritable, and a descriptor made inheritable while the start waited
+    for the lock is cleared. A descriptor that is not open, such as that of the listing
+    itself, is skipped. Raises ``OSError``, and so no child is made, when the open
+    descriptors cannot be listed, since the start has already told ``Popen`` not to
+    close them, and when a descriptor to pass is not open. **Residual.** Another thread
+    that makes a descriptor inheritable in the few instructions between the sweep and
+    the fork still gives it to the child. Nothing in this repository does."""
+    listing = _open_descriptors()
+    if listing is None:
+        raise OSError("the open descriptors cannot be listed, so no child was started")
+    for descriptor in sweep.passing:
+        os.set_inheritable(descriptor, True)
+    cleared = 0
+    for descriptor in listing:
+        if descriptor <= 2 or descriptor in sweep.passing:
+            continue
+        try:
+            if os.get_inheritable(descriptor):
                 os.set_inheritable(descriptor, False)
+                cleared += 1
+        except OSError:
+            continue
+    _cleared_total[0] += cleared
+    sweep.cleared = cleared
+
+
+def _unmark_inheritable(sweep: _Sweep) -> None:
+    """Make the passed descriptors non-inheritable again where they are still open,
+    when the call that forks has returned or failed. Never raises."""
+    for descriptor in sweep.passing:
+        with contextlib.suppress(OSError):
+            os.set_inheritable(descriptor, False)
 
 
 def cleared_descriptors() -> int:
     """How many inheritable descriptors the sweeps have cleared in this process."""
-    with _inherit_lock:
-        return _cleared_total[0]
+    return _cleared_total[0]
 
 
 @dataclass(frozen=True)
@@ -801,6 +820,53 @@ def _where(thread: threading.Thread) -> str:
         f"{Path(step.filename).name}:{step.lineno} {step.name}"
         for step in reversed(steps)
     )
+
+
+def _thread_ticks(native_id: int) -> float | None:
+    """Seconds of processor time the thread with the system's id has used, from
+    ``/proc/self/task`` on Linux, or ``None`` where that is not readable."""
+    text = _read_text(Path("/proc/self/task") / str(native_id) / "stat")
+    if text is None:
+        return None
+    try:
+        fields = text[text.rindex(")") + 2 :].split()
+        ticks = int(fields[11]) + int(fields[12])
+        per_second = os.sysconf("SC_CLK_TCK")
+    except (ValueError, IndexError, OSError):
+        return None
+    return ticks / per_second if per_second > 0 else None
+
+
+def thread_snapshot() -> str:
+    """Every thread of the process in one line, with its name, the processor time it
+    has used where the platform says, and its innermost three frames. **Round 16.** It
+    shows which thread runs Python while others wait. A thread whose innermost frame
+    is a call that waits on the operating system, such as ``open`` or ``read``, may
+    equally be waiting to take the interpreter lock back, which a snapshot cannot tell
+    apart, so the processor times are what separates a thread that runs from one that
+    waits. At most ``MAX_SNAPSHOT_THREADS`` threads, the busiest first. Never raises."""
+    try:
+        frames = sys._current_frames()  # pyright: ignore[reportPrivateUsage]
+        known = {thread.ident: thread for thread in threading.enumerate()}
+        rows: list[tuple[float, str]] = []
+        for ident, frame in frames.items():
+            thread = known.get(ident)
+            name = thread.name if thread is not None else f"thread-{ident}"
+            used = None if thread is None else _thread_ticks(thread.native_id or 0)
+            steps = traceback.extract_stack(frame, limit=3)
+            where = " <- ".join(
+                f"{Path(step.filename).name}:{step.lineno} {step.name}"
+                for step in reversed(steps)
+            )
+            cpu = "" if used is None else f" cpu {used:.1f}s"
+            rows.append((-1.0 if used is None else used, f"{name}{cpu} at {where}"))
+        rows.sort(key=lambda row: row[0], reverse=True)
+        listed = [text for _, text in rows[:MAX_SNAPSHOT_THREADS]]
+        more = len(rows) - len(listed)
+        suffix = f", and {more} more" if more > 0 else ""
+        return _clean("; ".join(listed) + suffix, 1500)
+    except Exception as error:  # noqa: BLE001
+        return f"the threads could not be listed: {type(error).__name__}"
 
 
 def _proc_children(
@@ -1436,6 +1502,8 @@ def _note_slow_start(
             f" {handoff.closing}, {_machine_text()}",
             700,
         )
+        if handoff.snapshot is not None:
+            text = f"{text}, threads at {SNAPSHOT_SECONDS:g}s: {handoff.snapshot}"
         with _slow_lock:
             if len(_slow_starts) < MAX_SLOW_STARTS_KEPT:
                 _slow_starts.append(text)
@@ -1504,27 +1572,28 @@ def _begin(
         outcome: subprocess.Popen[Any] | BaseException
         _enter(handoff)
         _fork_slot.current = handoff.fork
-        passing: tuple[int, ...] = ()
+        sweep: _Sweep | None = None
         try:
             chosen: dict[str, Any] = options
             if not children_close_descriptors():
-                passing = tuple(options["pass_fds"])
-                cleared = _sweep_inheritable(passing)
-                if cleared is None:
-                    passing = ()
+                if _open_descriptors() is None:
                     handoff.closing = "the child closes descriptors, none listed"
                 else:
+                    # Done by ``forking``, inside the fork lock, just before the fork.
+                    sweep = _Sweep(options["pass_fds"])
+                    _fork_slot.sweep = sweep
                     chosen = {**options, "close_fds": False, "pass_fds": ()}
-                    handoff.closing = f"{cleared} descriptors cleared in the parent"
             outcome = subprocess.Popen(argv, **chosen)  # noqa: S603
         except BaseException as error:  # noqa: BLE001
             # Carried to the caller, which decides what it means.
             outcome = error
         finally:
             _fork_slot.current = None
+            _fork_slot.sweep = None
             handoff.ended = time.monotonic()
             _leave(handoff)
-            _release_inheritable(passing)
+            if sweep is not None and sweep.cleared is not None:
+                handoff.closing = f"{sweep.cleared} descriptors cleared in the parent"
         slow = _note_slow_start(handoff, name, outcome)
         # The descriptors are closed here, once the start has ended, not by a caller
         # that was told the start stalled, who would close them under a late start.
@@ -1540,7 +1609,15 @@ def _begin(
 
     thread = threading.Thread(target=target, name="dromon-spawn", daemon=True)
     thread.start()
-    handoff.done.wait(bound)
+    first = min(SNAPSHOT_SECONDS, bound)
+    if not handoff.done.wait(first) and bound > first:
+        handoff.snapshot = thread_snapshot()
+        _say(
+            f"dromond: {shown} still starting after {first:g}s, threads: "
+            f"{handoff.snapshot}",
+            limited=True,
+        )
+        handoff.done.wait(bound - first)
     with handoff.lock:
         outcome = handoff.outcome
         if outcome is None:

@@ -2093,26 +2093,133 @@ def test_a_passed_descriptor_reaches_the_child_and_nothing_else_does(
         assert other_read not in seen and passed_read not in seen
         assert os.read(passed_read, 5) == b"hello"
         assert not os.get_inheritable(passed_write)
-        assert spawn._inheriting == {}  # pyright: ignore[reportPrivateUsage]
     finally:
         for descriptor in (passed_read, passed_write, other_read, other_write):
             os.close(descriptor)
 
 
-def test_one_starts_sweep_leaves_another_starts_passed_descriptor_alone(
+def _gated_popen(
+    monkeypatch: pytest.MonkeyPatch, marker: str
+) -> tuple[threading.Event, threading.Event]:
+    """Make a start whose program text holds ``marker`` wait, before it calls the real
+    ``Popen`` and so before any fork, until the test lets it go. Returns the event it
+    sets on arrival and the event it waits for."""
+    arrived, let_go = threading.Event(), threading.Event()
+    real = spawn._REAL_POPEN  # pyright: ignore[reportPrivateUsage]
+
+    class Gated(real):  # type: ignore[valid-type, misc]
+        """A subclass, so that ``isinstance`` against ``subprocess.Popen`` holds for
+        the child it makes, as ``dromon.spawn`` tests it."""
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            if marker in " ".join(str(word) for word in args[0]):  # type: ignore[attr-defined]
+                arrived.set()
+                assert let_go.wait(30)
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", Gated)
+    return arrived, let_go
+
+
+def test_a_start_that_has_not_forked_leaves_its_passed_descriptor_closed_to_others(
+    hygiene: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of round 16, audit findings 1 and 2. Start A passes a descriptor and has
+    not reached its fork, as a stalled start has not. Start B, which passes nothing,
+    forks meanwhile and its child must not hold A's descriptor. Then A goes on and its
+    own child holds it."""
+    arrived, let_go = _gated_popen(monkeypatch, "marker-a")
+    read, write = os.pipe()
+    results: dict[str, list[int]] = {}
+    try:
+        program = "import os\n# marker-a\n" + LISTER
+
+        def start_a() -> None:
+            child = spawn.start(
+                [sys.executable, "-I", "-c", program],
+                stdout=subprocess.PIPE,
+                text=True,
+                pass_fds=(write,),
+            )
+            results["a"] = _descriptors_seen_by(child)
+
+        thread = threading.Thread(target=start_a)
+        thread.start()
+        assert arrived.wait(30)
+        assert not os.get_inheritable(write)
+        other = spawn.start(
+            [sys.executable, "-I", "-c", LISTER], stdout=subprocess.PIPE, text=True
+        )
+        assert write not in _descriptors_seen_by(other)
+        assert not os.get_inheritable(write)
+        let_go.set()
+        thread.join(30)
+        assert not thread.is_alive()
+        assert write in results["a"]
+        assert not os.get_inheritable(write)
+    finally:
+        let_go.set()
+        os.close(read)
+        os.close(write)
+
+
+def test_a_descriptor_made_inheritable_while_a_start_waits_for_the_fork_lock_is_cleared(
+    hygiene: None,
+) -> None:
+    """Review of round 16, audit finding 3. The sweep runs after the wait for the lock,
+    so a descriptor made inheritable during the wait does not reach the child."""
+    read, write = os.pipe()
+    results: dict[str, list[int]] = {}
+    try:
+
+        def start() -> None:
+            child = spawn.start(
+                [sys.executable, "-I", "-c", LISTER], stdout=subprocess.PIPE, text=True
+            )
+            results["seen"] = _descriptors_seen_by(child)
+
+        with spawn.forking():
+            thread = threading.Thread(target=start)
+            thread.start()
+            time.sleep(0.3)
+            os.set_inheritable(write, True)
+        thread.join(30)
+        assert not thread.is_alive()
+        assert write not in results["seen"] and read not in results["seen"]
+        assert not os.get_inheritable(write)
+    finally:
+        os.close(read)
+        os.close(write)
+
+
+def test_a_failed_fork_leaves_the_passed_descriptor_non_inheritable(
     hygiene: None,
 ) -> None:
     read, write = os.pipe()
     try:
-        assert spawn._sweep_inheritable((write,)) is not None  # pyright: ignore[reportPrivateUsage]
-        assert spawn._sweep_inheritable(()) is not None  # pyright: ignore[reportPrivateUsage]
-        assert os.get_inheritable(write)
-        spawn._release_inheritable((write,))  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(FileNotFoundError):
+            spawn.start(["/nonexistent/dromon-program"], pass_fds=(write,))
         assert not os.get_inheritable(write)
-        assert spawn._inheriting == {}  # pyright: ignore[reportPrivateUsage]
     finally:
         os.close(read)
         os.close(write)
+
+
+def test_a_start_whose_descriptors_cannot_be_listed_inside_the_lock_makes_no_child(
+    hygiene: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fails closed. The probe before the lock saw a listing, and the listing inside it
+    does not, so the child must not be forked with its descriptors left open."""
+    calls = {"count": 0}
+    real = spawn._open_descriptors  # pyright: ignore[reportPrivateUsage]
+
+    def flaky() -> list[int] | None:
+        calls["count"] += 1
+        return real() if calls["count"] == 1 else None
+
+    monkeypatch.setattr(spawn, "_open_descriptors", flaky)
+    with pytest.raises(OSError, match="cannot be listed"):
+        spawn.start(["/usr/bin/true"])
 
 
 def test_a_passed_descriptor_that_is_not_open_fails_the_start_and_leaves_no_trace(
@@ -2123,7 +2230,6 @@ def test_a_passed_descriptor_that_is_not_open_fails_the_start_and_leaves_no_trac
     os.close(write)
     with pytest.raises(OSError):  # noqa: PT011
         spawn.start(["/usr/bin/true"], pass_fds=(write,))
-    assert spawn._inheriting == {}  # pyright: ignore[reportPrivateUsage]
 
 
 def test_where_descriptors_cannot_be_listed_the_child_closes_them_as_usual(
@@ -2151,7 +2257,6 @@ def test_where_descriptors_cannot_be_listed_the_child_closes_them_as_usual(
         os.close(write)
     assert "close_fds" not in seen[0]
     assert seen[0]["pass_fds"] == (write,)
-    assert spawn._inheriting == {}  # pyright: ignore[reportPrivateUsage]
 
 
 def test_the_slow_start_ledger_says_who_closed_the_descriptors(
@@ -2165,3 +2270,102 @@ def test_the_slow_start_ledger_says_who_closed_the_descriptors(
         "descriptors cleared in the parent" in line for line in spawn.slow_starts()
     )
     spawn.clear_slow_starts()
+
+
+# Round 16. A snapshot of every thread while a start is still running.
+
+
+def test_a_thread_snapshot_names_each_thread_and_where_it_waits() -> None:
+    release = threading.Event()
+    thread = threading.Thread(target=lambda: release.wait(30), name="probe-waiter")
+    thread.start()
+    try:
+        time.sleep(0.05)
+        text = spawn.thread_snapshot()
+    finally:
+        release.set()
+        thread.join(30)
+    assert "probe-waiter" in text and "threading.py" in text
+    assert "MainThread" in text or "pytest" in text or "test_spawn.py" in text
+    assert all(" " <= c <= "~" for c in text)
+
+
+@pytest.mark.skipif(not Path("/proc/self/task").is_dir(), reason="needs a Linux /proc")
+def test_a_thread_snapshot_gives_each_thread_its_processor_time_on_linux() -> None:
+    assert " cpu " in spawn.thread_snapshot()
+
+
+def test_a_thread_snapshot_lists_at_most_the_most_threads_and_says_how_many_more(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(spawn, "MAX_SNAPSHOT_THREADS", 1)
+    release = threading.Event()
+    threads = [
+        threading.Thread(target=lambda: release.wait(30), name=f"extra-{n}")
+        for n in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        time.sleep(0.05)
+        text = spawn.thread_snapshot()
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(30)
+    assert ", and " in text and " more" in text
+
+
+def test_a_thread_snapshot_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken() -> dict[int, object]:
+        raise RuntimeError("no frames")
+
+    monkeypatch.setattr(sys, "_current_frames", broken)
+    assert "could not be listed" in spawn.thread_snapshot()
+
+
+def test_a_start_that_outlasts_the_snapshot_time_records_every_thread(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(spawn, "SNAPSHOT_SECONDS", 0.1)
+    monkeypatch.setattr(spawn, "SLOW_START_SECONDS", 0.0)
+    spawn.clear_slow_starts()
+    arrived, let_go = _gated_popen(monkeypatch, "marker-slow")
+    timer = threading.Timer(0.5, let_go.set)
+    timer.start()
+    try:
+        child = spawn.start(
+            [sys.executable, "-I", "-c", "pass  # marker-slow"], start_seconds=20
+        )
+        assert child.wait(timeout=30) == 0
+    finally:
+        timer.cancel()
+        let_go.set()
+    assert arrived.is_set()
+    ledger = [line for line in spawn.slow_starts() if "threads at 0.1s:" in line]
+    assert ledger and "dromon-spawn" in ledger[0]
+    spawn.clear_slow_starts()
+    assert "still starting after 0.1s, threads:" in capsys.readouterr().err
+
+
+def test_a_start_with_a_bound_within_the_snapshot_time_takes_no_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr(spawn, "thread_snapshot", lambda: calls.append(1) or "x")
+    arrived, let_go = _gated_popen(monkeypatch, "marker-short")
+    try:
+        with pytest.raises(spawn.StartStalled):
+            spawn.start(
+                [sys.executable, "-I", "-c", "pass  # marker-short"],
+                start_seconds=BOUND,
+            )
+        assert arrived.is_set()
+    finally:
+        let_go.set()
+        # The abandoned start ends on its own thread, which must finish before the
+        # patched ``Popen`` is put back, as the thread compares its outcome with it.
+        ended = time.monotonic() + 30
+        while spawn.stranded_count() and time.monotonic() < ended:
+            time.sleep(0.01)
+    assert calls == []
