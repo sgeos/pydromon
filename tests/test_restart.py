@@ -38,6 +38,7 @@ from dromon.model import (
     LineAddress,
     LineConfigured,
     LineCreated,
+    LineTurnEnded,
     OperatorAddress,
     OperatorRegistered,
     RestartNoted,
@@ -89,6 +90,12 @@ class Scripted:
         after = self.world.after.get(line_id, [])
         if after:
             await after.pop(0).wait()
+        if line_id in self.world.raising:
+            raise RuntimeError("the engine ended the turn without a result")
+        if line_id in self.world.stopped_for:
+            # The engine was asked to end and reports the reason it kept, as one
+            # already stopped for another reason keeps that one.
+            reason = self.world.stopped_for[line_id]
         subtype = "success" if reason is None else "error_during_execution"
         return TurnReport(subtype, 1, "ok", (), reason, None, "session-1", None, None)
 
@@ -107,6 +114,10 @@ class World:
         self.prompts: dict[str, list[str]] = {}
         self.sessions: dict[str, list[str | None]] = {}
         self.reasons: dict[str, list[str | None]] = {}
+        self.raising: set[str] = set()
+        """Lines whose engine raises once it has reached its safe points."""
+        self.stopped_for: dict[str, str | None] = {}
+        """Lines whose engine reports this ``interrupted_for`` though it was asked."""
         self.log = EventLog(path)
         self.scheduler = self._scheduler()
         self.scheduler.ensure_operator("ana")
@@ -365,6 +376,97 @@ def test_a_turn_ended_for_a_restart_then_abandoned_is_told_so_and_woken(
     assert note.body == restart.ABANDONED_NOTE.format(operator="ana")
     assert len(world.prompts["alpha"]) == 2
     assert note.message_id in world.prompts["alpha"][1]
+
+
+def asked_to_end(target: World, abandon: bool = False) -> None:
+    """Run one turn of ``alpha`` that a restart in its interrupt mode asks to end,
+    abandoning the restart before the report arrives when ``abandon`` is set."""
+    gate = asyncio.Event()
+    after = asyncio.Event()
+    target.gates["alpha"] = [gate]
+    target.after["alpha"] = [after]
+
+    async def act() -> None:
+        target.scheduler.send(ANA, ALPHA, "work on it")
+        await until(lambda: target.scheduler.running_lines() == ["alpha"])
+        target.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60)
+        gate.set()
+        await until(lambda: "alpha" in target.reasons)
+        if abandon:
+            target.scheduler.abandon_restart("a test abandoned it")
+        after.set()
+        await until(lambda: not target.scheduler.running_lines())
+        target.monotonic = 10_000.0
+
+    run(target, act)
+    assert target.reasons["alpha"][0] == restart.REASON
+
+
+@pytest.mark.parametrize("abandon", [False, True])
+def test_a_turn_whose_report_names_another_stop_is_not_woken(
+    world: World, abandon: bool
+) -> None:
+    """**Round 16 review, finding 1.** A Pi turn past ``max_turns`` is aborted, and
+    a safe point dispatched after the abort records the restart's ask while the
+    report keeps ``max_turns``. A note would wake a line its driver stopped."""
+    world.stopped_for["alpha"] = "max_turns"
+    asked_to_end(world, abandon=abandon)
+    assert world.endings("alpha") == [
+        "error_during_execution, interrupted by its driver: max_turns"
+    ]
+    assert restart_notes(world) == []
+    line = world.log.state.lines["alpha"]
+    assert not line.failed and line.held_by is None
+    if not abandon:
+        world.restart()
+    run(world, nothing)
+    assert len(world.prompts["alpha"]) == 1
+
+
+@pytest.mark.parametrize("abandon", [False, True])
+def test_a_turn_asked_to_end_whose_report_names_no_stop_is_not_woken(
+    world: World, abandon: bool
+) -> None:
+    """Every engine records the restart's interrupt when it keeps none before it, so
+    a report that names none was not ended by the restart."""
+    world.stopped_for["alpha"] = None
+    asked_to_end(world, abandon=abandon)
+    assert world.endings("alpha") == ["success"]
+    assert restart_notes(world) == []
+    if not abandon:
+        world.restart()
+    run(world, nothing)
+    assert len(world.prompts["alpha"]) == 1
+
+
+def test_a_turn_asked_to_end_that_fails_is_held_and_not_woken(world: World) -> None:
+    """A note would clear the failure, as any new mail does, so the failure stands,
+    holds the line and asks an operator."""
+    world.raising.add("alpha")
+    asked_to_end(world)
+    assert restart_notes(world) == []
+    assert world.endings("alpha")[-1].startswith("failed:")
+    line = world.log.state.lines["alpha"]
+    assert line.failed and line.held_by is not None
+    world.restart()
+    run(world, nothing)
+    assert len(world.prompts["alpha"]) == 1
+
+
+def test_the_note_of_a_restart_follows_the_turn_s_recorded_end(world: World) -> None:
+    """The note is newer than the turn's end, so a successor replaying the log
+    reads the line as reached by new mail."""
+    asked_to_end(world)
+    events = [entry.event for entry in read_entries(world.path)]
+    ended = max(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, LineTurnEnded) and event.line_id == "alpha"
+    )
+    noted = next(
+        index for index, event in enumerate(events) if isinstance(event, RestartNoted)
+    )
+    assert noted > ended
 
 
 def test_a_second_restart_is_refused_while_one_drains(world: World) -> None:
@@ -1329,7 +1431,11 @@ def test_the_check_passes_and_leaves_the_log_as_it_was(
     config_path(paths.state_dir).write_text(AGREEING)
     before = digest(paths.event_log)
     assert daemon.run(paths, check_only=True) == exits.OK
-    assert daemon.CHECK_PASSED in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert daemon.CHECK_PASSED in err
+    # Round 16 review, finding 2. As it ends, the check says whether the live
+    # snapshot is still the one it held, and this log has none.
+    assert "dromond: there is still no snapshot a start would use" in err
     assert digest(paths.event_log) == before
     assert "gamma" not in replay(paths.event_log).lines
     assert leftovers(paths) == []

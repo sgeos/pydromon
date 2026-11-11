@@ -14,9 +14,16 @@ from pathlib import Path
 
 import pytest
 
-from dromon import statesnapshot
+from dromon import eventlog, statesnapshot
 from dromon.daemon import report_start
-from dromon.eventlog import EventLog, check_snapshot
+from dromon.eventlog import (
+    EventLog,
+    LogError,
+    check_snapshot,
+    hold_snapshot,
+    snapshot,
+    snapshot_since_held,
+)
 from dromon.model import (
     Event,
     LineCreated,
@@ -351,6 +358,151 @@ def test_the_check_fails_a_snapshot_that_differs_from_the_replay(path: Path) -> 
     )
     agrees, said = check_snapshot(statesnapshot.snapshot_path(path), path)
     assert not agrees and "differs from a full replay" in said
+
+
+# Round 16, item 2. The check compares a snapshot held before the copy, and only
+# within the copy's bound.
+
+
+def test_the_copy_gives_the_last_event_it_copied(path: Path) -> None:
+    assert snapshot(path, path.with_name("none.sqlite")) == 0
+    seeded(path)
+    with EventLog(path) as log:
+        last = log.last_seq
+    assert snapshot(path, path.with_name("copy.sqlite"), rows=1) == last > 0
+
+
+def test_a_snapshot_written_during_the_copy_is_not_compared_and_the_held_one_is(
+    path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon writes a snapshot while the check copies the log, as a busy
+    daemon does, and the check then appends its own events past the copy's bound.
+    The live snapshot is past the bound and is not compared, and the snapshot held
+    before the copy is compared and agrees."""
+    seeded(path)
+    live = statesnapshot.snapshot_path(path)
+    held = path.with_name("held.json")
+    assert hold_snapshot(live, held) is None
+    before = statesnapshot.read_bytes(live)
+    assert held.read_bytes() == before and held.stat().st_mode & 0o777 == 0o600
+    written: list[int] = []
+
+    def write_during(seconds: float) -> None:
+        del seconds
+        if written:
+            return
+        with EventLog(path, snapshots=True) as log:
+            # The daemon restored from the snapshot, and its own check passed, so
+            # it writes snapshots again.
+            log.restore_checked(None)
+            for event in events(2, start=100):
+                log.append(event)
+            written.append(log.last_seq)
+
+    monkeypatch.setattr(eventlog.time, "sleep", write_during)
+    copy = path.with_name("copy.sqlite")
+    through = snapshot(path, copy, rows=1)
+    monkeypatch.undo()
+    assert written and written[0] > through
+    assert statesnapshot.read_bytes(live) != before
+    with EventLog(copy, snapshots=False) as checking:
+        for name in ("one", "two", "three", "four", "five", "six"):
+            checking.append(OperatorRegistered(name))
+        assert checking.last_seq >= written[0]
+    agrees, said = check_snapshot(live, copy, through=through)
+    assert agrees and f"past the copy of the log, which ends at event {through}" in said
+    assert f"at event {written[0]}," in said and "nothing is compared" in said
+    agrees, said = check_snapshot(held, copy, through=through)
+    assert agrees and "agrees with a full replay" in said
+    assert f"the copy of the log ends at {through}" in said
+
+
+def test_a_held_snapshot_that_differs_still_fails_and_names_the_bound(
+    path: Path,
+) -> None:
+    seeded(path)
+    with EventLog(path) as log:
+        state = log.state
+        times = log.times.maps()
+        seq = log.last_seq
+    state.operators.add("intruder")
+    loaded = statesnapshot.read(
+        statesnapshot.snapshot_path(path), 1, lambda number: _rows(path)[number - 1]
+    )
+    statesnapshot.write(
+        statesnapshot.snapshot_path(path),
+        schema_version=1,
+        seq=seq,
+        first_row=loaded.first_row,
+        nth_row=loaded.nth_row,
+        state=state,
+        times=times,
+    )
+    held = path.with_name("held.json")
+    assert hold_snapshot(statesnapshot.snapshot_path(path), held) is None
+    copy = path.with_name("copy.sqlite")
+    through = snapshot(path, copy)
+    agrees, said = check_snapshot(held, copy, through=through)
+    assert not agrees and "differs from a full replay" in said
+    assert f"at event {seq} " in said and f"ends at {through}," in said
+
+
+def test_a_snapshot_that_cannot_be_held_is_not_used_and_says_why(path: Path) -> None:
+    held = path.with_name("held.json")
+    said = hold_snapshot(statesnapshot.snapshot_path(path), held)
+    assert said is not None and "there is no snapshot" in said
+    seeded(path)
+    loosen(path)
+    said = hold_snapshot(statesnapshot.snapshot_path(path), held)
+    assert said is not None and "readable by others than its owner" in said
+    assert not held.exists()
+
+
+def test_the_check_says_whether_the_live_snapshot_is_the_one_it_held(
+    path: Path,
+) -> None:
+    """**Round 16 review, finding 2.** The check compares only the held snapshot,
+    so as it ends it says whether the daemon wrote a later one, which a successor
+    restores and the check did not compare."""
+    seeded(path)
+    live = statesnapshot.snapshot_path(path)
+    held = path.with_name("held.json")
+    assert hold_snapshot(live, held) is None
+    assert snapshot_since_held(live, held) == (
+        "the live snapshot is the one this check held as it began"
+    )
+    with EventLog(path, snapshots=True) as log:
+        log.restore_checked(None)
+        for event in events(2, start=100):
+            log.append(event)
+    assert statesnapshot.read_bytes(live) != held.read_bytes()
+    said = snapshot_since_held(live, held)
+    assert "wrote a snapshot after the one this check held" in said
+    assert "did not compare" in said and "holds every line" in said
+    loosen(path)
+    said = snapshot_since_held(live, held)
+    assert "a start would not use it now" in said and "replays the whole log" in said
+
+
+def test_the_check_says_when_there_is_still_no_snapshot(path: Path) -> None:
+    live = statesnapshot.snapshot_path(path)
+    held = path.with_name("held.json")
+    assert hold_snapshot(live, held) is not None
+    assert not held.exists()
+    said = snapshot_since_held(live, held)
+    assert said.startswith("there is still no snapshot a start would use")
+    seeded(path)
+    said = snapshot_since_held(live, held)
+    assert "wrote a snapshot after the one this check held" in said
+
+
+def test_a_held_copy_never_replaces_a_file(path: Path) -> None:
+    seeded(path)
+    held = path.with_name("held.json")
+    held.write_text("already here\n")
+    with pytest.raises(LogError, match="cannot create a copy of the snapshot"):
+        hold_snapshot(statesnapshot.snapshot_path(path), held)
+    assert held.read_text() == "already here\n"
 
 
 def _rows(path: Path) -> list[tuple[str, str]]:

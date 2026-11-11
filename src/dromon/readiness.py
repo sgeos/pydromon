@@ -22,7 +22,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
-from dromon import spawn
+from dromon import spawn, workdir
 
 GIT_STATUS_SECONDS: Final = 20.0
 """How long ``git status`` may run before the report is refused."""
@@ -43,10 +43,11 @@ class ReadFailure(StrEnum):
 
     ``TIMED_OUT``, git ran past ``GIT_STATUS_SECONDS``. ``NOT_STARTED``, git could not
     be started, or its start stalled past ``spawn.START_SECONDS``, since
-    ``spawn.StartStalled`` is an ``OSError``. ``FAILED``, git exited with an error, as
-    outside a repository. ``MALFORMED``, git's output was not in the porcelain form.
-    ``NOT_TEXT``, git's output could not be decoded. ``NO_WORKDIR``, the line's working
-    directory is not known or not allowed, so git was not run."""
+    ``spawn.StartStalled`` is an ``OSError``. ``FAILED``, git exited with an error,
+    or the directory is outside any checkout, where git is not started.
+    ``MALFORMED``, git's output was not in the porcelain form. ``NOT_TEXT``, git's
+    output could not be decoded. ``NO_WORKDIR``, the line's working directory is
+    not known or not allowed, so git was not run."""
 
     TIMED_OUT = "timed_out"
     NOT_STARTED = "not_started"
@@ -135,8 +136,151 @@ def dirty_digest(worktree: Path) -> tuple[str, int]:
     )
 
 
+MAX_TREE_PATHS: Final = 10_000
+"""The most changed tracked paths ``tree_digest`` reads the size and time of. A
+tree with more is answered as one whose coverage cannot be told."""
+
+
+class Uncovered(StrEnum):
+    """Why ``tree_digest`` read ``git status`` and still cannot say whether a tree
+    changed, in one fixed word. **Round 16 review, findings 3 and 4.**
+
+    ``TOO_MANY_PATHS``, more than ``MAX_TREE_PATHS`` tracked paths are changed, and
+    an edit past the cap would not move the digest. ``UNSTAMPED_PATH``, a changed
+    tracked path that git does not list as deleted could not be stated, as where
+    ``core.worktree`` puts the work tree away from the ``.git`` entry, so an edit
+    inside it would not move the digest."""
+
+    TOO_MANY_PATHS = "too_many_paths"
+    UNSTAMPED_PATH = "unstamped_path"
+
+
+class TreeUncovered(RuntimeError):
+    """``tree_digest`` cannot give a digest that would move with every edit it
+    covers. ``cause`` says why in a fixed word, apart from the message, which may
+    name a path."""
+
+    def __init__(self, message: str, cause: Uncovered) -> None:
+        super().__init__(message)
+        self.cause = cause
+
+
+def tree_digest(worktree: Path) -> str:
+    """The SHA-256 of the state of ``worktree`` that a run or a gate covered: the
+    commit at ``HEAD``, the ``git status`` entries of tracked paths, and the size and
+    modification time of each. **Round 16, item 5, at core's request of round 15.**
+    A run records it as it starts, and ``run_status`` compares it with the digest
+    now, so a gate that passed on a tree since changed is not read as covering it.
+    Raises ``ReadinessUnknown`` as ``dirty_paths`` does. Blocking.
+
+    **Covered.** A commit, a tracked path that becomes changed or clean, and an
+    edit inside a tracked path already changed, which moves its size or time.
+    **Not covered, a residual.** Untracked paths are left out whole, new ones and
+    edited ones alike, since a run's own output in an untracked directory that is
+    not ignored would otherwise make every run read as no longer covering its
+    tree. A new test file is therefore not seen until it is added. An edit that
+    keeps a file's size and restores its modification time is not seen either.
+
+    **Round 16 review, findings 3 and 4.** A digest that an edit could leave as it
+    was is not given. Past ``MAX_TREE_PATHS`` changed tracked paths, or where a
+    changed tracked path that git does not list as deleted cannot be stated, this
+    raises ``TreeUncovered``, and the run's coverage reads as unknown. The second
+    covers a work tree that ``core.worktree`` puts elsewhere, which ``checkout_top``
+    does not follow, and a path deleted between the status and the stat. **A
+    residual.** Where ``core.worktree`` is set and a file of the same name happens
+    to lie beside the ``.git`` entry, that file is stated instead."""
+    output = _status(worktree)
+    head = workdir.read_head_commit(worktree) or ""
+    top = workdir.checkout_top(worktree)
+    entries = _tracked_changes(output)
+    if len(entries) > MAX_TREE_PATHS:
+        raise TreeUncovered(
+            f"{len(entries)} tracked paths are changed in {worktree}, more than"
+            f" {MAX_TREE_PATHS}",
+            Uncovered.TOO_MANY_PATHS,
+        )
+    digest = hashlib.sha256()
+    digest.update(head.encode("ascii", "replace") + b"\0")
+    digest.update(f"{len(entries)}\0".encode("ascii"))
+    for entry, path in entries:
+        digest.update(entry.encode("utf-8", "surrogateescape") + b"\0")
+        digest.update(_path_stamp(top, entry[:2], path))
+    return digest.hexdigest()
+
+
+def _tracked_changes(output: str) -> list[tuple[str, str]]:
+    """Each ``git status --porcelain=v1 -z`` entry other than an untracked one, as
+    its status letters with its path and any origin, and the path it names now, in
+    git's order. Raises ``ReadinessUnknown`` for output not in that form, as
+    ``parse_porcelain`` does."""
+    parse_porcelain(output)
+    fields = output.split("\0")
+    found: list[tuple[str, str]] = []
+    index = 0
+    # Bounded by the number of fields, since each pass consumes one or two. The
+    # form was checked above, so each entry is at least four characters.
+    while index < len(fields):
+        field = fields[index]
+        index += 1
+        if not field:
+            continue
+        status, path = field[:2], field[3:]
+        entry = field
+        if status[0] in "RC" or status[1] in "RC":
+            entry = f"{field}\0{fields[index]}"
+            index += 1
+        if status != "??":
+            found.append((entry, path))
+    return found
+
+
+def _path_stamp(top: Path | None, status: str, path: str) -> bytes:
+    """The size and modification time of ``path`` under ``top``, as bytes for the
+    digest, or a fixed mark for a path whose ``status`` letters name a deletion and
+    which is absent. Raises ``TreeUncovered`` for any other path that cannot be
+    stated, since a fixed mark there would not move with an edit."""
+    if top is not None:
+        try:
+            found = os.lstat(top / path)
+        except (OSError, ValueError):
+            pass
+        else:
+            return f"{found.st_size} {found.st_mtime_ns}\0".encode("ascii")
+        if "D" in status:
+            return b"absent\0"
+    raise TreeUncovered(
+        f"the changed path {path!r} could not be stated under the checkout's top",
+        Uncovered.UNSTAMPED_PATH,
+    )
+
+
 def _status(worktree: Path) -> str:
-    """The output of ``git status --porcelain=v1 -z`` in ``worktree``."""
+    """The output of ``git status --porcelain=v1 -z`` in ``worktree``.
+
+    **Round 16, item 1.** Bisecting runs put a rise in stalled starts in continuous
+    integration at the change that read this on every ``set_brief`` and on every
+    turn of a kept session. A directory the file system shows to be outside any
+    checkout is answered ``FAILED`` here, as git would answer it, without a start.
+
+    **Decided by core, for review.** The digest is not cached on ``HEAD``, the
+    index and the worktree's own modification time, as the task offered. An edit
+    in place of a tracked file below the top level changes none of the three, so a
+    cached digest would hide the very change the stale-brief notice reports. The
+    read stays lazy instead, made only for a brief that names a digest, and only
+    when a turn is about to show the notice or ``set_brief`` records one."""
+    if workdir.outside_checkout(worktree):
+        raise ReadinessUnknown(
+            f"{worktree} is not in a git checkout, so git status was not run",
+            ReadFailure.FAILED,
+        )
+    return _run_git_status(worktree)
+
+
+def _run_git_status(worktree: Path) -> str:
+    """Start ``git status`` in ``worktree`` and give its output. The one place this
+    module starts a child, so that the test suite can stand in for it. **Round 16,
+    item 1.** The suite's ``_no_real_git_status`` fixture answers a clean tree here
+    for every test not marked ``real_git_status``."""
     environment = {
         name: value for name, value in os.environ.items() if not name.startswith("GIT_")
     }
