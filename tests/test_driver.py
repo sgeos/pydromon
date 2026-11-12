@@ -1,6 +1,7 @@
 """The packaged Keleusma drivers run through pykeleusma, and the host's checks."""
 
 import re
+from dataclasses import replace
 from importlib import resources
 
 import pytest
@@ -26,6 +27,39 @@ OPUS = "claude-opus-5-5"
 HAIKU = "claude-haiku-5-5"
 LUNA = "gpt-6-luna"
 EVERY_DRIVER = [(model, strategy) for model in ENGINE_OF for strategy in Strategy]
+
+NEW_DRIVERS = [
+    ("claude-fable-5-2", "claude-fable-5-1"),
+    ("gpt-6-astra", LUNA),
+    ("gpt-6-sol", LUNA),
+    ("grok-4.7-build-fast", "grok-4.7"),
+    ("pi:openai/gpt-6-astra", "pi:openai/gpt-6-luna"),
+    ("pi:openai/gpt-6-sol", "pi:openai/gpt-6-luna"),
+    ("pi:openai/gpt-6.1-sol", "pi:openai/gpt-6-luna"),
+    ("pi:openai/gpt-6.1-terra", "pi:openai/gpt-6-luna"),
+]
+
+
+@pytest.mark.parametrize(("model", "predecessor"), NEW_DRIVERS)
+@pytest.mark.parametrize("strategy", Strategy)
+def test_new_drivers_derive_settings_and_refuse_the_predecessor(
+    model: str, predecessor: str, strategy: Strategy
+) -> None:
+    # The operator selected these predecessor policies. The catalogue confirms the
+    # Codex and Pi windows, while the Claude and Grok windows remain inherited.
+    driver = Driver.for_model(model, strategy)
+    previous = Driver.for_model(predecessor, strategy).settings
+    assert driver.settings == replace(previous, model=model)
+    assert (
+        driver.step(Event("init", reported_model(predecessor))).tag is ActionTag.REFUSE
+    )
+    assert driver.step(Event("init", reported_model(model))).tag is ActionTag.ACCEPT
+    if driver.settings.engine in {"codex", "pi"}:
+        assert driver.settings.context_window == 272000
+        expected = "medium" if strategy is Strategy.SUBSCRIPTION else "low"
+        assert driver.settings.effort == (
+            expected if driver.settings.engine == "codex" else "medium"
+        )
 
 
 def packaged_source(
