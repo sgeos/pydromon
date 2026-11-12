@@ -1547,7 +1547,7 @@ def test_the_session_carries_dromons_tools_instructions_and_ask_mode(
     ]
     assert session["_meta"]["yoloMode"] is False
     assert session["_meta"]["autoMode"] is False
-    assert session["_meta"]["rules"] == "Contents of RULES.md:\n\nBe careful."
+    assert session["_meta"]["rules"].startswith("Contents of RULES.md:\n\nBe careful.")
 
 
 def test_the_next_turn_loads_the_session(project: tuple[Path, Path, Path]) -> None:
@@ -2371,6 +2371,7 @@ def test_the_line_socket_serves_only_the_lines_own_tools(
             "release_lease",
             "list_leases",
             "line_status",
+            "overview",
             "read_instructions",
             "write_scratch",
             "check_disclosure",
@@ -2990,7 +2991,7 @@ def test_a_grok_built_in_is_counted_as_the_line_tool_that_permits_it(
     assert run(line(server, project, config=given)).tool_uses == ("Read",)
 
 
-@pytest.mark.parametrize("name", ["read_file", "spawn_subagent", "ask_user_question"])
+@pytest.mark.parametrize("name", ["read_file", "ask_user_question"])
 def test_a_grok_tool_the_line_was_not_given_is_refused(
     project: tuple[Path, Path, Path], name: str
 ) -> None:
@@ -3802,7 +3803,7 @@ def test_refused_replacement_is_cached_before_a_successful_retry(
     project: tuple[Path, Path, Path], preflight: bool
 ) -> None:
     server = FakeGrok(
-        [grok_call("todo_write")], servers=None if preflight else DROMON_ONLY
+        [grok_call("web_fetch")], servers=None if preflight else DROMON_ONLY
     )
     target = line(server, project, session_id="old:rules-incorrect")
     with pytest.raises(EngineRefused):
@@ -3852,9 +3853,9 @@ def test_unconfirmed_rejection_is_named_when_prompt_fails(
                         }
                     )
 
-    server = FailsAfterRejection([grok_permission(_meta=grok_meta("todo_write"))])
+    server = FailsAfterRejection([grok_permission(_meta=grok_meta("web_fetch"))])
     with pytest.raises(
-        EngineRefused, match="rejected tool call did not run: todo_write"
+        EngineRefused, match="rejected tool call did not run: web_fetch"
     ):
         run(line(server, project))
 
@@ -4128,3 +4129,185 @@ def test_start_check_rejects_a_wrong_grok_model_without_a_prompt(
         asyncio.run(line(server, project).check_start())
     assert "session/prompt" not in server.methods()
     assert server.stops == 1
+
+
+@pytest.mark.parametrize("name", grok_module.HOOK_DENIED_TOOLS)
+@pytest.mark.parametrize("fields", [{}, {"status": "pending"}, {"status": "failed"}])
+def test_fixed_hook_notice_requires_nonexecution_evidence(
+    project: tuple[Path, Path, Path], name: str, fields: dict[str, object]
+) -> None:
+    first = grok_call(name)
+    first["params"]["update"].update(fields)
+    server = FakeGrok([first, chunk("continued")])
+    with pytest.raises(EngineRefused):
+        run(line(server, project))
+    assert "session/cancel" in server.methods()
+
+
+@pytest.mark.parametrize("name", grok_module.HOOK_DENIED_TOOLS)
+def test_fixed_hook_positive_nonexecution_allows_continuation(
+    project: tuple[Path, Path, Path], name: str
+) -> None:
+    first = grok_call(name)
+    first["params"]["update"]["_meta"]["toolNotRun"] = True
+    server = FakeGrok(
+        [
+            first,
+            call_update("t", status="failed", _meta={"toolNotRun": True}),
+            chunk("continued"),
+        ]
+    )
+    assert run(line(server, project)).text == "continued"
+    assert "session/cancel" not in server.methods()
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"status": "completed"},
+        {"status": "in_progress"},
+        {"rawOutput": "effect"},
+        {"content": [{"type": "text", "text": "effect"}]},
+    ],
+)
+@pytest.mark.parametrize("initial", [False, True])
+def test_fixed_hook_execution_evidence_cancels(
+    project: tuple[Path, Path, Path], fields: dict[str, object], initial: bool
+) -> None:
+    first = grok_call("monitor")
+    first["params"]["update"]["_meta"]["toolNotRun"] = True
+    if initial:
+        first["params"]["update"].update(fields)
+        notices = [first]
+    else:
+        notices = [first, call_update("t", **fields)]
+    server = FakeGrok(notices)
+    with pytest.raises(EngineRefused, match="started a tool"):
+        run(line(server, project))
+    assert "session/cancel" in server.methods()
+
+
+def test_reports_instruction_uses_inline_scratch(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok()
+    run(line(server, project))
+    rules = server.params("session/new")["_meta"]["rules"]
+    assert "write_scratch called through use_tool with inline tool_input" in rules
+
+
+def recorded_hook_denial(name: str = "todo_write") -> list[dict[str, Any]]:
+    # Operator trace of 2026-11-11. The fixture retains the recorded methods and
+    # update payloads, normalizes identifiers and removes transport metadata.
+    fixture = Path(__file__).parent / "fixtures" / "grok-hook-denial.jsonl"
+    notices: list[dict[str, Any]] = [
+        json.loads(row) for row in fixture.read_text().splitlines()
+    ]
+    if name != "todo_write":
+        first = notices[0]["params"]["update"]
+        first["title"] = name
+        first["_meta"]["x.ai/tool"]["name"] = name
+        for index in (1, 2):
+            notices[index]["params"]["update"]["tool_name"] = name
+    return notices
+
+
+@pytest.mark.parametrize("name", grok_module.HOOK_DENIED_TOOLS)
+def test_recorded_hook_denial_allows_continuation(
+    project: tuple[Path, Path, Path], name: str
+) -> None:
+    notices = recorded_hook_denial(name)
+    assert [notice["method"] for notice in notices] == [
+        "session/update",
+        "_x.ai/session_notification",
+        "_x.ai/session_notification",
+        "_x.ai/session_notification",
+        "session/update",
+        "session/update",
+    ]
+    server = FakeGrok(notices)
+    report = run(line(server, project))
+    assert report.text == "done"
+    assert report.tool_uses == ()
+    assert "session/cancel" not in server.methods()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_execution",
+        "wrong_method",
+        "wrong_name",
+        "wrong_event",
+        "unblocked",
+        "successful",
+        "empty_runs",
+        "malformed_runs",
+        "missing_denial",
+        "wrong_status",
+        "other_output",
+        "extra_content",
+        "ambiguous",
+        "late_proof",
+        "no_final_update",
+    ],
+)
+def test_hook_denial_requires_unambiguous_positive_evidence(
+    project: tuple[Path, Path, Path], fault: str
+) -> None:
+    notices = recorded_hook_denial()
+    hook = notices[2]["params"]["update"]
+    final = notices[4]["params"]["update"]
+    if fault == "missing_execution":
+        del notices[2]
+    elif fault == "wrong_method":
+        notices[2]["method"] = "unrecognized/session_notification"
+    elif fault == "wrong_name":
+        hook["tool_name"] = "monitor"
+    elif fault == "wrong_event":
+        hook["event_name"] = "post_tool_use"
+    elif fault == "unblocked":
+        hook["runs"][0]["status"]["blocked"] = False
+    elif fault == "successful":
+        hook["runs"][0]["status"]["status"] = "success"
+    elif fault == "empty_runs":
+        hook["runs"] = []
+    elif fault == "malformed_runs":
+        hook["runs"] = [{"status": True}]
+    elif fault == "missing_denial":
+        final["content"] = []
+    elif fault == "wrong_status":
+        final["status"] = "completed"
+    elif fault == "other_output":
+        final["rawOutput"] = "effect"
+    elif fault == "extra_content":
+        final["content"].append({"type": "text", "text": "effect"})
+    elif fault == "ambiguous":
+        notices.insert(1, grok_call("todo_write", ident="second"))
+    elif fault == "late_proof":
+        notices.insert(1, chunk("premature continuation"))
+    elif fault == "no_final_update":
+        del notices[4]
+    server = FakeGrok(notices)
+    with pytest.raises(EngineRefused):
+        run(line(server, project))
+    assert "session/cancel" in server.methods()
+
+
+def test_hook_confirmation_cannot_be_reused_for_a_later_call(
+    project: tuple[Path, Path, Path],
+) -> None:
+    notices = recorded_hook_denial()[:-1]
+    notices += [
+        grok_call("todo_write", ident="second"),
+        call_update(
+            "second",
+            status="failed",
+            content=notices[-1]["params"]["update"]["content"],
+        ),
+        chunk("unconfirmed"),
+    ]
+    server = FakeGrok(notices)
+    with pytest.raises(EngineRefused):
+        run(line(server, project))
+    assert "session/cancel" in server.methods()

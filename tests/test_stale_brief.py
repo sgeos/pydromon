@@ -5,7 +5,13 @@ presented as current, and a kept session, which is led with its brief only when 
 engine session is new, never saw the flag on an ordinary turn. A brief now keeps the
 digest of the worktree's ``git status`` entries, and each turn of a kept session is
 headed by the flag while the commit or that digest differs, until the line sets the
-brief again. Each test uses a real git worktree."""
+brief again. Each test uses a real git repository.
+
+**Round 16, item 1.** Only the tests of the digest itself start ``git status``, and
+they are marked ``real_git_status``. The turn tests script what ``git status``
+answers through ``World.status``, since starting git on every turn was where the
+stalls in continuous integration showed, and what they test is the scheduler's
+comparison, not git's listing."""
 
 import asyncio
 import hashlib
@@ -34,6 +40,8 @@ ANA = OperatorAddress("ana")
 WORKTREE = "work"
 AT = "2026-11-05T05:00:00Z"
 CLEAN = hashlib.sha256(b"").hexdigest()
+NEW = "?? new.txt\0"
+"""What ``git status --porcelain=v1 -z`` gives for one untracked file."""
 
 
 def git(directory: Path, *arguments: str) -> str:
@@ -73,10 +81,12 @@ def repository(directory: Path) -> Path:
 # The digest.
 
 
+@pytest.mark.real_git_status
 def test_a_clean_worktree_has_the_digest_of_no_entries(tmp_path: Path) -> None:
     assert readiness.dirty_digest(repository(tmp_path / "w")) == (CLEAN, 0)
 
 
+@pytest.mark.real_git_status
 def test_the_digest_follows_which_paths_are_dirty_and_not_their_contents(
     tmp_path: Path,
 ) -> None:
@@ -94,10 +104,60 @@ def test_the_digest_follows_which_paths_are_dirty_and_not_their_contents(
     assert readiness.dirty_digest(worktree) == (CLEAN, 0)
 
 
-def test_a_directory_git_cannot_read_has_no_digest(tmp_path: Path) -> None:
-    with pytest.raises(readiness.ReadinessUnknown) as raised:
+def record_starts(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Each start ``dromon.readiness`` asks of ``dromon.spawn``, which fails it."""
+    calls: list[object] = []
+
+    def run(*arguments: object, **options: object) -> object:
+        calls.append(arguments)
+        del options
+        raise AssertionError("git was started")
+
+    monkeypatch.setattr(spawn, "run", run)
+    return calls
+
+
+@pytest.mark.real_git_status
+def test_a_directory_outside_any_checkout_has_no_digest_and_starts_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**Round 16, item 1.** Git could only fail there, so it is not started."""
+    starts = record_starts(monkeypatch)
+    for directory in (tmp_path / "absent", tmp_path):
+        with pytest.raises(readiness.ReadinessUnknown) as raised:
+            readiness.dirty_digest(directory)
+        assert raised.value.cause is readiness.ReadFailure.FAILED
+        assert "not in a git checkout" in str(raised.value)
+    assert starts == []
+
+
+@pytest.mark.real_git_status
+def test_a_checkout_whose_pointer_cannot_be_followed_is_left_to_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``.git`` file that names no git directory is not taken as no checkout,
+    since git, not this walk, says what it means."""
+    worktree = tmp_path / "w"
+    worktree.mkdir()
+    (worktree / ".git").write_text("not a pointer\n")
+    starts = record_starts(monkeypatch)
+    with pytest.raises(AssertionError, match="git was started"):
+        readiness.dirty_digest(worktree)
+    assert len(starts) == 1
+
+
+def test_the_suite_answers_a_clean_tree_without_starting_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The autouse fixture stands in for the start in a test not marked, and the
+    check outside a checkout still runs."""
+    worktree = repository(tmp_path / "w")
+    starts = record_starts(monkeypatch)
+    assert readiness.dirty_digest(worktree) == (CLEAN, 0)
+    assert readiness.dirty_paths(worktree) == readiness.Dirty((), 0)
+    with pytest.raises(readiness.ReadinessUnknown):
         readiness.dirty_digest(tmp_path / "absent")
-    assert raised.value.cause is readiness.ReadFailure.FAILED
+    assert starts == []
 
 
 @pytest.mark.parametrize(
@@ -112,6 +172,7 @@ def test_a_directory_git_cannot_read_has_no_digest(tmp_path: Path) -> None:
         ),
     ],
 )
+@pytest.mark.real_git_status
 def test_each_failed_read_gives_its_fixed_word(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -158,10 +219,19 @@ class Recorder:
 
 
 class World:
-    def __init__(self, tmp_path: Path) -> None:
+    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self.root = tmp_path.resolve() / "project"
         (self.root / ".dromon").mkdir(parents=True)
         self.worktree = repository(self.root / WORKTREE)
+        self.status = ""
+        """What ``git status --porcelain=v1 -z`` answers in the worktree, as each
+        test scripts it."""
+
+        def scripted(worktree: Path) -> str:
+            del worktree
+            return self.status
+
+        monkeypatch.setattr(readiness, "_run_git_status", scripted)
         self.prompts: list[str] = []
         self.answers: list[str] = []
         self.log = EventLog(tmp_path / "events.sqlite")
@@ -222,8 +292,8 @@ class World:
 
 
 @pytest.fixture
-def world(tmp_path: Path) -> Generator[World]:
-    target = World(tmp_path)
+def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generator[World]:
+    target = World(tmp_path, monkeypatch)
     yield target
     target.log.close()
 
@@ -256,9 +326,9 @@ def record_reads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 def test_set_brief_stamps_the_dirty_digest_it_read(world: World) -> None:
-    (world.worktree / "new.txt").write_text("one\n")
+    world.status = NEW
     brief = world.set_brief()
-    assert brief.workdir_dirty == readiness.dirty_digest(world.worktree)[0]
+    assert brief.workdir_dirty == hashlib.sha256(NEW.encode()).hexdigest()
     assert brief.workdir_commit == git(world.worktree, "rev-parse", "HEAD")
 
 
@@ -302,7 +372,7 @@ def test_a_kept_session_is_told_on_each_turn_until_the_brief_is_set_again(
     reads = record_reads(monkeypatch)
     assert world.set_brief().workdir_dirty == CLEAN, reads
     world.turn()
-    (world.worktree / "new.txt").write_text("one\n")
+    world.status = NEW
     first = world.turn()
     assert first.startswith("STALE BRIEF."), (reads, first[:300])
     assert "uncommitted changes differ" in first and "1 dirty path now" in first
@@ -319,10 +389,10 @@ def test_discarded_work_flags_the_brief(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     reads = record_reads(monkeypatch)
-    (world.worktree / "kept.txt").write_text("work in progress\n")
+    world.status = " M kept.txt\0"
     assert world.set_brief().workdir_dirty not in (None, CLEAN), reads
     world.turn()
-    git(world.worktree, "checkout", "-q", "--", "kept.txt")
+    world.status = ""
     text = world.turn()
     assert text.startswith("STALE BRIEF."), (reads, text[:300])
     assert "0 dirty paths now" in text
@@ -356,7 +426,7 @@ def test_a_turn_led_by_a_stale_brief_is_not_told_twice(world: World) -> None:
 def test_a_led_turn_is_still_told_of_changed_uncommitted_work(world: World) -> None:
     world.set_brief()
     git(world.worktree, "commit", "-q", "--allow-empty", "-m", "second")
-    (world.worktree / "new.txt").write_text("one\n")
+    world.status = NEW
     found = world.notice(led_brief=True)
     assert found is not None and "uncommitted changes differ" in found
     assert "moved from commit" not in found
@@ -371,22 +441,21 @@ def test_a_fresh_session_each_turn_is_never_told(world: World) -> None:
         "alpha",
         replace(DEFAULT_CONFIG, workdir=WORKTREE, fresh_session_each_turn=True),
     )
-    (world.worktree / "new.txt").write_text("one\n")
+    world.status = NEW
     assert world.notice() is None
 
 
 def test_a_line_without_a_brief_is_never_told(world: World) -> None:
-    (world.worktree / "new.txt").write_text("one\n")
+    world.status = NEW
     assert world.notice() is None
 
 
 def test_a_brief_without_a_digest_compares_the_commit_alone(world: World) -> None:
     head = git(world.worktree, "rev-parse", "HEAD")
     world.log.append(BriefSet("alpha", "the task", "", (), "", head, "", AT))
-    (world.worktree / "new.txt").write_text("one\n")
+    world.status = NEW
     assert world.notice() is None
-    git(world.worktree, "add", "new.txt")
-    git(world.worktree, "commit", "-q", "-m", "second")
+    git(world.worktree, "commit", "-q", "--allow-empty", "-m", "second")
     found = world.notice()
     assert found is not None and "moved from commit" in found
 
@@ -395,7 +464,7 @@ def test_an_unreadable_worktree_now_says_the_brief_currency_is_unknown(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     world.set_brief()
-    (world.worktree / "new.txt").write_text("one\n")
+    world.status = NEW
     assert world.notice() is not None
 
     def unread(line_id: str) -> readiness.ReadFailure:
@@ -460,3 +529,68 @@ def test_a_brief_without_a_digest_is_not_told_of_a_failed_read(
     # The brief names no digest, so the read is not made and nothing is unknown
     # beyond what set_brief already said.
     assert world.notice() is None
+
+
+# Round 16, item 4. Each notice names the brief's commit and HEAD.
+
+
+def test_a_notice_of_changed_uncommitted_work_names_both_commits(
+    world: World,
+) -> None:
+    head = git(world.worktree, "rev-parse", "HEAD")
+    world.set_brief()
+    world.status = NEW
+    found = world.notice()
+    assert found is not None and found.startswith("STALE BRIEF.")
+    assert (
+        f"The brief was set at commit {head[:12]}, and your worktree's HEAD is"
+        f" {head[:12]}." in found
+    )
+
+
+def test_a_notice_of_unknown_currency_names_both_commits(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = git(world.worktree, "rev-parse", "HEAD")
+    world.set_brief()
+    git(world.worktree, "commit", "-q", "--allow-empty", "-m", "second")
+    after = git(world.worktree, "rev-parse", "HEAD")
+    fail_reads(monkeypatch)
+    # Led with the brief, which already says the commit moved, so the notice says
+    # only that the uncommitted state is unknown, and names both commits itself.
+    found = world.notice(led_brief=True)
+    assert found is not None and found.startswith("BRIEF CURRENCY UNKNOWN.")
+    assert (
+        f"The brief was set at commit {before[:12]}, and your worktree's HEAD is"
+        f" {after[:12]}." in found
+    )
+
+
+def test_a_notice_whose_reason_names_both_commits_does_not_repeat_them(
+    world: World,
+) -> None:
+    world.set_brief()
+    git(world.worktree, "commit", "-q", "--allow-empty", "-m", "second")
+    world.status = NEW
+    found = world.notice()
+    assert found is not None and "moved from commit" in found
+    assert "The brief was set at commit" not in found
+
+
+def test_a_notice_says_which_commit_is_not_known(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.log.append(BriefSet("alpha", "the task", "", (), "", "", "", AT, CLEAN))
+    world.status = NEW
+    found = world.notice()
+    assert found is not None
+    assert "names no commit, since the daemon could not read one" in found
+    head = git(world.worktree, "rev-parse", "HEAD")
+    assert f"your worktree's HEAD is {head[:12]}." in found
+
+    def unreadable(line_id: str) -> None:
+        del line_id
+
+    monkeypatch.setattr(world.scheduler, "_workdir_commit", unreadable)
+    unread = world.notice()
+    assert unread is not None and "your worktree's HEAD could not be read." in unread

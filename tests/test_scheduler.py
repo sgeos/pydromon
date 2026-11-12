@@ -9,6 +9,7 @@ import gc
 import hashlib
 import re
 import threading
+import time
 from collections.abc import Callable, Coroutine, Iterator, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -697,6 +698,7 @@ def test_a_cooldown_delays_the_next_turn(make_world: MakeWorld) -> None:
             await asyncio.sleep(0)
         assert len(target.engines["alpha"].prompts) == 1
         now[0] += 31
+        target.scheduler.set_project(target.scheduler.limits, "ana", 0, 1)
 
     run(target, act)
     assert len(target.engines["alpha"].prompts) == 2
@@ -726,11 +728,14 @@ def test_an_engine_failure_holds_the_line_and_asks_an_operator(
     assert line.state is LineState.IDLE
     assert len(target.engines["alpha"].prompts) == 1
     err = capsys.readouterr().err
-    assert "turn failed: the engine broke" in err
+    assert "turn failed" in err
+    assert "the engine broke" not in err
     (question_id,) = questions_for(target)
     assert line.held_by == question_id
     question = target.log.state.messages[question_id]
-    assert "failed: the engine broke" in question.body
+    assert "failed" in question.body
+    assert "the engine broke" not in question.body
+    assert line.last_closing_reason == "the engine broke"
     target.engines["alpha"].fail = False
     run(target, send(target, "alpha", "again"))
     assert len(target.engines["alpha"].prompts) == 1
@@ -1640,14 +1645,15 @@ def test_each_turn_is_bracketed_in_the_line_activity(make_world: MakeWorld) -> N
     assert recorded[1][1] == "success"
 
 
-def test_a_failed_turn_says_why_in_the_activity(make_world: MakeWorld) -> None:
+def test_a_failed_turn_keeps_diagnostic_in_status(make_world: MakeWorld) -> None:
     target = make_world({"alpha": [[]]})
     target.engine("alpha").fail = True
     run(target, send(target, "alpha", "hello"))
     assert activity(target, "alpha")[-1] == (
         ActivityKind.TURN_ENDED,
-        "failed: the engine broke",
+        "failed",
     )
+    assert target.log.state.lines["alpha"].last_closing_reason == "the engine broke"
 
 
 def test_an_operator_interrupts_a_turn_in_flight(make_world: MakeWorld) -> None:
@@ -1702,6 +1708,7 @@ def test_a_line_switches_models_only_within_its_engine(make_world: MakeWorld) ->
         "claude-opus-5-5",
         "claude-haiku-5-5",
         "claude-fable-5-1",
+        "claude-fable-5-2",
         "claude-sonnet-5-5",
     )
     target.scheduler.override_line("alpha", "model", "claude-opus-5-5")
@@ -2018,3 +2025,39 @@ def test_canonical_stop_causes_keep_their_category_on_replay(
     target.scheduler._note_engine_stop("alpha", cause)  # pyright: ignore[reportPrivateUsage]
     notice = target.scheduler._engine_stop_notice("alpha")  # pyright: ignore[reportPrivateUsage]
     assert notice == scheduler_module.ENGINE_STOP_NOTE + cause
+
+
+@pytest.mark.parametrize("running", [False, True])
+def test_zero_tick_waits_without_spending_processor_time(
+    make_world: MakeWorld, running: bool
+) -> None:
+    """A blocked turn and an empty scheduler must both rest between events.
+
+    Thread processor time excludes unrelated worker activity. The tick assertion
+    also detects a spin on a machine too busy to grant much processor time.
+    """
+    target = make_world({"alpha": [[]]})
+
+    async def check() -> None:
+        stop = asyncio.Event()
+        gate = asyncio.Event()
+        target.engine("alpha").gate = gate
+        loop = asyncio.create_task(target.scheduler.run(stop))
+        try:
+            if running:
+                target.scheduler.send(ANA, LineAddress("alpha"), "start")
+                async with asyncio.timeout(5):
+                    while not target.engine("alpha").prompts:
+                        await asyncio.sleep(0.001)
+            await asyncio.sleep(0.02)
+            tick = target.scheduler.tick
+            before = time.thread_time()
+            await asyncio.sleep(0.25)
+            used = time.thread_time() - before
+            assert used < 0.05
+            assert target.scheduler.tick == tick
+        finally:
+            stop.set()
+            await loop
+
+    asyncio.run(check())

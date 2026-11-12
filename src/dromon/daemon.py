@@ -102,6 +102,8 @@ from dromon.eventlog import (
     LogError,
     RestoreMismatch,
     check_snapshot,
+    hold_snapshot,
+    snapshot_since_held,
     read_entries,
     snapshot,
     utc_now,
@@ -110,7 +112,15 @@ from dromon.eventlog import (
 from dromon.statesnapshot import snapshot_path
 from dromon.sealed import SealedStore, store_path
 from dromon.limits import DEFAULT_LIMITS, Limits
-from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
+from dromon.mailbox import (
+    MAX_PAGE,
+    listing,
+    outcome,
+    replied_ids,
+    sent,
+    summary,
+    unread_outside,
+)
 from dromon.lineconfig import (
     DEFAULT_CONFIG,
     ConfigError,
@@ -872,6 +882,7 @@ class Daemon:
                 | Operation.RUN_CLEAR
                 | Operation.SCRATCH_PLACE
                 | Operation.RUNS
+                | Operation.OVERVIEW
                 | Operation.START_CONTEXT
                 | Operation.BUDGETS
                 | Operation.BUDGET_SET
@@ -1027,9 +1038,12 @@ class Daemon:
                     values = _text_args(request.args, names)
                     found = self.scheduler.runs_view(values[0] if values else None)
                     result = {"runs": cast(object, found)}
+                case Operation.OVERVIEW:
+                    # Round 16, item 1. The line's own view, read only.
+                    (line_id,) = _text_args(request.args, ("line_id",))
+                    result = self.scheduler.overview(line_id)
                 case Operation.START_CONTEXT:
-                    _text_args(request.args, ())
-                    result = start_context(os.environ)
+                    result = self._start_context(request.args)
                 case Operation.BUDGETS:
                     _text_args(request.args, ())
                     result = self.scheduler.budgets_view()
@@ -1088,6 +1102,30 @@ class Daemon:
                 error_message=str(error),
             )
         return Response(request.request_id, True, result=result)
+
+    def _start_context(self, args: dict[str, object]) -> dict[str, object]:
+        """The ``start_context`` request, with no arguments, or with ``nonce`` and
+        ``secrets`` together, the client's own digests to compare. **Review of
+        16de365.** A nonce or digest in another form is a bad request, never an
+        exception that drops the connection."""
+        if not args:
+            return start_context(os.environ, self.line_secrets)
+        if set(args) != {"nonce", "secrets"}:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST,
+                f"the arguments are {sorted(args)}, expected none or"
+                " ['nonce', 'secrets']",
+            )
+        nonce = args["nonce"]
+        if not isinstance(nonce, str) or restart.NONCE_PATTERN.fullmatch(nonce) is None:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, "nonce must be 64 lowercase hexadecimal digits"
+            )
+        try:
+            compared = restart.check_compared(args["secrets"])
+        except ValueError as error:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, str(error)) from error
+        return start_context(os.environ, self.line_secrets, (nonce, compared))
 
     def _create_line(self, args: dict[str, object]) -> dict[str, object]:
         texts = {
@@ -1388,9 +1426,23 @@ class Daemon:
             raise InvalidField(str(error)) from error
         replied = replied_ids(self.log.state, owner)
         counts = summary(self.log.state, owner, 0)
+        # Round 16. The page is the oldest matches from the offset, so the unread
+        # mail before it and after it is counted, and a reader of one page learns
+        # that more waits beyond it.
+        unread_before, unread_after = unread_outside(
+            self.log.state,
+            owner,
+            unread_only=unread_only,
+            sender=None if sender is None else parse_any_address(sender),
+            issues_only=issues_only,
+            offset=offset,
+            limit=limit,
+        )
         return {
             "total": total,
             **counts.counts(),
+            "unread_before": unread_before,
+            "unread_after": unread_after,
             "messages": [
                 {
                     "message_id": message_id,
@@ -1737,6 +1789,7 @@ class Daemon:
         )
         self.scheduler.set_disclosure_terms(terms)
         self.scheduler.set_disclosure_accepted(config.disclosure_accepted)
+        self.scheduler.set_machine_status(machine_status_path(config, self.paths))
         self.scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
         self.scheduler.set_runs(
             config.run_commands,
@@ -1933,7 +1986,11 @@ class Daemon:
         reply, as a line's ``send_message`` does. **Follow-up of 2026-11-01.** Omitted,
         the daemon's rule decides, so a note asks a reply unless it is itself a reply,
         and an operator's note that asks nothing no longer has to stay in a line's
-        unanswered count until the line acknowledges it."""
+        unanswered count until the line acknowledges it.
+
+        ``operator``, optional from round 16, item 7, is the sender. Omitted, the
+        sender is the operator ``@operator`` names, ``Scheduler.default_sender``, and
+        the result's ``operator`` says which."""
         urgent = args.get("priority", False)
         if not isinstance(urgent, bool):
             raise ProtocolError(ErrorCode.BAD_REQUEST, "priority is not a boolean")
@@ -1945,11 +2002,13 @@ class Daemon:
             for key, value in args.items()
             if key not in ("priority", "asks_reply")
         }
+        named = ("operator",) if "operator" in texts else ()
         optional = ("reply_to",) if "reply_to" in texts else ()
-        values = _text_args(texts, ("recipient", "body", "operator", *optional))
-        recipient, body, operator = values[:3]
-        reply_to = values[3] if optional else None
-        sender = OperatorAddress(operator)
+        values = _text_args(texts, ("recipient", "body", *named, *optional))
+        recipient, body = values[:2]
+        rest = values[2:]
+        sender = OperatorAddress(rest[0]) if named else self.scheduler.default_sender()
+        reply_to = rest[-1] if optional else None
         address = parse_any_address(recipient)
         if urgent and not isinstance(address, RemoteAddress):
             # Checked before the operator is registered, so a refusal records nothing.
@@ -1958,7 +2017,11 @@ class Daemon:
         message_id = self.scheduler.send(
             sender, address, body, reply_to, priority=urgent, asks_reply=asks
         )
-        return {"message_id": message_id, "priority": urgent}
+        return {
+            "message_id": message_id,
+            "priority": urgent,
+            "operator": sender.operator_id,
+        }
 
     def _restart(self, args: dict[str, object]) -> dict[str, object]:
         """Begin a restart for ``operator``. ``mode`` is ``wait``, the default, or
@@ -3092,16 +3155,33 @@ def tls_serving(daemon: Daemon) -> TlsServing:
     return pinned_serving
 
 
-def start_context(environment: Mapping[str, str]) -> dict[str, object]:
+def start_context(
+    environment: Mapping[str, str],
+    granted: Mapping[str, Sequence[str]] | None = None,
+    compared: tuple[str, Mapping[str, str | None]] | None = None,
+) -> dict[str, object]:
     """What a restart's successor starts with that a client cannot see, its
     interpreter, which ``client.start`` runs, and ``restart.START_ENVIRONMENT`` as
-    ``environment`` holds it, each value ``None`` when unset. **Round 14, item 6.**"""
-    return {
+    ``environment`` holds it, each value ``None`` when unset. **Round 14, item 6.**
+
+    **Round 16, item 6, and the review of 16de365.** Also ``secret_names``, each name
+    the project file as last loaded grants a line, ``granted``. With ``compared``, a
+    client's nonce and its digest of each name, also ``secrets``, a verdict for each
+    name, ``same``, ``differs`` or ``not_granted``, as ``restart.compare_secrets``
+    gives. Never a value, and never a digest."""
+    allowed = granted or {}
+    result: dict[str, object] = {
         "interpreter": sys.executable,
         "environment": {
             name: environment.get(name) for name in restart.START_ENVIRONMENT
         },
+        "secret_names": list(restart.secret_names(allowed)),
     }
+    if compared is not None:
+        nonce, theirs = compared
+        verdicts = restart.compare_secrets(theirs, allowed, environment, nonce)
+        result["secrets"] = {name: str(verdict) for name, verdict in verdicts.items()}
+    return result
 
 
 def successor_args(overrides: Overrides, hold_wakes: bool) -> list[str]:
@@ -3496,6 +3576,17 @@ def check_lines_sandboxed(
         )
 
 
+def machine_status_path(config: ProjectConfig, paths: ProjectPaths) -> Path | None:
+    """The machine monitor's status file the project names, with a leading ``~`` the
+    home directory and a relative path relative to the project root, or ``None`` when
+    it names none. Only the path is made here, and nothing is read, so a file that is
+    missing is the scheduler's to report. **Round 16, item 3.**"""
+    if config.machine_status is None:
+        return None
+    named = Path(config.machine_status).expanduser()
+    return named if named.is_absolute() else paths.root / named
+
+
 def project_terms(config: ProjectConfig, paths: ProjectPaths) -> tuple[str, ...]:
     """The project's disclosure terms, or none when it names no list. Raises
     ``DisclosureError`` for a list that cannot be read, naming the file only."""
@@ -3805,6 +3896,10 @@ def check_private_dirs(paths: ProjectPaths) -> None:
 CHECK_PASSED: Final = "dromond: the start checks pass, and nothing was started"
 """What ``dromond --check`` says when a start would get past its checks."""
 
+HELD_SNAPSHOT: Final = "held-snapshot.json"
+"""The name of the copy of the live snapshot ``--check`` holds in its private
+directory, read before the log is copied. **Round 16, item 2.**"""
+
 
 def check_scratch(paths: ProjectPaths) -> Path:
     """A new private directory under the runtime directory for a check's copy of
@@ -4009,13 +4104,22 @@ def run(
     successor: list[str] | None = None
     scheduler: Scheduler | None = None
     scratch: Path | None = None
+    held: Path | None = None
+    held_refusal: str | None = None
+    copied_through = 0
     daemon_commit = read_head_commit(Path(__file__).parent)
     try:
         log_path = paths.event_log
         if check_only:
             scratch = check_scratch(paths)
             log_path = scratch / paths.event_log.name
-            snapshot(paths.event_log, log_path)
+            # Round 16, item 2. The snapshot is held before the log is copied, so
+            # it names an event within the copy, and the copy's bound is kept, so
+            # the check's own events past it are never compared with a snapshot.
+            # Named apart from the copy's own snapshot path, which is the log's.
+            held = scratch / HELD_SNAPSHOT
+            held_refusal = hold_snapshot(snapshot_path(paths.event_log), held)
+            copied_through = snapshot(paths.event_log, log_path)
             if launch_checks:
                 launcher.configure(scratch / "left")
         with EventLog(log_path, snapshots=not check_only) as log:
@@ -4045,6 +4149,11 @@ def run(
                     extra_protected=registry_protected(
                         paths, config.federation, registry_dir
                     ),
+                    # Read at each build, so a reload that names another file guards
+                    # it from the next turn. The name is bound just below.
+                    machine_status_file=lambda: (
+                        None if scheduler is None else scheduler.machine_status_file
+                    ),
                 ),
                 limits=limits,
                 default_operator=operator,
@@ -4070,6 +4179,7 @@ def run(
             scheduler.record_walk_gap(launcher.walk_gap())
             scheduler.set_disclosure_terms(terms)
             scheduler.set_disclosure_accepted(config.disclosure_accepted)
+            scheduler.set_machine_status(machine_status_path(config, paths))
             scheduler.set_git_ssh(line_git_ssh)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
             scheduler.set_runs(
@@ -4116,8 +4226,14 @@ def run(
                 # start before any socket is made.
                 daemon.relay_routes(config)
                 if check_only:
-                    agrees, said = check_snapshot(
-                        snapshot_path(paths.event_log), log_path
+                    if held is None:
+                        raise LogError(
+                            "the snapshot check requires a private directory"
+                        )
+                    agrees, said = (
+                        (True, held_refusal)
+                        if held_refusal is not None
+                        else check_snapshot(held, log_path, through=copied_through)
                     )
                     print(f"dromond: {said}", file=sys.stderr)
                     if not agrees:
@@ -4129,6 +4245,10 @@ def run(
                             check_engine_launches(daemon, scratch / "lines.sock")
                         ):
                             return exits.FAILURE
+                    # Round 16 review, finding 2. Read last, after the engine
+                    # checks, so it is as near the stop as the check comes.
+                    since = snapshot_since_held(snapshot_path(paths.event_log), held)
+                    print(f"dromond: {since}", file=sys.stderr)
                     print(CHECK_PASSED, file=sys.stderr)
                     return exits.OK
                 entry = open_registration(

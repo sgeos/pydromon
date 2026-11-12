@@ -410,6 +410,48 @@ def test_send_passes_asks_reply_only_when_asked(
     assert ("asks_reply" in args) is (expected is not None)
 
 
+@pytest.mark.parametrize("named", [False, True])
+@pytest.mark.parametrize("fleet", [False, True])
+def test_send_names_a_sender_only_when_given_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    named: bool,
+    fleet: bool,
+) -> None:
+    """Round 16, item 7. Without ``--operator`` the request names no sender, so the
+    daemon sends as the operator ``@operator`` names rather than as the login name,
+    and the client says which operator that was."""
+    monkeypatch.setattr(cli.getpass, "getuser", lambda: "login")
+    sent: list[tuple[Operation, dict[str, object] | None]] = []
+    answer: dict[str, object] = {
+        "message_id": "m-1",
+        "priority": False,
+        "operator": "ana" if named else "keeper",
+    }
+    monkeypatch.setattr(cli, "call", answering(sent, answer))
+    if fleet:
+
+        def routed(*given: object) -> tuple[ProjectPaths, str]:
+            del given
+            return project_paths(tmp_path, short_runtime), "alpha"
+
+        monkeypatch.setattr(cli, "_fleet_routed", routed)
+        argv = ["fleet", "send", "here:alpha", "stop"]
+    else:
+        runtime = ["--runtime-dir", str(short_runtime)]
+        argv = ["--project", str(tmp_path), *runtime, "send", "alpha", "stop"]
+    assert cli.main([*argv, *(["--operator", "ana"] if named else [])]) == exits.OK
+    ((operation, args),) = sent
+    assert operation is Operation.SEND and args is not None
+    assert args.get("operator") == ("ana" if named else None)
+    assert ("operator" in args) is named
+    out = capsys.readouterr().out
+    assert out.startswith("message_id m-1\n")
+    assert ("sent as @keeper" in out) is not named and "login" not in out
+
+
 def test_send_refuses_both_reply_flags(
     tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

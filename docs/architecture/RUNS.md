@@ -283,6 +283,37 @@ Each end records `run_ended` with the digest and size of the output file, read w
 end is recorded, then removes the receipt, and sends a note from the harness to the
 scope's present holder, the role's owner or else the line that started it.
 
+**One receipt, round 16, item 3.** The engines line asked in round 15 for one
+authoritative completion receipt per run, since it had polled `run_status` with timed
+wakes and waited for an exit after the output already showed the summary. The `Run
+ended` note is that receipt. It is sent once, when the end is recorded, to the holder
+and to each line whose wake waited for the run, and it gives the run, its command, its
+line, the commit it ran, its start, how it ended with the exit code, the output's size
+and digest, the test summary with what pytest skipped and how many it deselected, the
+tail of a failed run, and the wake it cancelled. Nothing else is sent at the end. The
+wake is withdrawn, so no wake note follows, and an end is recorded once, so a later
+reconciliation, as after a restart, sends no second note. **The commit it ran.** A
+commit run names its `commit`. A run in a worktree now names `workdir_commit`, the
+commit its worktree had checked out when the run started, which the daemon reads from
+the checkout's files before the command starts and records in `run_started`. The note
+says `in its worktree at commit C, as the worktree's own HEAD says, which the line can
+move, with any uncommitted changes`, since the command ran on the tree as the line left
+it, which a commit alone does not name. Where the commit cannot be read, as outside a
+checkout, nothing is said of it. **The worktree's claim, after the review of 16de365.**
+The commit is read from the nearest `.git` at or above the working directory, and the
+line can write both. It can move `HEAD` with its own git where its sandbox lets it
+write the git directory, and in a subdirectory of a checkout it can create a `.git`
+naming any commit. Reading only a `.git` at the declared directory's root was
+considered and rejected, because the line can create one exactly there. So the note
+labels the commit as the worktree's claim, and a reader who must know what ran starts
+a commit run, whose `commit` the daemon checked out itself. **What it skipped.** This
+is what pytest's summary says, the skip reasons and the deselected count, as the
+paragraph below specifies. Tests a gate script leaves out by its own means, such as a
+marker expression, appear only as that count, and the run's command in the log names
+the expression. **Inference.** The second note the engines line saw was the timed wake
+it scheduled to poll, which round 15's wake on a run replaced. No path that sends two
+notes for one end was found, and a test pins one.
+
 **The test summary, round 14, item 2.** The same reconciliation reads the last 64 KiB
 of the output, opened as the digest is, and finds pytest's final line, such as `5162
 passed, 10 skipped, 48 deselected in 231.52s`, with the skip reasons of the short
@@ -324,10 +355,43 @@ file could not already read, since the file is in the scope's working directory.
 summary enter the event log and every copy of it, such as the one `dromond --check`
 makes, where a term of the disclosure list, a token in a URL or a value a traceback
 printed would stay in clear. So both are screened against the disclosure list before
-the end is recorded, and when either holds a term both are withheld, and the note says
-`The output's test summary and last lines are withheld from this record, since they
-hold a term from the project's disclosure list`. The output file is unchanged. A
-withholding is the same answer a check gives, so it counts as a failing check of the
+the end is recorded, and the note says what was withheld, `The output's test summary and
+last lines are withheld from this record, since they hold a term from the project's
+disclosure list` when both hold one. The output file is unchanged.
+
+**Round 16, item 2, which part matched.** The first rule withheld both whenever either
+held a term. A failed run's tail is its last 20 lines, and a traceback
+names paths under the user's home directory.
+
+**Fact, from counts by the disclosure check, which never printed a term.** The runs of
+this machine's worktrees held 77 distinct summaries and 186 distinct lines of failed
+runs' tails. No summary matched. None of the 174 tail lines that name no path under a
+user directory matched, and all 12 that do matched. The first part of a home
+directory's path on macOS matched by itself, and the rest of such a path did not.
+**Inference.** The list holds a term that every path under a home directory
+contains, so the summary, which holds only counts and skip reasons, was withheld with a
+tail that could never pass on this machine, whatever the run printed.
+
+Each part is now screened on its own and only the part that holds a term is withheld,
+with a note naming it, `The output's test summary is withheld` or `The output's last
+lines are withheld`. Each match is one failing check, as before, and the notice leads the
+summary so that the note's bound cannot cut it off. **Residual.** A tail naming such a
+path is still withheld whole, so a failed run on this machine keeps its summary and not
+its traceback, which almost always names one, and the operator reads the traceback in
+the output file. A rewrite of the home directory in a tail would keep it, and was not
+made, since it would edit text the command wrote, which the screen exists to leave
+alone. **Why the split gives a line nothing new.** A line that prints a candidate term in
+its output chooses which part holds it, so which part was withheld is only what it
+placed there, and each probe still costs a failing check.
+
+**Round 16 review, point 5, the join.** A term can span the join of the note, or the
+notice, and the clean summary that follows it, which neither holds alone, and the
+recorded text then held it. The joined text is screened too, and a summary that completes
+a term in it is withheld as one that holds a term, with the same count. **Residual.** The
+join of the note and a withheld notice is not screened again, since the notice is fixed
+text and a listed term would have to be made of it.
+
+A withholding is the same answer a check gives, so it counts as a failing check of the
 line that started the run, which a line printing candidates in its output could
 otherwise use to test them outside the check's limit. A line that has spent its failing
 checks has both withheld whatever they hold, with a note naming that reason, so the
@@ -335,6 +399,97 @@ withholding tells it nothing. **Residual.** A tail that passes is not counted ag
 the pass limit, as a tool's passing text is not, so a line can test a tail of up to
 2,048 bytes for each run it can start, at most one at a time in its scope. Text that is
 no listed term, such as a credential the list does not name, is kept as before.
+
+## The machine's status
+
+**Round 16, item 3, at the admin session's suggestion.** The machine is shared by many
+sessions. A monitor outside every sandbox samples it once a minute and writes a status
+file, with a `level` of `ok`, `elevated` or `critical`, its `reasons` and an `epoch`.
+`daemon.machine_status` in the project file names that file, as
+[`PROJECT_CONFIG.md`](../protocol/PROJECT_CONFIG.md) says, and Dromon reads it before it
+starts a supervised run, a commit run or a line's turn. `dromon.machinestatus` is the
+reader and the decision, and is a pure function of the file's text and the time.
+
+| Status | A run, supervised or commit | A line's turn |
+|---|---|---|
+| `ok` | starts | starts |
+| `elevated`, for memory, swap, load or a reason Dromon does not know | deferred | starts, with a warning in its prompt |
+| `elevated`, raised only by free disk space | starts | starts, with a warning |
+| `critical` | deferred, unless only disk raised it | deferred |
+| stale, missing or unreadable | deferred, as an unknown reason | starts, with a warning |
+
+**A deferral.** A run's start is refused with `RunRefused`, naming the status and saying
+that nothing was started and that the line should wait with `wake_after` and start it
+again, so the line is told by its own tool's answer. The operator is told once for the
+deferral, by a note from the harness, and again only after a status that deferred nothing
+has intervened. A turn is not started and the line's mail waits. The line is told once by
+a harness note, which it reads with the mail that waited, and the operator once for the
+deferral, however many lines wait. The line's next prompt says how long its turn waited.
+A deferral keeps nothing ticking, since once both are told the loop rests and reads the
+status again at its next rest, at most 60 seconds on, and at most once every 15 seconds
+in all. Only starts are deferred. A run or a turn that is under way is never stopped by
+the status, since stopping work is the operator's decision. A malformed request is
+refused for itself and not deferred, since the check comes after the request's own.
+Mail the line has already answered is still delivered without a turn, since that costs
+the machine nothing.
+
+**Stale, missing, unreadable.** A sample older than three minutes, a file that is not
+there, is not a regular file, is over 64 KiB, or names no level or time Dromon knows, is
+treated as `elevated` and reported as what it is, so a monitor that stopped is seen and
+is not taken for a healthy machine. **Decision of the feature, for review.** Nothing is
+read unless `daemon.machine_status` is set, because a machine without the monitor would
+otherwise defer every run for ever. A status that is on and then lost defers runs until
+the monitor returns or the operator unsets the key. **Round 16 review, point 1.** A dead
+monitor therefore closes every gate, which is kept, and the cause is named where the
+deferral is. The refusal of a run, the note to the operator, the note to a line and the
+warning a turn proceeds with each say that the monitor looks stopped, since when, and how
+the gates are restored. A stale file is dated by its last sample. A missing or unreadable
+one is dated by the daemon's first sight of it in the spell, which is all the daemon can
+know and which a restart resets. The operator restores the gates by restarting the
+monitor, or by removing `daemon.machine_status` from the project file and reloading, which
+reads nothing and defers nothing. `line_status` gives the same sentence as `monitor`. The file is the monitor's own and
+its reasons are untrusted text. Each is cut to a printable line of at most 160
+characters, at most eight are kept, and a status whose sentence holds a term of the
+disclosure list is not shown. The file's path is never put in a note or in
+`line_status`. **Round 16 review, point 2.** Each reason and the problem that
+`line_status` gives are screened one by one, and one that holds a term is replaced by a
+placeholder.
+
+**Round 16 review, point 3. No line writes the file.** Anything that could write the
+status file could lift or force the deferrals. Each line's sandbox denies writes to the
+file and, unless that directory is, holds or lies in the line's working directory, to its
+directory, and the built-in file tools are denied the same paths, with a rule for the file
+itself. The real path of a link is denied too. The file is read at each build, so a reload
+that names another file guards it from the next turn. A Codex line has its write
+protection extended in the same way, as `read` entries of its profile for each path that
+exists when it is made, so a file the monitor has not yet written is left out. Whether
+Codex enforces such an entry for a file is not verified. The limits are stated in
+[`LINE_CONFIG.md`](../protocol/LINE_CONFIG.md), including that the directory, when it is
+an ancestor of the workdir, is guarded only by the sandbox. **Residual.** A line whose sandbox is disabled runs
+its shell as the operator and can write whatever the operator can, as for every protected
+path, and the other engines take no sandbox or settings, so the guard does not reach
+them. The file is no more protected from the operator's own processes than any other.
+
+**What it does not do.** It runs no command, so a machine without the monitor's tool
+needs nothing, and makes no call that needs the network. It does not read `load1` or
+the other numbers, only the level and the reasons the monitor chose, so Dromon and the
+monitor cannot disagree about a threshold. It does not defer a line's tool calls, a
+running turn or the engines' own work. **Interpretation, for review.** The operator's
+text lets a `critical` raised only by disk defer a turn or not. The stricter reading is
+taken, a turn is deferred and a run is not, and `machinestatus.decide` is the one line
+that changes it. **Residual.** The status is as old as 180 seconds, so a start it
+allowed can land on a machine that has just failed. **Bounded read, at the operator's
+request.** A worker thread reads the file and the loop waits for it at most half a
+second, `scheduler.MACHINE_WAIT_SECONDS`, so a file on a mount that hangs holds the
+worker and not the loop. Until that read returns the status is `unreadable`, which is
+acted on as `elevated` and says that reading it is taking too long, and no second
+worker is started, so a hang costs one thread and never more. A read that returns late
+is taken at the next call. A reader that raises is `unreadable` as well. **Residual.**
+The one worker stays blocked as long as the mount does, and Python cannot interrupt it,
+so a port should read on a task with a timeout that it can cancel. `line_status`
+gives the status in detail, as [`LINE_CONFIG.md`](../protocol/LINE_CONFIG.md) says. The
+deferral's record is the harness notes, since the daemon's memory of what it told is not
+in the event log, and a restart tells once again.
 
 ## A lost run
 
@@ -403,6 +558,36 @@ with the rest of its receipt. Before this the operator read `run_ended` from the
 log by hand. The request reads the log and records nothing. It is bounded by the
 number of scopes, since each scope gives at most ten runs.
 
+**Whether a run still covers the tree.** **Round 16, item 5, core's request of round
+15.** A gate that passed was read as covering a tree whose tracked files had changed
+after it started. A run in the line's working directory now records `tree` in
+`run_started`, the SHA-256 that `readiness.tree_digest` gives as the run starts, read
+off the event loop before the supervisor is launched. The digest covers the commit at
+`HEAD`, the `git status` entry of each changed tracked path, and that path's size and
+modification time. `run_status` reads the digest again for the latest run and says
+that the tree is as it was, or in capitals that the run no longer covers the tree and
+should be run again before its result is reported for the current tree, or that its
+coverage is unknown, with the fixed word for why git could not be read. A run that
+recorded no tree, from before the field or where its tree could not be read, says its
+coverage is unknown. A commit run covers its commit, records no tree, and says
+nothing. The operator's `runs` view gives `tree` as recorded.
+
+- **Residuals.** Untracked paths are left out whole, since a run's own output in an
+  untracked directory that is not ignored would otherwise make every run read as no
+  longer covering its tree. A new test file is therefore not seen until it is added.
+  An edit that keeps a file's size and restores its modification time is not seen.
+  Only the latest run is compared, since each comparison starts git.
+- **Coverage that cannot be told.** **Round 16 review, findings 3 and 4.** A digest
+  that an edit could leave as it was is not given. More than 10000 changed tracked
+  paths, past which an edit was not hashed, or a changed tracked path that git does
+  not list as deleted and that cannot be stated, answer that whether the run covers
+  the tree is unknown, with the fixed word `too_many_paths` or `unstamped_path`, and
+  a run that starts so records no tree. The second covers a work tree that
+  `core.worktree` puts away from the `.git` entry, which is not followed, where each
+  changed path had stamped as absent and an edit inside one already changed was not
+  seen. A residual remains. Where `core.worktree` is set and a file of the same name
+  lies beside the `.git` entry, that file is stated instead.
+
 ## Events and rollback hazards
 
 `run_started`, `run_ended` and `run_cleared` are specified in
@@ -418,7 +603,8 @@ names the commits of these and every other one-way change. **Task of 2026-11-05,
 reads every end without a tail and refuses the log once a failed run's tail is
 recorded. **Round 15 review.** `disclosure_checked` gained `checked_bytes` the same
 way, so a daemon from before it refuses the log once a `check_disclosure` call is
-recorded.
+recorded. **Round 16, item 5.** `run_started` gained `tree` the same way, so a daemon
+from before it refuses the log once a run records its tree.
 
 ## Descendants in a session of their own
 
@@ -876,6 +1062,45 @@ run whose output was complete as still running for up to a minute. Item 2 fixed 
 The flow found nothing else to fix. **Not covered.** The test runs a stand-in gate, not
 `scripts/check.sh`, whose `uv sync` in the checkout needs the network and a fresh
 home's cache, so the cost of the real gate in a commit run is not measured here.
+
+## Waiting for a long suite
+
+**Round 16, item 4, the audit line's request.** The audit line ran a long suite in
+its own turn and lost it twice. **Fact, from its round 15 report.** A daemon restart
+ended its turn while two background pytest tasks ran, which were marked stopped with
+no completion record, and a suite run in the foreground had to fit the shell tool's
+own time limit. **What ends such a wait today.** A wait held inside a turn ends with
+the turn. A restart ends every turn in flight and the engine process with it, and so
+the background tasks of that turn, and the shell tool bounds a foreground command,
+which Dromon does not set. A hold at the turn or cost limit starts no next turn, so a
+line that meant to come back to its own background task does not.
+
+**What survives.** A suite started as a declared run and awaited with `wake_after`
+on the run holds no turn open. The line starts the run, names it in `wake_after`, and
+ends its turn. Each part outlives a restart and a hold.
+
+- The run's supervisor is its own process, which a restart does not end, and the
+  restarted daemon finds it by its identifier and start time, as above.
+- The wake is `wake_scheduled` in the log, so a restart keeps it with its run.
+- A hold at the turn or cost limit withdraws no wake. The run's end withdraws it and
+  records the `Run ended` note, which waits in the held line's mailbox, and the
+  operator's release leaves it to start the line's next turn.
+
+Tests pin each of these, a wait across a restart and a wait across a hold at either
+limit. **Inference.** Nothing ended this wait before this round either. The change is
+that it is now tested and written down. **What is not fixed.**
+
+- A reading line, such as the review or audit line, can start only `review-gate`, on
+  a commit the operator has pushed. Its suite on an extracted tree is not a declared
+  run, so it still waits inside a turn. An operator who wants it can declare a
+  command with a parameter for the tree, as the parameters section above allows. That
+  is project configuration and not code.
+- The operator's stop of a line withdraws its wake on purpose, so a stopped line is
+  not woken by the run's end. It finds the run with `run_status` once released.
+- A wake waits at most 86,400 seconds. A run that outlives it lets the wake fire, and
+  the end then reaches the holder as a note without a wake to cancel.
+- A held line's turn starts only after an operator releases it, so the wait ends in a
+  turn only when the operator chooses.
 
 ## Not implemented
 

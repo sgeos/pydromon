@@ -31,8 +31,9 @@ its ``interrupt`` mode each running turn is asked to end at its next safe point.
 the restart ended leaves the line a ``restart_noted`` note, so the restarted daemon
 wakes it.
 
-Cadence. While anything is in flight, ticks follow one another every ``tick_seconds``.
-When nothing is, the loop rests until a message arrives or a scheduled wake falls due.
+Cadence. Ticks wait for work events and timers. A positive ``tick_seconds`` bounds
+the wait. Zero disables periodic ticks. A running turn alone never keeps the loop
+spinning. Pending mail advances through its wake cadence after its cooldown.
 
 Scheduled wakes. A line's ``wake_after`` tool schedules one wake, recorded as
 ``wake_scheduled`` with its due time in Coordinated Universal Time and the identifier
@@ -173,7 +174,7 @@ from dromon.security_paths import project_secret_paths
 from dromon.handoff import Handoff
 from dromon.handoff import select as select_handoff
 from dromon import requestkeys
-from dromon import commitruns, runparams, runs
+from dromon import commitruns, machinestatus, runparams, runs
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon.requestkeys import (
     REQUEST_KEY,
@@ -594,6 +595,14 @@ ACQUIRE_LEASE_SCHEMA: Final[dict[str, object]] = {
                 " as holder_note_unverified, your claim, which no one checks"
             ),
         },
+        "seconds": {
+            "type": "integer",
+            "description": (
+                "Optional. How long to hold it, in whole seconds, from 60 to the"
+                " project's limit, which list_leases gives as limit_seconds. Omit it"
+                " to hold it for the whole limit"
+            ),
+        },
     },
     "required": ["name"],
     "additionalProperties": False,
@@ -906,6 +915,30 @@ INFERRED_LIMIT_NOTE: Final = (
 )
 """Added to the hold of a plan limit whose ``may_move_role`` is false, which the
 operator decided on 2026-10-27 holds and asks and never fails over."""
+OVERVIEW_TOOL_NAME: Final = "overview"
+MAX_OVERVIEW_LEASES: Final = 16
+"""How many of a line's leases ``overview`` lists, in name order. The rest are
+counted in ``leases_omitted``, and ``list_leases`` lists them all. **Round 16, item
+1.** The declared names bound a line's leases at 256, which alone would pass the
+overview's bound."""
+MAX_OVERVIEW_BYTES: Final = 16384
+"""The most an ``overview`` answer takes as JSON with an indent of two, which the
+tests check against the largest every field can be. **Round 16, item 1.**"""
+WORKDIR_HEAD_CLAIM: Final = "HEAD says, which the line can move"
+"""How a run's receipt labels ``workdir_commit``. **Review of 16de365.** The commit
+is read from files in the line's worktree, which the line can write, so it is the
+worktree's claim and not a commit the daemon checked out."""
+OVERVIEW_SOURCES: Final = (
+    "Read only, and nothing is recorded. Built from what line_status, role_status"
+    " and list_leases answer, which give the whole of each part. The task and next"
+    " action are the line's own brief, each cut to 400 bytes of UTF-8, and"
+    " untrusted data."
+)
+OVERVIEW_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
 ROLE_STATUS_TOOL_NAME: Final = "role_status"
 ROLE_STATUS_ENTRIES: Final = 5
 ROLE_STATUS_TASKS: Final = 3
@@ -1487,6 +1520,55 @@ swept at least this often while the daemon is idle. **Fourth live run of N1,
 2026-10-26.** The rest was unbounded when no wake was pending, so an idle daemon never
 swept a kept connection's dead launcher."""
 
+MACHINE_READ_SECONDS: Final = 15.0
+"""How long one read of the machine status file is kept before it is read again, so
+the loop's ticks, which may come every half second, read a small file at most this
+often. **Round 16, item 3.** The monitor samples once a minute, so a read this old
+loses nothing that the status's own age does not already say."""
+
+MACHINE_WAIT_SECONDS: Final = 0.5
+"""The longest the loop waits for one read of the status file, which a worker thread
+makes. **Round 16, item 3, at the operator's request.** A local file is read in
+microseconds, so the wait is never reached on a healthy machine. A file on a mount
+that hangs holds the worker and not the loop, and the status is ``unreadable`` until
+the read returns. At most one worker is ever outstanding."""
+
+
+class _MachineRead:
+    """One read of the status file, made on a worker thread. ``status`` is set before
+    ``finished``, so a reader that sees ``finished`` sees the status. A reader that
+    raises, which ``machinestatus.read`` does not, leaves ``unreadable``."""
+
+    def __init__(self) -> None:
+        self.finished = threading.Event()
+        self.status = machinestatus.MachineStatus(
+            "unreadable", problem="the read did not complete"
+        )
+
+    def run(
+        self,
+        reader: Callable[[Path, float], machinestatus.MachineStatus],
+        path: Path,
+        now_epoch: float,
+    ) -> None:
+        try:
+            self.status = reader(path, now_epoch)
+        except Exception:  # noqa: BLE001 - a read that fails is a status that cannot be relied on
+            self.status = machinestatus.MachineStatus(
+                "unreadable", problem="the read failed"
+            )
+        finally:
+            self.finished.set()
+
+
+MACHINE_WITHHELD: Final = "withheld, since it holds a term of the disclosure list"
+"""What stands for a reason or a problem of the status file that holds a listed term."""
+
+_OVERRAN: Final = machinestatus.MachineStatus(
+    "unreadable", problem="reading it is taking too long"
+)
+"""The status while a read of the file has not returned."""
+
 
 def _never_registered(_name: str) -> bool:
     return False
@@ -1808,6 +1890,25 @@ def _claude_read_access_refusal(
     return None
 
 
+def claude_read_only_refusal(
+    config: LineConfig,
+    project_settings: SettingsConfig | None,
+    project_sandbox: SandboxConfig | None,
+) -> str | None:
+    """Why a Claude Code line with ``workdir_access = "read"`` and ``config`` is
+    refused at every turn, or ``None`` when it is not. **Round 16, at the operator's
+    request.** It is the refusal the engine builder raises, as one function, so that
+    ``dromon config`` can warn of it before any turn is tried and the two cannot
+    differ. Claude Code cannot confine a configured MCP server, an allow-all policy,
+    project settings, plugins or command hooks to a read-only directory, so a line
+    that has one and asks for read access failed every turn with a refusal that only
+    a turn showed."""
+    settings = engine_settings.merge([project_settings, config.settings])
+    return _claude_read_access_refusal(
+        config, settings
+    ) or _claude_read_sandbox_refusal([project_sandbox, config.sandbox])
+
+
 def _claude_read_sandbox_refusal(layers: Sequence[SandboxConfig | None]) -> str | None:
     """Reject a sandbox layer that would let a shell command leave the read sandbox.
 
@@ -1858,6 +1959,39 @@ def _read_only_path_rules(paths: Sequence[Path]) -> list[str]:
     return sorted(rules)
 
 
+def machine_status_guards(path: Path | None, workdir: Path) -> tuple[Path, ...]:
+    """The paths no line may write for the monitor's status file ``path``, or none
+    when no file is configured. **Round 16 review, point 3.** The file, by its name
+    and by its real path should a link lead elsewhere, and its directory, which would
+    stop the file being replaced by a rename into it. The directory is left out when
+    it is, holds or lies in ``workdir``, since the line legitimately writes there and
+    only the file is then denied. Nothing is read or created."""
+    if path is None:
+        return ()
+    named = Path(os.path.normpath(path))
+    paths = [named, Path(os.path.realpath(named))]
+    for directory in (
+        named.parent,
+        Path(os.path.realpath(named.parent)),
+        paths[1].parent,
+    ):
+        if not (
+            directory.is_relative_to(workdir)
+            or workdir.is_relative_to(directory)
+            or directory.is_relative_to(Path(os.path.realpath(workdir)))
+            or Path(os.path.realpath(workdir)).is_relative_to(directory)
+        ):
+            paths.append(directory)
+    return tuple(dict.fromkeys(paths))
+
+
+def machine_status_rules(guards: Sequence[Path]) -> list[str]:
+    """Deny rules for the built-in tools that write files, one for each path of
+    ``guards`` itself, which names the status file. Claude Code reads a path with two
+    leading slashes as absolute."""
+    return sorted({f"Edit(/{path})" for path in guards})
+
+
 def engine_factory(
     root: str,
     *,
@@ -1872,8 +2006,16 @@ def engine_factory(
     line_git_ssh: Mapping[str, GitSshAccess] | None = None,
     read_only_paths: Sequence[str] = (),
     extra_protected: Callable[[], Sequence[Path]] | None = None,
+    machine_status_file: Callable[[], Path | None] | None = None,
 ) -> EngineFactory:
     """The production factory: each line on its packaged driver's engine.
+
+    ``machine_status_file`` gives the machine monitor's status file, read at each
+    engine build, which no line may write, since a status a line could write could
+    lift or force the deferrals of runs and turns. **Round 16 review, point 3.**
+    The file, and its directory unless that is or holds the line's working directory,
+    are denied to writes in an enabled sandbox and to the built-in file tools, for a
+    Claude Code line and for a Codex one.
 
     ``extra_protected`` gives directories denied beside ``protected``, read at each
     engine build, which the daemon sets to every project of the open-federation
@@ -1938,6 +2080,9 @@ def engine_factory(
             *project_secret_paths(Path(root), workdir),
         )
         git_ssh = (line_git_ssh or {}).get(spec.line_id)
+        machine_guard = machine_status_guards(
+            None if machine_status_file is None else machine_status_file(), workdir
+        )
         if driver.settings.engine == codex.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
                 raise EngineRefused(
@@ -1961,7 +2106,7 @@ def engine_factory(
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
                 protected=engine_protected,
-                write_protected=read_only,
+                write_protected=(*read_only, *machine_guard),
                 observe=spec.observe,
                 mark=spec.mark,
                 task_ended=spec.task_ended,
@@ -2062,9 +2207,9 @@ def engine_factory(
         merged = merge([project_sandbox, spec.config.sandbox])
         settings = engine_settings.merge([project_settings, spec.config.settings])
         if spec.config.workdir_access is WorkdirAccess.READ:
-            refusal = _claude_read_access_refusal(
-                spec.config, settings
-            ) or _claude_read_sandbox_refusal([project_sandbox, spec.config.sandbox])
+            refusal = claude_read_only_refusal(
+                spec.config, project_settings, project_sandbox
+            )
             if refusal is not None:
                 raise EngineRefused(refusal)
             # Merged last, so no layer can turn these off. The refusal above names a
@@ -2117,11 +2262,11 @@ def engine_factory(
         if enabled and git_ssh is not None:
             merged = merge([merged, sandbox_layer(git_ssh)])
         guarded = git_write_guards(workdir) if enabled else ()
-        guarded = (*guarded, *read_only)
+        guarded = (*guarded, *read_only, *machine_guard)
         # A line that loads project settings or plugins must not write what it loads.
         claude_dir = (workdir / ".claude",) if spec.config.project_settings else ()
         plugin_dirs = tuple(resolve_plugin(path) for path in spec.config.plugins)
-        write_protected = (*claude_dir, *plugin_dirs)
+        write_protected = (*claude_dir, *plugin_dirs, *machine_guard)
         guarded = (*guarded, *write_protected)
         line_temp: LineTemp | None = None
         if enabled:
@@ -2164,6 +2309,17 @@ def engine_factory(
                     settings,
                     engine_settings.parse_settings(
                         {"permissions": {"deny": _read_only_path_rules(read_only)}}
+                    ),
+                ]
+            )
+        if machine_guard:
+            # A rule for the file itself, since the directory rules the protected
+            # paths give match what lies under a path and not the path.
+            settings = engine_settings.merge(
+                [
+                    settings,
+                    engine_settings.parse_settings(
+                        {"permissions": {"deny": machine_status_rules(machine_guard)}}
                     ),
                 ]
             )
@@ -2387,6 +2543,11 @@ def compose_prompt(
         " recently messaged you."
     )
     return "\n".join(parts)
+
+
+TreeNow = str | readiness.ReadFailure | readiness.Uncovered
+"""A working directory's ``readiness.tree_digest``, or the fixed word for why git
+status could not be read, or for why the digest cannot tell a change."""
 
 
 class Scheduler:
@@ -2714,6 +2875,29 @@ class Scheduler:
         self._repeats: dict[str, str] = {}
         """Each undelivered message to a line that repeats an earlier one, and that
         earlier message, until the repeat is delivered."""
+        self._machine_path: Path | None = None
+        """The machine monitor's status file, or ``None`` to read none. **Round 16,
+        item 3.**"""
+        self._machine_read: tuple[float, machinestatus.MachineStatus] | None = None
+        """The latest read and when it was made, on the monotonic clock."""
+        self._machine_pending: _MachineRead | None = None
+        """The read a worker thread is making and has not finished, if any. A worker
+        that never returns stays here, so no second one is started."""
+        self._machine_reader: Callable[[Path, float], machinestatus.MachineStatus] = (
+            machinestatus.read
+        )
+        """What reads the file. A seam for tests, which makes a read that hangs."""
+        self._machine_untrusted_since: datetime | None = None
+        """When the monitor's file was first seen unusable in the present spell, a
+        stale one by its last sample, or ``None`` while the file is fresh or none is
+        configured. **Round 16 review, point 1.** In memory."""
+        self._machine_noted: set[str] = set()
+        """What has been told in the current deferral, the operator once as ``operator``
+        and each line as its own identifier, or the run kind as ``run``, so a deferral
+        notes once and not at every tick. Emptied when nothing defers. In memory."""
+        self._machine_deferred: dict[str, datetime] = {}
+        """When each line's turn was first deferred in the current deferral, for the
+        note its next prompt leads with."""
         self._disclosure: tuple[str, ...] = ()
         self._disclosure_accepted: dict[str, tuple[str, ...]] = {}
         """The project's disclosure terms, case folded. Never logged or returned."""
@@ -3204,6 +3388,242 @@ class Scheduler:
                 " operator's own. Restore the file, or restart the daemon so that"
                 " it checks the file again, before resuming the line"
             )
+
+    @property
+    def machine_status_file(self) -> Path | None:
+        """The monitor's status file, or ``None``. **Round 16 review, point 3.**"""
+        return self._machine_path
+
+    def set_machine_status(self, path: Path | None) -> None:
+        """Read the machine monitor's status file at ``path`` before each run and turn
+        starts, or read none for ``None``. Replaces the earlier path and forgets what
+        was read. **Round 16, item 3.**"""
+        self._machine_path = path
+        self._machine_read = None
+        self._machine_pending = None
+        self._machine_untrusted_since = None
+        self._machine_noted.clear()
+        self._machine_deferred.clear()
+
+    def machine_status(self) -> machinestatus.MachineStatus | None:
+        """The machine's status, as ``_read_machine_status`` gives it, with the spell
+        in which the file cannot be relied on kept for the notes that name it."""
+        status = self._read_machine_status()
+        if status is None or status.level in machinestatus.KNOWN_LEVELS:
+            self._machine_untrusted_since = None
+        elif status.level == "stale" and status.age_seconds is not None:
+            self._machine_untrusted_since = self._wall_clock() - timedelta(
+                seconds=status.age_seconds
+            )
+        elif self._machine_untrusted_since is None:
+            self._machine_untrusted_since = self._wall_clock()
+        return status
+
+    def _read_machine_status(self) -> machinestatus.MachineStatus | None:
+        """The machine's status, read at most once every ``MACHINE_READ_SECONDS``, or
+        ``None`` when no status file is configured. A file that is missing, stale or
+        unreadable is a status of its own, which counts as elevated, so a monitor
+        that stopped is seen and not mistaken for a healthy machine.
+
+        The read is made by a worker thread and the loop waits at most
+        ``MACHINE_WAIT_SECONDS`` for it, so a file on a mount that hangs cannot hold
+        the loop. Until a read that overran returns, the status is ``unreadable``,
+        and no second worker is started. **Porting note.** A Rust port makes the
+        read on a blocking task with a timeout, and a Keleusma one in a stream
+        processor of its own."""
+        if self._machine_path is None:
+            return None
+        now = self._clock()
+        pending = self._machine_pending
+        if pending is not None:
+            if not pending.finished.is_set():
+                kept = self._machine_read
+                return kept[1] if kept is not None else _OVERRAN
+            return self._take_machine_read(now, pending)
+        kept = self._machine_read
+        if kept is not None and 0 <= now - kept[0] < MACHINE_READ_SECONDS:
+            return kept[1]
+        pending = _MachineRead()
+        threading.Thread(
+            target=pending.run,
+            args=(
+                self._machine_reader,
+                self._machine_path,
+                self._wall_clock().timestamp(),
+            ),
+            name="machine-status",
+            daemon=True,
+        ).start()
+        self._machine_pending = pending
+        if pending.finished.wait(MACHINE_WAIT_SECONDS):
+            return self._take_machine_read(now, pending)
+        self._machine_read = (now, _OVERRAN)
+        return _OVERRAN
+
+    def _take_machine_read(
+        self, now: float, pending: "_MachineRead"
+    ) -> machinestatus.MachineStatus:
+        """The finished read, kept as the latest, with no read outstanding."""
+        status = pending.status
+        self._machine_pending = None
+        self._machine_read = (now, status)
+        return status
+
+    def machine_status_view(self) -> dict[str, object]:
+        """The machine's status as ``line_status`` gives it in detail, never the
+        file's path. **Round 16, item 3.**"""
+        status = self.machine_status()
+        if status is None:
+            return {"configured": False}
+        decision = machinestatus.decide(status)
+        # **Round 16 review, point 2.** The reasons and the problem are the monitor's
+        # text and reach a line here, so each is screened as a note is, and one that
+        # holds a listed term is withheld alone.
+        return {
+            "configured": True,
+            "level": status.level,
+            "acted_on_as": status.effective,
+            "age_seconds": status.age_seconds,
+            "reasons": [self._machine_screened(reason) for reason in status.reasons],
+            "problem": (
+                None
+                if status.problem is None
+                else self._machine_screened(status.problem)
+            ),
+            "monitor": self._monitor_trouble(status),
+            "defers_runs": decision.defer_runs,
+            "defers_turns": decision.defer_turns,
+        }
+
+    def machine_decision(self) -> machinestatus.Decision:
+        """What the machine's status allows now, which is everything when none is
+        configured. Forgets what a deferral told once nothing defers any more."""
+        status = self.machine_status()
+        decision = (
+            machinestatus.NO_DECISION
+            if status is None
+            else machinestatus.decide(status)
+        )
+        if not decision.defer_runs and not decision.defer_turns:
+            self._machine_noted.clear()
+        return decision
+
+    def _machine_words(self, status: machinestatus.MachineStatus) -> str:
+        """``status`` in a sentence, with its reasons withheld should one hold a term
+        of the disclosure list, since the file is the monitor's and its text is not
+        the project's own."""
+        text = status.describe()
+        return (
+            "the machine status cannot be shown here" if self.discloses(text) else text
+        )
+
+    def _machine_screened(self, text: str) -> str:
+        """``text`` of the monitor's file, or a placeholder when it holds a term of the
+        disclosure list."""
+        return MACHINE_WITHHELD if self.discloses(text) else text
+
+    def _monitor_trouble(self, status: machinestatus.MachineStatus) -> str | None:
+        """A sentence saying that the monitor looks stopped and how the operator
+        restores the gates, or ``None`` while the file is fresh. **Round 16 review,
+        point 1.** A file that is stale, missing or unreadable defers every run until
+        the monitor writes again, so a monitor that died closes every gate, and the
+        cause is named where the deferral is. A stale file is dated by its last
+        sample. A file first seen missing or unreadable is dated by the daemon's
+        first sight of it, since the daemon cannot know earlier."""
+        if status.level in machinestatus.KNOWN_LEVELS:
+            return None
+        since = self._machine_untrusted_since
+        when = (
+            "since a time it did not record"
+            if since is None
+            else (
+                f"since its last sample at {format_due(since)}"
+                if status.level == "stale"
+                else f"since the daemon first saw it so at {format_due(since)}"
+            )
+        )
+        return (
+            f"The machine monitor looks stopped or its file is {status.level}, {when}."
+            " Runs stay deferred until it writes a fresh status. The operator"
+            " restores them by restarting the monitor, or by removing"
+            " daemon.machine_status from the project file and reloading."
+        )
+
+    def _machine_cause(self, status: machinestatus.MachineStatus) -> str:
+        """The monitor's trouble as a sentence to append to a note, with a space first,
+        or nothing while the file is fresh."""
+        trouble = self._monitor_trouble(status)
+        return "" if trouble is None else f" {trouble}"
+
+    def _machine_run_refusal(self, line_id: str) -> str | None:
+        """Why a run of ``line_id`` is deferred by the machine's status, or ``None``.
+        Tells the operator once for the deferral. Nothing has started or been recorded
+        when it returns text."""
+        status = self.machine_status()
+        if status is None or not self.machine_decision().defer_runs:
+            return None
+        words = self._machine_words(status)
+        cause = self._machine_cause(status)
+        if "run" not in self._machine_noted:
+            self._machine_noted.add("run")
+            self._tell_operator(
+                line_id,
+                f"Dromon deferred a run of {line_id}, since {words}. It starts"
+                " nothing heavy until the status is ok again, and the line was told"
+                f" to wait and ask again.{cause}",
+            )
+        return (
+            f"the run is deferred, since {words}. Nothing was started. This machine"
+            " is shared, so wait with wake_after and start it again once"
+            f" machine-status says ok, and say in your report that you waited.{cause}"
+        )
+
+    def _note_turn_deferral(self, line_id: str) -> None:
+        """Tell the line and the operator, once each for the deferral, that a turn
+        waits on the machine's status. The line's note leads its next prompt's mail
+        and the line learns how long it waited from the prompt."""
+        status = self.machine_status()
+        if status is None:
+            return
+        words = self._machine_words(status)
+        cause = self._machine_cause(status)
+        self._machine_deferred.setdefault(line_id, self._wall_clock())
+        if line_id not in self._machine_noted:
+            self._machine_noted.add(line_id)
+            self._harness_note(
+                LineAddress(line_id),
+                f"Dromon deferred your turn, since {words}. It starts when the"
+                " status is no longer critical, and your mail waits until then."
+                f"{cause}",
+            )
+        if "operator" not in self._machine_noted:
+            self._machine_noted.add("operator")
+            self._tell_operator(
+                line_id,
+                f"Dromon deferred the turns of lines with mail waiting, starting with"
+                f" {line_id}, since {words}. No turn starts until the status is no"
+                f" longer critical.{cause}",
+            )
+
+    def _machine_notice(self, line_id: str) -> str | None:
+        """What a turn that proceeds is told of the machine's status, or ``None``. A
+        warning when the status is elevated, with the advice of the shared machine
+        rule, and how long the turn was deferred, when it was."""
+        status = self.machine_status()
+        deferred = self._machine_deferred.pop(line_id, None)
+        parts: list[str] = []
+        if deferred is not None:
+            waited = int((self._wall_clock() - deferred).total_seconds())
+            parts.append(f"Your turn was deferred for {waited} seconds by the status.")
+        if status is not None and machinestatus.decide(status).warn:
+            words = self._machine_words(status)
+            parts.append(
+                f"{words[:1].upper()}{words[1:]}. This machine is shared,"
+                " so start nothing heavy, such as a full gate, until it is ok, and"
+                " say so in your report if you wait. Your turn proceeds."
+                f"{self._machine_cause(status)}"
+            )
+        return "Dromon note: " + " ".join(parts) if parts else None
 
     def set_disclosure_accepted(self, entries: Mapping[str, tuple[str, ...]]) -> None:
         """Replace operator accepted occurrences on startup and reload."""
@@ -3896,6 +4316,38 @@ class Scheduler:
             "end_tasks": plan.end_tasks,
         }
 
+    def _restart_turn_ended(
+        self, line_id: str, report: TurnReport | None, *, asked: bool
+    ) -> None:
+        """Note the restart to ``line_id`` when a restart asked its turn to end, and
+        the turn's report names the restart as why it ended, and the turn did not
+        fail. Called once the turn's end is recorded, so the note is newer than it.
+
+        **Round 16, item 3.** A line whose turn a restart interrupted sat idle after
+        the restart until it was mailed. The note had been left only when the reason
+        last recorded for the turn's redirect was the restart's, so priority mail or
+        a change of access asked at a later safe point of the same turn, whose own
+        interrupt the engine ignores since it keeps the first reason, took the note
+        away. The gate is now the reason the report names. Inference, not observed,
+        that this was the path in the field.
+
+        **Round 16 review, finding 1.** Every engine records the first interrupt of
+        a turn and ignores any later one, so a report that names another reason,
+        such as a Pi turn past ``max_turns``, or none, was not ended by the restart,
+        though the ask was recorded at a safe point the engine still dispatched. Its
+        driver or the engine stopped it, and a note would wake a line that was
+        stopped for a reason of its own. The engine stop note, which does not wake,
+        tells it why. A turn that failed or raised gets no note either, since a note
+        would clear the failure, as any new mail does."""
+        if (
+            not asked
+            or report is None
+            or report.interrupted_for != restart.REASON
+            or line_id in self._failed
+        ):
+            return
+        self._note_restart(line_id)
+
     def _note_restart(self, line_id: str) -> None:
         """Leave ``line_id`` a note that a restart ended its turn, which wakes it once
         the restarted daemon runs, or in this daemon when the restart was abandoned."""
@@ -4544,16 +4996,39 @@ class Scheduler:
             return None
         return lease
 
-    def acquire_lease(self, line_id: str, name: str, note: str | None = None) -> str:
-        """Give ``line_id`` the lease ``name`` for the project's time to live, and
-        return when it expires. Raises ``LeaseRefused`` for an undeclared name, for a
-        lease another line holds, and for one the line holds already, so that one
-        acquisition lasts at most one time to live. The holder may acquire it again
-        once it has expired, by the wall clock."""
+    def acquire_lease(
+        self,
+        line_id: str,
+        name: str,
+        note: str | None = None,
+        seconds: int | None = None,
+    ) -> str:
+        """Give ``line_id`` the lease ``name`` for ``seconds``, or for the project's
+        time to live when it is ``None``, and return when it expires. Raises
+        ``LeaseRefused`` for an undeclared name, for a duration outside 60 seconds
+        to the project's time to live, for a lease another line holds, and for one
+        the line holds already, so that one acquisition lasts at most one time to
+        live. The holder may acquire it again once it has expired, by the wall clock.
+
+        **Round 16, item 2.** Every lease lasted the project's whole time to live,
+        so lines that asked for one hour and for four hours were each given the
+        project's limit. A line now asks for a duration up to that limit. The
+        duration is recorded on the lease as its ``expires``, which is
+        ``acquired_at`` plus the duration, so ``lease_acquired`` needs no new field
+        and a daemon from before this change reads every such lease."""
         if name not in self._lease_names:
             declared = ", ".join(sorted(self._lease_names)) or "none"
             raise LeaseRefused(
                 f"the project declares no lease {name!r}. Declared leases: {declared}"
+            )
+        duration = self._lease_ttl if seconds is None else seconds
+        if (
+            type(duration) is not int
+            or not MIN_LEASE_TTL_SECONDS <= duration <= self._lease_ttl
+        ):
+            raise LeaseRefused(
+                f"seconds must be a whole number from {MIN_LEASE_TTL_SECONDS} to"
+                f" {self._lease_ttl}, the project's limit for a lease"
             )
         held = self._live_lease(name)
         if held is not None and held.line_id == line_id:
@@ -4569,7 +5044,7 @@ class Scheduler:
         start = now.replace(microsecond=0)
         if start < now:
             start += timedelta(seconds=1)
-        expires = format_due(start + timedelta(seconds=self._lease_ttl))
+        expires = format_due(start + timedelta(seconds=duration))
         try:
             event = LeaseAcquired(name, line_id, format_due(start), expires, note)
         except InvalidField as error:
@@ -4602,6 +5077,7 @@ class Scheduler:
                 "holder": lease.line_id,
                 "acquired_at": lease.acquired_at,
                 "expires": lease.expires,
+                "seconds": _lease_seconds(lease),
             }
             if lease.note is not None:
                 entry[LEASE_NOTE_KEY] = lease.note
@@ -4624,6 +5100,7 @@ class Scheduler:
                     {
                         "leases": held,
                         "free": free,
+                        "limit_seconds": self._lease_ttl,
                         "caveat": LEASE_INVENTORY_CAVEAT,
                     },
                     indent=2,
@@ -4635,8 +5112,10 @@ class Scheduler:
             name=LIST_LEASES_TOOL_NAME,
             description=(
                 "List every live lease with its holder, when it was acquired, when it"
-                " expires and the holder's unverified note, and the declared leases"
-                " no line holds. Read only. " + LEASE_INVENTORY_CAVEAT
+                " expires, the seconds it was acquired for and the holder's"
+                " unverified note, the declared leases no line holds, and"
+                " limit_seconds, the longest a lease may be acquired for. Read only. "
+                + LEASE_INVENTORY_CAVEAT
             ),
             input_schema=LIST_LEASES_SCHEMA,
             handler=handler,
@@ -4648,7 +5127,13 @@ class Scheduler:
         for name in sorted(self._state().leases):
             lease = self._live_lease(name)
             if lease is not None and lease.line_id == line_id:
-                held.append({"name": name, "expires": lease.expires})
+                held.append(
+                    {
+                        "name": name,
+                        "expires": lease.expires,
+                        "seconds": _lease_seconds(lease),
+                    }
+                )
         return held
 
     def _lease_tool(self, line_id: str, acquire: bool) -> SdkMcpTool[Any]:
@@ -4660,17 +5145,20 @@ class Scheduler:
                 return _tool_error(unexpected)
             name: object = args.get("name")
             note: object = args.get("note")
+            seconds: object = args.get("seconds")
             if not isinstance(name, str):
                 return _tool_error("name must be text")
             if note is not None and not isinstance(note, str):
                 return _tool_error("note must be text")
+            if seconds is not None and type(seconds) is not int:
+                return _tool_error("seconds must be a whole number")
             if note is not None:
                 refusal = self.refuse_disclosed(line_id, ("note", note))
                 if refusal is not None:
                     return _tool_error(refusal)
             try:
                 if acquire:
-                    expires = self.acquire_lease(line_id, name, note)
+                    expires = self.acquire_lease(line_id, name, note, seconds)
                     return _tool_text(
                         f"you hold lease {name} until {expires}. Release it when"
                         " you are done."
@@ -4690,7 +5178,8 @@ class Scheduler:
                     "Acquire a lease the project declares, such as one for a shared"
                     " machine resource, before using that resource. It succeeds only"
                     " if no other line holds it, and otherwise says who does. It ends"
-                    " when you release it or when its time to live passes."
+                    " when you release it or when the seconds you asked for pass, or"
+                    " the project's limit when you asked for none."
                 ),
                 input_schema=ACQUIRE_LEASE_SCHEMA,
                 handler=handler,
@@ -4866,6 +5355,9 @@ class Scheduler:
                 f"previous must name the latest run, so you start one only after"
                 f" reading its record. The latest is {seen}"
             )
+        deferred = self._machine_run_refusal(line_id)
+        if deferred is not None:
+            raise runs.RunRefused(deferred)
         if self._report_dir is None:
             raise runs.RunRefused("this daemon has no report directory for receipts")
         directory = self._report_dir
@@ -4930,6 +5422,19 @@ class Scheduler:
             else await self._make_checkout(line_id, command, run_id, commit)
         )
         command_dir = None if checkout is None else checkout.tree
+        # Round 16, item 5. Read before the launch, so a change made while the run
+        # starts is a change after the tree it covers.
+        tree = (
+            None
+            if commit is not None
+            else await asyncio.to_thread(_tree_or_none, workdir)
+        )
+        # Round 16, item 3. The commit a run in a worktree ran, read before its
+        # command starts, so the receipt names it. A file read, as line_status does,
+        # and the worktree's own claim, as RunStarted.workdir_commit records.
+        head = None if commit is not None else read_head_commit(workdir)
+        if head is not None and COMMIT_PATTERN.fullmatch(head) is None:
+            head = None
         if checkout is not None:
             # A fresh private home, so the commit's code finds none of the
             # operator's settings, credentials or caches by its home. It is not a
@@ -4961,6 +5466,8 @@ class Scheduler:
                 format_due(self._wall_clock()),
                 commit,
                 None if command_dir is None else str(command_dir),
+                tree,
+                head,
             )
             try:
                 self._log.append(started)
@@ -5099,12 +5606,17 @@ class Scheduler:
             lambda: runs.signal_run(latest.started, self._run_start_of)
         )
 
-    def run_status(self, line_id: str) -> str:
+    def run_status(self, line_id: str, tree_now: TreeNow | None = None) -> str:
         """The latest runs of ``line_id``'s scope, newest first, with their
         receipts, and the commands the project declares. **Round 14, item 2.** A
         failed run names the run that corrected it, and that run names each it
         corrected, as ``runs.corrections`` links them, read from every run of the
-        scope, so a link to a run older than those shown is still named."""
+        scope, so a link to a run older than those shown is still named.
+
+        **Round 16, item 5.** ``tree_now`` is the working directory's
+        ``readiness.tree_digest`` read now, or why it could not be read, or ``None``
+        when it was not read. The latest run then says whether it still covers the
+        tree, as ``_tree_text`` words it."""
         scope = self._scope_runs(line_id)
         found = scope[-MAX_RUNS_SHOWN:]
         declared = ", ".join(sorted(self._run_commands)) or "none"
@@ -5137,6 +5649,7 @@ class Scheduler:
         # reason is read with the receipt. Older tails stay in the log and in the
         # runs view.
         lines[0] += _run_tail(found[-1])
+        lines[0] += _tree_text(found[-1].started, tree_now)
         return (
             f"previous is {found[-1].started.run_id}. Declared commands: {declared}.\n"
             + "\n".join(lines)
@@ -5391,12 +5904,15 @@ class Scheduler:
     ) -> tuple[str, str | None]:
         """The note and tail a run's end records, with its output's summary and tail
         screened against the disclosure list first. **Round 15 review, R1, the
-        operator's decision.** Either holding a term withholds both, and counts as a
-        failing check of ``line_id``, which started the run, as a tool's refusal
-        does, so a line cannot print candidates in a run's output to test them
-        outside the check's limit. A line that has spent its failing checks has both
-        withheld whatever they hold, so the withholding tells it nothing. A run of a
-        line no longer known is screened and nothing is counted."""
+        operator's decision.** Either holding a term counts as a failing check of
+        ``line_id``, which started the run, as a tool's refusal does, so a line cannot
+        print candidates in a run's output to test them outside the check's limit.
+        **Round 16, item 2.** Only the part that holds a term is withheld, so a clean
+        summary survives a tail whose traceback names paths under a user directory,
+        and both are withheld only when both hold one. A line that has spent its
+        failing checks has both withheld whatever they hold, so the withholding tells
+        it nothing. A run of a line no longer known is screened and nothing is
+        counted."""
         summary, tail = finding.summary, finding.tail
         if summary is None and tail is None:
             return finding.note, None
@@ -5407,12 +5923,26 @@ class Scheduler:
             or self._disclosure_reopens(line_id, now) is not None
         ):
             return runs.note_withheld(finding.note, runs.OUTPUT_WITHHELD_SPENT), None
-        texts = tuple(text for text in (summary, tail) if text is not None)
-        if not self.discloses(*texts):
+        summary_held = summary is not None and self.discloses(summary)
+        tail_held = tail is not None and self.discloses(tail)
+        if summary is not None and not summary_held:
+            # **Round 16 review, point 5.** A term can span the join of the note,
+            # or the notice, and the clean summary, which neither holds alone. The
+            # text the end will record is screened as well, and a summary that
+            # completes a term in it is withheld as one that holds a term.
+            lead = (
+                runs.note_withheld(finding.note, runs.TAIL_WITHHELD)
+                if tail_held
+                else finding.note
+            )
+            summary_held = self.discloses(runs.note_with_summary(lead, summary))
+        if not summary_held and not tail_held:
             return runs.note_with_summary(finding.note, summary), tail
         if known:
             matched = sum(
-                disclosure.matching_lines(self._disclosure, text) for text in texts
+                disclosure.matching_lines(self._disclosure, text)
+                for text, held in ((summary, summary_held), (tail, tail_held))
+                if text is not None and held
             )
             self._log.append(
                 DisclosureChecked(
@@ -5421,7 +5951,14 @@ class Scheduler:
                     min(max(matched, 1), MAX_DISCLOSURE_MATCHES),
                 )
             )
-        return runs.note_withheld(finding.note, runs.OUTPUT_WITHHELD), None
+        if summary_held and tail_held:
+            return runs.note_withheld(finding.note, runs.OUTPUT_WITHHELD), None
+        if summary_held:
+            return runs.note_withheld(finding.note, runs.SUMMARY_WITHHELD), tail
+        # Only the tail holds a term. Its notice leads, so a long summary after it
+        # cannot cut the notice off at the note's bound.
+        notice = runs.note_withheld(finding.note, runs.TAIL_WITHHELD)
+        return runs.note_with_summary(notice, summary), None
 
     def _withdraw_run_wakes(self, run_id: str) -> dict[str, str]:
         """Withdraw each pending wake that waits for the run ``run_id``, and return
@@ -5504,7 +6041,13 @@ class Scheduler:
             # recorded first, so a finished output is never shown as still running.
             if any(run.ended is None for run in self._scope_runs(line_id)):
                 await self.fresh_runs()
-            return _tool_text(self.run_status(line_id))
+            scope = self._scope_runs(line_id)
+            tree_now: TreeNow | None = None
+            if scope and scope[-1].started.tree is not None:
+                tree_now = await asyncio.to_thread(
+                    _tree_or_failure, Path(scope[-1].started.workdir)
+                )
+            return _tool_text(self.run_status(line_id, tree_now))
 
         async def stop(args: dict[str, Any]) -> dict[str, Any]:
             unexpected = _unexpected(args, STOP_RUN_SCHEMA)
@@ -5678,6 +6221,9 @@ class Scheduler:
             # Round 9 review, F1. The compaction is of the session the line no
             # longer resumes, so it says nothing of the session its next turn opens.
             return
+        # Round 16, item 7. A request made before this compaction is spent by it, as
+        # its wake is below. Kept, it compacted the session again in the next turn.
+        self._compact_requests.discard(line_id)
         if cause == "engine":
             # A compaction Dromon asked for came at the start of a turn whose prompt
             # already led with the brief. One the engine made by itself may have
@@ -6342,6 +6888,7 @@ class Scheduler:
             "cost_usd": self.cost_status(line_id),
             "provider_budget": self.provider_budget_status(line_id),
             "disclosure": self.disclosure_status(),
+            "machine_status": self.machine_status_view(),
             "leases": self.leases_of(line_id),
             "scheduled_wake": _scheduled_summary(pending),
             **summary(state, LineAddress(line_id), 0).counts(),
@@ -6796,7 +7343,8 @@ class Scheduler:
         """The stated budget of the line's provider, or an entry that says it is
         unknown. **Round 14, item 4.** Never ``None``."""
         engine = ENGINE_OF.get(self.model_of(line_id))
-        return _budget_entry(engine, self._budget_of(line_id))
+        now = self._wall_clock()
+        return _budget_entry(engine, self._budget_of(line_id, now), now)
 
     def disclosure_status(self) -> dict[str, object]:
         """Whether the project has a disclosure list, so a line learns early that
@@ -8244,6 +8792,114 @@ class Scheduler:
             handler=handler,
         )
 
+    def overview(self, line_id: str) -> dict[str, object]:
+        """One read-only view of ``line_id``'s task, checkpoint, leases, cost carried
+        and ceilings, for the line's ``overview`` tool and the operator's ``overview``
+        request. Raises ``EventRejected`` for an unknown line.
+
+        **Round 16, item 1.** Another project's lines read ``line_status``,
+        ``role_status`` and ``list_leases`` apart to learn these, and asked for one
+        view. Every part is taken from what those already answer, through the same
+        methods, so the overview says nothing they do not and records nothing. The
+        reads of one call share one copy of the state, as ``line_status`` does.
+        **Interpretation.** The other project's word checkpoint is read as what a
+        successor resumes from. That is the brief's stamped commits, the commits now
+        and, for a seat, the role's owner and its newest journal entry without its
+        body, which ``role_status`` gives. Bounded by ``MAX_OVERVIEW_BYTES``, as
+        ``_bounded_overview`` makes sure."""
+        if line_id not in self._state().lines:
+            raise EventRejected(f"no line {line_id}")
+        if self._snapshot is not None:
+            return _bounded_overview(self._overview(line_id))
+        self._snapshot = (self._log.last_seq, self._log.state)
+        try:
+            return _bounded_overview(self._overview(line_id))
+        finally:
+            self._snapshot = None
+
+    def _overview(self, line_id: str) -> dict[str, object]:
+        state = self._state()
+        line = state.lines[line_id]
+        limits = self.limits_for(line_id)
+        cost = self.cost_status(line_id)
+        commits = self.commits(line_id)
+        leases = self.leases_of(line_id)
+        return {
+            "line_id": line_id,
+            "condition": self.condition(line_id),
+            "hold_cause": _hold_cause(line),
+            "task": _compact_brief(self._brief_status(line_id)),
+            "checkpoint": {
+                "workdir_commit": commits["workdir"],
+                "daemon_commit": commits["daemon"],
+                "daemon_stale": commits["stale"],
+                "role": self._overview_role(state, line_id),
+            },
+            "leases": leases[:MAX_OVERVIEW_LEASES],
+            "leases_omitted": max(0, len(leases) - MAX_OVERVIEW_LEASES),
+            "cost": {
+                "since_release_usd": cost["estimate"],
+                "basis": cost["basis"],
+                "carried": cost["whole"],
+            },
+            "ceilings": {
+                "autonomous_turns": {
+                    "used": self._autonomous.get(line_id, 0),
+                    "allowed": limits.max_autonomous_turns,
+                },
+                "cost_usd": {
+                    "limit": cost["limit"],
+                    "enforced": cost["limit_enforced"],
+                },
+                "provider_budget": self.provider_budget_status(line_id),
+                "lease_seconds": self._lease_ttl,
+            },
+            "sources": OVERVIEW_SOURCES,
+        }
+
+    def _overview_role(self, state: State, line_id: str) -> dict[str, object] | None:
+        """The role part of an overview, or ``None`` for a line that is no seat: the
+        role, its owner and its newest journal entry without the body. The entries
+        are scanned once, as ``role_view`` scans them."""
+        seat = state.seats.get(line_id)
+        if seat is None:
+            return None
+        role = state.roles[seat.role_id]
+        newest: RoleNoted | None = None
+        for entry in state.role_entries.values():
+            if entry.role_id == seat.role_id:
+                newest = entry
+        return {
+            "role_id": seat.role_id,
+            "owner": role.owner,
+            "you_own": role.owner == line_id,
+            "newest_entry": (
+                None if newest is None else _entry_view(newest, with_body=False)
+            ),
+        }
+
+    def overview_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The read-only ``overview`` tool for ``line_id``. Round 16, item 1."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, OVERVIEW_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            return _tool_text(
+                json.dumps(self.overview(line_id), indent=2, sort_keys=True)
+            )
+
+        return SdkMcpTool(
+            name=OVERVIEW_TOOL_NAME,
+            description=(
+                "Show one read-only view of your task, checkpoint, leases held, cost"
+                " carried across releases and ceilings, joined from what line_status,"
+                " role_status and list_leases answer. It records nothing."
+            ),
+            input_schema=OVERVIEW_SCHEMA,
+            handler=handler,
+        )
+
     def role_status(self, line_id: str) -> dict[str, object]:
         """What a seat may know of its role: the worktree, the owner and the latest
         change of owner, each seat's condition, engine and its provider's stated
@@ -8284,10 +8940,11 @@ class Scheduler:
             raise EventRejected(f"no role {role_id}")
         seats: list[dict[str, object]] = []
         usable = self.usable_seats(role_id)
+        now = self._wall_clock()
         for seat_id in seat_order(state, role_id):
             other = state.seats[seat_id]
             engine = ENGINE_OF.get(self.model_of(seat_id))
-            budget = self._budget_of(seat_id)
+            budget = self._budget_of(seat_id, now)
             seats.append(
                 {
                     "line_id": seat_id,
@@ -8300,7 +8957,7 @@ class Scheduler:
                     "waits_unconfined": self.waits_unconfined(seat_id),
                     "model": self.model_of(seat_id),
                     "provider": engine,
-                    "budget": _budget_entry(engine, budget),
+                    "budget": _budget_entry(engine, budget, now),
                     "cost_whole": self.whole_cost(seat_id),
                     "workdir_commit": self._workdir_commit(seat_id),
                     "recent_tasks": [
@@ -9844,7 +10501,7 @@ class Scheduler:
         self._log.append(event)
         return {
             "provider": provider,
-            **_budget_view(event),
+            **_budget_view(event, self._wall_clock()),
             "followed": self._budget_followed(event),
         }
 
@@ -9861,7 +10518,7 @@ class Scheduler:
             budgets.append(
                 {
                     "provider": provider,
-                    **_budget_view(budget),
+                    **_budget_view(budget, now),
                     "spent": budget_spent(budget, now),
                 }
             )
@@ -10561,6 +11218,7 @@ class Scheduler:
             self.list_leases_tool(line_id),
             *self._run_tools(line_id),
             self.line_status_tool(line_id),
+            self.overview_tool(line_id),
             self.read_instructions_tool(line_id),
             self.write_scratch_tool(line_id),
             self.check_disclosure_tool(line_id),
@@ -11002,6 +11660,20 @@ class Scheduler:
             + (f" the operators are {known}" if known else " there are none")
         )
 
+    def default_sender(self) -> OperatorAddress:
+        """The operator an operator's ``send`` speaks for when it names none, the one
+        ``@operator`` names, as ``resolve_operator`` reads it, so a line's reply to
+        ``@operator`` reaches the mailbox the note came from.
+
+        **Round 16, item 7.** ``dromon send`` without ``--operator`` sent as the login
+        name, while ``@operator`` names the project's ``daemon.operator``, so a line
+        told to mail ``@operator`` could not thread its reply where they differed.
+        Unlike ``resolve_operator`` it never refuses, since ``send`` registers its
+        sender."""
+        if OPERATOR_ALIAS in self._state().operators:
+            return OperatorAddress(OPERATOR_ALIAS)
+        return self._default_operator
+
     def _operator_for(self, line_id: str, to: str | None) -> OperatorAddress:
         if to is not None:
             address = parse_address(to)
@@ -11322,16 +11994,25 @@ class Scheduler:
             self._ensure_context_compaction_wake(line_id)
         if self._running or self._sent or self._due_wakes():
             return True
+        deferring = self.machine_decision().defer_turns
         return any(
-            self._eligible(line_id) and self._may_wake(line_id)
+            self._eligible(line_id)
+            and self._may_wake(line_id)
+            and not (deferring and self._turn_deferral_told(line_id))
             for line_id in self._state().lines
         )
+
+    def _turn_deferral_told(self, line_id: str) -> bool:
+        """Whether the current deferral has told ``line_id`` and the operator, so a
+        deferred line no longer keeps the loop ticking. The loop's rest, at most
+        ``MAX_REST_SECONDS``, then reads the status again. **Round 16, item 3.**"""
+        return line_id in self._machine_noted and "operator" in self._machine_noted
 
     def _may_wake(self, line_id: str) -> bool:
         """Whether the line has post office mail that may start its turn. Peer mail
         past its peer's turn allowance waits without keeping the loop ticking, and
-        the loop's rest, at most ``MAX_REST_SECONDS``, finds it once the hour
-        allows."""
+        bounded maintenance inspection finds it once the hour allows, even with
+        zero tick cadence."""
         messages = self.deliverable(line_id)
         return bool(messages) and self.peer_turns.may_wake(
             line_id, (message for _, message in messages)
@@ -11448,6 +12129,9 @@ class Scheduler:
         if self._nothing_new(line_id, messages):
             self._deliver_without_turn(messages)
             return
+        if self.machine_decision().defer_turns:
+            self._note_turn_deferral(line_id)
+            return
         self._begin_turn(line_id, messages)
 
     async def run(self, stop: asyncio.Event) -> None:
@@ -11456,6 +12140,7 @@ class Scheduler:
         on, so the scheduler neither dies nor spins."""
         try:
             while not stop.is_set():
+                self._work.clear()
                 if self._work_waiting():
                     try:
                         self.step()
@@ -11470,35 +12155,52 @@ class Scheduler:
                                 stop.wait(),
                                 max(SECRETS_RETRY_SECONDS, self._tick_seconds),
                             )
-                    elif self._tick_seconds:
-                        with contextlib.suppress(TimeoutError):
-                            await asyncio.wait_for(stop.wait(), self._tick_seconds)
-                    else:
-                        await asyncio.sleep(0)
-                    continue
-                self._work.clear()
-                # Each rest, at most MAX_REST_SECONDS apart, also sweeps the launch
-                # records of launchers that exited between turns. Review N1.
-                try:
-                    with self._refusing_on_secrets("the sweep of left processes"):
-                        self.collect_left()
-                    self.note_stuck_starts()
-                except Exception as error:  # noqa: BLE001
-                    await self._fault_found(error, stop)
-                    continue
+                        continue
+                else:
+                    # A rest also sweeps records of launchers that exited between turns.
+                    try:
+                        with self._refusing_on_secrets("the sweep of left processes"):
+                            self.collect_left()
+                        self.note_stuck_starts()
+                    except Exception as error:  # noqa: BLE001
+                        await self._fault_found(error, stop)
+                        continue
+                until = self.seconds_until_next_wake()
+                timeouts = [] if until is None else [min(until, MAX_REST_SECONDS)]
+                if self._tick_seconds > 0:
+                    timeouts.append(min(self._tick_seconds, MAX_REST_SECONDS))
+                # Launch records and peer allowance expiry are maintenance work.
+                # Their bounded inspection remains due even with no periodic ticks.
+                if self._report_dir is not None or self._post_office:
+                    timeouts.append(MAX_REST_SECONDS)
+                # Mail already in the post office may need another tick to reach
+                # its wake cadence. Advance only while that mail can make progress.
+                for line_id in self._state().lines:
+                    if not (self._eligible(line_id) and self._may_wake(line_id)):
+                        continue
+                    ended = self._last_turn_end.get(line_id)
+                    remaining = (
+                        0.0
+                        if ended is None
+                        else self.limits_for(line_id).cooldown_seconds
+                        - (self._clock() - ended)
+                    )
+                    if remaining > 0 and not self._priority_waiting(line_id):
+                        timeouts.append(remaining)
+                    elif self._tick_seconds == 0:
+                        self._work.set()
                 worker = asyncio.create_task(self._work.wait())
                 stopping = asyncio.create_task(stop.wait())
-                # Rest until work arrives, or until the next scheduled wake falls due.
-                until = self.seconds_until_next_wake()
-                await asyncio.wait(
-                    {worker, stopping},
-                    timeout=MAX_REST_SECONDS
-                    if until is None
-                    else min(until, MAX_REST_SECONDS),
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                worker.cancel()
-                stopping.cancel()
+                try:
+                    await asyncio.wait(
+                        {worker, stopping},
+                        timeout=min(timeouts) if timeouts else None,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    worker.cancel()
+                    stopping.cancel()
+                    await asyncio.gather(worker, stopping, return_exceptions=True)
         finally:
             for watcher in list(self._pid_watchers.values()):
                 watcher.cancel()
@@ -11717,6 +12419,9 @@ class Scheduler:
             behind = self._behind_notice(line_id)
             if behind is not None:
                 prompt = f"{behind}\n\n{prompt}"
+            machine = self._machine_notice(line_id)
+            if machine is not None:
+                prompt = f"{machine}\n\n{prompt}"
             moved = self._head_notice(line_id)
             if moved is not None:
                 prompt = f"{moved}\n\n{prompt}"
@@ -11786,6 +12491,7 @@ class Scheduler:
         stop_cause: str | None = None
         engine: LineEngine | None = None
         started = False
+        closing_error: BaseException | None = None
         failure: tuple[FailureCause, str | None] | None = None
         mailed = self._operator_mail(line_id)
         sent = self._line_mail(line_id)
@@ -11834,8 +12540,6 @@ class Scheduler:
             redirected = self._redirected.get(line_id)
             if redirected is not None and report.interrupted_for == redirected:
                 ending += f", ended at a safe point for {redirected}"
-                if redirected == restart.REASON:
-                    self._note_restart(line_id)
             elif report.interrupted_for is not None:
                 stop_cause = f"The driver interrupted it for {report.interrupted_for}."
                 ending += f", interrupted by its driver: {report.interrupted_for}"
@@ -11880,8 +12584,9 @@ class Scheduler:
             self._failed.add(line_id)
             if isinstance(error, EngineRefused):
                 stop_cause = str(error)
-            ending = f"failed: {error}"
+            ending = "failed"
             failed = True
+            closing_error = error
             failure = raised_failure(
                 error,
                 started=started,
@@ -11889,7 +12594,7 @@ class Scheduler:
                 interrupted=line_id in self._interrupted,
             )
             breached = isinstance(error, ConfinementBreach)
-            print(f"dromond: line {line_id} turn failed: {error}", file=sys.stderr)
+            print(f"dromond: line {line_id} turn failed", file=sys.stderr)
         finally:
             self._end_token(line_id, engine)
             self.collect_left()
@@ -11900,6 +12605,7 @@ class Scheduler:
             self._redirect_for.pop(line_id, None)
             self._redirected.pop(line_id, None)
             self._role_redirect.pop(line_id, None)
+            asked = line_id in self._restart_asked
             self._restart_asked.discard(line_id)
             # A compaction the engine did not report leaves no cause for a later one.
             self._compaction_cause.pop(line_id, None)
@@ -11920,7 +12626,8 @@ class Scheduler:
                 # Round 8 review, ON1. With no report the prompt may never have
                 # reached the engine, as when it could not be composed, so the turn
                 # retires none of the notes delivered into it.
-                self._end_turn(line_id, report, failure)
+                self._end_turn(line_id, report, failure, closing_error)
+                self._restart_turn_ended(line_id, report, asked=asked)
             if stop_cause is not None and line is not None:
                 self._note_engine_stop(line_id, stop_cause)
             # A handoff asked for in the turn takes effect now that it has ended,
@@ -11938,11 +12645,30 @@ class Scheduler:
             self._hold_failed(line_id, ending, breached)
         self.fail_over_if_unable(line_id)
 
+    def _closing_reason(self, line_id: str, error: BaseException | None) -> str | None:
+        """Keep only a bounded, screened diagnostic. Screening failure withholds it.
+
+        Screen the complete masked first line before truncating, so neither a
+        credential nor a disclosure term can survive as a cut prefix. Automatic
+        diagnostics do not consume the line's scratch screening allowance.
+        """
+        if error is None:
+            return None
+        try:
+            text = redact.mask(self._log.scrub_text(str(error).split("\n", 1)[0]))
+            text = "".join(char if char.isprintable() else " " for char in text)
+            if self.discloses(type(error).__name__, text):
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        return text[:240] or None
+
     def _end_turn(
         self,
         line_id: str,
         report: TurnReport | None,
         failure: tuple[FailureCause, str | None] | None,
+        closing_error: BaseException | None = None,
     ) -> None:
         """Record ``line_turn_ended`` for a turn of ``line_id``, with the cause of its
         failure if it failed, and write that cause to the daemon log. **Round 15
@@ -11951,6 +12677,11 @@ class Scheduler:
         failed = line_id in self._failed
         if failed and failure is None:
             failure = (FailureCause.UNKNOWN, None)
+        closing_reason = (
+            self._closing_reason(line_id, closing_error) if failed else None
+        )
+        if closing_error is not None and closing_reason is None and failure is not None:
+            failure = (failure[0], None)
         self._log.append(
             LineTurnEnded(
                 line_id,
@@ -11959,6 +12690,7 @@ class Scheduler:
                 True if failed else None,
                 failure[0] if failed and failure is not None else None,
                 failure[1] if failed and failure is not None else None,
+                closing_reason,
             )
         )
         if failed and failure is not None:
@@ -12346,7 +13078,13 @@ class Scheduler:
         and how, and not their contents, so a line's edits inside a file already
         dirty do not flag the brief, while a new dirty path, a path made clean, or
         work discarded does. A line whose own work flagged it clears the flag by
-        setting the brief again."""
+        setting the brief again.
+
+        **Round 16, item 4, at the review line's request.** Each notice names the
+        commit the brief was set at and the worktree's ``HEAD``, or says that one of
+        them is not known, so a line can read the log between them without first
+        finding either. A notice whose reason already names both does not repeat
+        them."""
         brief = self._state().briefs.get(line_id)
         if brief is None or self.effective_config(line_id).fresh_session_each_turn:
             return None
@@ -12381,20 +13119,43 @@ class Scheduler:
                 " possibly stale, and check it against git status yourself."
             )
         )
+        if not reasons and unknown is None:
+            return None
+        commits = (
+            ""
+            if moved and not led_brief
+            else f" {self._brief_commits(brief.workdir_commit, head)}"
+        )
         if not reasons:
-            if unknown is None:
-                return None
             return (
                 f"BRIEF CURRENCY UNKNOWN. Your standing brief was set at"
-                f" {brief.set_at}. {unknown}"
+                f" {brief.set_at}.{commits} {unknown}"
             )
         stale = (
             f"STALE BRIEF. Your standing brief, set at {brief.set_at}, was set before"
             f" {' and '.join(reasons)}, so it may not describe your current task."
-            " Check it against git log, git status and your mail before acting on"
-            " it, and set it again with set_brief, which clears this notice."
+            f"{commits} Check it against git log, git status and your mail before"
+            " acting on it, and set it again with set_brief, which clears this"
+            " notice."
         )
         return stale if unknown is None else f"{stale} {unknown}"
+
+    @staticmethod
+    def _brief_commits(named: str, head: str | None) -> str:
+        """One sentence naming the commit a brief was set at and the worktree's
+        ``HEAD``, each shortened as the notices shorten commits, or saying which is
+        not known. **Round 16, item 4.**"""
+        brief_at = (
+            f"was set at commit {named[:12]}"
+            if named
+            else "names no commit, since the daemon could not read one when it was set"
+        )
+        now = (
+            f"your worktree's HEAD is {head[:12]}"
+            if head is not None
+            else "your worktree's HEAD could not be read"
+        )
+        return f"The brief {brief_at}, and {now}."
 
     def _mail_since_brief(self, line_id: str, brief: BriefSet) -> str:
         """One sentence for the brief's lead when an operator mailed ``line_id``
@@ -13262,6 +14023,7 @@ class Scheduler:
         error: Exception | None = None
         ending = "cancelled"
         failed = False
+        closing_error: BaseException | None = None
         failure: tuple[FailureCause, str | None] | None = None
         engine = self._engines.get(line_id)
         try:
@@ -13283,7 +14045,8 @@ class Scheduler:
                 else:
                     self._failed.add(line_id)
                     failed = True
-                    ending = f"failed: {error}"
+                    ending = "failed"
+                    closing_error = error
                     failure = raised_failure(
                         error,
                         started=True,
@@ -13291,7 +14054,7 @@ class Scheduler:
                         interrupted=line_id in self._interrupted,
                     )
                     print(
-                        f"dromond: line {line_id} self-started turn failed: {error}",
+                        f"dromond: line {line_id} self-started turn failed",
                         file=sys.stderr,
                     )
             elif report is not None:
@@ -13306,8 +14069,6 @@ class Scheduler:
                 redirected = self._redirected.get(line_id)
                 if redirected is not None and report.interrupted_for == redirected:
                     ending += f", ended at a safe point for {redirected}"
-                    if redirected == restart.REASON:
-                        self._note_restart(line_id)
                 elif report.interrupted_for is not None:
                     ending += f", interrupted by its driver: {report.interrupted_for}"
                 elif turn_outcome(report) == FAILED:
@@ -13331,7 +14092,8 @@ class Scheduler:
             error = unexpected
             self._failed.add(line_id)
             failed = True
-            ending = f"failed: {unexpected}"
+            ending = "failed"
+            closing_error = unexpected
             failure = raised_failure(
                 unexpected,
                 started=True,
@@ -13339,7 +14101,7 @@ class Scheduler:
                 interrupted=line_id in self._interrupted,
             )
             print(
-                f"dromond: line {line_id} self-started turn failed: {unexpected}",
+                f"dromond: line {line_id} self-started turn failed",
                 file=sys.stderr,
             )
         finally:
@@ -13351,6 +14113,7 @@ class Scheduler:
             self._redirect_for.pop(line_id, None)
             self._redirected.pop(line_id, None)
             self._role_redirect.pop(line_id, None)
+            asked = line_id in self._restart_asked
             self._restart_asked.discard(line_id)
             self.activity.record(line_id, ActivityKind.TURN_ENDED, ending)
             line = self._state().lines.get(line_id)
@@ -13362,7 +14125,8 @@ class Scheduler:
             if line is not None:
                 # Round 8 review, ON1, as in ``_turn``. An engine turn that failed or
                 # was cancelled before it reported retires none of its task notes.
-                self._end_turn(line_id, report, failure)
+                self._end_turn(line_id, report, failure, closing_error)
+                self._restart_turn_ended(line_id, report, asked=asked)
             self._settle_relinquish(line_id)
             self._work.set()
         self._apply_limits(line_id, TurnCause.AUTONOMOUS, True, report)
@@ -14054,6 +14818,35 @@ def _brief_fields(brief: BriefSet) -> dict[str, object]:
     }
 
 
+def _overview_size(view: dict[str, object]) -> int:
+    """The bytes ``view`` takes as the ``overview`` tool gives it."""
+    return len(json.dumps(view, indent=2, sort_keys=True).encode())
+
+
+def _bounded_overview(view: dict[str, object]) -> dict[str, object]:
+    """``view`` within ``MAX_OVERVIEW_BYTES``. **Round 16, item 1.** Each part is
+    bounded where it is built, so the steps below are a guard for a part whose bound
+    a later change raises. The brief's text goes first, then the leases, each
+    replaced by a sentence naming the tool that gives it whole, and what is left is
+    of fixed size. Raises ``AssertionError`` if even that passes the bound, which
+    would be a defect and not a property of any line."""
+    if _overview_size(view) <= MAX_OVERVIEW_BYTES:
+        return view
+    task = view.get("task")
+    if isinstance(task, dict):
+        cut = dict(cast(dict[str, object], task))
+        cut["untrusted_data"] = None
+        cut["cut"] = "the overview passed its bound, and line_status gives the brief"
+        view = {**view, "task": cut}
+    if _overview_size(view) > MAX_OVERVIEW_BYTES:
+        leases = cast(list[object], view["leases"])
+        omitted = cast(int, view["leases_omitted"]) + len(leases)
+        view = {**view, "leases": [], "leases_omitted": omitted}
+    if _overview_size(view) > MAX_OVERVIEW_BYTES:
+        raise AssertionError("an overview passed its bound with its lists removed")
+    return view
+
+
 def _compact_brief(brief: object) -> dict[str, object] | None:
     """A standing brief as the compact ``line_status`` gives it, its task and next
     action cut short, so the default view stays within its bound. The detailed view
@@ -14121,6 +14914,7 @@ def failure_view(line: Line) -> dict[str, object] | None:
     return {
         "cause": (line.last_failure or FailureCause.UNKNOWN).value,
         "error_class": line.last_failure_class,
+        "closing_reason": line.last_closing_reason,
         "current": line.failed,
     }
 
@@ -14128,6 +14922,14 @@ def failure_view(line: Line) -> dict[str, object] | None:
 def _lease_live(lease: LeaseAcquired, now: datetime) -> bool:
     """Whether ``lease`` is still held at ``now``, by its expiry."""
     return parse_due(lease.expires) > now
+
+
+def _lease_seconds(lease: LeaseAcquired) -> int:
+    """The whole seconds ``lease`` was acquired for, from its two recorded times.
+    **Round 16, item 2.** A lease acquired before durations could be asked for
+    gives the project's time to live then, which is what it was given."""
+    held = parse_due(lease.expires) - parse_due(lease.acquired_at)
+    return int(held.total_seconds())
 
 
 def _live_leases_by_line(state: State, now: datetime) -> dict[str, list[str]]:
@@ -14538,11 +15340,18 @@ def _scheduled_summary(pending: ScheduledWake | None) -> dict[str, object] | Non
     return {"due": pending.due, "message_id": pending.message_id}
 
 
-def _budget_view(budget: BudgetStated) -> dict[str, object]:
+def _budget_view(budget: BudgetStated, now: datetime) -> dict[str, object]:
     """A provider's stated budget as ``role_status`` gives it, with its source and
     time, since it is a snapshot. A field the statement left out says ``unknown`` and
-    is never ``None``. **Round 14, item 4.**"""
+    is never ``None``. **Round 14, item 4.**
+
+    **Round 16, item 6, from another project's reports.** A figure carried forward
+    without its time could not be told from a fresh one, so beside the figure stand
+    ``observed_at``, the time it was stated or reported, and its age at ``now``, in
+    whole seconds and in words. ``stated_at`` is kept, with the same value, for the
+    clients that read it."""
     percent = budget.remaining_percent
+    seconds, words = _age_of(budget.stated_at, now)
     return {
         "status": "stated",
         "provider": budget.provider,
@@ -14551,17 +15360,50 @@ def _budget_view(budget: BudgetStated) -> dict[str, object]:
         "source": budget.source.value,
         "note": budget.note,
         "stated_at": budget.stated_at,
+        "observed_at": budget.stated_at,
+        "age_seconds": seconds,
+        "age": words,
     }
 
 
+def _age_of(observed_at: str, now: datetime) -> tuple[int | str, str]:
+    """How long before ``now`` the instant ``observed_at`` was, in whole seconds
+    and in words, or ``unknown`` for both when it cannot be read. **Round 16, item
+    6.** An instant after ``now``, as when the daemon's clock was set back, is not
+    given as an age of zero, which would read as fresh, and says so instead."""
+    try:
+        observed = parse_due(observed_at)
+    except InvalidField:
+        return UNKNOWN, UNKNOWN
+    seconds = int((now - observed).total_seconds())
+    if seconds < 0:
+        return (
+            seconds,
+            "observed after the daemon's current time, so its age is unknown",
+        )
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    parts = [
+        f"{count} {unit}{'' if count == 1 else 's'}"
+        for count, unit in ((days, "day"), (hours, "hour"), (minutes, "minute"))
+        if count
+    ]
+    return seconds, (
+        "observed less than a minute ago"
+        if not parts
+        else f"observed {' '.join(parts)} ago"
+    )
+
+
 def _budget_entry(
-    provider: str | None, budget: BudgetStated | None
+    provider: str | None, budget: BudgetStated | None, now: datetime
 ) -> dict[str, object]:
     """The budget entry for a provider: the statement, or a named entry that says no
     budget is known. Dromon takes no action on a budget it does not know, so a role
     never moves on it. **Round 14, item 4.**"""
     if budget is not None:
-        return _budget_view(budget)
+        return _budget_view(budget, now)
     return {
         "status": UNKNOWN,
         "provider": UNKNOWN if provider is None else provider,
@@ -14573,6 +15415,9 @@ def _budget_entry(
             " left and moves no role on it. dromon budget set states one"
         ),
         "stated_at": UNKNOWN,
+        "observed_at": UNKNOWN,
+        "age_seconds": UNKNOWN,
+        "age": UNKNOWN,
     }
 
 
@@ -14775,6 +15620,8 @@ def _run_view(
         "previous": started.previous,
         "commit": started.commit,
         "checkout": started.checkout,
+        "tree": started.tree,
+        "workdir_commit": started.workdir_commit,
         "workdir": started.workdir,
         "output_file": started.output_file,
         "pid": started.pid,
@@ -14794,10 +15641,84 @@ def _run_view(
     }
 
 
+def _tree_or_none(directory: Path) -> str | None:
+    """``readiness.tree_digest`` of ``directory``, or ``None`` where it cannot be
+    read, so a run starts whether or not its tree can be read. Blocking."""
+    found = _tree_or_failure(directory)
+    # A failure word is a ``StrEnum``, and so also a ``str``, so it is tested first.
+    return (
+        None
+        if isinstance(found, (readiness.ReadFailure, readiness.Uncovered))
+        else found
+    )
+
+
+def _tree_or_failure(directory: Path) -> TreeNow:
+    """``readiness.tree_digest`` of ``directory``, or the fixed word for why it
+    cannot be read or cannot tell a change. Blocking."""
+    try:
+        return readiness.tree_digest(directory)
+    except readiness.ReadinessUnknown as error:
+        return error.cause
+    except readiness.TreeUncovered as error:
+        return error.cause
+
+
+def _tree_text(started: RunStarted, tree_now: TreeNow | None) -> str:
+    """Whether the run ``started`` still covers its working directory, for the
+    latest run in ``run_status``, or nothing. **Round 16, item 5, core's request
+    of round 15.** A gate that passed was read as covering the tree after tracked
+    files had changed. A commit run covers its commit and says nothing here. A run
+    recorded with no tree, before the field or where the tree could not be read as
+    it started, says that its coverage is unknown. The comparison is as
+    ``readiness.tree_digest`` describes, with its residuals."""
+    if started.commit is not None:
+        return ""
+    if started.tree is None:
+        return (
+            ". It recorded no digest of the tree as it started, so whether it covers"
+            " the tree now is unknown"
+        )
+    if tree_now is None:
+        return ""
+    if isinstance(tree_now, readiness.ReadFailure):
+        return (
+            ". Whether it still covers the tree is unknown, since git status could"
+            f" not be read now, for the reason {tree_now.value}"
+        )
+    if isinstance(tree_now, readiness.Uncovered):
+        # Round 16 review, findings 3 and 4. A digest an edit could leave as it
+        # was is not compared, so the run is not read as covering the tree.
+        return (
+            ". Whether it still covers the tree is unknown, since the tree's changed"
+            " files cannot all be compared now, for the reason"
+            f" {tree_now.value}"
+        )
+    if tree_now == started.tree:
+        return (
+            ". The tree is as it was when it started, as far as HEAD and the status,"
+            " size and time of each changed tracked file show. Untracked files are"
+            " not compared"
+        )
+    return (
+        ". IT NO LONGER COVERS THE TREE, since HEAD or a tracked file changed after"
+        " it started. Run it again before reporting its result for the current tree"
+    )
+
+
 def _run_line(run: Run) -> str:
     """One run as a line reads it, with its receipt once it has ended."""
     started = run.started
-    on = "" if started.commit is None else f" on commit {started.commit}"
+    on = (
+        f" on commit {started.commit}"
+        if started.commit is not None
+        # Round 16, item 3. The receipt names the commit a worktree run ran, as
+        # the worktree's own claim after the review of 16de365.
+        else f" in its worktree at commit {started.workdir_commit}, as the"
+        f" worktree's own {WORKDIR_HEAD_CLAIM}, with any uncommitted changes"
+        if started.workdir_commit is not None
+        else ""
+    )
     head = (
         f"run {started.run_id} of {started.command}{on} by line {started.line_id},"
         f" started {started.started_at}, output {started.output_file} in"

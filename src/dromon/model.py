@@ -929,7 +929,17 @@ class LineTurnEnded:
     ``failure``, as ``check_failure_class`` bounds it, given only with ``failure``
     and only where one exists."""
 
+    closing_reason: str | None = None
+    """Credential-masked and disclosure-screened first exception line, at most
+    240 characters. Absent on old events or when screening withholds it."""
+
     def __post_init__(self) -> None:
+        if self.closing_reason is not None and (
+            self.failure is None
+            or len(self.closing_reason) > 240
+            or any(ord(char) < 32 or ord(char) == 127 for char in self.closing_reason)
+        ):
+            raise InvalidField("invalid closing_reason")
         check_id("line_id", self.line_id)
         if self.workdir_commit is not None:
             check_commit("workdir_commit", self.workdir_commit)
@@ -2308,14 +2318,48 @@ class RunStarted:
     """The absolute directory the command of a commit run ran in, the daemon's
     detached checkout of ``commit``, given exactly when ``commit`` is. ``workdir``
     then holds only the output file."""
+    tree: str | None = None
+    """**Round 16, item 5.** The SHA-256 ``readiness.tree_digest`` gave for the
+    working directory as the run started, or ``None`` for a commit run, for a run
+    recorded before the field, or where the tree could not be read. A later digest
+    that differs says the run no longer covers the tree."""
+    workdir_commit: str | None = None
+    """**Round 16, item 3.** The commit ``HEAD`` named in the line's working
+    directory when a run there started, read by the daemon from the checkout's own
+    files, or ``None`` for a commit run, whose ``commit`` names what ran, and where it
+    could not be read. It says nothing of uncommitted changes, which the command also
+    ran with.
+
+    **Review of 16de365. The worktree's own claim.** It is what the nearest ``.git``
+    at or above the working directory says, and the line can write both. It can move
+    ``HEAD`` with its own git where its sandbox lets it write the git directory, and
+    where it works in a subdirectory of a checkout it can create a ``.git`` there
+    naming any commit. Reading only a ``.git`` at the declared directory's root was
+    considered and does not help, since the line can create one exactly there. So
+    the receipt says the commit is the worktree's own ``HEAD``, which the line can
+    move, and a reader who must know what ran starts a commit run, whose ``commit``
+    the daemon checked out itself. It follows ``tree``, which main recorded first at
+    ``STATE_VERSION`` 4, and raised the version to 5."""
 
     def __post_init__(self) -> None:
         check_id("run_id", self.run_id)
+        if self.tree is not None and DIGEST_PATTERN.fullmatch(self.tree) is None:
+            raise InvalidField("tree must be null or a SHA-256 digest in hex")
+        if self.tree is not None and self.commit is not None:
+            raise InvalidField("a commit run records no tree")
         check_id("line_id", self.line_id)
         check_optional_id("role_id", self.role_id)
         check_optional_id("previous", self.previous)
         if self.commit is not None and COMMIT_PATTERN.fullmatch(self.commit) is None:
             raise InvalidField("commit must be null or a full hexadecimal commit")
+        if self.workdir_commit is not None and (
+            COMMIT_PATTERN.fullmatch(self.workdir_commit) is None
+        ):
+            raise InvalidField(
+                "workdir_commit must be null or a full hexadecimal commit"
+            )
+        if self.workdir_commit is not None and self.commit is not None:
+            raise InvalidField("workdir_commit is given only for a run in a worktree")
         if (self.commit is None) != (self.checkout is None):
             raise InvalidField("checkout is given exactly when commit is")
         if self.checkout is not None:
@@ -2564,6 +2608,7 @@ class Line:
     an operator can still ask why. **Round 15 follow-up of 2026-11-05.** ``None``
     when no turn failed, or when the latest failed one was logged before causes
     were, which ``line_status`` reads as unknown with ``failed``."""
+    last_closing_reason: str | None = None
     last_failure_class: str | None = None
     """The class behind ``last_failure``, where one was recorded."""
 
@@ -3515,6 +3560,7 @@ class State:
                         failed=True,
                         last_failure=event.failure,
                         last_failure_class=event.failure_class,
+                        last_closing_reason=event.closing_reason,
                     )
                 elif line.failed:
                     self.lines[event.line_id] = replace(line, failed=False)

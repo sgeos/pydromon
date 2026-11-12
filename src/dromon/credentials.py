@@ -169,6 +169,10 @@ class SecretsUnavailable(model.EventRejected):
 
 def has_text(event: Event) -> bool:
     """Whether ``scrub_event`` looks at any field of ``event``."""
+    # Turn completion must remain recordable when the credential source is
+    # unavailable and no diagnostic was retained.
+    if isinstance(event, model.LineTurnEnded):
+        return event.closing_reason is not None
     return type(event) in COVERED
 
 
@@ -208,6 +212,7 @@ def environment_values(
 
 
 COVERED: Final[dict[type, tuple[str, ...]]] = {
+    model.LineTurnEnded: ("closing_reason",),
     model.MessageSent: ("body", "choices"),
     model.MessageReceived: ("body",),
     model.MessageAcknowledged: ("reason",),
