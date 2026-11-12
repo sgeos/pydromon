@@ -2313,6 +2313,23 @@ class RunStarted:
     working directory as the run started, or ``None`` for a commit run, for a run
     recorded before the field, or where the tree could not be read. A later digest
     that differs says the run no longer covers the tree."""
+    workdir_commit: str | None = None
+    """**Round 16, item 3.** The commit ``HEAD`` named in the line's working
+    directory when a run there started, read by the daemon from the checkout's own
+    files, or ``None`` for a commit run, whose ``commit`` names what ran, and where it
+    could not be read. It says nothing of uncommitted changes, which the command also
+    ran with.
+
+    **Review of 16de365. The worktree's own claim.** It is what the nearest ``.git``
+    at or above the working directory says, and the line can write both. It can move
+    ``HEAD`` with its own git where its sandbox lets it write the git directory, and
+    where it works in a subdirectory of a checkout it can create a ``.git`` there
+    naming any commit. Reading only a ``.git`` at the declared directory's root was
+    considered and does not help, since the line can create one exactly there. So
+    the receipt says the commit is the worktree's own ``HEAD``, which the line can
+    move, and a reader who must know what ran starts a commit run, whose ``commit``
+    the daemon checked out itself. It follows ``tree``, which main recorded first at
+    ``STATE_VERSION`` 4, and raised the version to 5."""
 
     def __post_init__(self) -> None:
         check_id("run_id", self.run_id)
@@ -2325,6 +2342,14 @@ class RunStarted:
         check_optional_id("previous", self.previous)
         if self.commit is not None and COMMIT_PATTERN.fullmatch(self.commit) is None:
             raise InvalidField("commit must be null or a full hexadecimal commit")
+        if self.workdir_commit is not None and (
+            COMMIT_PATTERN.fullmatch(self.workdir_commit) is None
+        ):
+            raise InvalidField(
+                "workdir_commit must be null or a full hexadecimal commit"
+            )
+        if self.workdir_commit is not None and self.commit is not None:
+            raise InvalidField("workdir_commit is given only for a run in a worktree")
         if (self.commit is None) != (self.checkout is None):
             raise InvalidField("checkout is given exactly when commit is")
         if self.checkout is not None:

@@ -366,7 +366,10 @@ def test_send_records_a_message_from_the_operator(paths: ProjectPaths) -> None:
 @pytest.mark.parametrize(
     ("args", "code"),
     [
-        ({"recipient": "alpha", "body": "x"}, ErrorCode.BAD_REQUEST),
+        # Round 16, item 7. An omitted sender is the default, so a sender that is
+        # not text is what is refused now.
+        ({"recipient": "alpha", "body": "x", "operator": 3}, ErrorCode.BAD_REQUEST),
+        ({"recipient": "alpha"}, ErrorCode.BAD_REQUEST),
         ({"recipient": "nobody", "body": "x", "operator": "ana"}, ErrorCode.REJECTED),
         ({"recipient": "alpha", "body": "x", "operator": "Ana!"}, ErrorCode.REJECTED),
         (
@@ -384,6 +387,55 @@ def test_a_bad_send_is_refused(
     )
     response = request(paths, "send", args)
     assert (response.ok, response.error_code) == (False, code)
+
+
+def send_as_default(paths: ProjectPaths, default: str, *registered: str) -> str:
+    """Send with no sender to a daemon whose default operator is ``default``, with
+    ``registered`` operators already known, and give the recorded sender."""
+    paths.state_dir.mkdir(mode=0o700, exist_ok=True)
+    with EventLog(paths.event_log) as log:
+        log.append(LineCreated("alpha", HAIKU, "api"))
+        for name in registered:
+            log.append(OperatorRegistered(name))
+        scheduler = Scheduler(log, no_engine, hold_wakes=True, default_operator=default)
+        daemon = Daemon(paths, log, "2026-10-25T00:00:00Z", scheduler)
+        args = {"recipient": "alpha", "body": "x"}
+        line = json.dumps({"id": "r", "op": "send", "v": 1, "args": args})
+        response = daemon.respond((line + "\n").encode())
+        assert response.ok and response.result is not None
+        message = log.state.messages[str(response.result["message_id"])]
+        assert f"@{response.result['operator']}" == str(message.sender)
+        resolved = scheduler.resolve_operator(OperatorAddress("operator"))
+        assert str(resolved) == str(message.sender)
+        return str(message.sender)
+
+
+def test_a_send_without_a_sender_is_from_the_operator_at_operator_names(
+    paths: ProjectPaths,
+) -> None:
+    """Round 16, item 7. The sender agrees with what ``@operator`` resolves to, so a
+    line's reply to ``@operator`` reaches the mailbox the note came from, which a
+    login name that differs from ``daemon.operator`` broke."""
+    assert send_as_default(paths, "keeper") == "@keeper"
+
+
+def test_a_registered_operator_named_operator_is_the_default_sender(
+    paths: ProjectPaths,
+) -> None:
+    """``@operator`` names an operator of that very name when one is registered, so
+    the default sender is that one too."""
+    assert send_as_default(paths, "keeper", "operator", "keeper") == "@operator"
+
+
+def test_a_named_sender_is_kept_and_said(paths: ProjectPaths) -> None:
+    request(
+        paths, "create_line", {"line_id": "alpha", "model": HAIKU, "strategy": "api"}
+    )
+    response = request(
+        paths, "send", {"recipient": "alpha", "body": "x", "operator": "ana"}
+    )
+    assert response.ok and response.result is not None
+    assert response.result["operator"] == "ana"
 
 
 def test_create_line_accepts_a_configuration(paths: ProjectPaths) -> None:

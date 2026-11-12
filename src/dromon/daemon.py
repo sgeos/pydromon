@@ -874,6 +874,7 @@ class Daemon:
                 | Operation.RUN_CLEAR
                 | Operation.SCRATCH_PLACE
                 | Operation.RUNS
+                | Operation.OVERVIEW
                 | Operation.START_CONTEXT
                 | Operation.BUDGETS
                 | Operation.BUDGET_SET
@@ -1029,9 +1030,12 @@ class Daemon:
                     values = _text_args(request.args, names)
                     found = self.scheduler.runs_view(values[0] if values else None)
                     result = {"runs": cast(object, found)}
+                case Operation.OVERVIEW:
+                    # Round 16, item 1. The line's own view, read only.
+                    (line_id,) = _text_args(request.args, ("line_id",))
+                    result = self.scheduler.overview(line_id)
                 case Operation.START_CONTEXT:
-                    _text_args(request.args, ())
-                    result = start_context(os.environ)
+                    result = self._start_context(request.args)
                 case Operation.BUDGETS:
                     _text_args(request.args, ())
                     result = self.scheduler.budgets_view()
@@ -1090,6 +1094,30 @@ class Daemon:
                 error_message=str(error),
             )
         return Response(request.request_id, True, result=result)
+
+    def _start_context(self, args: dict[str, object]) -> dict[str, object]:
+        """The ``start_context`` request, with no arguments, or with ``nonce`` and
+        ``secrets`` together, the client's own digests to compare. **Review of
+        16de365.** A nonce or digest in another form is a bad request, never an
+        exception that drops the connection."""
+        if not args:
+            return start_context(os.environ, self.line_secrets)
+        if set(args) != {"nonce", "secrets"}:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST,
+                f"the arguments are {sorted(args)}, expected none or"
+                " ['nonce', 'secrets']",
+            )
+        nonce = args["nonce"]
+        if not isinstance(nonce, str) or restart.NONCE_PATTERN.fullmatch(nonce) is None:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, "nonce must be 64 lowercase hexadecimal digits"
+            )
+        try:
+            compared = restart.check_compared(args["secrets"])
+        except ValueError as error:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, str(error)) from error
+        return start_context(os.environ, self.line_secrets, (nonce, compared))
 
     def _create_line(self, args: dict[str, object]) -> dict[str, object]:
         texts = {
@@ -1935,7 +1963,11 @@ class Daemon:
         reply, as a line's ``send_message`` does. **Follow-up of 2026-11-01.** Omitted,
         the daemon's rule decides, so a note asks a reply unless it is itself a reply,
         and an operator's note that asks nothing no longer has to stay in a line's
-        unanswered count until the line acknowledges it."""
+        unanswered count until the line acknowledges it.
+
+        ``operator``, optional from round 16, item 7, is the sender. Omitted, the
+        sender is the operator ``@operator`` names, ``Scheduler.default_sender``, and
+        the result's ``operator`` says which."""
         urgent = args.get("priority", False)
         if not isinstance(urgent, bool):
             raise ProtocolError(ErrorCode.BAD_REQUEST, "priority is not a boolean")
@@ -1947,11 +1979,13 @@ class Daemon:
             for key, value in args.items()
             if key not in ("priority", "asks_reply")
         }
+        named = ("operator",) if "operator" in texts else ()
         optional = ("reply_to",) if "reply_to" in texts else ()
-        values = _text_args(texts, ("recipient", "body", "operator", *optional))
-        recipient, body, operator = values[:3]
-        reply_to = values[3] if optional else None
-        sender = OperatorAddress(operator)
+        values = _text_args(texts, ("recipient", "body", *named, *optional))
+        recipient, body = values[:2]
+        rest = values[2:]
+        sender = OperatorAddress(rest[0]) if named else self.scheduler.default_sender()
+        reply_to = rest[-1] if optional else None
         address = parse_any_address(recipient)
         if urgent and not isinstance(address, RemoteAddress):
             # Checked before the operator is registered, so a refusal records nothing.
@@ -1960,7 +1994,11 @@ class Daemon:
         message_id = self.scheduler.send(
             sender, address, body, reply_to, priority=urgent, asks_reply=asks
         )
-        return {"message_id": message_id, "priority": urgent}
+        return {
+            "message_id": message_id,
+            "priority": urgent,
+            "operator": sender.operator_id,
+        }
 
     def _restart(self, args: dict[str, object]) -> dict[str, object]:
         """Begin a restart for ``operator``. ``mode`` is ``wait``, the default, or
@@ -3094,16 +3132,33 @@ def tls_serving(daemon: Daemon) -> TlsServing:
     return pinned_serving
 
 
-def start_context(environment: Mapping[str, str]) -> dict[str, object]:
+def start_context(
+    environment: Mapping[str, str],
+    granted: Mapping[str, Sequence[str]] | None = None,
+    compared: tuple[str, Mapping[str, str | None]] | None = None,
+) -> dict[str, object]:
     """What a restart's successor starts with that a client cannot see, its
     interpreter, which ``client.start`` runs, and ``restart.START_ENVIRONMENT`` as
-    ``environment`` holds it, each value ``None`` when unset. **Round 14, item 6.**"""
-    return {
+    ``environment`` holds it, each value ``None`` when unset. **Round 14, item 6.**
+
+    **Round 16, item 6, and the review of 16de365.** Also ``secret_names``, each name
+    the project file as last loaded grants a line, ``granted``. With ``compared``, a
+    client's nonce and its digest of each name, also ``secrets``, a verdict for each
+    name, ``same``, ``differs`` or ``not_granted``, as ``restart.compare_secrets``
+    gives. Never a value, and never a digest."""
+    allowed = granted or {}
+    result: dict[str, object] = {
         "interpreter": sys.executable,
         "environment": {
             name: environment.get(name) for name in restart.START_ENVIRONMENT
         },
+        "secret_names": list(restart.secret_names(allowed)),
     }
+    if compared is not None:
+        nonce, theirs = compared
+        verdicts = restart.compare_secrets(theirs, allowed, environment, nonce)
+        result["secrets"] = {name: str(verdict) for name, verdict in verdicts.items()}
+    return result
 
 
 def successor_args(overrides: Overrides, hold_wakes: bool) -> list[str]:

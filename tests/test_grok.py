@@ -2371,6 +2371,7 @@ def test_the_line_socket_serves_only_the_lines_own_tools(
             "release_lease",
             "list_leases",
             "line_status",
+            "overview",
             "read_instructions",
             "write_scratch",
             "check_disclosure",

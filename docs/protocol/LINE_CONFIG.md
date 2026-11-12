@@ -254,6 +254,7 @@ argument outside a tool's schema is refused.
 | `list_leases` | From round 14. Lists every live lease, with its holder, both times and the holder's unverified note, and the declared leases no line holds. Read only, the same for every line, as below |
 | `start_run`, `run_status`, `stop_run` | Offered while the project declares a run command, or while the line's scope has a run to read. Start a declared command as a supervised run that outlives the turn, the seat and the daemon, show the scope's latest runs with their receipts, and stop its open run, as [`RUNS.md`](../architecture/RUNS.md) specifies. A seat must own its role, and every line needs write access to its working directory. A lost run blocks its scope until no process is left in its supervisor's group or session, or an operator clears it. Added on 2026-10-31, and the last two sentences in the review of that day. From round 14 they are also offered while the project declares a commit command, and `start_run` takes `commit`, the full commit a commit command runs on in a checkout the daemon makes, which a line that only reads its working directory may start and stop. From the task of 2026-11-05 `start_run` takes `arguments`, a value for each parameter a command declares, each matching its pattern, `run_status` reconciles an open run before it answers and shows a failed latest run's untrusted output tail, and `wake_after` may wait for an open run |
 | `line_status` | Shows a compact read-only status by default, with diagnostic detail and long lists available by argument, as below |
+| `overview` | From round 16. No arguments. One read-only view of the line's task, checkpoint, leases, cost carried across releases and ceilings, joined from what `line_status`, `role_status` and `list_leases` answer, recording nothing, as below |
 | `role_status` | Offered only to a seat of a role. Shows the role's worktree, whether the project file or an operator holds it, its declared failover order, failover policy, handoff threshold, owner, the seat a failover would pass it to now and the latest change of owner, its seats in the failover order with whether each is usable for a failover, their condition, worktree access, whether each waits because its engine cannot confine it, model, provider and stated budget, each seat's latest three background task ends with the digest of their output, and its latest five journal entries, the newest with its body, read only, as [`ROLES.md`](../architecture/ROLES.md) describes. Added on 2026-10-27, the task ends on 2026-10-28, the holder and the order on 2026-10-31 in round 10, and whether the project file declares the role, how a role an operator holds differs from it, and the lines that wait beside the owner, in the round 10 review. **Round 15, item 5.** It also gives `reviews`, the roles this role reviews, `reviewed_by`, the roles that review it, and `review_diversity`, each pair of a reviewing role and a role it reviews, this role being either, whose owners run the same engine and model, with `reviewer`, `reviewer_owner`, `author`, `author_owner`, `model`, `provider` and `text`, a sentence that says so. A pair either role of which is vacant is left out. Nothing is refused for a pair |
 | `record_role_note` | Offered only to a seat. Records a journal entry of `kind` `note`, by any seat, or `recovery`, by the owner, which the daemon stamps with the role worktree's commit, its own commit and the time. A handoff entry is written only by `relinquish_ownership`. Added on 2026-10-27 |
 | `relinquish_ownership` | Offered only to a seat, and refused unless it owns its role. Records the handoff `note` as a handoff entry and gives the role to the seat `to`, or with no `to` to the seat the handoff that gave it the role named as `back_to`, or else leaves it vacant. A return to a seat that can no longer own the role leaves it vacant and says so. Called inside the owner's own turn, which is how a seat calls it, the request is checked at once and the change is made when that turn ends, with the entry stamped then, and the tool says so. A second call in the same turn is refused. A change that no longer applies when the turn ends is not made, and the operator is told. A successor is awakened and sent a note from the harness, `!dromon`, saying the former owner handed it the role, and the former owner's engine is dropped, so its next turn is built read only. `back_to`, which needs `to`, is the seat the role returns to when the successor next relinquishes without naming one. Added on 2026-10-27 |
@@ -1350,6 +1351,41 @@ during that turn.
   now. The turn's end records the commit, so this is said once. A worktree whose commit
   cannot be read now is told nothing, since nothing could be compared.
 
+**`overview`, round 16, item 1.** Another project's lines read `line_status`,
+`role_status` and `list_leases` apart to learn their task, what they would resume
+from, the leases they hold, the cost carried and their ceilings, and asked for one
+view. `overview` takes no arguments and answers with these fields.
+
+- `line_id`, `condition` and `hold_cause`, as `line_status` and another line's view
+  give them.
+- `task`, the line's standing brief as the compact `line_status` gives it, its task
+  and next action cut to 400 bytes and labelled untrusted data, or `null` without a
+  brief.
+- `checkpoint`, what a successor resumes from. That is `workdir_commit`,
+  `daemon_commit` and `daemon_stale` as `commits` gives them now, and `role`, which
+  for a seat gives `role_id`, `owner`, `you_own` and `newest_entry`, the role's newest
+  journal entry without its body, as `role_status` lists it, or `null` for a line
+  that is no seat. The brief's own stamped commits are in `task`. **Interpretation.**
+  The other project's word checkpoint is read as these, since Dromon has no record
+  by that name.
+- `leases`, the leases the line holds with `name`, `expires` and `seconds`, at most
+  16 in name order, and `leases_omitted`, how many more. `list_leases` lists them all.
+- `cost`, with `since_release_usd` and `basis` as `line_status` gives them in
+  `cost_usd`, and `carried`, the whole cost and turns no release resets.
+- `ceilings`, with `autonomous_turns` as `used` and `allowed`, `cost_usd` as `limit`
+  and `enforced`, `provider_budget` as `line_status` gives it, with the time the
+  budget was stated, and `lease_seconds`, the longest a lease may be acquired for.
+- `sources`, a sentence that names the three tools and says the view records
+  nothing.
+
+Each part comes from the same method its source tool uses, so the view adds nothing
+of its own, and the reads of one call share one copy of the state. **Bound.** The
+answer is at most 16 KiB as JSON. Each part is bounded where it is built, and a guard
+drops the brief's text and then the lease list, each replaced by a pointer to the
+tool that gives it, should a later change raise a part's bound. The operator reads
+the same view with the `overview` request and `dromon overview LINE`, as
+[`CLIENT.md`](CLIENT.md) specifies.
+
 **Leases.** **Decided by the operator on 2026-10-26.** A project declares named leases
 in its `[leases]` table, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies, so its
 lines can take turns at a shared resource, such as a machine that runs one full gate at
@@ -1366,13 +1402,27 @@ a time.
   the lease is held for, checked against the disclosure list and recorded in
   `lease_acquired`. A note that is not text, is blank or is too long is refused, and
   nothing is acquired.
+- **A duration, round 16, item 2.** `acquire_lease` takes an optional `seconds`, a
+  whole number from 60 to the project's `leases.ttl_seconds`, and the lease then ends
+  that many seconds after its acquisition rather than after the whole time to live.
+  Omitted, it is the time to live, as before. Another project's lines asked for one
+  hour and for four hours and were each given the whole limit, since nothing let them
+  ask for less. A duration that is not a whole number, is below 60 or is above the
+  limit is refused, naming the limit, and nothing is acquired. **Recorded on the
+  lease.** The duration is `expires` less `acquired_at` in `lease_acquired`, so the
+  event needs no new field and a daemon from before this change reads every lease
+  this one records. **Residual.** A reload that lowers the limit leaves a lease
+  acquired under the higher one to its recorded expiry, as it did before.
 - **`release_lease`.** Argument `name`. It ends the line's lease, and is refused for a
   lease the line does not hold. From round 14 its answer says that releasing a lease
   does not end the processes started under it.
 - **`list_leases`, from round 14.** **Required by the operator on 2026-11-01.** No
   arguments. It answers with `leases`, each live lease in name order with `name`,
-  `holder`, `acquired_at`, `expires` and `holder_note_unverified` when a note was
-  given, `free`, the declared names no line holds, and `caveat`. Expiry is read by the
+  `holder`, `acquired_at`, `expires`, `seconds`, the whole seconds it was acquired
+  for, and `holder_note_unverified` when a note was given, `free`, the declared names
+  no line holds, `limit_seconds`, the longest a lease may be acquired for, from round
+  16, and `caveat`. `line_status` gives `seconds` with each lease the line holds too.
+  Expiry is read by the
   wall clock as an acquisition reads it, so the two agree. A note passes with its lease
   on a change of owner, as the times do.
 - **The note is the holder's claim.** **Round 14 review, T1, required by the operator

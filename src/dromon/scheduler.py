@@ -595,6 +595,14 @@ ACQUIRE_LEASE_SCHEMA: Final[dict[str, object]] = {
                 " as holder_note_unverified, your claim, which no one checks"
             ),
         },
+        "seconds": {
+            "type": "integer",
+            "description": (
+                "Optional. How long to hold it, in whole seconds, from 60 to the"
+                " project's limit, which list_leases gives as limit_seconds. Omit it"
+                " to hold it for the whole limit"
+            ),
+        },
     },
     "required": ["name"],
     "additionalProperties": False,
@@ -907,6 +915,30 @@ INFERRED_LIMIT_NOTE: Final = (
 )
 """Added to the hold of a plan limit whose ``may_move_role`` is false, which the
 operator decided on 2026-10-27 holds and asks and never fails over."""
+OVERVIEW_TOOL_NAME: Final = "overview"
+MAX_OVERVIEW_LEASES: Final = 16
+"""How many of a line's leases ``overview`` lists, in name order. The rest are
+counted in ``leases_omitted``, and ``list_leases`` lists them all. **Round 16, item
+1.** The declared names bound a line's leases at 256, which alone would pass the
+overview's bound."""
+MAX_OVERVIEW_BYTES: Final = 16384
+"""The most an ``overview`` answer takes as JSON with an indent of two, which the
+tests check against the largest every field can be. **Round 16, item 1.**"""
+WORKDIR_HEAD_CLAIM: Final = "HEAD says, which the line can move"
+"""How a run's receipt labels ``workdir_commit``. **Review of 16de365.** The commit
+is read from files in the line's worktree, which the line can write, so it is the
+worktree's claim and not a commit the daemon checked out."""
+OVERVIEW_SOURCES: Final = (
+    "Read only, and nothing is recorded. Built from what line_status, role_status"
+    " and list_leases answer, which give the whole of each part. The task and next"
+    " action are the line's own brief, each cut to 400 bytes of UTF-8, and"
+    " untrusted data."
+)
+OVERVIEW_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
 ROLE_STATUS_TOOL_NAME: Final = "role_status"
 ROLE_STATUS_ENTRIES: Final = 5
 ROLE_STATUS_TASKS: Final = 3
@@ -4582,16 +4614,39 @@ class Scheduler:
             return None
         return lease
 
-    def acquire_lease(self, line_id: str, name: str, note: str | None = None) -> str:
-        """Give ``line_id`` the lease ``name`` for the project's time to live, and
-        return when it expires. Raises ``LeaseRefused`` for an undeclared name, for a
-        lease another line holds, and for one the line holds already, so that one
-        acquisition lasts at most one time to live. The holder may acquire it again
-        once it has expired, by the wall clock."""
+    def acquire_lease(
+        self,
+        line_id: str,
+        name: str,
+        note: str | None = None,
+        seconds: int | None = None,
+    ) -> str:
+        """Give ``line_id`` the lease ``name`` for ``seconds``, or for the project's
+        time to live when it is ``None``, and return when it expires. Raises
+        ``LeaseRefused`` for an undeclared name, for a duration outside 60 seconds
+        to the project's time to live, for a lease another line holds, and for one
+        the line holds already, so that one acquisition lasts at most one time to
+        live. The holder may acquire it again once it has expired, by the wall clock.
+
+        **Round 16, item 2.** Every lease lasted the project's whole time to live,
+        so lines that asked for one hour and for four hours were each given the
+        project's limit. A line now asks for a duration up to that limit. The
+        duration is recorded on the lease as its ``expires``, which is
+        ``acquired_at`` plus the duration, so ``lease_acquired`` needs no new field
+        and a daemon from before this change reads every such lease."""
         if name not in self._lease_names:
             declared = ", ".join(sorted(self._lease_names)) or "none"
             raise LeaseRefused(
                 f"the project declares no lease {name!r}. Declared leases: {declared}"
+            )
+        duration = self._lease_ttl if seconds is None else seconds
+        if (
+            type(duration) is not int
+            or not MIN_LEASE_TTL_SECONDS <= duration <= self._lease_ttl
+        ):
+            raise LeaseRefused(
+                f"seconds must be a whole number from {MIN_LEASE_TTL_SECONDS} to"
+                f" {self._lease_ttl}, the project's limit for a lease"
             )
         held = self._live_lease(name)
         if held is not None and held.line_id == line_id:
@@ -4607,7 +4662,7 @@ class Scheduler:
         start = now.replace(microsecond=0)
         if start < now:
             start += timedelta(seconds=1)
-        expires = format_due(start + timedelta(seconds=self._lease_ttl))
+        expires = format_due(start + timedelta(seconds=duration))
         try:
             event = LeaseAcquired(name, line_id, format_due(start), expires, note)
         except InvalidField as error:
@@ -4640,6 +4695,7 @@ class Scheduler:
                 "holder": lease.line_id,
                 "acquired_at": lease.acquired_at,
                 "expires": lease.expires,
+                "seconds": _lease_seconds(lease),
             }
             if lease.note is not None:
                 entry[LEASE_NOTE_KEY] = lease.note
@@ -4662,6 +4718,7 @@ class Scheduler:
                     {
                         "leases": held,
                         "free": free,
+                        "limit_seconds": self._lease_ttl,
                         "caveat": LEASE_INVENTORY_CAVEAT,
                     },
                     indent=2,
@@ -4673,8 +4730,10 @@ class Scheduler:
             name=LIST_LEASES_TOOL_NAME,
             description=(
                 "List every live lease with its holder, when it was acquired, when it"
-                " expires and the holder's unverified note, and the declared leases"
-                " no line holds. Read only. " + LEASE_INVENTORY_CAVEAT
+                " expires, the seconds it was acquired for and the holder's"
+                " unverified note, the declared leases no line holds, and"
+                " limit_seconds, the longest a lease may be acquired for. Read only. "
+                + LEASE_INVENTORY_CAVEAT
             ),
             input_schema=LIST_LEASES_SCHEMA,
             handler=handler,
@@ -4686,7 +4745,13 @@ class Scheduler:
         for name in sorted(self._state().leases):
             lease = self._live_lease(name)
             if lease is not None and lease.line_id == line_id:
-                held.append({"name": name, "expires": lease.expires})
+                held.append(
+                    {
+                        "name": name,
+                        "expires": lease.expires,
+                        "seconds": _lease_seconds(lease),
+                    }
+                )
         return held
 
     def _lease_tool(self, line_id: str, acquire: bool) -> SdkMcpTool[Any]:
@@ -4698,17 +4763,20 @@ class Scheduler:
                 return _tool_error(unexpected)
             name: object = args.get("name")
             note: object = args.get("note")
+            seconds: object = args.get("seconds")
             if not isinstance(name, str):
                 return _tool_error("name must be text")
             if note is not None and not isinstance(note, str):
                 return _tool_error("note must be text")
+            if seconds is not None and type(seconds) is not int:
+                return _tool_error("seconds must be a whole number")
             if note is not None:
                 refusal = self.refuse_disclosed(line_id, ("note", note))
                 if refusal is not None:
                     return _tool_error(refusal)
             try:
                 if acquire:
-                    expires = self.acquire_lease(line_id, name, note)
+                    expires = self.acquire_lease(line_id, name, note, seconds)
                     return _tool_text(
                         f"you hold lease {name} until {expires}. Release it when"
                         " you are done."
@@ -4728,7 +4796,8 @@ class Scheduler:
                     "Acquire a lease the project declares, such as one for a shared"
                     " machine resource, before using that resource. It succeeds only"
                     " if no other line holds it, and otherwise says who does. It ends"
-                    " when you release it or when its time to live passes."
+                    " when you release it or when the seconds you asked for pass, or"
+                    " the project's limit when you asked for none."
                 ),
                 input_schema=ACQUIRE_LEASE_SCHEMA,
                 handler=handler,
@@ -4975,6 +5044,12 @@ class Scheduler:
             if commit is not None
             else await asyncio.to_thread(_tree_or_none, workdir)
         )
+        # Round 16, item 3. The commit a run in a worktree ran, read before its
+        # command starts, so the receipt names it. A file read, as line_status does,
+        # and the worktree's own claim, as RunStarted.workdir_commit records.
+        head = None if commit is not None else read_head_commit(workdir)
+        if head is not None and COMMIT_PATTERN.fullmatch(head) is None:
+            head = None
         if checkout is not None:
             # A fresh private home, so the commit's code finds none of the
             # operator's settings, credentials or caches by its home. It is not a
@@ -5007,6 +5082,7 @@ class Scheduler:
                 commit,
                 None if command_dir is None else str(command_dir),
                 tree,
+                head,
             )
             try:
                 self._log.append(started)
@@ -8306,6 +8382,114 @@ class Scheduler:
             handler=handler,
         )
 
+    def overview(self, line_id: str) -> dict[str, object]:
+        """One read-only view of ``line_id``'s task, checkpoint, leases, cost carried
+        and ceilings, for the line's ``overview`` tool and the operator's ``overview``
+        request. Raises ``EventRejected`` for an unknown line.
+
+        **Round 16, item 1.** Another project's lines read ``line_status``,
+        ``role_status`` and ``list_leases`` apart to learn these, and asked for one
+        view. Every part is taken from what those already answer, through the same
+        methods, so the overview says nothing they do not and records nothing. The
+        reads of one call share one copy of the state, as ``line_status`` does.
+        **Interpretation.** The other project's word checkpoint is read as what a
+        successor resumes from. That is the brief's stamped commits, the commits now
+        and, for a seat, the role's owner and its newest journal entry without its
+        body, which ``role_status`` gives. Bounded by ``MAX_OVERVIEW_BYTES``, as
+        ``_bounded_overview`` makes sure."""
+        if line_id not in self._state().lines:
+            raise EventRejected(f"no line {line_id}")
+        if self._snapshot is not None:
+            return _bounded_overview(self._overview(line_id))
+        self._snapshot = (self._log.last_seq, self._log.state)
+        try:
+            return _bounded_overview(self._overview(line_id))
+        finally:
+            self._snapshot = None
+
+    def _overview(self, line_id: str) -> dict[str, object]:
+        state = self._state()
+        line = state.lines[line_id]
+        limits = self.limits_for(line_id)
+        cost = self.cost_status(line_id)
+        commits = self.commits(line_id)
+        leases = self.leases_of(line_id)
+        return {
+            "line_id": line_id,
+            "condition": self.condition(line_id),
+            "hold_cause": _hold_cause(line),
+            "task": _compact_brief(self._brief_status(line_id)),
+            "checkpoint": {
+                "workdir_commit": commits["workdir"],
+                "daemon_commit": commits["daemon"],
+                "daemon_stale": commits["stale"],
+                "role": self._overview_role(state, line_id),
+            },
+            "leases": leases[:MAX_OVERVIEW_LEASES],
+            "leases_omitted": max(0, len(leases) - MAX_OVERVIEW_LEASES),
+            "cost": {
+                "since_release_usd": cost["estimate"],
+                "basis": cost["basis"],
+                "carried": cost["whole"],
+            },
+            "ceilings": {
+                "autonomous_turns": {
+                    "used": self._autonomous.get(line_id, 0),
+                    "allowed": limits.max_autonomous_turns,
+                },
+                "cost_usd": {
+                    "limit": cost["limit"],
+                    "enforced": cost["limit_enforced"],
+                },
+                "provider_budget": self.provider_budget_status(line_id),
+                "lease_seconds": self._lease_ttl,
+            },
+            "sources": OVERVIEW_SOURCES,
+        }
+
+    def _overview_role(self, state: State, line_id: str) -> dict[str, object] | None:
+        """The role part of an overview, or ``None`` for a line that is no seat: the
+        role, its owner and its newest journal entry without the body. The entries
+        are scanned once, as ``role_view`` scans them."""
+        seat = state.seats.get(line_id)
+        if seat is None:
+            return None
+        role = state.roles[seat.role_id]
+        newest: RoleNoted | None = None
+        for entry in state.role_entries.values():
+            if entry.role_id == seat.role_id:
+                newest = entry
+        return {
+            "role_id": seat.role_id,
+            "owner": role.owner,
+            "you_own": role.owner == line_id,
+            "newest_entry": (
+                None if newest is None else _entry_view(newest, with_body=False)
+            ),
+        }
+
+    def overview_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The read-only ``overview`` tool for ``line_id``. Round 16, item 1."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, OVERVIEW_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            return _tool_text(
+                json.dumps(self.overview(line_id), indent=2, sort_keys=True)
+            )
+
+        return SdkMcpTool(
+            name=OVERVIEW_TOOL_NAME,
+            description=(
+                "Show one read-only view of your task, checkpoint, leases held, cost"
+                " carried across releases and ceilings, joined from what line_status,"
+                " role_status and list_leases answer. It records nothing."
+            ),
+            input_schema=OVERVIEW_SCHEMA,
+            handler=handler,
+        )
+
     def role_status(self, line_id: str) -> dict[str, object]:
         """What a seat may know of its role: the worktree, the owner and the latest
         change of owner, each seat's condition, engine and its provider's stated
@@ -10624,6 +10808,7 @@ class Scheduler:
             self.list_leases_tool(line_id),
             *self._run_tools(line_id),
             self.line_status_tool(line_id),
+            self.overview_tool(line_id),
             self.read_instructions_tool(line_id),
             self.write_scratch_tool(line_id),
             self.check_disclosure_tool(line_id),
@@ -11064,6 +11249,20 @@ class Scheduler:
             f"no operator {address.operator_id};"
             + (f" the operators are {known}" if known else " there are none")
         )
+
+    def default_sender(self) -> OperatorAddress:
+        """The operator an operator's ``send`` speaks for when it names none, the one
+        ``@operator`` names, as ``resolve_operator`` reads it, so a line's reply to
+        ``@operator`` reaches the mailbox the note came from.
+
+        **Round 16, item 7.** ``dromon send`` without ``--operator`` sent as the login
+        name, while ``@operator`` names the project's ``daemon.operator``, so a line
+        told to mail ``@operator`` could not thread its reply where they differed.
+        Unlike ``resolve_operator`` it never refuses, since ``send`` registers its
+        sender."""
+        if OPERATOR_ALIAS in self._state().operators:
+            return OperatorAddress(OPERATOR_ALIAS)
+        return self._default_operator
 
     def _operator_for(self, line_id: str, to: str | None) -> OperatorAddress:
         if to is not None:
@@ -14164,6 +14363,35 @@ def _brief_fields(brief: BriefSet) -> dict[str, object]:
     }
 
 
+def _overview_size(view: dict[str, object]) -> int:
+    """The bytes ``view`` takes as the ``overview`` tool gives it."""
+    return len(json.dumps(view, indent=2, sort_keys=True).encode())
+
+
+def _bounded_overview(view: dict[str, object]) -> dict[str, object]:
+    """``view`` within ``MAX_OVERVIEW_BYTES``. **Round 16, item 1.** Each part is
+    bounded where it is built, so the steps below are a guard for a part whose bound
+    a later change raises. The brief's text goes first, then the leases, each
+    replaced by a sentence naming the tool that gives it whole, and what is left is
+    of fixed size. Raises ``AssertionError`` if even that passes the bound, which
+    would be a defect and not a property of any line."""
+    if _overview_size(view) <= MAX_OVERVIEW_BYTES:
+        return view
+    task = view.get("task")
+    if isinstance(task, dict):
+        cut = dict(cast(dict[str, object], task))
+        cut["untrusted_data"] = None
+        cut["cut"] = "the overview passed its bound, and line_status gives the brief"
+        view = {**view, "task": cut}
+    if _overview_size(view) > MAX_OVERVIEW_BYTES:
+        leases = cast(list[object], view["leases"])
+        omitted = cast(int, view["leases_omitted"]) + len(leases)
+        view = {**view, "leases": [], "leases_omitted": omitted}
+    if _overview_size(view) > MAX_OVERVIEW_BYTES:
+        raise AssertionError("an overview passed its bound with its lists removed")
+    return view
+
+
 def _compact_brief(brief: object) -> dict[str, object] | None:
     """A standing brief as the compact ``line_status`` gives it, its task and next
     action cut short, so the default view stays within its bound. The detailed view
@@ -14238,6 +14466,14 @@ def failure_view(line: Line) -> dict[str, object] | None:
 def _lease_live(lease: LeaseAcquired, now: datetime) -> bool:
     """Whether ``lease`` is still held at ``now``, by its expiry."""
     return parse_due(lease.expires) > now
+
+
+def _lease_seconds(lease: LeaseAcquired) -> int:
+    """The whole seconds ``lease`` was acquired for, from its two recorded times.
+    **Round 16, item 2.** A lease acquired before durations could be asked for
+    gives the project's time to live then, which is what it was given."""
+    held = parse_due(lease.expires) - parse_due(lease.acquired_at)
+    return int(held.total_seconds())
 
 
 def _live_leases_by_line(state: State, now: datetime) -> dict[str, list[str]]:
@@ -14929,6 +15165,7 @@ def _run_view(
         "commit": started.commit,
         "checkout": started.checkout,
         "tree": started.tree,
+        "workdir_commit": started.workdir_commit,
         "workdir": started.workdir,
         "output_file": started.output_file,
         "pid": started.pid,
@@ -15016,7 +15253,16 @@ def _tree_text(started: RunStarted, tree_now: TreeNow | None) -> str:
 def _run_line(run: Run) -> str:
     """One run as a line reads it, with its receipt once it has ended."""
     started = run.started
-    on = "" if started.commit is None else f" on commit {started.commit}"
+    on = (
+        f" on commit {started.commit}"
+        if started.commit is not None
+        # Round 16, item 3. The receipt names the commit a worktree run ran, as
+        # the worktree's own claim after the review of 16de365.
+        else f" in its worktree at commit {started.workdir_commit}, as the"
+        f" worktree's own {WORKDIR_HEAD_CLAIM}, with any uncommitted changes"
+        if started.workdir_commit is not None
+        else ""
+    )
     head = (
         f"run {started.run_id} of {started.command}{on} by line {started.line_id},"
         f" started {started.started_at}, output {started.output_file} in"
