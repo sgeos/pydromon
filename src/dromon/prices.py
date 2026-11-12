@@ -60,8 +60,15 @@ PRICES: Final[Mapping[str, Price]] = {
     "gpt-6-luna": Price(500_000, 50_000, 4_000_000),
     "gpt-6.1-terra": Price(2_000_000, 200_000, 16_000_000),
     "gpt-6.1-sol": Price(5_000_000, 500_000, 40_000_000),
+    # Round 16, audit of the new drivers. Added by core on 2026-11-11 at the
+    # highest Codex placeholder above, so that an estimate errs high. Not read
+    # from any price list, as none of these were.
+    "gpt-6-sol": Price(5_000_000, 500_000, 40_000_000),
+    "gpt-6-astra": Price(5_000_000, 500_000, 40_000_000),
 }
-"""Estimated prices by model. A model not here gets no estimate."""
+"""Estimated prices by model. A model not here gets no estimate, so every model of an
+engine in ``dromon.scheduler.TOKEN_PRICED_ENGINES`` with a metered driver needs one,
+which ``tests/test_whole_cost.py`` checks."""
 
 ESTIMATE_NOTE: Final = (
     "estimated from the engine's token counts and Dromon's price table, whose prices"

@@ -7,6 +7,7 @@ tokens and a price table, labelled as estimates, and ``line_cost_recorded`` keep
 every line's whole cost, which no release resets."""
 
 import json
+from importlib import resources
 from collections.abc import Callable, Generator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -17,7 +18,7 @@ from claude_agent_sdk import SdkMcpTool
 from dromon import prices
 from dromon.cli import _line_row  # pyright: ignore[reportPrivateUsage]
 from dromon.codec import DecodeError, decode, encode
-from dromon.driver import ENGINE_OF, Strategy
+from dromon.driver import ENGINE_OF, Strategy, driver_resource
 from dromon.engine import INTERRUPTED_KIND
 from dromon.eventlog import EventLog
 from dromon.limits import Limits
@@ -34,6 +35,7 @@ from dromon.model import (
     State,
 )
 from dromon.scheduler import (
+    COST_UNREPORTED_ENGINES,
     TOKEN_PRICED_ENGINES,
     WHOLE_COST_SINCE,
     LineEngine,
@@ -98,6 +100,44 @@ def test_each_priced_model_is_estimated_from_its_tokens(model: str) -> None:
     found = prices.estimate_micro_usd(model, USAGE)
     assert found == expected_micro(USAGE, prices.PRICES[model])
     assert found is not None and found > 0
+
+
+METERED: tuple[Strategy, ...] = (Strategy.API, Strategy.FLEXIBLE)
+"""The strategies whose turns may spend money rather than quota."""
+
+
+def metered_models(engines: frozenset[str]) -> list[str]:
+    """Each model of one of ``engines`` that has a packaged driver for a metered
+    strategy, read from the drivers the package ships."""
+    drivers = resources.files("dromon.drivers")
+    return sorted(
+        model
+        for model, engine in ENGINE_OF.items()
+        if engine in engines
+        and any(
+            drivers.joinpath(driver_resource(model, strategy)).is_file()
+            for strategy in METERED
+        )
+    )
+
+
+def test_every_metered_model_of_a_token_priced_engine_has_a_price() -> None:
+    """**Round 16, audit of the new drivers.** ``gpt-6-sol`` and ``gpt-6-astra``
+    had Codex drivers for ``api`` and ``flexible`` and no price, so their turns,
+    which report tokens and no cost, counted as zero toward ``max_cost_usd``.
+
+    Pi differs, and is not checked here. Pi reports each turn's cost itself, from
+    its own model catalogue, so it is neither in ``TOKEN_PRICED_ENGINES`` nor in
+    ``COST_UNREPORTED_ENGINES``, and a reported cost is always preferred to an
+    estimate. Whether Pi's catalogue prices the newer models was not checked."""
+    found = metered_models(TOKEN_PRICED_ENGINES)
+    assert {"gpt-6-sol", "gpt-6-astra", CODEX} <= set(found)
+    assert [model for model in found if not prices.priced(model)] == []
+
+
+def test_pi_reports_its_own_cost_so_needs_no_price() -> None:
+    assert "pi" not in TOKEN_PRICED_ENGINES | COST_UNREPORTED_ENGINES
+    assert "pi:openai/gpt-6-sol" in metered_models(frozenset({"pi"}))
 
 
 def test_a_cost_is_rounded_up_never_down() -> None:

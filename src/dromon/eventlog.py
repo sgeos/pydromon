@@ -569,7 +569,17 @@ def replay_through(path: Path, seq: int) -> tuple[State, dict[str, dict[str, str
     return state, times.maps()
 
 
-def check_snapshot(snapshot_file: Path, log_copy: Path) -> tuple[bool, str]:
+class _PastCopy(Exception):
+    """A snapshot names a row past the copy's bound, so the copy cannot judge it."""
+
+    def __init__(self, seq: int) -> None:
+        super().__init__(seq)
+        self.seq = seq
+
+
+def check_snapshot(
+    snapshot_file: Path, log_copy: Path, through: int | None = None
+) -> tuple[bool, str]:
     """Whether the snapshot at ``snapshot_file`` agrees with a full replay of the log
     copy at ``log_copy``, with a sentence saying so. **Round 15, item 4.** The copy
     is replayed from its first event up to the snapshot's ``seq`` and its state and
@@ -577,18 +587,40 @@ def check_snapshot(snapshot_file: Path, log_copy: Path) -> tuple[bool, str]:
     difference means the code applies events differently from the code that wrote
     the snapshot without raising ``STATE_VERSION``, and fails the check. No snapshot,
     or one a start would ignore, passes with its reason, since a start would then
-    replay the whole log, which is always correct."""
+    replay the whole log, which is always correct.
+
+    **Round 16, item 2.** ``through`` is the last event copied from the live log,
+    as ``snapshot`` returns it. The check appends its own events to the copy after
+    that bound, so a row past it is the check's and not the live log's, and a
+    snapshot naming one is neither read against it nor compared, and passes with
+    that reason. Without the bound, a snapshot the daemon wrote during the copy was
+    checked against the check's own rows. Inference from reading the code, not
+    observed, is that such a snapshot was then refused and passed without any
+    comparison, and that it could fail only where the check's row at its ``seq``
+    had the same time and payload as the live row. The caller holds a snapshot read
+    before the copy began, with ``hold_snapshot``, so a snapshot within the bound is
+    compared. Each answer names the snapshot's event and the bound."""
+    bound = "" if through is None else f", and the copy of the log ends at {through}"
+
+    def row(seq: int) -> tuple[str, str] | None:
+        if through is not None and seq > through:
+            raise _PastCopy(seq)
+        return _row(reading, seq)
+
     connection = _connect_read_only(log_copy)
     try:
         with _transaction(connection, "BEGIN") as reading:
             try:
-                loaded = statesnapshot.read(
-                    snapshot_file, SCHEMA_VERSION, lambda seq: _row(reading, seq)
-                )
+                loaded = statesnapshot.read(snapshot_file, SCHEMA_VERSION, row)
             except statesnapshot.SnapshotRefused as refused:
                 return (
                     True,
                     f"the snapshot is not used, so nothing is compared: {refused}",
+                )
+            except _PastCopy as past:
+                return True, (
+                    f"the snapshot is at event {past.seq}, past the copy of the log,"
+                    f" which ends at event {through}, so nothing is compared"
                 )
     finally:
         connection.close()
@@ -600,10 +632,77 @@ def check_snapshot(snapshot_file: Path, log_copy: Path) -> tuple[bool, str]:
     if replayed != stored:
         return False, (
             f"the snapshot at event {loaded.seq} differs from a full replay of the"
-            " log, so this code applies events differently from the code that wrote"
-            " it without a new state version"
+            f" log{bound}, so this code applies events differently from the code that"
+            " wrote it without a new state version"
         )
-    return True, f"the snapshot at event {loaded.seq} agrees with a full replay"
+    return True, (
+        f"the snapshot at event {loaded.seq} agrees with a full replay{bound}"
+    )
+
+
+def hold_snapshot(snapshot_file: Path, held: Path) -> str | None:
+    """Copy the snapshot at ``snapshot_file`` to ``held``, which must not exist and
+    is created owner only, and give ``None``, or give why it is not used and copy
+    nothing. **Round 16, item 2.** ``dromond --check`` holds the snapshot before it
+    copies the log, so the snapshot it compares lies within the copy, since the
+    daemon writes a snapshot only after the event it names is committed. The file
+    is read under the rules a start reads it by, so a snapshot a start would refuse
+    for its kind, its owner or its size is refused here in the same words.
+    Blocking."""
+    try:
+        raw = statesnapshot.read_bytes(snapshot_file)
+    except statesnapshot.SnapshotRefused as refused:
+        return f"the snapshot is not used, so nothing is compared: {refused}"
+    try:
+        descriptor = os.open(
+            held, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600
+        )
+    except OSError as error:
+        raise LogError(f"cannot create a copy of the snapshot at {held}") from error
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(raw)
+    return None
+
+
+def snapshot_since_held(snapshot_file: Path, held: Path) -> str:
+    """A sentence saying whether the snapshot at ``snapshot_file`` is still the one
+    ``hold_snapshot`` copied to ``held``, read as a start reads it. Blocking.
+
+    **Round 16 review, finding 2.** ``dromond --check`` compares only the held
+    snapshot, and the live daemon may write a later one before it stops, which is
+    the one a successor restores. That one names an event past the copy, so the
+    check cannot replay to it, and copying the log again would race the daemon the
+    same way. **Decided by core, for review.** The check therefore reads the live
+    snapshot again as it ends and says whether it is the one compared. A later one
+    does not fail the check, since a busy daemon writes one in most checks. The
+    successor compares a snapshot it restores with a full replay of the log as it
+    starts, and holds every line when they differ, so a later snapshot is still
+    checked, though after the stop rather than before it."""
+    try:
+        now: bytes | None = statesnapshot.read_bytes(snapshot_file)
+    except statesnapshot.SnapshotRefused:
+        now = None
+    try:
+        before: bytes | None = held.read_bytes()
+    except FileNotFoundError:
+        before = None
+    if now == before:
+        if now is None:
+            return (
+                "there is still no snapshot a start would use, so a successor"
+                " replays the whole log"
+            )
+        return "the live snapshot is the one this check held as it began"
+    if now is None:
+        return (
+            "the live snapshot changed after this check held one, and a start would"
+            " not use it now, so a successor replays the whole log"
+        )
+    return (
+        "the daemon wrote a snapshot after the one this check held, which this check"
+        " did not compare, and a successor that restores it compares it with a full"
+        " replay of the log as it starts and holds every line if they differ"
+    )
 
 
 def verify_restored(
@@ -697,9 +796,10 @@ def snapshot(
     rows: int = SNAPSHOT_ROWS,
     max_bytes: int = SNAPSHOT_BYTES,
     pause_seconds: float = SNAPSHOT_PAUSE_SECONDS,
-) -> None:
+) -> int:
     """Copy the log at ``source`` to ``destination`` as it stood when the copy
-    began, never writing ``source``, so a check can open the copy and append to it
+    began, and give the sequence number of the last event copied, never writing
+    ``source``, so a check can open the copy and append to it
     while a daemon still writes the original. ``destination`` must not exist, and is
     created owner only, since the log holds message bodies and answers.
 
@@ -740,7 +840,7 @@ def snapshot(
     if rows < 1 or max_bytes < 1:
         raise ValueError("a snapshot copies at least one row at a time")
     if not source.exists():
-        return
+        return 0
     try:
         descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except OSError as error:
@@ -755,8 +855,11 @@ def snapshot(
                 "ATTACH DATABASE ? AS source", (f"{source.resolve().as_uri()}?mode=ro",)
             )
             tables = _copy_schema(copying)
-            if "events" in tables:
+            bound = (
                 _copy_events(copying, rows, max_bytes, pause_seconds)
+                if "events" in tables
+                else 0
+            )
             for table in sorted(tables - {"events"}):
                 # The name is the log's own, from its schema, quoted as an
                 # identifier, which SQL cannot take as a parameter.
@@ -769,6 +872,7 @@ def snapshot(
             copying.close()
     except sqlite3.Error as error:
         raise LogError(f"cannot copy the event log at {source}: {error}") from error
+    return bound
 
 
 def _copy_schema(copying: sqlite3.Connection) -> set[str]:
@@ -790,8 +894,9 @@ def _copy_schema(copying: sqlite3.Connection) -> set[str]:
 
 def _copy_events(
     copying: sqlite3.Connection, rows: int, max_bytes: int, pause_seconds: float
-) -> None:
-    """Copy the events up to the newest sequence number when the copy begins, in
+) -> int:
+    """Copy the events up to the newest sequence number when the copy begins, and
+    give that number, in
     ranges of at most ``rows`` events and about ``max_bytes`` bytes. Each range is
     read through one cursor, which holds the live log's read lock, and the cursor is
     closed once the range is read, before anything is written, so the lock is held
@@ -834,6 +939,7 @@ def _copy_events(
         time.sleep(pause_seconds)
     if copied != bound:
         raise LogError(f"the copy of the log stopped at event {copied} of {bound}")
+    return bound
 
 
 def _row_bytes(row: tuple[object, ...]) -> int:
