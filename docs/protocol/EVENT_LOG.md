@@ -199,6 +199,7 @@ branch's merge.
 
 | Change | First commit | Floor on `main` | Branch |
 |---|---|---|---|
+| `line_turn_ended.closing_reason`, `STATE_VERSION` 6 | `b73c57d` | Pending | `fix/r16-grok-continue` |
 | `operator_registered`, operator addresses, `note` and `question` kinds | `4d9b3ff` | `621d6db` | `feat/operator-addresses`, #5 |
 | `line_configured` | `7040c16` | `2d04603` | `feat/ticks-and-line-tools`, #11 |
 | `line_session` | `885540c` | `2e413c8` | `feat/operator-questions`, #12 |
@@ -862,3 +863,34 @@ with write access to the file, so the file's permissions are the security bounda
 - Compaction of long logs. Bounded start above builds a snapshot, which bounds the
   start's replay and not the memory the state holds, and the log is never compacted.
 - Migration between schema versions. Version 1 refuses every other version.
+
+## Round 16 closing diagnostics
+
+Fact. `line_turn_ended` may carry `closing_reason` beside its fixed failure cause
+and exception class. It is absent on older events and on non-exception failures.
+A failed event alone may carry it. Its maximum length is 240 characters with no
+ASCII control characters. Replay retains it in the latest failure status.
+
+Fact. The scheduler masks the full first exception line, replaces nonprinting
+characters, and screens that entire line and the exception class before cutting
+the reason to 240 characters. Screening errors or disclosure matches withhold both.
+Automatic diagnostic screening does not spend the line scratch screening budget.
+The scheduler uses the event log credential source to scrub literal values before
+truncation. The event log also scrubs `closing_reason` on append, as it does for
+other free text. Activity and stderr notices omit the original exception.
+
+Fact. Snapshot version 6 adds closing diagnostics and their latest failure state,
+with a nonempty closing reason exercised by the replay scenario. Main retains
+version 4 for `run_started.tree` and version 5 for `run_started.workdir_commit`.
+The combined closing diagnostic pin is appended after those main pins. The two
+superseded branch pins did not reach main. Older snapshot caches are invalidated
+and rebuilt from the event log. The event wire format version is unchanged.
+
+Limit. Pattern masking and literal credential scrubbing cover recognized patterns
+and values supplied to the event log. Other private text requires the disclosure
+list. No later exception line is persisted in this field. Historical events and
+separate engine evidence files are unchanged.
+
+Rollback hazard. Older daemons refuse events carrying `closing_reason`. The floor
+table above records the first compatible commit and its pending main floor. Ports
+must preserve the character bound and screening order.

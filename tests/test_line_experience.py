@@ -743,7 +743,9 @@ def test_a_failure_composing_the_prompt_holds_the_line(
         line = world.log.state.lines[line_id]
         assert line.held_by is not None
         body = world.log.state.messages[line.held_by].body
-        assert "failed: the prompt broke" in body
+        assert "failed" in body
+        assert "the prompt broke" not in body
+        assert line.last_closing_reason == "the prompt broke"
         assert "sent no operator mail during it" in body
 
 

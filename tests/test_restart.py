@@ -446,7 +446,7 @@ def test_a_turn_asked_to_end_that_fails_is_held_and_not_woken(world: World) -> N
     world.raising.add("alpha")
     asked_to_end(world)
     assert restart_notes(world) == []
-    assert world.endings("alpha")[-1].startswith("failed:")
+    assert world.endings("alpha")[-1] == "failed"
     line = world.log.state.lines["alpha"]
     assert line.failed and line.held_by is not None
     world.restart()
