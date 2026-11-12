@@ -2800,6 +2800,22 @@ def test_line_status_gives_the_provider_budget_as_unknown_not_null(
     assert len(text.encode("utf-8")) <= MAX_LINE_STATUS_DEFAULT_BYTES
 
 
+def test_line_status_gives_a_stated_budget_with_its_time_and_age(
+    world: World,
+) -> None:
+    """**Round 16, item 6.** A budget carried forward shows when it was observed
+    and how old it is, so a line can tell it from a fresh one."""
+    stated = world.scheduler.state_budget("claude-code", 40, None, "by hand")
+    world.clock.now += timedelta(hours=2, seconds=5)
+    text, _ = world.call("line_status")
+    budget = json.loads(text)["provider_budget"]
+    assert budget["remaining_percent"] == 40
+    assert budget["observed_at"] == stated["stated_at"]
+    assert budget["age_seconds"] == 2 * 3600 + 5
+    assert budget["age"] == "observed 2 hours ago"
+    assert len(text.encode("utf-8")) <= MAX_LINE_STATUS_DEFAULT_BYTES
+
+
 def test_line_status_shows_how_unknown_cost_counts(world: World) -> None:
     scheduler = world.scheduler
     scheduler.spent_between("alpha", INTERRUPTED_KIND, None, None)

@@ -109,12 +109,12 @@ relay = "tail"          # the route of operator ana's mail
 |---|---|---|---|
 | `version` | integer | required | Must be 1 |
 | `daemon.operator` | identifier | `operator` | The default operator. It also declares that operator, whom a peer may reach before that operator has sent anything, as decision 25 of [`FEDERATION.md`](../architecture/FEDERATION.md) specifies. The built-in default declares no one |
-| `daemon.tick_seconds` | number in [0, 60] | 1 | The tick cadence |
+| `daemon.tick_seconds` | number in [0, 60] | 1 | The maximum tick wait in seconds. Zero waits for events and due timers |
 | `daemon.require_sandbox` | boolean | `false` | Whether every Claude Code line must run with an enabled sandbox, as below |
 | `daemon.disclosure_terms` | path | none | The project's disclosure list, relative to the project root, as below |
 | `read_only_paths` | list of relative paths | empty | Existing files or directories denied writes under every line's resolved workdir. Symbolic links are resolved and targets must remain inside that workdir |
 | `leases.names` | list of identifiers | none | The leases lines may acquire, each named once, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies |
-| `leases.ttl_seconds` | integer in [60, 86400] | 10800 | How long an acquired lease lasts unless released first |
+| `leases.ttl_seconds` | integer in [60, 86400] | 10800 | How long an acquired lease lasts unless released first, and from round 16 the longest a line may ask for with `acquire_lease`'s `seconds` |
 | `runs.commands` | table of names to arrays of text | none | The commands lines may start as supervised runs, at most 64, each name an identifier and each command its program and at most 63 arguments, never a shell string, as [`RUNS.md`](../architecture/RUNS.md) specifies. A declared command runs with the daemon's authority, outside any line's sandbox. Added on 2026-10-31 |
 | `runs.commit_commands` | table of names to arrays of text | none | Commands a line, a line that only reads its working directory included, may start on a commit it names, in a checkout the daemon makes in its state directory, as the commit run section of [`RUNS.md`](../architecture/RUNS.md) specifies. Each as in `runs.commands`, and no name may be in both tables. Declaring one requires `runs.commit_refs.patterns`. Added in round 14 |
 | `runs.parameters.COMMAND.NAME` | table with `pattern` text and an optional `description` | none | A parameter of the declared command COMMAND, whose argument `{NAME}` a line's `start_run` replaces with a value it gives in `arguments`. `pattern` is a regular expression of at most 256 bytes without `(?`, backreferences or possessive quantifiers, which the whole value must match, and `description` printable text of at most 256 bytes. Every placeholder of a command must be declared and every declaration used, at most eight a command. A value is also 1 to 256 printable bytes and never begins with `-`, as the parameter section of [`RUNS.md`](../architecture/RUNS.md) specifies with its trust argument. Added in the task of 2026-11-05 |
@@ -660,3 +660,16 @@ numbers or line ranges are returned to a line. File and line locations were decl
 they would let a line narrow its own text to a listed term. Aggregate counts and
 the hourly limit remain diagnostic safeguards, not protection against a malicious
 agent. The gate reads the same project acceptance table.
+
+## Waiting between ticks
+
+A positive `daemon.tick_seconds` bounds the wait between work events. Zero disables
+periodic ticks. A running turn alone does not require another tick. Messages, turn
+completion and configuration changes wake the loop. Scheduled wakes and mail whose
+cooldown expires retain their timers. Mail awaiting a wake cadence advances only
+while a tick can make progress. Stop requests interrupt the wait.
+
+Launch record inspection and pending peer mail retain bounded maintenance timers,
+even with zero cadence. Tests that advance an injected clock must also provide an
+event to notify the scheduler of that change.
+This avoids spending processor time polling a clock that cannot advance itself.

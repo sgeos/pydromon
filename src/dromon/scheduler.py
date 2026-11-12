@@ -31,8 +31,9 @@ its ``interrupt`` mode each running turn is asked to end at its next safe point.
 the restart ended leaves the line a ``restart_noted`` note, so the restarted daemon
 wakes it.
 
-Cadence. While anything is in flight, ticks follow one another every ``tick_seconds``.
-When nothing is, the loop rests until a message arrives or a scheduled wake falls due.
+Cadence. Ticks wait for work events and timers. A positive ``tick_seconds`` bounds
+the wait. Zero disables periodic ticks. A running turn alone never keeps the loop
+spinning. Pending mail advances through its wake cadence after its cooldown.
 
 Scheduled wakes. A line's ``wake_after`` tool schedules one wake, recorded as
 ``wake_scheduled`` with its due time in Coordinated Universal Time and the identifier
@@ -594,6 +595,14 @@ ACQUIRE_LEASE_SCHEMA: Final[dict[str, object]] = {
                 " as holder_note_unverified, your claim, which no one checks"
             ),
         },
+        "seconds": {
+            "type": "integer",
+            "description": (
+                "Optional. How long to hold it, in whole seconds, from 60 to the"
+                " project's limit, which list_leases gives as limit_seconds. Omit it"
+                " to hold it for the whole limit"
+            ),
+        },
     },
     "required": ["name"],
     "additionalProperties": False,
@@ -906,6 +915,30 @@ INFERRED_LIMIT_NOTE: Final = (
 )
 """Added to the hold of a plan limit whose ``may_move_role`` is false, which the
 operator decided on 2026-10-27 holds and asks and never fails over."""
+OVERVIEW_TOOL_NAME: Final = "overview"
+MAX_OVERVIEW_LEASES: Final = 16
+"""How many of a line's leases ``overview`` lists, in name order. The rest are
+counted in ``leases_omitted``, and ``list_leases`` lists them all. **Round 16, item
+1.** The declared names bound a line's leases at 256, which alone would pass the
+overview's bound."""
+MAX_OVERVIEW_BYTES: Final = 16384
+"""The most an ``overview`` answer takes as JSON with an indent of two, which the
+tests check against the largest every field can be. **Round 16, item 1.**"""
+WORKDIR_HEAD_CLAIM: Final = "HEAD says, which the line can move"
+"""How a run's receipt labels ``workdir_commit``. **Review of 16de365.** The commit
+is read from files in the line's worktree, which the line can write, so it is the
+worktree's claim and not a commit the daemon checked out."""
+OVERVIEW_SOURCES: Final = (
+    "Read only, and nothing is recorded. Built from what line_status, role_status"
+    " and list_leases answer, which give the whole of each part. The task and next"
+    " action are the line's own brief, each cut to 400 bytes of UTF-8, and"
+    " untrusted data."
+)
+OVERVIEW_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
 ROLE_STATUS_TOOL_NAME: Final = "role_status"
 ROLE_STATUS_ENTRIES: Final = 5
 ROLE_STATUS_TASKS: Final = 3
@@ -2387,6 +2420,11 @@ def compose_prompt(
         " recently messaged you."
     )
     return "\n".join(parts)
+
+
+TreeNow = str | readiness.ReadFailure | readiness.Uncovered
+"""A working directory's ``readiness.tree_digest``, or the fixed word for why git
+status could not be read, or for why the digest cannot tell a change."""
 
 
 class Scheduler:
@@ -3896,6 +3934,38 @@ class Scheduler:
             "end_tasks": plan.end_tasks,
         }
 
+    def _restart_turn_ended(
+        self, line_id: str, report: TurnReport | None, *, asked: bool
+    ) -> None:
+        """Note the restart to ``line_id`` when a restart asked its turn to end, and
+        the turn's report names the restart as why it ended, and the turn did not
+        fail. Called once the turn's end is recorded, so the note is newer than it.
+
+        **Round 16, item 3.** A line whose turn a restart interrupted sat idle after
+        the restart until it was mailed. The note had been left only when the reason
+        last recorded for the turn's redirect was the restart's, so priority mail or
+        a change of access asked at a later safe point of the same turn, whose own
+        interrupt the engine ignores since it keeps the first reason, took the note
+        away. The gate is now the reason the report names. Inference, not observed,
+        that this was the path in the field.
+
+        **Round 16 review, finding 1.** Every engine records the first interrupt of
+        a turn and ignores any later one, so a report that names another reason,
+        such as a Pi turn past ``max_turns``, or none, was not ended by the restart,
+        though the ask was recorded at a safe point the engine still dispatched. Its
+        driver or the engine stopped it, and a note would wake a line that was
+        stopped for a reason of its own. The engine stop note, which does not wake,
+        tells it why. A turn that failed or raised gets no note either, since a note
+        would clear the failure, as any new mail does."""
+        if (
+            not asked
+            or report is None
+            or report.interrupted_for != restart.REASON
+            or line_id in self._failed
+        ):
+            return
+        self._note_restart(line_id)
+
     def _note_restart(self, line_id: str) -> None:
         """Leave ``line_id`` a note that a restart ended its turn, which wakes it once
         the restarted daemon runs, or in this daemon when the restart was abandoned."""
@@ -4544,16 +4614,39 @@ class Scheduler:
             return None
         return lease
 
-    def acquire_lease(self, line_id: str, name: str, note: str | None = None) -> str:
-        """Give ``line_id`` the lease ``name`` for the project's time to live, and
-        return when it expires. Raises ``LeaseRefused`` for an undeclared name, for a
-        lease another line holds, and for one the line holds already, so that one
-        acquisition lasts at most one time to live. The holder may acquire it again
-        once it has expired, by the wall clock."""
+    def acquire_lease(
+        self,
+        line_id: str,
+        name: str,
+        note: str | None = None,
+        seconds: int | None = None,
+    ) -> str:
+        """Give ``line_id`` the lease ``name`` for ``seconds``, or for the project's
+        time to live when it is ``None``, and return when it expires. Raises
+        ``LeaseRefused`` for an undeclared name, for a duration outside 60 seconds
+        to the project's time to live, for a lease another line holds, and for one
+        the line holds already, so that one acquisition lasts at most one time to
+        live. The holder may acquire it again once it has expired, by the wall clock.
+
+        **Round 16, item 2.** Every lease lasted the project's whole time to live,
+        so lines that asked for one hour and for four hours were each given the
+        project's limit. A line now asks for a duration up to that limit. The
+        duration is recorded on the lease as its ``expires``, which is
+        ``acquired_at`` plus the duration, so ``lease_acquired`` needs no new field
+        and a daemon from before this change reads every such lease."""
         if name not in self._lease_names:
             declared = ", ".join(sorted(self._lease_names)) or "none"
             raise LeaseRefused(
                 f"the project declares no lease {name!r}. Declared leases: {declared}"
+            )
+        duration = self._lease_ttl if seconds is None else seconds
+        if (
+            type(duration) is not int
+            or not MIN_LEASE_TTL_SECONDS <= duration <= self._lease_ttl
+        ):
+            raise LeaseRefused(
+                f"seconds must be a whole number from {MIN_LEASE_TTL_SECONDS} to"
+                f" {self._lease_ttl}, the project's limit for a lease"
             )
         held = self._live_lease(name)
         if held is not None and held.line_id == line_id:
@@ -4569,7 +4662,7 @@ class Scheduler:
         start = now.replace(microsecond=0)
         if start < now:
             start += timedelta(seconds=1)
-        expires = format_due(start + timedelta(seconds=self._lease_ttl))
+        expires = format_due(start + timedelta(seconds=duration))
         try:
             event = LeaseAcquired(name, line_id, format_due(start), expires, note)
         except InvalidField as error:
@@ -4602,6 +4695,7 @@ class Scheduler:
                 "holder": lease.line_id,
                 "acquired_at": lease.acquired_at,
                 "expires": lease.expires,
+                "seconds": _lease_seconds(lease),
             }
             if lease.note is not None:
                 entry[LEASE_NOTE_KEY] = lease.note
@@ -4624,6 +4718,7 @@ class Scheduler:
                     {
                         "leases": held,
                         "free": free,
+                        "limit_seconds": self._lease_ttl,
                         "caveat": LEASE_INVENTORY_CAVEAT,
                     },
                     indent=2,
@@ -4635,8 +4730,10 @@ class Scheduler:
             name=LIST_LEASES_TOOL_NAME,
             description=(
                 "List every live lease with its holder, when it was acquired, when it"
-                " expires and the holder's unverified note, and the declared leases"
-                " no line holds. Read only. " + LEASE_INVENTORY_CAVEAT
+                " expires, the seconds it was acquired for and the holder's"
+                " unverified note, the declared leases no line holds, and"
+                " limit_seconds, the longest a lease may be acquired for. Read only. "
+                + LEASE_INVENTORY_CAVEAT
             ),
             input_schema=LIST_LEASES_SCHEMA,
             handler=handler,
@@ -4648,7 +4745,13 @@ class Scheduler:
         for name in sorted(self._state().leases):
             lease = self._live_lease(name)
             if lease is not None and lease.line_id == line_id:
-                held.append({"name": name, "expires": lease.expires})
+                held.append(
+                    {
+                        "name": name,
+                        "expires": lease.expires,
+                        "seconds": _lease_seconds(lease),
+                    }
+                )
         return held
 
     def _lease_tool(self, line_id: str, acquire: bool) -> SdkMcpTool[Any]:
@@ -4660,17 +4763,20 @@ class Scheduler:
                 return _tool_error(unexpected)
             name: object = args.get("name")
             note: object = args.get("note")
+            seconds: object = args.get("seconds")
             if not isinstance(name, str):
                 return _tool_error("name must be text")
             if note is not None and not isinstance(note, str):
                 return _tool_error("note must be text")
+            if seconds is not None and type(seconds) is not int:
+                return _tool_error("seconds must be a whole number")
             if note is not None:
                 refusal = self.refuse_disclosed(line_id, ("note", note))
                 if refusal is not None:
                     return _tool_error(refusal)
             try:
                 if acquire:
-                    expires = self.acquire_lease(line_id, name, note)
+                    expires = self.acquire_lease(line_id, name, note, seconds)
                     return _tool_text(
                         f"you hold lease {name} until {expires}. Release it when"
                         " you are done."
@@ -4690,7 +4796,8 @@ class Scheduler:
                     "Acquire a lease the project declares, such as one for a shared"
                     " machine resource, before using that resource. It succeeds only"
                     " if no other line holds it, and otherwise says who does. It ends"
-                    " when you release it or when its time to live passes."
+                    " when you release it or when the seconds you asked for pass, or"
+                    " the project's limit when you asked for none."
                 ),
                 input_schema=ACQUIRE_LEASE_SCHEMA,
                 handler=handler,
@@ -4930,6 +5037,19 @@ class Scheduler:
             else await self._make_checkout(line_id, command, run_id, commit)
         )
         command_dir = None if checkout is None else checkout.tree
+        # Round 16, item 5. Read before the launch, so a change made while the run
+        # starts is a change after the tree it covers.
+        tree = (
+            None
+            if commit is not None
+            else await asyncio.to_thread(_tree_or_none, workdir)
+        )
+        # Round 16, item 3. The commit a run in a worktree ran, read before its
+        # command starts, so the receipt names it. A file read, as line_status does,
+        # and the worktree's own claim, as RunStarted.workdir_commit records.
+        head = None if commit is not None else read_head_commit(workdir)
+        if head is not None and COMMIT_PATTERN.fullmatch(head) is None:
+            head = None
         if checkout is not None:
             # A fresh private home, so the commit's code finds none of the
             # operator's settings, credentials or caches by its home. It is not a
@@ -4961,6 +5081,8 @@ class Scheduler:
                 format_due(self._wall_clock()),
                 commit,
                 None if command_dir is None else str(command_dir),
+                tree,
+                head,
             )
             try:
                 self._log.append(started)
@@ -5099,12 +5221,17 @@ class Scheduler:
             lambda: runs.signal_run(latest.started, self._run_start_of)
         )
 
-    def run_status(self, line_id: str) -> str:
+    def run_status(self, line_id: str, tree_now: TreeNow | None = None) -> str:
         """The latest runs of ``line_id``'s scope, newest first, with their
         receipts, and the commands the project declares. **Round 14, item 2.** A
         failed run names the run that corrected it, and that run names each it
         corrected, as ``runs.corrections`` links them, read from every run of the
-        scope, so a link to a run older than those shown is still named."""
+        scope, so a link to a run older than those shown is still named.
+
+        **Round 16, item 5.** ``tree_now`` is the working directory's
+        ``readiness.tree_digest`` read now, or why it could not be read, or ``None``
+        when it was not read. The latest run then says whether it still covers the
+        tree, as ``_tree_text`` words it."""
         scope = self._scope_runs(line_id)
         found = scope[-MAX_RUNS_SHOWN:]
         declared = ", ".join(sorted(self._run_commands)) or "none"
@@ -5137,6 +5264,7 @@ class Scheduler:
         # reason is read with the receipt. Older tails stay in the log and in the
         # runs view.
         lines[0] += _run_tail(found[-1])
+        lines[0] += _tree_text(found[-1].started, tree_now)
         return (
             f"previous is {found[-1].started.run_id}. Declared commands: {declared}.\n"
             + "\n".join(lines)
@@ -5504,7 +5632,13 @@ class Scheduler:
             # recorded first, so a finished output is never shown as still running.
             if any(run.ended is None for run in self._scope_runs(line_id)):
                 await self.fresh_runs()
-            return _tool_text(self.run_status(line_id))
+            scope = self._scope_runs(line_id)
+            tree_now: TreeNow | None = None
+            if scope and scope[-1].started.tree is not None:
+                tree_now = await asyncio.to_thread(
+                    _tree_or_failure, Path(scope[-1].started.workdir)
+                )
+            return _tool_text(self.run_status(line_id, tree_now))
 
         async def stop(args: dict[str, Any]) -> dict[str, Any]:
             unexpected = _unexpected(args, STOP_RUN_SCHEMA)
@@ -5678,6 +5812,9 @@ class Scheduler:
             # Round 9 review, F1. The compaction is of the session the line no
             # longer resumes, so it says nothing of the session its next turn opens.
             return
+        # Round 16, item 7. A request made before this compaction is spent by it, as
+        # its wake is below. Kept, it compacted the session again in the next turn.
+        self._compact_requests.discard(line_id)
         if cause == "engine":
             # A compaction Dromon asked for came at the start of a turn whose prompt
             # already led with the brief. One the engine made by itself may have
@@ -6796,7 +6933,8 @@ class Scheduler:
         """The stated budget of the line's provider, or an entry that says it is
         unknown. **Round 14, item 4.** Never ``None``."""
         engine = ENGINE_OF.get(self.model_of(line_id))
-        return _budget_entry(engine, self._budget_of(line_id))
+        now = self._wall_clock()
+        return _budget_entry(engine, self._budget_of(line_id, now), now)
 
     def disclosure_status(self) -> dict[str, object]:
         """Whether the project has a disclosure list, so a line learns early that
@@ -8244,6 +8382,114 @@ class Scheduler:
             handler=handler,
         )
 
+    def overview(self, line_id: str) -> dict[str, object]:
+        """One read-only view of ``line_id``'s task, checkpoint, leases, cost carried
+        and ceilings, for the line's ``overview`` tool and the operator's ``overview``
+        request. Raises ``EventRejected`` for an unknown line.
+
+        **Round 16, item 1.** Another project's lines read ``line_status``,
+        ``role_status`` and ``list_leases`` apart to learn these, and asked for one
+        view. Every part is taken from what those already answer, through the same
+        methods, so the overview says nothing they do not and records nothing. The
+        reads of one call share one copy of the state, as ``line_status`` does.
+        **Interpretation.** The other project's word checkpoint is read as what a
+        successor resumes from. That is the brief's stamped commits, the commits now
+        and, for a seat, the role's owner and its newest journal entry without its
+        body, which ``role_status`` gives. Bounded by ``MAX_OVERVIEW_BYTES``, as
+        ``_bounded_overview`` makes sure."""
+        if line_id not in self._state().lines:
+            raise EventRejected(f"no line {line_id}")
+        if self._snapshot is not None:
+            return _bounded_overview(self._overview(line_id))
+        self._snapshot = (self._log.last_seq, self._log.state)
+        try:
+            return _bounded_overview(self._overview(line_id))
+        finally:
+            self._snapshot = None
+
+    def _overview(self, line_id: str) -> dict[str, object]:
+        state = self._state()
+        line = state.lines[line_id]
+        limits = self.limits_for(line_id)
+        cost = self.cost_status(line_id)
+        commits = self.commits(line_id)
+        leases = self.leases_of(line_id)
+        return {
+            "line_id": line_id,
+            "condition": self.condition(line_id),
+            "hold_cause": _hold_cause(line),
+            "task": _compact_brief(self._brief_status(line_id)),
+            "checkpoint": {
+                "workdir_commit": commits["workdir"],
+                "daemon_commit": commits["daemon"],
+                "daemon_stale": commits["stale"],
+                "role": self._overview_role(state, line_id),
+            },
+            "leases": leases[:MAX_OVERVIEW_LEASES],
+            "leases_omitted": max(0, len(leases) - MAX_OVERVIEW_LEASES),
+            "cost": {
+                "since_release_usd": cost["estimate"],
+                "basis": cost["basis"],
+                "carried": cost["whole"],
+            },
+            "ceilings": {
+                "autonomous_turns": {
+                    "used": self._autonomous.get(line_id, 0),
+                    "allowed": limits.max_autonomous_turns,
+                },
+                "cost_usd": {
+                    "limit": cost["limit"],
+                    "enforced": cost["limit_enforced"],
+                },
+                "provider_budget": self.provider_budget_status(line_id),
+                "lease_seconds": self._lease_ttl,
+            },
+            "sources": OVERVIEW_SOURCES,
+        }
+
+    def _overview_role(self, state: State, line_id: str) -> dict[str, object] | None:
+        """The role part of an overview, or ``None`` for a line that is no seat: the
+        role, its owner and its newest journal entry without the body. The entries
+        are scanned once, as ``role_view`` scans them."""
+        seat = state.seats.get(line_id)
+        if seat is None:
+            return None
+        role = state.roles[seat.role_id]
+        newest: RoleNoted | None = None
+        for entry in state.role_entries.values():
+            if entry.role_id == seat.role_id:
+                newest = entry
+        return {
+            "role_id": seat.role_id,
+            "owner": role.owner,
+            "you_own": role.owner == line_id,
+            "newest_entry": (
+                None if newest is None else _entry_view(newest, with_body=False)
+            ),
+        }
+
+    def overview_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The read-only ``overview`` tool for ``line_id``. Round 16, item 1."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, OVERVIEW_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            return _tool_text(
+                json.dumps(self.overview(line_id), indent=2, sort_keys=True)
+            )
+
+        return SdkMcpTool(
+            name=OVERVIEW_TOOL_NAME,
+            description=(
+                "Show one read-only view of your task, checkpoint, leases held, cost"
+                " carried across releases and ceilings, joined from what line_status,"
+                " role_status and list_leases answer. It records nothing."
+            ),
+            input_schema=OVERVIEW_SCHEMA,
+            handler=handler,
+        )
+
     def role_status(self, line_id: str) -> dict[str, object]:
         """What a seat may know of its role: the worktree, the owner and the latest
         change of owner, each seat's condition, engine and its provider's stated
@@ -8284,10 +8530,11 @@ class Scheduler:
             raise EventRejected(f"no role {role_id}")
         seats: list[dict[str, object]] = []
         usable = self.usable_seats(role_id)
+        now = self._wall_clock()
         for seat_id in seat_order(state, role_id):
             other = state.seats[seat_id]
             engine = ENGINE_OF.get(self.model_of(seat_id))
-            budget = self._budget_of(seat_id)
+            budget = self._budget_of(seat_id, now)
             seats.append(
                 {
                     "line_id": seat_id,
@@ -8300,7 +8547,7 @@ class Scheduler:
                     "waits_unconfined": self.waits_unconfined(seat_id),
                     "model": self.model_of(seat_id),
                     "provider": engine,
-                    "budget": _budget_entry(engine, budget),
+                    "budget": _budget_entry(engine, budget, now),
                     "cost_whole": self.whole_cost(seat_id),
                     "workdir_commit": self._workdir_commit(seat_id),
                     "recent_tasks": [
@@ -9844,7 +10091,7 @@ class Scheduler:
         self._log.append(event)
         return {
             "provider": provider,
-            **_budget_view(event),
+            **_budget_view(event, self._wall_clock()),
             "followed": self._budget_followed(event),
         }
 
@@ -9861,7 +10108,7 @@ class Scheduler:
             budgets.append(
                 {
                     "provider": provider,
-                    **_budget_view(budget),
+                    **_budget_view(budget, now),
                     "spent": budget_spent(budget, now),
                 }
             )
@@ -10561,6 +10808,7 @@ class Scheduler:
             self.list_leases_tool(line_id),
             *self._run_tools(line_id),
             self.line_status_tool(line_id),
+            self.overview_tool(line_id),
             self.read_instructions_tool(line_id),
             self.write_scratch_tool(line_id),
             self.check_disclosure_tool(line_id),
@@ -11002,6 +11250,20 @@ class Scheduler:
             + (f" the operators are {known}" if known else " there are none")
         )
 
+    def default_sender(self) -> OperatorAddress:
+        """The operator an operator's ``send`` speaks for when it names none, the one
+        ``@operator`` names, as ``resolve_operator`` reads it, so a line's reply to
+        ``@operator`` reaches the mailbox the note came from.
+
+        **Round 16, item 7.** ``dromon send`` without ``--operator`` sent as the login
+        name, while ``@operator`` names the project's ``daemon.operator``, so a line
+        told to mail ``@operator`` could not thread its reply where they differed.
+        Unlike ``resolve_operator`` it never refuses, since ``send`` registers its
+        sender."""
+        if OPERATOR_ALIAS in self._state().operators:
+            return OperatorAddress(OPERATOR_ALIAS)
+        return self._default_operator
+
     def _operator_for(self, line_id: str, to: str | None) -> OperatorAddress:
         if to is not None:
             address = parse_address(to)
@@ -11330,8 +11592,8 @@ class Scheduler:
     def _may_wake(self, line_id: str) -> bool:
         """Whether the line has post office mail that may start its turn. Peer mail
         past its peer's turn allowance waits without keeping the loop ticking, and
-        the loop's rest, at most ``MAX_REST_SECONDS``, finds it once the hour
-        allows."""
+        bounded maintenance inspection finds it once the hour allows, even with
+        zero tick cadence."""
         messages = self.deliverable(line_id)
         return bool(messages) and self.peer_turns.may_wake(
             line_id, (message for _, message in messages)
@@ -11456,6 +11718,7 @@ class Scheduler:
         on, so the scheduler neither dies nor spins."""
         try:
             while not stop.is_set():
+                self._work.clear()
                 if self._work_waiting():
                     try:
                         self.step()
@@ -11470,35 +11733,52 @@ class Scheduler:
                                 stop.wait(),
                                 max(SECRETS_RETRY_SECONDS, self._tick_seconds),
                             )
-                    elif self._tick_seconds:
-                        with contextlib.suppress(TimeoutError):
-                            await asyncio.wait_for(stop.wait(), self._tick_seconds)
-                    else:
-                        await asyncio.sleep(0)
-                    continue
-                self._work.clear()
-                # Each rest, at most MAX_REST_SECONDS apart, also sweeps the launch
-                # records of launchers that exited between turns. Review N1.
-                try:
-                    with self._refusing_on_secrets("the sweep of left processes"):
-                        self.collect_left()
-                    self.note_stuck_starts()
-                except Exception as error:  # noqa: BLE001
-                    await self._fault_found(error, stop)
-                    continue
+                        continue
+                else:
+                    # A rest also sweeps records of launchers that exited between turns.
+                    try:
+                        with self._refusing_on_secrets("the sweep of left processes"):
+                            self.collect_left()
+                        self.note_stuck_starts()
+                    except Exception as error:  # noqa: BLE001
+                        await self._fault_found(error, stop)
+                        continue
+                until = self.seconds_until_next_wake()
+                timeouts = [] if until is None else [min(until, MAX_REST_SECONDS)]
+                if self._tick_seconds > 0:
+                    timeouts.append(min(self._tick_seconds, MAX_REST_SECONDS))
+                # Launch records and peer allowance expiry are maintenance work.
+                # Their bounded inspection remains due even with no periodic ticks.
+                if self._report_dir is not None or self._post_office:
+                    timeouts.append(MAX_REST_SECONDS)
+                # Mail already in the post office may need another tick to reach
+                # its wake cadence. Advance only while that mail can make progress.
+                for line_id in self._state().lines:
+                    if not (self._eligible(line_id) and self._may_wake(line_id)):
+                        continue
+                    ended = self._last_turn_end.get(line_id)
+                    remaining = (
+                        0.0
+                        if ended is None
+                        else self.limits_for(line_id).cooldown_seconds
+                        - (self._clock() - ended)
+                    )
+                    if remaining > 0 and not self._priority_waiting(line_id):
+                        timeouts.append(remaining)
+                    elif self._tick_seconds == 0:
+                        self._work.set()
                 worker = asyncio.create_task(self._work.wait())
                 stopping = asyncio.create_task(stop.wait())
-                # Rest until work arrives, or until the next scheduled wake falls due.
-                until = self.seconds_until_next_wake()
-                await asyncio.wait(
-                    {worker, stopping},
-                    timeout=MAX_REST_SECONDS
-                    if until is None
-                    else min(until, MAX_REST_SECONDS),
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                worker.cancel()
-                stopping.cancel()
+                try:
+                    await asyncio.wait(
+                        {worker, stopping},
+                        timeout=min(timeouts) if timeouts else None,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    worker.cancel()
+                    stopping.cancel()
+                    await asyncio.gather(worker, stopping, return_exceptions=True)
         finally:
             for watcher in list(self._pid_watchers.values()):
                 watcher.cancel()
@@ -11835,8 +12115,6 @@ class Scheduler:
             redirected = self._redirected.get(line_id)
             if redirected is not None and report.interrupted_for == redirected:
                 ending += f", ended at a safe point for {redirected}"
-                if redirected == restart.REASON:
-                    self._note_restart(line_id)
             elif report.interrupted_for is not None:
                 stop_cause = f"The driver interrupted it for {report.interrupted_for}."
                 ending += f", interrupted by its driver: {report.interrupted_for}"
@@ -11902,6 +12180,7 @@ class Scheduler:
             self._redirect_for.pop(line_id, None)
             self._redirected.pop(line_id, None)
             self._role_redirect.pop(line_id, None)
+            asked = line_id in self._restart_asked
             self._restart_asked.discard(line_id)
             # A compaction the engine did not report leaves no cause for a later one.
             self._compaction_cause.pop(line_id, None)
@@ -11923,6 +12202,7 @@ class Scheduler:
                 # reached the engine, as when it could not be composed, so the turn
                 # retires none of the notes delivered into it.
                 self._end_turn(line_id, report, failure, closing_error)
+                self._restart_turn_ended(line_id, report, asked=asked)
             if stop_cause is not None and line is not None:
                 self._note_engine_stop(line_id, stop_cause)
             # A handoff asked for in the turn takes effect now that it has ended,
@@ -12373,7 +12653,13 @@ class Scheduler:
         and how, and not their contents, so a line's edits inside a file already
         dirty do not flag the brief, while a new dirty path, a path made clean, or
         work discarded does. A line whose own work flagged it clears the flag by
-        setting the brief again."""
+        setting the brief again.
+
+        **Round 16, item 4, at the review line's request.** Each notice names the
+        commit the brief was set at and the worktree's ``HEAD``, or says that one of
+        them is not known, so a line can read the log between them without first
+        finding either. A notice whose reason already names both does not repeat
+        them."""
         brief = self._state().briefs.get(line_id)
         if brief is None or self.effective_config(line_id).fresh_session_each_turn:
             return None
@@ -12408,20 +12694,43 @@ class Scheduler:
                 " possibly stale, and check it against git status yourself."
             )
         )
+        if not reasons and unknown is None:
+            return None
+        commits = (
+            ""
+            if moved and not led_brief
+            else f" {self._brief_commits(brief.workdir_commit, head)}"
+        )
         if not reasons:
-            if unknown is None:
-                return None
             return (
                 f"BRIEF CURRENCY UNKNOWN. Your standing brief was set at"
-                f" {brief.set_at}. {unknown}"
+                f" {brief.set_at}.{commits} {unknown}"
             )
         stale = (
             f"STALE BRIEF. Your standing brief, set at {brief.set_at}, was set before"
             f" {' and '.join(reasons)}, so it may not describe your current task."
-            " Check it against git log, git status and your mail before acting on"
-            " it, and set it again with set_brief, which clears this notice."
+            f"{commits} Check it against git log, git status and your mail before"
+            " acting on it, and set it again with set_brief, which clears this"
+            " notice."
         )
         return stale if unknown is None else f"{stale} {unknown}"
+
+    @staticmethod
+    def _brief_commits(named: str, head: str | None) -> str:
+        """One sentence naming the commit a brief was set at and the worktree's
+        ``HEAD``, each shortened as the notices shorten commits, or saying which is
+        not known. **Round 16, item 4.**"""
+        brief_at = (
+            f"was set at commit {named[:12]}"
+            if named
+            else "names no commit, since the daemon could not read one when it was set"
+        )
+        now = (
+            f"your worktree's HEAD is {head[:12]}"
+            if head is not None
+            else "your worktree's HEAD could not be read"
+        )
+        return f"The brief {brief_at}, and {now}."
 
     def _mail_since_brief(self, line_id: str, brief: BriefSet) -> str:
         """One sentence for the brief's lead when an operator mailed ``line_id``
@@ -13335,8 +13644,6 @@ class Scheduler:
                 redirected = self._redirected.get(line_id)
                 if redirected is not None and report.interrupted_for == redirected:
                     ending += f", ended at a safe point for {redirected}"
-                    if redirected == restart.REASON:
-                        self._note_restart(line_id)
                 elif report.interrupted_for is not None:
                     ending += f", interrupted by its driver: {report.interrupted_for}"
                 elif turn_outcome(report) == FAILED:
@@ -13381,6 +13688,7 @@ class Scheduler:
             self._redirect_for.pop(line_id, None)
             self._redirected.pop(line_id, None)
             self._role_redirect.pop(line_id, None)
+            asked = line_id in self._restart_asked
             self._restart_asked.discard(line_id)
             self.activity.record(line_id, ActivityKind.TURN_ENDED, ending)
             line = self._state().lines.get(line_id)
@@ -13393,6 +13701,7 @@ class Scheduler:
                 # Round 8 review, ON1, as in ``_turn``. An engine turn that failed or
                 # was cancelled before it reported retires none of its task notes.
                 self._end_turn(line_id, report, failure, closing_error)
+                self._restart_turn_ended(line_id, report, asked=asked)
             self._settle_relinquish(line_id)
             self._work.set()
         self._apply_limits(line_id, TurnCause.AUTONOMOUS, True, report)
@@ -14084,6 +14393,35 @@ def _brief_fields(brief: BriefSet) -> dict[str, object]:
     }
 
 
+def _overview_size(view: dict[str, object]) -> int:
+    """The bytes ``view`` takes as the ``overview`` tool gives it."""
+    return len(json.dumps(view, indent=2, sort_keys=True).encode())
+
+
+def _bounded_overview(view: dict[str, object]) -> dict[str, object]:
+    """``view`` within ``MAX_OVERVIEW_BYTES``. **Round 16, item 1.** Each part is
+    bounded where it is built, so the steps below are a guard for a part whose bound
+    a later change raises. The brief's text goes first, then the leases, each
+    replaced by a sentence naming the tool that gives it whole, and what is left is
+    of fixed size. Raises ``AssertionError`` if even that passes the bound, which
+    would be a defect and not a property of any line."""
+    if _overview_size(view) <= MAX_OVERVIEW_BYTES:
+        return view
+    task = view.get("task")
+    if isinstance(task, dict):
+        cut = dict(cast(dict[str, object], task))
+        cut["untrusted_data"] = None
+        cut["cut"] = "the overview passed its bound, and line_status gives the brief"
+        view = {**view, "task": cut}
+    if _overview_size(view) > MAX_OVERVIEW_BYTES:
+        leases = cast(list[object], view["leases"])
+        omitted = cast(int, view["leases_omitted"]) + len(leases)
+        view = {**view, "leases": [], "leases_omitted": omitted}
+    if _overview_size(view) > MAX_OVERVIEW_BYTES:
+        raise AssertionError("an overview passed its bound with its lists removed")
+    return view
+
+
 def _compact_brief(brief: object) -> dict[str, object] | None:
     """A standing brief as the compact ``line_status`` gives it, its task and next
     action cut short, so the default view stays within its bound. The detailed view
@@ -14159,6 +14497,14 @@ def failure_view(line: Line) -> dict[str, object] | None:
 def _lease_live(lease: LeaseAcquired, now: datetime) -> bool:
     """Whether ``lease`` is still held at ``now``, by its expiry."""
     return parse_due(lease.expires) > now
+
+
+def _lease_seconds(lease: LeaseAcquired) -> int:
+    """The whole seconds ``lease`` was acquired for, from its two recorded times.
+    **Round 16, item 2.** A lease acquired before durations could be asked for
+    gives the project's time to live then, which is what it was given."""
+    held = parse_due(lease.expires) - parse_due(lease.acquired_at)
+    return int(held.total_seconds())
 
 
 def _live_leases_by_line(state: State, now: datetime) -> dict[str, list[str]]:
@@ -14569,11 +14915,18 @@ def _scheduled_summary(pending: ScheduledWake | None) -> dict[str, object] | Non
     return {"due": pending.due, "message_id": pending.message_id}
 
 
-def _budget_view(budget: BudgetStated) -> dict[str, object]:
+def _budget_view(budget: BudgetStated, now: datetime) -> dict[str, object]:
     """A provider's stated budget as ``role_status`` gives it, with its source and
     time, since it is a snapshot. A field the statement left out says ``unknown`` and
-    is never ``None``. **Round 14, item 4.**"""
+    is never ``None``. **Round 14, item 4.**
+
+    **Round 16, item 6, from another project's reports.** A figure carried forward
+    without its time could not be told from a fresh one, so beside the figure stand
+    ``observed_at``, the time it was stated or reported, and its age at ``now``, in
+    whole seconds and in words. ``stated_at`` is kept, with the same value, for the
+    clients that read it."""
     percent = budget.remaining_percent
+    seconds, words = _age_of(budget.stated_at, now)
     return {
         "status": "stated",
         "provider": budget.provider,
@@ -14582,17 +14935,50 @@ def _budget_view(budget: BudgetStated) -> dict[str, object]:
         "source": budget.source.value,
         "note": budget.note,
         "stated_at": budget.stated_at,
+        "observed_at": budget.stated_at,
+        "age_seconds": seconds,
+        "age": words,
     }
 
 
+def _age_of(observed_at: str, now: datetime) -> tuple[int | str, str]:
+    """How long before ``now`` the instant ``observed_at`` was, in whole seconds
+    and in words, or ``unknown`` for both when it cannot be read. **Round 16, item
+    6.** An instant after ``now``, as when the daemon's clock was set back, is not
+    given as an age of zero, which would read as fresh, and says so instead."""
+    try:
+        observed = parse_due(observed_at)
+    except InvalidField:
+        return UNKNOWN, UNKNOWN
+    seconds = int((now - observed).total_seconds())
+    if seconds < 0:
+        return (
+            seconds,
+            "observed after the daemon's current time, so its age is unknown",
+        )
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    parts = [
+        f"{count} {unit}{'' if count == 1 else 's'}"
+        for count, unit in ((days, "day"), (hours, "hour"), (minutes, "minute"))
+        if count
+    ]
+    return seconds, (
+        "observed less than a minute ago"
+        if not parts
+        else f"observed {' '.join(parts)} ago"
+    )
+
+
 def _budget_entry(
-    provider: str | None, budget: BudgetStated | None
+    provider: str | None, budget: BudgetStated | None, now: datetime
 ) -> dict[str, object]:
     """The budget entry for a provider: the statement, or a named entry that says no
     budget is known. Dromon takes no action on a budget it does not know, so a role
     never moves on it. **Round 14, item 4.**"""
     if budget is not None:
-        return _budget_view(budget)
+        return _budget_view(budget, now)
     return {
         "status": UNKNOWN,
         "provider": UNKNOWN if provider is None else provider,
@@ -14604,6 +14990,9 @@ def _budget_entry(
             " left and moves no role on it. dromon budget set states one"
         ),
         "stated_at": UNKNOWN,
+        "observed_at": UNKNOWN,
+        "age_seconds": UNKNOWN,
+        "age": UNKNOWN,
     }
 
 
@@ -14806,6 +15195,8 @@ def _run_view(
         "previous": started.previous,
         "commit": started.commit,
         "checkout": started.checkout,
+        "tree": started.tree,
+        "workdir_commit": started.workdir_commit,
         "workdir": started.workdir,
         "output_file": started.output_file,
         "pid": started.pid,
@@ -14825,10 +15216,84 @@ def _run_view(
     }
 
 
+def _tree_or_none(directory: Path) -> str | None:
+    """``readiness.tree_digest`` of ``directory``, or ``None`` where it cannot be
+    read, so a run starts whether or not its tree can be read. Blocking."""
+    found = _tree_or_failure(directory)
+    # A failure word is a ``StrEnum``, and so also a ``str``, so it is tested first.
+    return (
+        None
+        if isinstance(found, (readiness.ReadFailure, readiness.Uncovered))
+        else found
+    )
+
+
+def _tree_or_failure(directory: Path) -> TreeNow:
+    """``readiness.tree_digest`` of ``directory``, or the fixed word for why it
+    cannot be read or cannot tell a change. Blocking."""
+    try:
+        return readiness.tree_digest(directory)
+    except readiness.ReadinessUnknown as error:
+        return error.cause
+    except readiness.TreeUncovered as error:
+        return error.cause
+
+
+def _tree_text(started: RunStarted, tree_now: TreeNow | None) -> str:
+    """Whether the run ``started`` still covers its working directory, for the
+    latest run in ``run_status``, or nothing. **Round 16, item 5, core's request
+    of round 15.** A gate that passed was read as covering the tree after tracked
+    files had changed. A commit run covers its commit and says nothing here. A run
+    recorded with no tree, before the field or where the tree could not be read as
+    it started, says that its coverage is unknown. The comparison is as
+    ``readiness.tree_digest`` describes, with its residuals."""
+    if started.commit is not None:
+        return ""
+    if started.tree is None:
+        return (
+            ". It recorded no digest of the tree as it started, so whether it covers"
+            " the tree now is unknown"
+        )
+    if tree_now is None:
+        return ""
+    if isinstance(tree_now, readiness.ReadFailure):
+        return (
+            ". Whether it still covers the tree is unknown, since git status could"
+            f" not be read now, for the reason {tree_now.value}"
+        )
+    if isinstance(tree_now, readiness.Uncovered):
+        # Round 16 review, findings 3 and 4. A digest an edit could leave as it
+        # was is not compared, so the run is not read as covering the tree.
+        return (
+            ". Whether it still covers the tree is unknown, since the tree's changed"
+            " files cannot all be compared now, for the reason"
+            f" {tree_now.value}"
+        )
+    if tree_now == started.tree:
+        return (
+            ". The tree is as it was when it started, as far as HEAD and the status,"
+            " size and time of each changed tracked file show. Untracked files are"
+            " not compared"
+        )
+    return (
+        ". IT NO LONGER COVERS THE TREE, since HEAD or a tracked file changed after"
+        " it started. Run it again before reporting its result for the current tree"
+    )
+
+
 def _run_line(run: Run) -> str:
     """One run as a line reads it, with its receipt once it has ended."""
     started = run.started
-    on = "" if started.commit is None else f" on commit {started.commit}"
+    on = (
+        f" on commit {started.commit}"
+        if started.commit is not None
+        # Round 16, item 3. The receipt names the commit a worktree run ran, as
+        # the worktree's own claim after the review of 16de365.
+        else f" in its worktree at commit {started.workdir_commit}, as the"
+        f" worktree's own {WORKDIR_HEAD_CLAIM}, with any uncommitted changes"
+        if started.workdir_commit is not None
+        else ""
+    )
     head = (
         f"run {started.run_id} of {started.command}{on} by line {started.line_id},"
         f" started {started.started_at}, output {started.output_file} in"
