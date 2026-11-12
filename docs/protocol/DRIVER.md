@@ -37,14 +37,23 @@ subscription draws on a plan's limits while API usage is charged for every token
 | `claude_haiku_5_5_api.kel` | Claude Haiku 5.5 | api | low | 2 | 10 |
 | `claude_haiku_5_5_flexible.kel` | Claude Haiku 5.5 | flexible | low | 2 | 10 |
 | `claude_fable_5_1_subscription.kel` | Claude Fable 5.1 | subscription | high | 200 | 400 |
+| `claude_fable_5_2_subscription.kel` | Claude Fable 5.2 | subscription | high | 200 | 400 |
 | `claude_fable_5_1_api.kel` | Claude Fable 5.1 | api | medium | 4 | 20 |
+| `claude_fable_5_2_api.kel` | Claude Fable 5.2 | api | medium | 4 | 20 |
 | `claude_fable_5_1_flexible.kel` | Claude Fable 5.1 | flexible | medium | 4 | 20 |
+| `claude_fable_5_2_flexible.kel` | Claude Fable 5.2 | flexible | medium | 4 | 20 |
 | `claude_sonnet_5_5_subscription.kel` | Claude Sonnet 5.5 | subscription | high | 200 | 400 |
 | `claude_sonnet_5_5_api.kel` | Claude Sonnet 5.5 | api | medium | 4 | 20 |
 | `claude_sonnet_5_5_flexible.kel` | Claude Sonnet 5.5 | flexible | medium | 4 | 20 |
 | `gpt_6_luna_subscription.kel` | GPT-6-Luna on Codex | subscription | medium | 200 | 400 |
+| `gpt_6_sol_subscription.kel` | GPT-6-Sol on Codex | subscription | medium | 200 | 400 |
+| `gpt_6_astra_subscription.kel` | GPT-6-Astra on Codex | subscription | medium | 200 | 400 |
 | `gpt_6_luna_api.kel` | GPT-6-Luna on Codex | api | low | 2 | 10 |
+| `gpt_6_sol_api.kel` | GPT-6-Sol on Codex | api | low | 2 | 10 |
+| `gpt_6_astra_api.kel` | GPT-6-Astra on Codex | api | low | 2 | 10 |
 | `gpt_6_luna_flexible.kel` | GPT-6-Luna on Codex | flexible | low | 2 | 10 |
+| `gpt_6_sol_flexible.kel` | GPT-6-Sol on Codex | flexible | low | 2 | 10 |
+| `gpt_6_astra_flexible.kel` | GPT-6-Astra on Codex | flexible | low | 2 | 10 |
 | `gpt_6_1_sol_subscription.kel` | GPT-6.1-Sol on Codex | subscription | medium | 200 | 400 |
 | `gpt_6_1_sol_api.kel` | GPT-6.1-Sol on Codex | api | low | 2 | 10 |
 | `gpt_6_1_sol_flexible.kel` | GPT-6.1-Sol on Codex | flexible | low | 2 | 10 |
@@ -52,11 +61,26 @@ subscription draws on a plan's limits while API usage is charged for every token
 | `gpt_6_1_terra_api.kel` | GPT-6.1 Terra on Codex | api | low | 2 | 10 |
 | `gpt_6_1_terra_flexible.kel` | GPT-6.1 Terra on Codex | flexible | low | 2 | 10 |
 | `grok_4_7_subscription.kel` | Grok 4.7 on Grok Build | subscription | high | 200 | 400 |
+| `grok_4_7_build_fast_subscription.kel` | Grok 4.7 Build Fast on Grok Build | subscription | high | 200 | 400 |
 | `grok_4_7_api.kel` | Grok 4.7 on Grok Build | api | medium | 4 | 20 |
+| `grok_4_7_build_fast_api.kel` | Grok 4.7 Build Fast on Grok Build | api | medium | 4 | 20 |
 | `grok_4_7_flexible.kel` | Grok 4.7 on Grok Build | flexible | medium | 4 | 20 |
+| `grok_4_7_build_fast_flexible.kel` | Grok 4.7 Build Fast on Grok Build | flexible | medium | 4 | 20 |
 | `pi__openai__gpt_6_luna_subscription.kel` | GPT-6-Luna on Pi | subscription | medium | 200 | 400 |
+| `pi__openai__gpt_6_1_terra_subscription.kel` | GPT-6.1 Terra on Pi | subscription | medium | 200 | 400 |
+| `pi__openai__gpt_6_1_sol_subscription.kel` | GPT-6.1-Sol on Pi | subscription | medium | 200 | 400 |
+| `pi__openai__gpt_6_sol_subscription.kel` | GPT-6-Sol on Pi | subscription | medium | 200 | 400 |
+| `pi__openai__gpt_6_astra_subscription.kel` | GPT-6-Astra on Pi | subscription | medium | 200 | 400 |
 | `pi__openai__gpt_6_luna_api.kel` | GPT-6-Luna on Pi | api | medium | 4 | 20 |
+| `pi__openai__gpt_6_1_terra_api.kel` | GPT-6.1 Terra on Pi | api | medium | 4 | 20 |
+| `pi__openai__gpt_6_1_sol_api.kel` | GPT-6.1-Sol on Pi | api | medium | 4 | 20 |
+| `pi__openai__gpt_6_sol_api.kel` | GPT-6-Sol on Pi | api | medium | 4 | 20 |
+| `pi__openai__gpt_6_astra_api.kel` | GPT-6-Astra on Pi | api | medium | 4 | 20 |
 | `pi__openai__gpt_6_luna_flexible.kel` | GPT-6-Luna on Pi | flexible | medium | 4 | 20 |
+| `pi__openai__gpt_6_1_terra_flexible.kel` | GPT-6.1 Terra on Pi | flexible | medium | 4 | 20 |
+| `pi__openai__gpt_6_1_sol_flexible.kel` | GPT-6.1-Sol on Pi | flexible | medium | 4 | 20 |
+| `pi__openai__gpt_6_sol_flexible.kel` | GPT-6-Sol on Pi | flexible | medium | 4 | 20 |
+| `pi__openai__gpt_6_astra_flexible.kel` | GPT-6-Astra on Pi | flexible | medium | 4 | 20 |
 | `cursor_agent__gpt_5_6_luna_medium_subscription.kel` | GPT-5.6 Luna on Cursor Agent | subscription | medium | 200 | 400 |
 | `cursor_agent__gpt_5_6_luna_medium_api.kel` | GPT-5.6 Luna on Cursor Agent | api | medium | 4 | 20 |
 | `cursor_agent__gpt_5_6_luna_medium_flexible.kel` | GPT-5.6 Luna on Cursor Agent | flexible | medium | 4 | 20 |
@@ -99,6 +123,31 @@ medium that GPT-6-Luna's subscription driver sets, and the drivers that may bill
 token keep low. **Not verified.** No turn has run on either model through Dromon, so
 whether Codex reports each model under its catalogue name, which the drivers require,
 and whether the operator's ChatGPT plan serves them, are unobserved.
+
+**Fact, added on 2026-11-11.** Packaged drivers now include Claude Fable 5.2,
+GPT-6-Astra and GPT-6-Sol on Codex, Grok 4.7 Build Fast, and GPT-6-Astra,
+GPT-6-Sol, GPT-6.1-Sol and GPT-6.1 Terra on Pi. Each has subscription,
+application programming interface usage and flexible strategies. **Not verified.**
+No turn through Dromon has run on any of these new model and engine bindings.
+Model acceptance, credential reporting and subscription availability remain unobserved.
+
+**Fact.** The operator read the catalogues on 2026-11-11. Claude Code 2.1.322
+names `claude-fable-5-2`, but the material read gives neither a context window nor
+a default effort. At the operator's direction its settings derive from Fable 5.1,
+including the unverified window of 1,000,000 tokens. Codex 0.167.1 lists
+`gpt-6-astra` and `gpt-6-sol` with 272,000 tokens and medium default effort.
+Their settings follow GPT-6-Luna, including low effort for metered strategies.
+Grok Build 1.0.70 lists `grok-4.7-build-fast`. Its settings follow Grok 4.7,
+including the inherited window of 256,000 tokens and effort policy, which this
+catalogue does not independently confirm. Pi 1.5.2 lists all four new OpenAI
+models with 272,000 tokens each. Their settings follow Pi GPT-6-Luna, including
+medium effort for every strategy. Tests derive all inherited settings from the
+predecessor drivers, and all new bindings retain strict model and credential refusal.
+
+**Inference.** These inherited policies are suitable starting settings, rather than
+measurements of the new models. Operator probe turns after merge are still required.
+An engine returning a different identifier will be refused, and a model whose real
+context window is smaller than the inherited value may exhaust context earlier.
 
 ## Engines
 
