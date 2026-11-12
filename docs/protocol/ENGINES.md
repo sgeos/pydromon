@@ -344,6 +344,65 @@ unverified. Without the flag the refusal names it. The flag is refused without
 **Never a credential store.** No check opens a credential file itself. A test runs
 Pi's check with its `auth.json` made unreadable, and the check still succeeds.
 
+## Claude Code Model Context Protocol result selection
+
+**Documented limit, checked 2026-11-11.** Claude Code 2.1.310, bundled with the
+pinned `claude-agent-sdk==0.2.174`, may deliver only the structured content of a
+Model Context Protocol result that carries both `content` text blocks and
+`structuredContent`. This selection belongs to Claude Code, not Dromon. Dromon
+passes configured external servers to the client and does not rewrite their
+results before the client delivers them to the model.
+
+**Fact from client inspection and an offline fixture.** The bundled result
+converters first try a content preference under a feature predicate. That predicate
+requires an internal condition and the `tengu_eventual_noodle` flag, whose fallback
+is false. When the preference does not apply, the converters omit adjacent text
+blocks and serialize the structured value for the model. An offline fixture using
+the extracted converters retained the text with the predicate true and returned
+only the structured value with it false. This does not establish the flag state
+of any account or reproduce the original project's live invocation.
+
+**Server compatibility rule.** A server intended for Dromon lines should put
+everything the model needs in the text as well as the structure, or in the
+structure alone. Essential instructions or explanations must not occur only in
+text beside a structured value that omits them. Dromon cannot guarantee which
+representation a client selects.
+
+**How to check a client.** Check the dependency pin in `pyproject.toml` and
+`uv.lock`, the installed package version, and the actual client selected for the
+line. For the bundled client, the following inspection reads the package and
+binary without launching Claude Code.
+
+```sh
+uv run python - <<'PY'
+from importlib.metadata import version
+from pathlib import Path
+import hashlib
+import re
+import claude_agent_sdk
+
+binary = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
+data = binary.read_bytes()
+text = data.decode("utf-8", errors="replace")
+print("Agent SDK", version("claude-agent-sdk"))
+pattern = r'code\.claude\.com/docs/en/overview",VERSION:"([^"]+)"'
+print("Claude Code versions", sorted(set(re.findall(pattern, text))))
+print("SHA-256", hashlib.sha256(data).hexdigest())
+print("Content preference flag present", "tengu_eventual_noodle" in text)
+PY
+```
+
+The inspected binary had SHA-256
+`ffb64331bc0ee1b69efb7c2c428bd3ab516bc31b75bf60886b356c97c1c25ffd`.
+A version, hash or flag string alone does not prove selection behavior. Inspect
+the result conversion around `structuredContent` and the filtering of text blocks,
+then exercise the converter with distinct text and structured sentinels under
+both predicate outcomes. Function names in a minified client may change. To
+confirm live behavior for an account, the operator can use a scratch server that
+returns those distinct sentinels and check the result delivered to the model,
+rather than relying on display metadata or the model's answer alone. Repeat the
+check when the selected client changes.
+
 ## The longest Claude Code message
 
 The Agent SDK reads Claude Code's output one line of JSON at a time, and refuses a line
