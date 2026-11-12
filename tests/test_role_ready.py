@@ -171,6 +171,7 @@ def test_a_line_that_is_no_seat_is_refused(role: Role) -> None:
         role.ready("gamma")
 
 
+@pytest.mark.real_git_status
 def test_the_owner_reports_head_and_dirty_paths_together(role: Role) -> None:
     role.scheduler.give_ownership(ANA, "core", "beta")
     (role.worktree / "kept.txt").write_text("changed\n")

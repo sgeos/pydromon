@@ -12,6 +12,7 @@ import json
 import os
 import math
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -88,6 +89,7 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "ack": "acknowledge a message without replying",
     "sent": "show what became of the mail an operator sent",
     "release": "resume a line the daemon held at a conversation limit",
+    "overview": "show one line's task, checkpoint, leases, cost carried and ceilings",
     "interrupt": "stop a line's turn in flight, as Escape does in an attached client",
     "hibernate": "start no more turns of a line, keeping its mail, session and wakes",
     "awaken": "let a hibernated line be woken again by the mail and wakes it kept",
@@ -538,12 +540,18 @@ def _ask_start_context(paths: ProjectPaths, command: str) -> StartContext | None
     """The running daemon's interpreter and start variables, or ``None`` with a
     note when it does not give them, as a daemon from before round 14, item 6 does
     not, and the check then runs on this client's interpreter and environment, as
-    before."""
+    before.
+
+    **Round 16, item 6.** It also warns when a secret the project grants a line
+    differs between the running daemon's environment and this shell's, since the
+    successor inherits the daemon's, as ``_compare_secrets`` gives."""
     try:
         response = call(paths.socket, Operation.START_CONTEXT)
     except (DaemonNotRunning, ProtocolError, TimeoutError, OSError) as error:
         print(f"dromon {command}: {error}", file=sys.stderr)
         return None
+    if response.ok and response.result is not None:
+        _compare_secrets(paths, command, response.result.get("secret_names"))
     context = (
         _start_context(response.result)
         if response.ok and response.result is not None
@@ -555,6 +563,93 @@ def _ask_start_context(paths: ProjectPaths, command: str) -> StartContext | None
             " environment, so the check runs on this client's, which can differ"
         )
     return context
+
+
+def _secret_names_of(found: object) -> tuple[str, ...] | None:
+    """The granted names a ``start_context`` answer lists, or ``None`` when it lists
+    none in the daemon's form, at most ``restart.MAX_COMPARED_SECRETS`` names each in
+    ``restart.SECRET_NAME_PATTERN`` form, so a name later printed holds no control
+    character."""
+    if not isinstance(found, list):
+        return None
+    names = cast(list[object], found)
+    if len(names) > restart.MAX_COMPARED_SECRETS:
+        return None
+    listed: list[str] = []
+    for name in names:
+        if not isinstance(name, str) or not restart.SECRET_NAME_PATTERN.fullmatch(name):
+            return None
+        listed.append(name)
+    return tuple(dict.fromkeys(listed))
+
+
+def _compare_secrets(paths: ProjectPaths, command: str, found: object) -> None:
+    """Ask the daemon whether each secret it grants holds this shell's value, and warn
+    of each that does not.
+
+    **Round 16, item 6, and the review of 16de365.** The client digests its own value
+    of each granted name under a fresh nonce and sends the digests, and the daemon
+    answers only ``same``, ``differs`` or ``not_granted`` for each, so nothing that
+    could test a guess offline leaves the daemon, as ``restart.compare_secrets``
+    gives. A daemon from before this lists no names, and the client then says that a
+    changed secret is not found."""
+    names = _secret_names_of(found)
+    if names is None:
+        print(
+            f"dromon {command}: the daemon does not list the secrets it holds, so a"
+            " secret changed in this shell is not found"
+        )
+        return
+    if not names:
+        return
+    nonce = secrets.token_hex(32)
+    digests = restart.secret_digests(names, os.environ, nonce)
+    try:
+        response = call(
+            paths.socket,
+            Operation.START_CONTEXT,
+            args={"nonce": nonce, "secrets": digests},
+        )
+    except (DaemonNotRunning, ProtocolError, TimeoutError, OSError) as error:
+        print(f"dromon {command}: {error}", file=sys.stderr)
+        return
+    answer = response.result if response.ok else None
+    _warn_secrets(command, names, None if answer is None else answer.get("secrets"))
+
+
+def _warn_secrets(command: str, asked: tuple[str, ...], found: object) -> None:
+    """Say which of the names ``asked`` the running daemon holds otherwise than this
+    shell, from the daemon's verdicts ``found``.
+
+    **Round 16, item 6, decided here and accepted by the operator.** Another project
+    exported a new value for a secret its project file refers to and restarted, and a
+    line still presented the old one, because the successor inherits the running
+    daemon's environment. The client warns rather than carrying its own values into
+    the successor. Carrying would send secret values over the socket and into the
+    daemon's restart plan, and would mix two shells' environments in one daemon, of
+    which a shell that lacks a name would remove it. The warning names the variables
+    and never a value, and the restart goes on, since the operator may mean to keep
+    the daemon's values. Only stopping the daemon and starting it from the shell that
+    holds the new values replaces them. Only names the client asked about are named,
+    and an answer in another form is said to have compared nothing."""
+    if not isinstance(found, dict):
+        print(
+            f"dromon {command}: the daemon did not compare its secrets with this"
+            " shell's, so a changed secret is not found"
+        )
+        return
+    verdicts = cast(dict[object, object], found)
+    differing = sorted(
+        name for name in asked if verdicts.get(name) == restart.SecretVerdict.DIFFERS
+    )
+    if differing:
+        print(
+            f"dromon {command}: warning: the running daemon's environment differs"
+            f" from this shell's for {', '.join(differing)}, which the project file"
+            " grants to lines. The restarted daemon inherits the running daemon's"
+            " environment, so lines keep its values. To use this shell's, run dromon"
+            " stop and then dromon start from this shell"
+        )
 
 
 def _installed_commit() -> str | None:
@@ -1052,11 +1147,18 @@ def _configure(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 
 def _send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Send an operator's note. **Round 16, item 7.** Without ``--operator`` the
+    request names no sender, and the daemon sends as the operator ``@operator``
+    names, so a line's reply to ``@operator`` threads. That operator is then said on
+    a line of its own, after the message identifier, so a script reading the first
+    line still can. A daemon from before this refuses a request without a sender,
+    and is not asked again, since the operator's choice of sender is not guessed."""
     args: dict[str, object] = {
         "recipient": arguments.recipient,
         "body": arguments.body,
-        "operator": arguments.operator,
     }
+    if arguments.operator is not None:
+        args["operator"] = arguments.operator
     if arguments.reply_to is not None:
         args["reply_to"] = arguments.reply_to
     if arguments.priority:
@@ -1073,6 +1175,9 @@ def _send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     print(f"message_id {answer.get('message_id')}")
     if answer.get("priority") is True:
         print("priority mail")
+    sender = answer.get("operator")
+    if arguments.operator is None and isinstance(sender, str):
+        print(f"sent as @{sender}")
     return exits.OK
 
 
@@ -1897,6 +2002,20 @@ def _sandbox_summary(sandbox: SandboxConfig | None) -> str:
 def _release(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     args: dict[str, object] = {"line_id": arguments.line_id}
     return _request(paths, "release", Operation.RELEASE, args)
+
+
+def _overview(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Send ``overview`` and print the line's view as indented JSON, as its own
+    ``overview`` tool gives it. **Round 16, item 1.** JSON keeps every field and its
+    labels, such as which text is the line's own untrusted brief, which a summary
+    in prose could lose."""
+    result = _call(
+        paths, "overview", Operation.OVERVIEW, {"line_id": arguments.line_id}
+    )
+    if isinstance(result, int):
+        return result
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return exits.OK
 
 
 def _interrupt(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
@@ -3139,6 +3258,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "ack": _ack,
     "sent": _sent,
     "release": _release,
+    "overview": _overview,
     "interrupt": _interrupt,
     "hibernate": _hibernate,
     "awaken": _awaken,
@@ -3365,7 +3485,14 @@ def _add_fleet_commands(command: argparse.ArgumentParser) -> None:
     )
     for action, help_text in FLEET_COMMANDS.items():
         sub = actions.add_parser(action, help=help_text, description=help_text)
-        if action != "hosts":
+        if action == "send":
+            # Round 16, item 7, as for dromon send.
+            sub.add_argument(
+                "--operator",
+                default=None,
+                help="the operator, default the one @operator names in that project",
+            )
+        elif action != "hosts":
             sub.add_argument(
                 "--operator",
                 default=default_operator(),
@@ -3473,6 +3600,8 @@ def build_parser() -> argparse.ArgumentParser:
             )
         if name == "release":
             command.add_argument("line_id", help="the held line")
+        if name == "overview":
+            command.add_argument("line_id", help="the line to show")
         if name == "interrupt":
             command.add_argument("line_id", help="the line whose turn to stop")
         if name == "hibernate":
@@ -3933,8 +4062,9 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("body", help="the message text")
             command.add_argument(
                 "--operator",
-                default=default_operator(),
-                help="the operator sending it, default %(default)s",
+                default=None,
+                help="the operator sending it, default the operator @operator names,"
+                " the project's daemon.operator",
             )
             command.add_argument(
                 "--reply-to", default=None, help="the message answered"

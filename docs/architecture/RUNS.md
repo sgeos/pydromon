@@ -283,6 +283,37 @@ Each end records `run_ended` with the digest and size of the output file, read w
 end is recorded, then removes the receipt, and sends a note from the harness to the
 scope's present holder, the role's owner or else the line that started it.
 
+**One receipt, round 16, item 3.** The engines line asked in round 15 for one
+authoritative completion receipt per run, since it had polled `run_status` with timed
+wakes and waited for an exit after the output already showed the summary. The `Run
+ended` note is that receipt. It is sent once, when the end is recorded, to the holder
+and to each line whose wake waited for the run, and it gives the run, its command, its
+line, the commit it ran, its start, how it ended with the exit code, the output's size
+and digest, the test summary with what pytest skipped and how many it deselected, the
+tail of a failed run, and the wake it cancelled. Nothing else is sent at the end. The
+wake is withdrawn, so no wake note follows, and an end is recorded once, so a later
+reconciliation, as after a restart, sends no second note. **The commit it ran.** A
+commit run names its `commit`. A run in a worktree now names `workdir_commit`, the
+commit its worktree had checked out when the run started, which the daemon reads from
+the checkout's files before the command starts and records in `run_started`. The note
+says `in its worktree at commit C, as the worktree's own HEAD says, which the line can
+move, with any uncommitted changes`, since the command ran on the tree as the line left
+it, which a commit alone does not name. Where the commit cannot be read, as outside a
+checkout, nothing is said of it. **The worktree's claim, after the review of 16de365.**
+The commit is read from the nearest `.git` at or above the working directory, and the
+line can write both. It can move `HEAD` with its own git where its sandbox lets it
+write the git directory, and in a subdirectory of a checkout it can create a `.git`
+naming any commit. Reading only a `.git` at the declared directory's root was
+considered and rejected, because the line can create one exactly there. So the note
+labels the commit as the worktree's claim, and a reader who must know what ran starts
+a commit run, whose `commit` the daemon checked out itself. **What it skipped.** This
+is what pytest's summary says, the skip reasons and the deselected count, as the
+paragraph below specifies. Tests a gate script leaves out by its own means, such as a
+marker expression, appear only as that count, and the run's command in the log names
+the expression. **Inference.** The second note the engines line saw was the timed wake
+it scheduled to poll, which round 15's wake on a run replaced. No path that sends two
+notes for one end was found, and a test pins one.
+
 **The test summary, round 14, item 2.** The same reconciliation reads the last 64 KiB
 of the output, opened as the digest is, and finds pytest's final line, such as `5162
 passed, 10 skipped, 48 deselected in 231.52s`, with the skip reasons of the short
@@ -527,6 +558,36 @@ with the rest of its receipt. Before this the operator read `run_ended` from the
 log by hand. The request reads the log and records nothing. It is bounded by the
 number of scopes, since each scope gives at most ten runs.
 
+**Whether a run still covers the tree.** **Round 16, item 5, core's request of round
+15.** A gate that passed was read as covering a tree whose tracked files had changed
+after it started. A run in the line's working directory now records `tree` in
+`run_started`, the SHA-256 that `readiness.tree_digest` gives as the run starts, read
+off the event loop before the supervisor is launched. The digest covers the commit at
+`HEAD`, the `git status` entry of each changed tracked path, and that path's size and
+modification time. `run_status` reads the digest again for the latest run and says
+that the tree is as it was, or in capitals that the run no longer covers the tree and
+should be run again before its result is reported for the current tree, or that its
+coverage is unknown, with the fixed word for why git could not be read. A run that
+recorded no tree, from before the field or where its tree could not be read, says its
+coverage is unknown. A commit run covers its commit, records no tree, and says
+nothing. The operator's `runs` view gives `tree` as recorded.
+
+- **Residuals.** Untracked paths are left out whole, since a run's own output in an
+  untracked directory that is not ignored would otherwise make every run read as no
+  longer covering its tree. A new test file is therefore not seen until it is added.
+  An edit that keeps a file's size and restores its modification time is not seen.
+  Only the latest run is compared, since each comparison starts git.
+- **Coverage that cannot be told.** **Round 16 review, findings 3 and 4.** A digest
+  that an edit could leave as it was is not given. More than 10000 changed tracked
+  paths, past which an edit was not hashed, or a changed tracked path that git does
+  not list as deleted and that cannot be stated, answer that whether the run covers
+  the tree is unknown, with the fixed word `too_many_paths` or `unstamped_path`, and
+  a run that starts so records no tree. The second covers a work tree that
+  `core.worktree` puts away from the `.git` entry, which is not followed, where each
+  changed path had stamped as absent and an edit inside one already changed was not
+  seen. A residual remains. Where `core.worktree` is set and a file of the same name
+  lies beside the `.git` entry, that file is stated instead.
+
 ## Events and rollback hazards
 
 `run_started`, `run_ended` and `run_cleared` are specified in
@@ -542,7 +603,8 @@ names the commits of these and every other one-way change. **Task of 2026-11-05,
 reads every end without a tail and refuses the log once a failed run's tail is
 recorded. **Round 15 review.** `disclosure_checked` gained `checked_bytes` the same
 way, so a daemon from before it refuses the log once a `check_disclosure` call is
-recorded.
+recorded. **Round 16, item 5.** `run_started` gained `tree` the same way, so a daemon
+from before it refuses the log once a run records its tree.
 
 ## Descendants in a session of their own
 
@@ -1000,6 +1062,45 @@ run whose output was complete as still running for up to a minute. Item 2 fixed 
 The flow found nothing else to fix. **Not covered.** The test runs a stand-in gate, not
 `scripts/check.sh`, whose `uv sync` in the checkout needs the network and a fresh
 home's cache, so the cost of the real gate in a commit run is not measured here.
+
+## Waiting for a long suite
+
+**Round 16, item 4, the audit line's request.** The audit line ran a long suite in
+its own turn and lost it twice. **Fact, from its round 15 report.** A daemon restart
+ended its turn while two background pytest tasks ran, which were marked stopped with
+no completion record, and a suite run in the foreground had to fit the shell tool's
+own time limit. **What ends such a wait today.** A wait held inside a turn ends with
+the turn. A restart ends every turn in flight and the engine process with it, and so
+the background tasks of that turn, and the shell tool bounds a foreground command,
+which Dromon does not set. A hold at the turn or cost limit starts no next turn, so a
+line that meant to come back to its own background task does not.
+
+**What survives.** A suite started as a declared run and awaited with `wake_after`
+on the run holds no turn open. The line starts the run, names it in `wake_after`, and
+ends its turn. Each part outlives a restart and a hold.
+
+- The run's supervisor is its own process, which a restart does not end, and the
+  restarted daemon finds it by its identifier and start time, as above.
+- The wake is `wake_scheduled` in the log, so a restart keeps it with its run.
+- A hold at the turn or cost limit withdraws no wake. The run's end withdraws it and
+  records the `Run ended` note, which waits in the held line's mailbox, and the
+  operator's release leaves it to start the line's next turn.
+
+Tests pin each of these, a wait across a restart and a wait across a hold at either
+limit. **Inference.** Nothing ended this wait before this round either. The change is
+that it is now tested and written down. **What is not fixed.**
+
+- A reading line, such as the review or audit line, can start only `review-gate`, on
+  a commit the operator has pushed. Its suite on an extracted tree is not a declared
+  run, so it still waits inside a turn. An operator who wants it can declare a
+  command with a parameter for the tree, as the parameters section above allows. That
+  is project configuration and not code.
+- The operator's stop of a line withdraws its wake on purpose, so a stopped line is
+  not woken by the run's end. It finds the run with `run_status` once released.
+- A wake waits at most 86,400 seconds. A run that outlives it lets the wake fire, and
+  the end then reaches the holder as a note without a wake to cancel.
+- A held line's turn starts only after an operator releases it, so the wait ends in a
+  turn only when the operator chooses.
 
 ## Not implemented
 

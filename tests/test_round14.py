@@ -2,6 +2,7 @@
 disclosure in parts, and a budget that says unknown."""
 
 import random
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -153,17 +154,28 @@ def test_accepted_line_digests_apply_across_parts() -> None:
 # A budget that says unknown.
 
 
+NOW = datetime(2026, 11, 1, 2, 30, 15, tzinfo=UTC)
+
+
 def test_an_unknown_budget_is_a_named_entry_and_never_none() -> None:
-    entry = _budget_entry("claude-code", None)
+    entry = _budget_entry("claude-code", None, NOW)
     assert entry["status"] == UNKNOWN
     assert entry["provider"] == "claude-code"
     assert all(value is not None for value in entry.values())
     assert all(
         entry[key] == UNKNOWN
-        for key in ("remaining_percent", "resets_at", "source", "stated_at")
+        for key in (
+            "remaining_percent",
+            "resets_at",
+            "source",
+            "stated_at",
+            "observed_at",
+            "age_seconds",
+            "age",
+        )
     )
     assert "moves no role" in str(entry["note"])
-    assert _budget_entry(None, None)["provider"] == UNKNOWN
+    assert _budget_entry(None, None, NOW)["provider"] == UNKNOWN
 
 
 def test_a_stated_budget_with_a_missing_field_says_unknown_for_it() -> None:
@@ -175,7 +187,7 @@ def test_a_stated_budget_with_a_missing_field_says_unknown_for_it() -> None:
         "set by hand",
         "2026-11-01T00:00:00Z",
     )
-    view = _budget_view(stated)
+    view = _budget_view(stated, NOW)
     assert view["status"] == "stated"
     assert view["remaining_percent"] == UNKNOWN
     assert view["resets_at"] == "2026-11-02T00:00:00Z"
@@ -188,8 +200,39 @@ def test_a_stated_budget_with_a_missing_field_says_unknown_for_it() -> None:
         "",
         "2026-11-01T00:00:00Z",
     )
-    assert _budget_view(percent)["remaining_percent"] == 40
-    assert _budget_view(percent)["resets_at"] == UNKNOWN
+    assert _budget_view(percent, NOW)["remaining_percent"] == 40
+    assert _budget_view(percent, NOW)["resets_at"] == UNKNOWN
+
+
+def test_a_stated_budget_gives_when_it_was_observed_and_its_age() -> None:
+    """**Round 16, item 6.** A figure carried forward is told from a fresh one by
+    its time and age, which stand beside it."""
+    stated = BudgetStated(
+        "claude-code", 40, None, BudgetSource.ENGINE, "", "2026-11-01T00:00:00Z"
+    )
+    view = _budget_view(stated, NOW)
+    assert view["observed_at"] == view["stated_at"] == "2026-11-01T00:00:00Z"
+    assert view["age_seconds"] == int(
+        (NOW - datetime(2026, 11, 1, tzinfo=UTC)).total_seconds()
+    )
+    assert view["age"] == "observed 2 hours 30 minutes ago"
+    later = NOW + timedelta(days=1, minutes=1)
+    assert _budget_view(stated, later)["age"] == (
+        "observed 1 day 2 hours 31 minutes ago"
+    )
+    fresh = datetime(2026, 11, 1, 0, 0, 59, tzinfo=UTC)
+    assert _budget_view(stated, fresh)["age"] == "observed less than a minute ago"
+
+
+def test_a_budget_observed_after_the_daemon_s_time_has_no_age() -> None:
+    """A clock set back must not make an old figure read as fresh."""
+    stated = BudgetStated(
+        "claude-code", 40, None, BudgetSource.ENGINE, "", "2026-11-01T00:00:00Z"
+    )
+    before = datetime(2026, 10, 31, 23, 0, tzinfo=UTC)
+    view = _budget_view(stated, before)
+    assert view["age_seconds"] == -3600
+    assert "its age is unknown" in str(view["age"])
 
 
 def test_a_turn_of_unknown_cost_counts_as_zero_and_says_so() -> None:
