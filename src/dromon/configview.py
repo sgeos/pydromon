@@ -211,6 +211,11 @@ def project_entries(
                 config.disclosure_terms or "none",
             ),
             info(
+                "daemon.machine_status",
+                "the machine monitor's status file, read before a run or a turn starts",
+                config.machine_status or "none",
+            ),
+            info(
                 "leases",
                 "the leases lines may acquire, and how long each lasts",
                 (", ".join(config.lease_names) or "none")
