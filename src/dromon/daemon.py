@@ -112,7 +112,15 @@ from dromon.eventlog import (
 from dromon.statesnapshot import snapshot_path
 from dromon.sealed import SealedStore, store_path
 from dromon.limits import DEFAULT_LIMITS, Limits
-from dromon.mailbox import MAX_PAGE, listing, outcome, replied_ids, sent, summary
+from dromon.mailbox import (
+    MAX_PAGE,
+    listing,
+    outcome,
+    replied_ids,
+    sent,
+    summary,
+    unread_outside,
+)
 from dromon.lineconfig import (
     DEFAULT_CONFIG,
     ConfigError,
@@ -1418,9 +1426,23 @@ class Daemon:
             raise InvalidField(str(error)) from error
         replied = replied_ids(self.log.state, owner)
         counts = summary(self.log.state, owner, 0)
+        # Round 16. The page is the oldest matches from the offset, so the unread
+        # mail before it and after it is counted, and a reader of one page learns
+        # that more waits beyond it.
+        unread_before, unread_after = unread_outside(
+            self.log.state,
+            owner,
+            unread_only=unread_only,
+            sender=None if sender is None else parse_any_address(sender),
+            issues_only=issues_only,
+            offset=offset,
+            limit=limit,
+        )
         return {
             "total": total,
             **counts.counts(),
+            "unread_before": unread_before,
+            "unread_after": unread_after,
             "messages": [
                 {
                     "message_id": message_id,
@@ -1767,6 +1789,7 @@ class Daemon:
         )
         self.scheduler.set_disclosure_terms(terms)
         self.scheduler.set_disclosure_accepted(config.disclosure_accepted)
+        self.scheduler.set_machine_status(machine_status_path(config, self.paths))
         self.scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
         self.scheduler.set_runs(
             config.run_commands,
@@ -3553,6 +3576,17 @@ def check_lines_sandboxed(
         )
 
 
+def machine_status_path(config: ProjectConfig, paths: ProjectPaths) -> Path | None:
+    """The machine monitor's status file the project names, with a leading ``~`` the
+    home directory and a relative path relative to the project root, or ``None`` when
+    it names none. Only the path is made here, and nothing is read, so a file that is
+    missing is the scheduler's to report. **Round 16, item 3.**"""
+    if config.machine_status is None:
+        return None
+    named = Path(config.machine_status).expanduser()
+    return named if named.is_absolute() else paths.root / named
+
+
 def project_terms(config: ProjectConfig, paths: ProjectPaths) -> tuple[str, ...]:
     """The project's disclosure terms, or none when it names no list. Raises
     ``DisclosureError`` for a list that cannot be read, naming the file only."""
@@ -4115,6 +4149,11 @@ def run(
                     extra_protected=registry_protected(
                         paths, config.federation, registry_dir
                     ),
+                    # Read at each build, so a reload that names another file guards
+                    # it from the next turn. The name is bound just below.
+                    machine_status_file=lambda: (
+                        None if scheduler is None else scheduler.machine_status_file
+                    ),
                 ),
                 limits=limits,
                 default_operator=operator,
@@ -4140,6 +4179,7 @@ def run(
             scheduler.record_walk_gap(launcher.walk_gap())
             scheduler.set_disclosure_terms(terms)
             scheduler.set_disclosure_accepted(config.disclosure_accepted)
+            scheduler.set_machine_status(machine_status_path(config, paths))
             scheduler.set_git_ssh(line_git_ssh)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
             scheduler.set_runs(

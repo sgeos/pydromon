@@ -174,7 +174,7 @@ from dromon.security_paths import project_secret_paths
 from dromon.handoff import Handoff
 from dromon.handoff import select as select_handoff
 from dromon import requestkeys
-from dromon import commitruns, runparams, runs
+from dromon import commitruns, machinestatus, runparams, runs
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon.requestkeys import (
     REQUEST_KEY,
@@ -1520,6 +1520,55 @@ swept at least this often while the daemon is idle. **Fourth live run of N1,
 2026-10-26.** The rest was unbounded when no wake was pending, so an idle daemon never
 swept a kept connection's dead launcher."""
 
+MACHINE_READ_SECONDS: Final = 15.0
+"""How long one read of the machine status file is kept before it is read again, so
+the loop's ticks, which may come every half second, read a small file at most this
+often. **Round 16, item 3.** The monitor samples once a minute, so a read this old
+loses nothing that the status's own age does not already say."""
+
+MACHINE_WAIT_SECONDS: Final = 0.5
+"""The longest the loop waits for one read of the status file, which a worker thread
+makes. **Round 16, item 3, at the operator's request.** A local file is read in
+microseconds, so the wait is never reached on a healthy machine. A file on a mount
+that hangs holds the worker and not the loop, and the status is ``unreadable`` until
+the read returns. At most one worker is ever outstanding."""
+
+
+class _MachineRead:
+    """One read of the status file, made on a worker thread. ``status`` is set before
+    ``finished``, so a reader that sees ``finished`` sees the status. A reader that
+    raises, which ``machinestatus.read`` does not, leaves ``unreadable``."""
+
+    def __init__(self) -> None:
+        self.finished = threading.Event()
+        self.status = machinestatus.MachineStatus(
+            "unreadable", problem="the read did not complete"
+        )
+
+    def run(
+        self,
+        reader: Callable[[Path, float], machinestatus.MachineStatus],
+        path: Path,
+        now_epoch: float,
+    ) -> None:
+        try:
+            self.status = reader(path, now_epoch)
+        except Exception:  # noqa: BLE001 - a read that fails is a status that cannot be relied on
+            self.status = machinestatus.MachineStatus(
+                "unreadable", problem="the read failed"
+            )
+        finally:
+            self.finished.set()
+
+
+MACHINE_WITHHELD: Final = "withheld, since it holds a term of the disclosure list"
+"""What stands for a reason or a problem of the status file that holds a listed term."""
+
+_OVERRAN: Final = machinestatus.MachineStatus(
+    "unreadable", problem="reading it is taking too long"
+)
+"""The status while a read of the file has not returned."""
+
 
 def _never_registered(_name: str) -> bool:
     return False
@@ -1841,6 +1890,25 @@ def _claude_read_access_refusal(
     return None
 
 
+def claude_read_only_refusal(
+    config: LineConfig,
+    project_settings: SettingsConfig | None,
+    project_sandbox: SandboxConfig | None,
+) -> str | None:
+    """Why a Claude Code line with ``workdir_access = "read"`` and ``config`` is
+    refused at every turn, or ``None`` when it is not. **Round 16, at the operator's
+    request.** It is the refusal the engine builder raises, as one function, so that
+    ``dromon config`` can warn of it before any turn is tried and the two cannot
+    differ. Claude Code cannot confine a configured MCP server, an allow-all policy,
+    project settings, plugins or command hooks to a read-only directory, so a line
+    that has one and asks for read access failed every turn with a refusal that only
+    a turn showed."""
+    settings = engine_settings.merge([project_settings, config.settings])
+    return _claude_read_access_refusal(
+        config, settings
+    ) or _claude_read_sandbox_refusal([project_sandbox, config.sandbox])
+
+
 def _claude_read_sandbox_refusal(layers: Sequence[SandboxConfig | None]) -> str | None:
     """Reject a sandbox layer that would let a shell command leave the read sandbox.
 
@@ -1891,6 +1959,39 @@ def _read_only_path_rules(paths: Sequence[Path]) -> list[str]:
     return sorted(rules)
 
 
+def machine_status_guards(path: Path | None, workdir: Path) -> tuple[Path, ...]:
+    """The paths no line may write for the monitor's status file ``path``, or none
+    when no file is configured. **Round 16 review, point 3.** The file, by its name
+    and by its real path should a link lead elsewhere, and its directory, which would
+    stop the file being replaced by a rename into it. The directory is left out when
+    it is, holds or lies in ``workdir``, since the line legitimately writes there and
+    only the file is then denied. Nothing is read or created."""
+    if path is None:
+        return ()
+    named = Path(os.path.normpath(path))
+    paths = [named, Path(os.path.realpath(named))]
+    for directory in (
+        named.parent,
+        Path(os.path.realpath(named.parent)),
+        paths[1].parent,
+    ):
+        if not (
+            directory.is_relative_to(workdir)
+            or workdir.is_relative_to(directory)
+            or directory.is_relative_to(Path(os.path.realpath(workdir)))
+            or Path(os.path.realpath(workdir)).is_relative_to(directory)
+        ):
+            paths.append(directory)
+    return tuple(dict.fromkeys(paths))
+
+
+def machine_status_rules(guards: Sequence[Path]) -> list[str]:
+    """Deny rules for the built-in tools that write files, one for each path of
+    ``guards`` itself, which names the status file. Claude Code reads a path with two
+    leading slashes as absolute."""
+    return sorted({f"Edit(/{path})" for path in guards})
+
+
 def engine_factory(
     root: str,
     *,
@@ -1905,8 +2006,16 @@ def engine_factory(
     line_git_ssh: Mapping[str, GitSshAccess] | None = None,
     read_only_paths: Sequence[str] = (),
     extra_protected: Callable[[], Sequence[Path]] | None = None,
+    machine_status_file: Callable[[], Path | None] | None = None,
 ) -> EngineFactory:
     """The production factory: each line on its packaged driver's engine.
+
+    ``machine_status_file`` gives the machine monitor's status file, read at each
+    engine build, which no line may write, since a status a line could write could
+    lift or force the deferrals of runs and turns. **Round 16 review, point 3.**
+    The file, and its directory unless that is or holds the line's working directory,
+    are denied to writes in an enabled sandbox and to the built-in file tools, for a
+    Claude Code line and for a Codex one.
 
     ``extra_protected`` gives directories denied beside ``protected``, read at each
     engine build, which the daemon sets to every project of the open-federation
@@ -1971,6 +2080,9 @@ def engine_factory(
             *project_secret_paths(Path(root), workdir),
         )
         git_ssh = (line_git_ssh or {}).get(spec.line_id)
+        machine_guard = machine_status_guards(
+            None if machine_status_file is None else machine_status_file(), workdir
+        )
         if driver.settings.engine == codex.ENGINE_NAME:
             if project_sandbox is not None or project_settings is not None:
                 raise EngineRefused(
@@ -1994,7 +2106,7 @@ def engine_factory(
                 mcp_tools=list(own_tools),
                 session_id=spec.session_id,
                 protected=engine_protected,
-                write_protected=read_only,
+                write_protected=(*read_only, *machine_guard),
                 observe=spec.observe,
                 mark=spec.mark,
                 task_ended=spec.task_ended,
@@ -2095,9 +2207,9 @@ def engine_factory(
         merged = merge([project_sandbox, spec.config.sandbox])
         settings = engine_settings.merge([project_settings, spec.config.settings])
         if spec.config.workdir_access is WorkdirAccess.READ:
-            refusal = _claude_read_access_refusal(
-                spec.config, settings
-            ) or _claude_read_sandbox_refusal([project_sandbox, spec.config.sandbox])
+            refusal = claude_read_only_refusal(
+                spec.config, project_settings, project_sandbox
+            )
             if refusal is not None:
                 raise EngineRefused(refusal)
             # Merged last, so no layer can turn these off. The refusal above names a
@@ -2150,11 +2262,11 @@ def engine_factory(
         if enabled and git_ssh is not None:
             merged = merge([merged, sandbox_layer(git_ssh)])
         guarded = git_write_guards(workdir) if enabled else ()
-        guarded = (*guarded, *read_only)
+        guarded = (*guarded, *read_only, *machine_guard)
         # A line that loads project settings or plugins must not write what it loads.
         claude_dir = (workdir / ".claude",) if spec.config.project_settings else ()
         plugin_dirs = tuple(resolve_plugin(path) for path in spec.config.plugins)
-        write_protected = (*claude_dir, *plugin_dirs)
+        write_protected = (*claude_dir, *plugin_dirs, *machine_guard)
         guarded = (*guarded, *write_protected)
         line_temp: LineTemp | None = None
         if enabled:
@@ -2197,6 +2309,17 @@ def engine_factory(
                     settings,
                     engine_settings.parse_settings(
                         {"permissions": {"deny": _read_only_path_rules(read_only)}}
+                    ),
+                ]
+            )
+        if machine_guard:
+            # A rule for the file itself, since the directory rules the protected
+            # paths give match what lies under a path and not the path.
+            settings = engine_settings.merge(
+                [
+                    settings,
+                    engine_settings.parse_settings(
+                        {"permissions": {"deny": machine_status_rules(machine_guard)}}
                     ),
                 ]
             )
@@ -2752,6 +2875,29 @@ class Scheduler:
         self._repeats: dict[str, str] = {}
         """Each undelivered message to a line that repeats an earlier one, and that
         earlier message, until the repeat is delivered."""
+        self._machine_path: Path | None = None
+        """The machine monitor's status file, or ``None`` to read none. **Round 16,
+        item 3.**"""
+        self._machine_read: tuple[float, machinestatus.MachineStatus] | None = None
+        """The latest read and when it was made, on the monotonic clock."""
+        self._machine_pending: _MachineRead | None = None
+        """The read a worker thread is making and has not finished, if any. A worker
+        that never returns stays here, so no second one is started."""
+        self._machine_reader: Callable[[Path, float], machinestatus.MachineStatus] = (
+            machinestatus.read
+        )
+        """What reads the file. A seam for tests, which makes a read that hangs."""
+        self._machine_untrusted_since: datetime | None = None
+        """When the monitor's file was first seen unusable in the present spell, a
+        stale one by its last sample, or ``None`` while the file is fresh or none is
+        configured. **Round 16 review, point 1.** In memory."""
+        self._machine_noted: set[str] = set()
+        """What has been told in the current deferral, the operator once as ``operator``
+        and each line as its own identifier, or the run kind as ``run``, so a deferral
+        notes once and not at every tick. Emptied when nothing defers. In memory."""
+        self._machine_deferred: dict[str, datetime] = {}
+        """When each line's turn was first deferred in the current deferral, for the
+        note its next prompt leads with."""
         self._disclosure: tuple[str, ...] = ()
         self._disclosure_accepted: dict[str, tuple[str, ...]] = {}
         """The project's disclosure terms, case folded. Never logged or returned."""
@@ -3242,6 +3388,242 @@ class Scheduler:
                 " operator's own. Restore the file, or restart the daemon so that"
                 " it checks the file again, before resuming the line"
             )
+
+    @property
+    def machine_status_file(self) -> Path | None:
+        """The monitor's status file, or ``None``. **Round 16 review, point 3.**"""
+        return self._machine_path
+
+    def set_machine_status(self, path: Path | None) -> None:
+        """Read the machine monitor's status file at ``path`` before each run and turn
+        starts, or read none for ``None``. Replaces the earlier path and forgets what
+        was read. **Round 16, item 3.**"""
+        self._machine_path = path
+        self._machine_read = None
+        self._machine_pending = None
+        self._machine_untrusted_since = None
+        self._machine_noted.clear()
+        self._machine_deferred.clear()
+
+    def machine_status(self) -> machinestatus.MachineStatus | None:
+        """The machine's status, as ``_read_machine_status`` gives it, with the spell
+        in which the file cannot be relied on kept for the notes that name it."""
+        status = self._read_machine_status()
+        if status is None or status.level in machinestatus.KNOWN_LEVELS:
+            self._machine_untrusted_since = None
+        elif status.level == "stale" and status.age_seconds is not None:
+            self._machine_untrusted_since = self._wall_clock() - timedelta(
+                seconds=status.age_seconds
+            )
+        elif self._machine_untrusted_since is None:
+            self._machine_untrusted_since = self._wall_clock()
+        return status
+
+    def _read_machine_status(self) -> machinestatus.MachineStatus | None:
+        """The machine's status, read at most once every ``MACHINE_READ_SECONDS``, or
+        ``None`` when no status file is configured. A file that is missing, stale or
+        unreadable is a status of its own, which counts as elevated, so a monitor
+        that stopped is seen and not mistaken for a healthy machine.
+
+        The read is made by a worker thread and the loop waits at most
+        ``MACHINE_WAIT_SECONDS`` for it, so a file on a mount that hangs cannot hold
+        the loop. Until a read that overran returns, the status is ``unreadable``,
+        and no second worker is started. **Porting note.** A Rust port makes the
+        read on a blocking task with a timeout, and a Keleusma one in a stream
+        processor of its own."""
+        if self._machine_path is None:
+            return None
+        now = self._clock()
+        pending = self._machine_pending
+        if pending is not None:
+            if not pending.finished.is_set():
+                kept = self._machine_read
+                return kept[1] if kept is not None else _OVERRAN
+            return self._take_machine_read(now, pending)
+        kept = self._machine_read
+        if kept is not None and 0 <= now - kept[0] < MACHINE_READ_SECONDS:
+            return kept[1]
+        pending = _MachineRead()
+        threading.Thread(
+            target=pending.run,
+            args=(
+                self._machine_reader,
+                self._machine_path,
+                self._wall_clock().timestamp(),
+            ),
+            name="machine-status",
+            daemon=True,
+        ).start()
+        self._machine_pending = pending
+        if pending.finished.wait(MACHINE_WAIT_SECONDS):
+            return self._take_machine_read(now, pending)
+        self._machine_read = (now, _OVERRAN)
+        return _OVERRAN
+
+    def _take_machine_read(
+        self, now: float, pending: "_MachineRead"
+    ) -> machinestatus.MachineStatus:
+        """The finished read, kept as the latest, with no read outstanding."""
+        status = pending.status
+        self._machine_pending = None
+        self._machine_read = (now, status)
+        return status
+
+    def machine_status_view(self) -> dict[str, object]:
+        """The machine's status as ``line_status`` gives it in detail, never the
+        file's path. **Round 16, item 3.**"""
+        status = self.machine_status()
+        if status is None:
+            return {"configured": False}
+        decision = machinestatus.decide(status)
+        # **Round 16 review, point 2.** The reasons and the problem are the monitor's
+        # text and reach a line here, so each is screened as a note is, and one that
+        # holds a listed term is withheld alone.
+        return {
+            "configured": True,
+            "level": status.level,
+            "acted_on_as": status.effective,
+            "age_seconds": status.age_seconds,
+            "reasons": [self._machine_screened(reason) for reason in status.reasons],
+            "problem": (
+                None
+                if status.problem is None
+                else self._machine_screened(status.problem)
+            ),
+            "monitor": self._monitor_trouble(status),
+            "defers_runs": decision.defer_runs,
+            "defers_turns": decision.defer_turns,
+        }
+
+    def machine_decision(self) -> machinestatus.Decision:
+        """What the machine's status allows now, which is everything when none is
+        configured. Forgets what a deferral told once nothing defers any more."""
+        status = self.machine_status()
+        decision = (
+            machinestatus.NO_DECISION
+            if status is None
+            else machinestatus.decide(status)
+        )
+        if not decision.defer_runs and not decision.defer_turns:
+            self._machine_noted.clear()
+        return decision
+
+    def _machine_words(self, status: machinestatus.MachineStatus) -> str:
+        """``status`` in a sentence, with its reasons withheld should one hold a term
+        of the disclosure list, since the file is the monitor's and its text is not
+        the project's own."""
+        text = status.describe()
+        return (
+            "the machine status cannot be shown here" if self.discloses(text) else text
+        )
+
+    def _machine_screened(self, text: str) -> str:
+        """``text`` of the monitor's file, or a placeholder when it holds a term of the
+        disclosure list."""
+        return MACHINE_WITHHELD if self.discloses(text) else text
+
+    def _monitor_trouble(self, status: machinestatus.MachineStatus) -> str | None:
+        """A sentence saying that the monitor looks stopped and how the operator
+        restores the gates, or ``None`` while the file is fresh. **Round 16 review,
+        point 1.** A file that is stale, missing or unreadable defers every run until
+        the monitor writes again, so a monitor that died closes every gate, and the
+        cause is named where the deferral is. A stale file is dated by its last
+        sample. A file first seen missing or unreadable is dated by the daemon's
+        first sight of it, since the daemon cannot know earlier."""
+        if status.level in machinestatus.KNOWN_LEVELS:
+            return None
+        since = self._machine_untrusted_since
+        when = (
+            "since a time it did not record"
+            if since is None
+            else (
+                f"since its last sample at {format_due(since)}"
+                if status.level == "stale"
+                else f"since the daemon first saw it so at {format_due(since)}"
+            )
+        )
+        return (
+            f"The machine monitor looks stopped or its file is {status.level}, {when}."
+            " Runs stay deferred until it writes a fresh status. The operator"
+            " restores them by restarting the monitor, or by removing"
+            " daemon.machine_status from the project file and reloading."
+        )
+
+    def _machine_cause(self, status: machinestatus.MachineStatus) -> str:
+        """The monitor's trouble as a sentence to append to a note, with a space first,
+        or nothing while the file is fresh."""
+        trouble = self._monitor_trouble(status)
+        return "" if trouble is None else f" {trouble}"
+
+    def _machine_run_refusal(self, line_id: str) -> str | None:
+        """Why a run of ``line_id`` is deferred by the machine's status, or ``None``.
+        Tells the operator once for the deferral. Nothing has started or been recorded
+        when it returns text."""
+        status = self.machine_status()
+        if status is None or not self.machine_decision().defer_runs:
+            return None
+        words = self._machine_words(status)
+        cause = self._machine_cause(status)
+        if "run" not in self._machine_noted:
+            self._machine_noted.add("run")
+            self._tell_operator(
+                line_id,
+                f"Dromon deferred a run of {line_id}, since {words}. It starts"
+                " nothing heavy until the status is ok again, and the line was told"
+                f" to wait and ask again.{cause}",
+            )
+        return (
+            f"the run is deferred, since {words}. Nothing was started. This machine"
+            " is shared, so wait with wake_after and start it again once"
+            f" machine-status says ok, and say in your report that you waited.{cause}"
+        )
+
+    def _note_turn_deferral(self, line_id: str) -> None:
+        """Tell the line and the operator, once each for the deferral, that a turn
+        waits on the machine's status. The line's note leads its next prompt's mail
+        and the line learns how long it waited from the prompt."""
+        status = self.machine_status()
+        if status is None:
+            return
+        words = self._machine_words(status)
+        cause = self._machine_cause(status)
+        self._machine_deferred.setdefault(line_id, self._wall_clock())
+        if line_id not in self._machine_noted:
+            self._machine_noted.add(line_id)
+            self._harness_note(
+                LineAddress(line_id),
+                f"Dromon deferred your turn, since {words}. It starts when the"
+                " status is no longer critical, and your mail waits until then."
+                f"{cause}",
+            )
+        if "operator" not in self._machine_noted:
+            self._machine_noted.add("operator")
+            self._tell_operator(
+                line_id,
+                f"Dromon deferred the turns of lines with mail waiting, starting with"
+                f" {line_id}, since {words}. No turn starts until the status is no"
+                f" longer critical.{cause}",
+            )
+
+    def _machine_notice(self, line_id: str) -> str | None:
+        """What a turn that proceeds is told of the machine's status, or ``None``. A
+        warning when the status is elevated, with the advice of the shared machine
+        rule, and how long the turn was deferred, when it was."""
+        status = self.machine_status()
+        deferred = self._machine_deferred.pop(line_id, None)
+        parts: list[str] = []
+        if deferred is not None:
+            waited = int((self._wall_clock() - deferred).total_seconds())
+            parts.append(f"Your turn was deferred for {waited} seconds by the status.")
+        if status is not None and machinestatus.decide(status).warn:
+            words = self._machine_words(status)
+            parts.append(
+                f"{words[:1].upper()}{words[1:]}. This machine is shared,"
+                " so start nothing heavy, such as a full gate, until it is ok, and"
+                " say so in your report if you wait. Your turn proceeds."
+                f"{self._machine_cause(status)}"
+            )
+        return "Dromon note: " + " ".join(parts) if parts else None
 
     def set_disclosure_accepted(self, entries: Mapping[str, tuple[str, ...]]) -> None:
         """Replace operator accepted occurrences on startup and reload."""
@@ -4973,6 +5355,9 @@ class Scheduler:
                 f"previous must name the latest run, so you start one only after"
                 f" reading its record. The latest is {seen}"
             )
+        deferred = self._machine_run_refusal(line_id)
+        if deferred is not None:
+            raise runs.RunRefused(deferred)
         if self._report_dir is None:
             raise runs.RunRefused("this daemon has no report directory for receipts")
         directory = self._report_dir
@@ -5519,12 +5904,15 @@ class Scheduler:
     ) -> tuple[str, str | None]:
         """The note and tail a run's end records, with its output's summary and tail
         screened against the disclosure list first. **Round 15 review, R1, the
-        operator's decision.** Either holding a term withholds both, and counts as a
-        failing check of ``line_id``, which started the run, as a tool's refusal
-        does, so a line cannot print candidates in a run's output to test them
-        outside the check's limit. A line that has spent its failing checks has both
-        withheld whatever they hold, so the withholding tells it nothing. A run of a
-        line no longer known is screened and nothing is counted."""
+        operator's decision.** Either holding a term counts as a failing check of
+        ``line_id``, which started the run, as a tool's refusal does, so a line cannot
+        print candidates in a run's output to test them outside the check's limit.
+        **Round 16, item 2.** Only the part that holds a term is withheld, so a clean
+        summary survives a tail whose traceback names paths under a user directory,
+        and both are withheld only when both hold one. A line that has spent its
+        failing checks has both withheld whatever they hold, so the withholding tells
+        it nothing. A run of a line no longer known is screened and nothing is
+        counted."""
         summary, tail = finding.summary, finding.tail
         if summary is None and tail is None:
             return finding.note, None
@@ -5535,12 +5923,26 @@ class Scheduler:
             or self._disclosure_reopens(line_id, now) is not None
         ):
             return runs.note_withheld(finding.note, runs.OUTPUT_WITHHELD_SPENT), None
-        texts = tuple(text for text in (summary, tail) if text is not None)
-        if not self.discloses(*texts):
+        summary_held = summary is not None and self.discloses(summary)
+        tail_held = tail is not None and self.discloses(tail)
+        if summary is not None and not summary_held:
+            # **Round 16 review, point 5.** A term can span the join of the note,
+            # or the notice, and the clean summary, which neither holds alone. The
+            # text the end will record is screened as well, and a summary that
+            # completes a term in it is withheld as one that holds a term.
+            lead = (
+                runs.note_withheld(finding.note, runs.TAIL_WITHHELD)
+                if tail_held
+                else finding.note
+            )
+            summary_held = self.discloses(runs.note_with_summary(lead, summary))
+        if not summary_held and not tail_held:
             return runs.note_with_summary(finding.note, summary), tail
         if known:
             matched = sum(
-                disclosure.matching_lines(self._disclosure, text) for text in texts
+                disclosure.matching_lines(self._disclosure, text)
+                for text, held in ((summary, summary_held), (tail, tail_held))
+                if text is not None and held
             )
             self._log.append(
                 DisclosureChecked(
@@ -5549,7 +5951,14 @@ class Scheduler:
                     min(max(matched, 1), MAX_DISCLOSURE_MATCHES),
                 )
             )
-        return runs.note_withheld(finding.note, runs.OUTPUT_WITHHELD), None
+        if summary_held and tail_held:
+            return runs.note_withheld(finding.note, runs.OUTPUT_WITHHELD), None
+        if summary_held:
+            return runs.note_withheld(finding.note, runs.SUMMARY_WITHHELD), tail
+        # Only the tail holds a term. Its notice leads, so a long summary after it
+        # cannot cut the notice off at the note's bound.
+        notice = runs.note_withheld(finding.note, runs.TAIL_WITHHELD)
+        return runs.note_with_summary(notice, summary), None
 
     def _withdraw_run_wakes(self, run_id: str) -> dict[str, str]:
         """Withdraw each pending wake that waits for the run ``run_id``, and return
@@ -6479,6 +6888,7 @@ class Scheduler:
             "cost_usd": self.cost_status(line_id),
             "provider_budget": self.provider_budget_status(line_id),
             "disclosure": self.disclosure_status(),
+            "machine_status": self.machine_status_view(),
             "leases": self.leases_of(line_id),
             "scheduled_wake": _scheduled_summary(pending),
             **summary(state, LineAddress(line_id), 0).counts(),
@@ -11584,10 +11994,19 @@ class Scheduler:
             self._ensure_context_compaction_wake(line_id)
         if self._running or self._sent or self._due_wakes():
             return True
+        deferring = self.machine_decision().defer_turns
         return any(
-            self._eligible(line_id) and self._may_wake(line_id)
+            self._eligible(line_id)
+            and self._may_wake(line_id)
+            and not (deferring and self._turn_deferral_told(line_id))
             for line_id in self._state().lines
         )
+
+    def _turn_deferral_told(self, line_id: str) -> bool:
+        """Whether the current deferral has told ``line_id`` and the operator, so a
+        deferred line no longer keeps the loop ticking. The loop's rest, at most
+        ``MAX_REST_SECONDS``, then reads the status again. **Round 16, item 3.**"""
+        return line_id in self._machine_noted and "operator" in self._machine_noted
 
     def _may_wake(self, line_id: str) -> bool:
         """Whether the line has post office mail that may start its turn. Peer mail
@@ -11709,6 +12128,9 @@ class Scheduler:
             return
         if self._nothing_new(line_id, messages):
             self._deliver_without_turn(messages)
+            return
+        if self.machine_decision().defer_turns:
+            self._note_turn_deferral(line_id)
             return
         self._begin_turn(line_id, messages)
 
@@ -11997,6 +12419,9 @@ class Scheduler:
             behind = self._behind_notice(line_id)
             if behind is not None:
                 prompt = f"{behind}\n\n{prompt}"
+            machine = self._machine_notice(line_id)
+            if machine is not None:
+                prompt = f"{machine}\n\n{prompt}"
             moved = self._head_notice(line_id)
             if moved is not None:
                 prompt = f"{moved}\n\n{prompt}"

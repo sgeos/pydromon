@@ -1,6 +1,7 @@
 """Fixtures shared across the test suite."""
 
 import gc
+import os
 import shutil
 import subprocess
 import tempfile
@@ -414,6 +415,102 @@ def _no_automatic_collection() -> Iterator[None]:
     finally:
         gc.enable()
         gc.collect()
+
+
+REOPEN_DEPTH = 6
+"""How far below a directory ``reopen_directories`` looks."""
+
+
+def owned_by_running_pytest(base: Path) -> bool:
+    """Whether ``base``, a numbered directory of the pytest base, belongs to a pytest
+    that is still running. **Round 16 review, point 4.** Pytest writes its process
+    identifier to ``.lock`` in the directory it makes and removes it as it exits, so a
+    lock naming a live process is a running session, and one naming a process that is
+    gone, or no lock, is a session that is over. A process that cannot be signalled
+    for want of permission exists, and is kept as running. A lock that is not an
+    identifier names no process. Pytest's own lock is the evidence, and not an age,
+    since a gate can run for an hour. **Checked** against the pinned pytest 9.1.1,
+    whose ``create_cleanup_lock`` writes ``str(os.getpid())`` to ``.lock``, with no
+    newline, after it makes the directory, and whose exit hook removes it. A test pins
+    this. **Race.** The lock is made just after the directory, so a scan in that window
+    sees no lock, which can only repair a base that holds nothing yet, since no test has
+    run in it. A process identifier that a later process reuses keeps a dead session's
+    base unrepaired, which fails safe."""
+    try:
+        text = (base / ".lock").read_text()
+    except OSError:
+        return False
+    try:
+        pid = int(text.strip())
+    except ValueError:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def reopen_directories(
+    root: Path,
+    depth: int = REOPEN_DEPTH,
+    skip: Path | None = None,
+    keep: Callable[[Path], bool] | None = None,
+) -> int:
+    """Give the owner full access to every directory of this user below ``root``, down
+    to ``depth`` levels, and return how many were changed. **Round 16.** A test that
+    makes a directory unreadable on purpose restores it in a ``finally`` clause, which a
+    kill skips, and pytest then cannot delete the old base directory, so the next
+    session's gate exits 1 after every test has passed. The observed case was a leftover
+    of 2026-11-04 in the worktree test of an unreadable directory, found on 2026-11-11.
+    Symbolic links are neither followed nor changed, a path that
+    cannot be changed is left, ``skip`` is not entered, and the walk is bounded by
+    ``depth``. A directory for which ``keep`` is true is neither changed nor entered,
+    so a parallel session's deliberately unreadable test directory is not restored
+    under it."""
+    changed = 0
+    pending = [(root, depth)]
+    uid = os.getuid()
+    while pending:
+        directory, remaining = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                if keep is not None and keep(Path(entry.path)):
+                    continue
+                mode = entry.stat(follow_symlinks=False)
+                if mode.st_uid != uid:
+                    continue
+                if mode.st_mode & 0o700 != 0o700:
+                    os.chmod(entry.path, mode.st_mode | 0o700)
+                    changed += 1
+            except OSError:
+                continue
+            if remaining > 1 and Path(entry.path) != skip:
+                pending.append((Path(entry.path), remaining - 1))
+    return changed
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _reopen_old_temporary_directories(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Repair what an earlier killed session left, before pytest deletes it at the
+    end of this one. The current session's own base is left alone, and so is the base of
+    any other pytest that is running, which a parallel gate of the same user is."""
+    current = tmp_path_factory.getbasetemp()
+    reopen_directories(
+        current.parent, REOPEN_DEPTH + 1, skip=current, keep=owned_by_running_pytest
+    )
 
 
 @pytest.fixture(autouse=True)
