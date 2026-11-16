@@ -225,14 +225,20 @@ def test_a_stated_budget_gives_when_it_was_observed_and_its_age() -> None:
 
 
 def test_a_budget_observed_after_the_daemon_s_time_has_no_age() -> None:
-    """A clock set back must not make an old figure read as fresh."""
+    """A clock set back must not make an old figure read as fresh. **Round 17, item
+    4.** This pinned ``age_seconds`` at -3600 beside words saying the age was
+    unknown, which disagreed. Both now say unknown, and the words say how far
+    ahead the statement is."""
     stated = BudgetStated(
         "claude-code", 40, None, BudgetSource.ENGINE, "", "2026-11-01T00:00:00Z"
     )
     before = datetime(2026, 10, 31, 23, 0, tzinfo=UTC)
     view = _budget_view(stated, before)
-    assert view["age_seconds"] == -3600
-    assert "its age is unknown" in str(view["age"])
+    assert view["age_seconds"] == "unknown"
+    assert view["age"] == (
+        "observed 1 hour after the daemon's current time, as when its clock was set"
+        " back, so its age is unknown"
+    )
 
 
 def test_a_turn_of_unknown_cost_counts_as_zero_and_says_so() -> None:

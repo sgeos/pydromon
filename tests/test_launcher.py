@@ -32,6 +32,7 @@ from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
 from dromon import launcher, processes, spawn
+from dromon.modulecommand import BOOT, package_root
 from dromon.launcher import (
     LAUNCH_MARK_VARIABLE,
     LAUNCH_VARIABLES,
@@ -517,7 +518,20 @@ def test_a_wrapped_command_starts_the_launcher_with_its_variables() -> None:
         LAUNCH_MARK_VARIABLE: MARK,
     }
     arguments, launched, policy = wrap(["/opt/harness", "--mode", "rpc"], environment)
-    assert arguments == [sys.executable, "-I", "-m", "dromon.launcher", "--mode", "rpc"]
+    assert arguments == [
+        sys.executable,
+        "-I",
+        "-c",
+        BOOT,
+        package_root(),
+        "dromon.launcher",
+        "--mode",
+        "rpc",
+    ]
+    assert (
+        Path(package_root(), "dromon", "launcher.py").resolve()
+        == Path(launcher.__file__).resolve()
+    )
     assert policy is StopPolicy.LEAVE_BACKGROUND
     assert launched[TARGET_VARIABLE] == "/opt/harness"
     assert launched[PARENT_VARIABLE] == str(os.getpid())
@@ -1666,6 +1680,17 @@ def test_a_launcher_is_running_only_while_it_holds_its_harness() -> None:
     assert not launcher_running([TreeRow(7, 1, 7, "[dromon-launch] <defunct>")], 7)
     assert not launcher_running([TreeRow(7, 1, 7, "/bin/sleep 60")], 7)
     assert not launcher_running(held, 8)
+
+
+def test_the_launcher_started_through_the_boot_command_is_recognised() -> None:
+    """Round 17, item 6. The launcher now starts as ``python -I -c BOOT ROOT
+    dromon.launcher``, with the boot code before the module's name. ``ps`` is read
+    with ``-ww``, so the whole command reaches the table and the name still matches."""
+    command = " ".join(wrap(["/opt/claude", "-p"], {})[0])
+    assert command.index(BOOT) < command.index("dromon.launcher")
+    held = [TreeRow(7, 1, 7, command), TreeRow(40, 7, 40, "/opt/claude -p")]
+    assert launcher_running(held, 7, 40, "/opt/claude")
+    assert not launcher_running([TreeRow(7, 1, 7, command[:80])], 7)
 
 
 def test_a_sweep_reads_the_table_while_a_record_is_unfinished(tmp_path: Path) -> None:

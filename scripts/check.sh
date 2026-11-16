@@ -230,9 +230,68 @@ pass "shellcheck is clean on ${#shell_files[@]} shell files"
 # only the file and line of each unaccepted match, never its text. The list lives under
 # secret/, so the scan cannot run in a clone or in continuous integration, and it says
 # so rather than passing silently.
-terms_file="secret/disclosure-terms.txt"
-accepted_file="secret/disclosure-accepted.txt"
-if [[ -f "$terms_file" ]]; then
+#
+# Round 17, item 1. A linked worktree has no secret/ of its own, so a gate run there
+# skipped the scan every time, including every full-gate run. When this checkout has
+# no list, the list, its accepted lines and the project file's accepted hashes are
+# read from the main checkout, the parent of the directory that
+# `git rev-parse --git-common-dir` names, which is where `scripts/worktree.sh` and the
+# operator keep them. All three come from one checkout, so an acceptance never applies
+# to another checkout's list. A clone's common directory is its own, so a clone and
+# continuous integration still skip with the message they always gave. A line's
+# sandbox may refuse to read the main checkout's files. The gate then says it skipped
+# the scan and why, and does not fail, since a refused read says nothing about the
+# tracked files. Residual. A skip is not a pass, so only a gate run where the read is
+# allowed, such as full-gate, shows the scan ran.
+disclosure_root=""
+disclosure_source="this checkout"
+if [[ ! -e "secret/disclosure-terms.txt" ]]; then
+    common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+    if [[ -n "$common_dir" && "$(basename "$common_dir")" == ".git" ]]; then
+        main_root="$(cd "$(dirname "$common_dir")" 2>/dev/null && pwd -P || true)"
+        if [[ -n "$main_root" && "$main_root" != "$(pwd -P)" ]]; then
+            disclosure_root="$main_root/"
+            disclosure_source="the main checkout at $main_root"
+        fi
+    fi
+fi
+terms_file="${disclosure_root}secret/disclosure-terms.txt"
+accepted_file="${disclosure_root}secret/disclosure-accepted.txt"
+config_file="${disclosure_root}.dromon/dromon.toml"
+# Each input is missing, readable, or present and refused, which a sandbox reports as
+# a permission error, so a refusal is told apart from a missing list. Prints one word,
+# or "refused" with the reason on the same line.
+readable() {
+    python3 -I -c '
+import sys
+try:
+    open(sys.argv[1], "rb").close()
+except FileNotFoundError:
+    print("missing")
+except OSError as error:
+    print("refused", error.strerror or type(error).__name__)
+else:
+    print("ok")
+' "$1"
+}
+terms_state="$(readable "$terms_file")"
+scan_refused=""
+if [[ "$terms_state" == refused* ]]; then
+    scan_refused="$terms_file could not be read, with the error ${terms_state#refused }"
+elif [[ "$terms_state" == ok ]]; then
+    for input in "$accepted_file" "$config_file"; do
+        input_state="$(readable "$input")"
+        if [[ "$input_state" == refused* ]]; then
+            scan_refused="$input could not be read, with the error ${input_state#refused }"
+            break
+        fi
+    done
+fi
+if [[ -n "$scan_refused" ]]; then
+    printf 'check.sh: note: SKIPPED the disclosure scan, because %s, as a sandbox may refuse. A gate run where the read is allowed scans\n' "$scan_refused"
+elif [[ "$terms_state" == ok ]]; then
+    [[ -z "$disclosure_root" ]] ||
+        printf 'check.sh: note: this checkout has no secret/disclosure-terms.txt, so the scan uses %s\n' "$disclosure_source"
     patterns=()
     while IFS= read -r term || [[ -n "$term" ]]; do
         [[ "$term" =~ ^[[:space:]]*(#|$) ]] && continue
@@ -241,13 +300,14 @@ if [[ -f "$terms_file" ]]; then
     if ((${#patterns[@]} > 0)); then
         hits="$(git grep -n -I -i -F "${patterns[@]}" -- . || true)"
         # Operator hashes exempt only the configured file and exact line.
-        hits="$(printf '%s\n' "$hits" | python3 -I -c '
+        hits="$(printf '%s\n' "$hits" | DISCLOSURE_CONFIG="$config_file" python3 -I -c '
 import hashlib
+import os
 import pathlib
 import sys
 import tomllib
 
-config = pathlib.Path(".dromon/dromon.toml")
+config = pathlib.Path(os.environ["DISCLOSURE_CONFIG"])
 accepted = {}
 if config.exists():
     accepted = tomllib.loads(config.read_text(encoding="utf-8")).get("daemon", {}).get("disclosure_accepted", {})
@@ -348,6 +408,13 @@ case "$changelog_status" in
 3) printf 'check.sh: SKIPPED: the changelog rule had no base branch, so only the fragments were validated\n' ;;
 *) fail "the changelog fragment rule, explained above" ;;
 esac
+
+# Rollback floor fragments, round 17, item 3. A branch records a one-way change of the
+# event log in docs/protocol/floors/ rather than as a pending row of the table, which
+# conflicted at every merge. This reads no history, so it runs in a shallow clone.
+python3 -I scripts/assemble_floors.py check ||
+    fail "the rollback floor fragments or table, explained above"
+pass "rollback floor fragments are valid and the table holds no pending row"
 
 # A stale environment tests old code, so the installed environment must match the lock.
 uv sync --locked

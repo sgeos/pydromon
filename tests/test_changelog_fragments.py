@@ -807,6 +807,19 @@ def gate_repository(tmp_path: Path, workflow: str | None = None) -> tuple[Path, 
     shutil.copy2(
         REPOSITORY / "scripts" / "ci_pythons.py", root / "scripts" / "ci_pythons.py"
     )
+    # Round 17, item 3. The gate checks the rollback floor table, so the repository
+    # holds the script and a table with no row, which passes.
+    floors = REPOSITORY / "scripts" / "assemble_floors.py"
+    shutil.copy2(floors, root / "scripts" / "assemble_floors.py")
+    (root / "docs" / "protocol").mkdir(parents=True)
+    header = next(
+        line.split('"')[1]
+        for line in floors.read_text(encoding="utf-8").splitlines()
+        if line.startswith("HEADER: Final = ")
+    )
+    (root / "docs" / "protocol" / "EVENT_LOG.md").write_text(
+        f"# Event log\n\n{header}\n| --- | --- | --- | --- |\n", encoding="utf-8"
+    )
     (root / ".github" / "workflows").mkdir(parents=True)
     target = root / ".github" / "workflows" / "ci.yml"
     if workflow is None:

@@ -148,7 +148,7 @@ def test_a_first_page_says_where_it_ends_and_how_much_unread_waits() -> None:
     notes = _page_notes({"total": 30, "unread_after": 4, "unread_before": 0}, 0, 20)
     assert notes == [
         "showing matches 1 to 20 of 30, oldest first",
-        "4 unread after this page, the newest of them among them. --offset 20"
+        "4 unread matches after this page, including the newest. --offset 20"
         " shows them",
     ]
 
@@ -157,14 +157,16 @@ def test_a_later_page_names_the_unread_before_it() -> None:
     notes = _page_notes({"total": 30, "unread_after": 0, "unread_before": 2}, 20, 10)
     assert notes == [
         "showing matches 21 to 30 of 30, oldest first",
-        "2 unread before this page. --offset 0 shows them",
+        "2 unread matches before this page. --offset 0 shows them",
     ]
 
 
 def test_a_page_past_the_end_says_it_is_empty() -> None:
     notes = _page_notes({"total": 5, "unread_after": 0, "unread_before": 1}, 50, 0)
-    assert notes[0] == "this page is empty, the 5 matches are all before --offset"
-    assert notes[1] == "1 unread before this page. --offset 0 shows them"
+    assert notes[0] == (
+        "this page is empty, since all 5 matches come before --offset 50"
+    )
+    assert notes[1] == "1 unread match before this page. --offset 0 shows them"
     assert _page_notes({"total": 0}, 0, 0) == []
 
 
@@ -215,7 +217,7 @@ def test_dromon_mail_prints_the_notes_after_the_page(
     assert out.count(" from alpha") + out.count(" from beta") == 10
     assert ids[0] in out and ids[9] in out and ids[10] not in out
     assert "showing matches 1 to 10 of 25, oldest first" in out
-    assert "15 unread after this page, the newest of them among them." in out
+    assert "15 unread matches after this page, including the newest." in out
     assert "--offset 10 shows them" in out
 
 

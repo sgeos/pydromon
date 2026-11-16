@@ -55,7 +55,7 @@ from OpenSSL.SSL import Context as OpenSSLContext
 
 from dromon.scheduler import StartCheckEngine
 from dromon import __version__, exits, fleet, grok, peercred, registry, restart, runs
-from dromon import credentials, evidence
+from dromon import credentials, evidence, mcpstates
 from dromon import proposals as proposal_store
 from dromon.federation import (
     MAX_OPEN_REMOTE_PEERS,
@@ -386,6 +386,7 @@ class Daemon:
             wake_every_ticks=scheduler.wake_every_for(line_id),
             own_wake=own_wake,
             rebound=line.rebound,
+            mcp_summary=mcpstates.summary(scheduler.mcp_server_states(line_id)),
         )
 
     # The gateway's view of the daemon.
