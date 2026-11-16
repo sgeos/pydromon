@@ -1073,3 +1073,40 @@ def test_start_check_reads_state_without_a_model_prompt(home: Path) -> None:
     methods = [message.get("type") for message in server.sent]
     assert "get_state" in methods
     assert "prompt" not in methods
+
+
+def test_google_credentials_are_metered_and_allowlisted() -> None:
+    environment = {"GEMINI_API_KEY": "example", "GOOGLE_API_KEY": "excluded"}
+    assert (
+        engine_environment(environment, Strategy.API, "google").get("GEMINI_API_KEY")
+        == "example"
+    )
+    assert "GOOGLE_API_KEY" not in engine_environment(
+        environment, Strategy.API, "google"
+    )
+    assert "GEMINI_API_KEY" not in engine_environment(
+        environment, Strategy.SUBSCRIPTION, "google"
+    )
+    assert (
+        credential_of(
+            "google", {"provider": "google", "status": "ready", "authType": "api_key"}
+        )
+        is Credential.API
+    )
+    with pytest.raises(EngineRefused):
+        credential_of(
+            "google", {"provider": "google", "status": "ready", "authType": "oauth"}
+        )
+
+
+@pytest.mark.parametrize("reported_cost", [0, None])
+def test_unpriced_pi_usage_is_unknown_instead_of_free(
+    home: Path, reported_cost: int | None
+) -> None:
+    spent = usage(100, 10, cost=0)
+    if reported_cost is None:
+        del spent["cost"]
+    server = FakePi([TURN_START, assistant("done", spent=spent)])
+    report = run(line(server, home))
+    assert report.cost_estimate_usd is None
+    assert report.usage_note is not None and "Cost is unknown" in report.usage_note

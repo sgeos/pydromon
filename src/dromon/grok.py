@@ -2036,6 +2036,7 @@ class GrokLine:
                     if not permitted:
                         turn.rejected_calls.add(identifier)
                         turn.rejected_labels[identifier] = label
+                        await self._act(Event("tool_use", label), turn)
                 # Count an allowed call before granting it, so the driver can stop
                 # at its budget without authorizing another execution.
                 await self._record(

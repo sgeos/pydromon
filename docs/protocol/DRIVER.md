@@ -84,6 +84,16 @@ subscription draws on a plan's limits while API usage is charged for every token
 | `cursor_agent__gpt_5_6_luna_medium_subscription.kel` | GPT-5.6 Luna on Cursor Agent | subscription | medium | 200 | 400 |
 | `cursor_agent__gpt_5_6_luna_medium_api.kel` | GPT-5.6 Luna on Cursor Agent | api | medium | 4 | 20 |
 | `cursor_agent__gpt_5_6_luna_medium_flexible.kel` | GPT-5.6 Luna on Cursor Agent | flexible | medium | 4 | 20 |
+| `cursor_agent__gemini_4_argon_medium_subscription.kel` | Gemini 4 Argon on Cursor Agent | subscription | medium | 200 | 400 |
+| `cursor_agent__gemini_4_argon_medium_api.kel` | Gemini 4 Argon on Cursor Agent | api | medium | 4 | 20 |
+| `cursor_agent__gemini_4_argon_medium_flexible.kel` | Gemini 4 Argon on Cursor Agent | flexible | medium | 4 | 20 |
+| `cursor_agent__gemini_4_carbon_medium_subscription.kel` | Gemini 4 Carbon on Cursor Agent | subscription | medium | 200 | 400 |
+| `cursor_agent__gemini_4_carbon_medium_api.kel` | Gemini 4 Carbon on Cursor Agent | api | medium | 4 | 20 |
+| `cursor_agent__gemini_4_carbon_medium_flexible.kel` | Gemini 4 Carbon on Cursor Agent | flexible | medium | 4 | 20 |
+| `cursor_agent__gemini_4_hydrogen_medium_subscription.kel` | Gemini 4 Hydrogen on Cursor Agent | subscription | medium | 200 | 400 |
+| `cursor_agent__gemini_4_hydrogen_medium_api.kel` | Gemini 4 Hydrogen on Cursor Agent | api | medium | 4 | 20 |
+| `cursor_agent__gemini_4_hydrogen_medium_flexible.kel` | Gemini 4 Hydrogen on Cursor Agent | flexible | medium | 4 | 20 |
+| `pi__google__gemini_4_argon_api.kel` | Gemini 4 Argon on Pi | api | medium | 4 | 20 |
 | `antigravity__gemini_3_8_flash_high_subscription.kel` | Gemini 3.8 Flash at high effort on Antigravity | subscription | high | 200 | 400 |
 | `antigravity__gemini_3_8_flash_high_api.kel` | Gemini 3.8 Flash at high effort on Antigravity | api | high | 4 | 20 |
 | `antigravity__gemini_3_8_flash_high_flexible.kel` | Gemini 3.8 Flash at high effort on Antigravity | flexible | high | 4 | 20 |
@@ -148,6 +158,15 @@ predecessor drivers, and all new bindings retain strict model and credential ref
 measurements of the new models. Operator probe turns after merge are still required.
 An engine returning a different identifier will be refused, and a model whose real
 context window is smaller than the inherited value may exhaust context earlier.
+
+**Fact, reported by the operator on 2026-11-16.** The Agent Software Development
+Kit bundles Claude Code 2.1.310, which logs `unrecognized_model` for
+`claude-fable-5-2` and nevertheless serves it. The warning therefore does not
+establish model rejection. No dependency change follows from this observation.
+The Fable 5.2 window of 1,000,000 tokens and the Grok 4.7 Build Fast window of
+256,000 tokens remain inherited and independently unconfirmed. Verify first by
+checking the selected model and effective context limit in an operator turn before
+relying on either window for context management.
 
 ## Engines
 
@@ -285,3 +304,23 @@ Code prefer an API credential, because the driver cannot see the environment.
 - Events for messages from other lines and for operator answers, which arrive with
   roadmap task 5.
 - Drivers for Dromon's own loop, where the driver would also decide each model call.
+
+## Gemini 4 bindings recorded on 2026-11-16
+
+**Fact.** The operator reported generally available Gemini 4 Argon, Carbon and
+Hydrogen and their medium effort identifiers in the Cursor Agent account list.
+Their Cursor settings derive from the GPT-5.6 Luna medium drivers for each strategy.
+**Inference.** The display names are `Gemini 4 Argon`, `Gemini 4 Carbon` and
+`Gemini 4 Hydrogen`. These names have not been observed in an engine init event.
+A different name fails the driver's model check. The 1,000,000 token window follows
+the operator's observation of Google's model page.
+
+**Fact.** Pi's installed bundled catalogue lists `google/gemini-4-argon` with
+1,048,576 tokens and medium effort support. Its driver derives all other settings
+from Pi GPT-6-Sol with the api strategy. Subscription and flexible strategies are
+refused at driver load because the Google provider has no documented subscription
+sign-in. No credential file was read.
+
+**Not verified live.** Every new Gemini binding requires an operator verify-first
+turn to check model identity, credential source, tool routing and effective context
+limit. Cursor and Pi retain their existing isolation restrictions.

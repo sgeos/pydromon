@@ -105,6 +105,7 @@ Claude sign-in through Pi is not taken to be a subscription and refuses the turn
 
 PROVIDER_CREDENTIALS: Final[dict[str, tuple[str, ...]]] = {
     "openai": ("OPENAI_API_KEY",),
+    "google": ("GEMINI_API_KEY",),
 }
 """Credential variables available to metered Pi strategies, keyed by the provider
 named in the packaged driver's model. Add a provider only with its verified key
@@ -521,6 +522,7 @@ class _Turn:
         default_factory=list[dict[str, int | bool]]
     )
     cost: float | None = None
+    cost_unknown: bool = False
 
 
 USAGE_KEYS: Final = {
@@ -572,6 +574,13 @@ def _count_usage(usage: Mapping[str, object], turn: _Turn) -> dict[str, int | bo
     total = cast(dict[str, Any], cost).get("total") if isinstance(cost, dict) else None
     if isinstance(total, int | float) and not isinstance(total, bool) and total >= 0:
         turn.cost = (turn.cost or 0.0) + float(total)
+    if (
+        not isinstance(total, int | float)
+        or isinstance(total, bool)
+        or total < 0
+        or (total == 0 and any(call.get(key, 0) for key in USAGE_KEYS.values()))
+    ):
+        turn.cost_unknown = True
     return call
 
 
@@ -710,7 +719,7 @@ class PiLine:
                 finally:
                     self._connection = None
         except asyncio.CancelledError:
-            self._interrupted_cost = turn.cost
+            self._interrupted_cost = None if turn.cost_unknown else turn.cost
             raise
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
@@ -782,11 +791,17 @@ class PiLine:
             credential=credential,
             session_id=self.session_id or "",
             capabilities=None,
-            cost_estimate_usd=turn.cost,
+            cost_estimate_usd=None if turn.cost_unknown else turn.cost,
             usage=usage,
             calls=tuple(dict(call) for call in turn.calls[-50:]),
             context_tokens=turn.context,
-            usage_note=PI_USAGE_NOTE if turn.calls else None,
+            usage_note=(
+                PI_USAGE_NOTE + " Cost is unknown because Pi reported unpriced usage."
+                if turn.cost_unknown
+                else PI_USAGE_NOTE
+                if turn.calls
+                else None
+            ),
             # Pi documents that it has no sandbox, as the module says.
             sandbox_mode="none",
         )

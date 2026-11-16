@@ -20,7 +20,14 @@ from claude_agent_sdk import SdkMcpTool
 
 from dromon import antigravity, cursor
 from dromon.codec import encode
-from dromon.driver import ENGINE_OF, MODELS, Strategy, harness_id
+from dromon.driver import (
+    API_ONLY_MODELS,
+    ENGINE_OF,
+    MODELS,
+    DriverError,
+    Strategy,
+    harness_id,
+)
 from dromon.engine import TurnReport
 from dromon.eventlog import EventLog, LogCorrupt, replay
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
@@ -97,6 +104,11 @@ def test_the_qualified_models_are_the_ones_the_identifier_pattern_refuses() -> N
 def test_a_line_can_be_created_on_every_packaged_model_a_daemon_may_hold(
     scheduler: Scheduler, model: str, strategy: Strategy
 ) -> None:
+    if model in API_ONLY_MODELS and strategy is not Strategy.API:
+        with pytest.raises(DriverError, match="only the api strategy"):
+            scheduler.create_line("alpha", model, strategy)
+        assert "alpha" not in scheduler.state.lines
+        return
     refusal = cost_bound_refusal(ENGINE_OF[model], strategy)
     if refusal is not None:
         # Review of a9995d8, item 4. The api strategy is refused where no cost is
@@ -132,7 +144,12 @@ def test_a_line_can_be_rebound_onto_and_off_a_qualified_model(
     scheduler: Scheduler, model: str
 ) -> None:
     scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
-    scheduler.rebind_line("alpha", model, Strategy.SUBSCRIPTION)
+    if model in API_ONLY_MODELS:
+        with pytest.raises(DriverError, match="only the api strategy"):
+            scheduler.rebind_line("alpha", model, Strategy.SUBSCRIPTION)
+        assert scheduler.state.lines["alpha"].engine == HAIKU
+    strategy = Strategy.API if model in API_ONLY_MODELS else Strategy.SUBSCRIPTION
+    scheduler.rebind_line("alpha", model, strategy)
     assert scheduler.state.lines["alpha"].engine == model
     scheduler.rebind_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
     assert scheduler.state.lines["alpha"].engine == HAIKU
