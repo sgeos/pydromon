@@ -332,6 +332,7 @@ from dromon.lineconfig import (
 )
 from dromon.model import (
     COMMIT_PATTERN,
+    DEFAULT_QUEUE_MAX_AGE_SECONDS,
     MAX_BRIEF_ARTIFACTS,
     MAX_CLOSE_REASON_BYTES,
     MAX_LEASE_NOTE_BYTES,
@@ -2952,6 +2953,7 @@ class Scheduler:
         self._machine_read_epoch: float | None = None
         self._machine_sampled_at: datetime | None = None
         self._run_slot: str | None = None
+        self._queue_max_age = DEFAULT_QUEUE_MAX_AGE_SECONDS
         self._queue_task: asyncio.Task[None] | None = None
         """When the monitor's file was first seen unusable in the present spell, a
         stale one by its last sample, or ``None`` while the file is fresh or none is
@@ -5348,6 +5350,7 @@ class Scheduler:
         commit_refs: Sequence[str] = (),
         parameters: Mapping[str, Mapping[str, runparams.RunParameter]] | None = None,
         slot_lease: str | None = None,
+        queue_max_age_seconds: int = DEFAULT_QUEUE_MAX_AGE_SECONDS,
     ) -> None:
         """Declare the commands lines may start as runs, and the commit commands
         with the refs their commits must be in, as the project file does at start
@@ -5370,6 +5373,7 @@ class Scheduler:
         self._commit_refs = tuple(commit_refs)
         self._run_parameters = declared
         self._run_slot = slot_lease
+        self._queue_max_age = queue_max_age_seconds
 
     def _run_role(self, line_id: str) -> str | None:
         seat = self._state().seats.get(line_id)
@@ -5651,6 +5655,18 @@ class Scheduler:
         pairs = tuple(
             sorted((name, str(value)) for name, value in (arguments or {}).items())
         )
+        for name, value in pairs:
+            try:
+                masked = self._log.scrub_text(value)
+            except credentials.SecretsUnavailable as error:
+                raise runs.RunRefused(str(error)) from error
+            if masked != value:
+                raise runs.RunRefused(
+                    f"the value of {name} looks like a credential, and a queued run"
+                    " keeps its values in the event log, which cannot mask them, since"
+                    " the run is started from them. Start the run when it is not"
+                    " deferred, or pass no credential as a parameter"
+                )
         try:
             event = RunQueued(
                 new_id("q"),
@@ -5697,6 +5713,13 @@ class Scheduler:
         moved. A change of the files there without a commit is not a reason, and the
         run's receipt names the tree it ran. A release drops the line's entry as it
         is made, in ``release``."""
+        waited = (self._wall_clock() - parse_due(entry.queued_at)).total_seconds()
+        if waited > self._queue_max_age:
+            return (
+                f"it waited {int(waited)} seconds, longer than the project's"
+                f" runs.queue_max_age_seconds of {self._queue_max_age}, and still"
+                f" {self._run_wait_reason(entry.line_id) or 'could not start'}"
+            )
         line = self._state().lines.get(entry.line_id)
         if line is None:
             return "its line no longer exists"
@@ -5746,6 +5769,8 @@ class Scheduler:
         raises."""
         try:
             for entry in list(self._state().queued_runs.values()):
+                if self._settle_if_started(entry):
+                    continue
                 reason = self._queue_drop_reason(entry)
                 if reason is not None:
                     self._drop_queued(entry, reason)
@@ -5769,6 +5794,8 @@ class Scheduler:
                 queued=entry.queue_id,
             )
         except (runs.RunRefused, ProcessRefused, EventRejected) as error:
+            if self._settle_if_started(entry):
+                return
             if self._run_wait_reason(entry.line_id) is None:
                 self._drop_queued(entry, f"its start was refused, {error}")
             return
@@ -5787,6 +5814,55 @@ class Scheduler:
             f" {started.run_id}, writing {started.output_file}. Its end is sent to"
             " its scope's holder, and run_status shows it.",
         )
+
+    def _started_from(self, entry: RunQueued) -> RunStarted | None:
+        """The run that ``entry`` began, or ``None``. **Review of 883c00f, finding 4.**
+        A run began from an entry when it is the line's, of the entry's command and
+        commit, and names as its predecessor the run the line read when it queued,
+        since no other start of the line is allowed while an entry waits, so no
+        other run has that predecessor. It is also not older than the entry."""
+        queued_at = parse_due(entry.queued_at)
+        for run in self._state().runs.values():
+            started = run.started
+            if (
+                started.line_id == entry.line_id
+                and started.command == entry.command
+                and started.commit == entry.commit
+                and started.previous == entry.previous
+                and parse_due(started.started_at) >= queued_at
+            ):
+                return started
+        return None
+
+    def _settle_if_started(self, entry: RunQueued) -> bool:
+        """Record that ``entry`` left the queue as the run it began, when the log
+        shows one, and tell the line so, and return whether it did. **Review of
+        883c00f, finding 4.** ``run_started`` is logged before ``run_dequeued``, since
+        a start can still fail after the supervisor is launched and the entry must
+        stay until the run exists. A daemon that stopped between the two events finds
+        the run and the entry together. It must not drop the entry, which would tell
+        the line its run was dropped while it runs, nor begin a second run, so it
+        closes the entry as started, with the run it finds."""
+        started = self._started_from(entry)
+        if started is None:
+            return False
+        self._log.append(
+            RunDequeued(
+                entry.queue_id,
+                QueueEnd.STARTED,
+                started.run_id,
+                "",
+                format_due(self._wall_clock()),
+            )
+        )
+        self._harness_note(
+            LineAddress(entry.line_id),
+            f"Your queued run {entry.queue_id} of {entry.command} started as run"
+            f" {started.run_id}, writing {started.output_file}, before the daemon"
+            " restarted, and it is not dropped. Its end is sent to its scope's"
+            " holder, and run_status shows it.",
+        )
+        return True
 
     def _check_commit_start(self, scope: tuple[str, str]) -> None:
         """Refuse a commit run's start while another of ``scope``'s is in progress,

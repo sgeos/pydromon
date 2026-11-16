@@ -10,7 +10,12 @@ Type: Added
   The project file may name its gate slot with `runs.slot_lease`, a declared lease that
   holds a run in the queue while another line has it. `run_queued` and `run_dequeued` are
   new events, `STATE_VERSION` is 7, and a daemon from before them refuses a log that
-  holds one.
+  holds one. **Review of 883c00f.** An entry is also dropped after waiting longer than
+  `runs.queue_max_age_seconds`, by default 7,200, from 60 to 86,400. A start whose
+  parameter value looks like a credential is not queued, since the log cannot mask what
+  the run starts from. A daemon that stopped between a queued run's start and its
+  dequeue closes the entry as started on restart and tells the line the run is not
+  dropped.
 - The daemon says what `dromon config` says. It prints each warning about a file that
   loads to its standard error at a start, and `reload_project` gives them as `warnings`,
   which `dromon reload` prints.

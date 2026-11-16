@@ -2501,6 +2501,21 @@ would is refused with the queue's state, so no line waits unseen behind a full o
 
 MAX_QUEUE_REASON_BYTES: Final = 512
 
+DEFAULT_QUEUE_MAX_AGE_SECONDS: Final = 7200
+"""How long a queued run may wait before it is dropped, by default. **Review of
+883c00f, finding 1.** A queue without a bound lets a slot holder that keeps renewing,
+or a machine status that never clears, hold a line's run and so its other starts
+indefinitely. Two hours is eight runs, the queue's limit, of a quarter of an hour each,
+which is about the length of the full gate, so the last of a full queue still starts,
+and a wait longer than that means the slot or the machine is stuck and the line should
+hear so and decide."""
+
+MIN_QUEUE_MAX_AGE_SECONDS: Final = 60
+MAX_QUEUE_MAX_AGE_SECONDS: Final = 86400
+"""The bounds of the project's ``runs.queue_max_age_seconds``. A minute is the least
+that outlasts one look of the queue, and a day is the longest a line's start is kept
+without a person seeing it."""
+
 
 class QueueEnd(StrEnum):
     """How a queued run left the queue. ``started`` means its run began, and

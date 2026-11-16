@@ -1164,13 +1164,21 @@ have made at that moment, with every check made again. The line is sent a note, 
 wakes it, saying the queued run started as the run it names. The run's end is sent as
 for any run, to the scope's holder. If the start is refused for a reason other than a
 wait, the entry is dropped with the refusal as its reason. If a wait returned between
-the look and the start, it stays queued. Because `run_dequeued` follows `run_started`, a
-daemon that stopped between them finds on restart that the line's latest run is not the
-`previous` it queued, and drops the entry instead of beginning a second run.
+the look and the start, it stays queued. **Review of 883c00f, finding 4.**
+`run_dequeued` follows `run_started`, since a start can still fail after the supervisor
+is launched and the entry must stay until the run exists. A daemon that stopped between
+the two events finds the run and the entry together. Before it drops or begins any entry,
+a look closes each whose run the log shows, as started, with that run, and tells the line
+that the run started before the restart and is not dropped. A run is the entry's when it
+is the line's, of its command and commit, names as predecessor the run the entry read,
+and is not older than the entry. No other start of the line is allowed while an entry
+waits, so no other run has that predecessor. Without this a restart tried to begin the
+entry again, was refused since the line's run had not ended, and told the line it was
+dropped while it ran.
 
 **Dropping it.** Each drop is recorded as `run_dequeued` with its reason, and the line
 is sent a note with the reason unless it withdrew the entry. The reasons are that the
-line no longer exists, is stopped or is hibernated, that an operator released it, which
+entry waited longer than `runs.queue_max_age_seconds`, that the line no longer exists, is stopped or is hibernated, that an operator released it, which
 is done as the release is made, that it no longer owns what the run would write, that
 its working directory is another path than the one asked about, and that the commit
 checked out there has moved. **Residual.** Edits without a commit are not a change that
@@ -1178,12 +1186,33 @@ drops it. A line that edits while its run waits has the edited tree run, and the
 receipt names the tree that ran, as round 16 made it. A held line keeps its entry,
 which may start while it is held, since a hold stops turns and not runs.
 
+**The age bound.** **Review of 883c00f, finding 1.** An entry waits at most
+`runs.queue_max_age_seconds`, by default `DEFAULT_QUEUE_MAX_AGE_SECONDS`, 7,200, from
+60 to 86,400. Without a bound a slot holder that kept renewing, or a status that never
+cleared, held the entry and so every other start of the line for ever. The default is
+eight quarter hours, the queue's size at the length of the full gate, so the last of a
+full queue still starts, and a longer wait says the slot or the machine is stuck. The
+drop is an event and a note naming the limit and what the entry still waited for, and
+the line decides whether to start again. The age counts from `queued_at` by the
+daemon's wall clock, so a clock that steps forward drops entries early, which is a
+failure toward telling the line, not toward a start nobody asked for.
+
+**Values in the log.** **Review of 883c00f, finding 2.** An entry holds the parameter
+values as given, since the run is started from them, so they cannot be masked as
+`run_started.argv` is. The daemon instead refuses to queue a start for which any value
+changes under credential scrubbing, by pattern or by the literal secret values of the
+project, and says why, so a permissive parameter pattern cannot put a token in the log
+through the queue. The refusal means the line starts the run when nothing defers it, or
+does not pass a credential as a parameter. **Residual.** A credential that neither the
+patterns nor the literal values recognise is recorded, as in any text.
+
 **Failure modes.** The event log refuses the new events in a daemon from before them,
 so rolling back after a queue entry is recorded needs the log's floor, which
 [`EVENT_LOG.md`](../protocol/EVENT_LOG.md) names. A daemon restart keeps the queue and
 begins it again, from the state alone. A queued start whose wait never ends stays in the
-queue until the line is stopped, hibernated, released or withdraws it. The slot's
-holder may keep the lease for its whole time to live, so a run may wait that long.
+queue until the age bound, the line is stopped, hibernated or released, or it withdraws
+it. The slot's holder may keep the lease for its whole time to live, so a run may wait
+that long, up to the bound.
 
 ## Not implemented
 

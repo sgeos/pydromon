@@ -1798,6 +1798,7 @@ class Daemon:
             config.run_commit_refs,
             config.run_parameters,
             config.run_slot_lease,
+            config.run_queue_max_age_seconds,
         )
         self.project = config
         self.project_file_present = present
@@ -4191,6 +4192,7 @@ def run(
                 config.run_commit_refs,
                 config.run_parameters,
                 config.run_slot_lease,
+                config.run_queue_max_age_seconds,
             )
             check_lines_sandboxed(config, log, scheduler)
             check_roles(scheduler, log, config)

@@ -43,6 +43,9 @@ from dromon.lineconfig import (
 )
 from dromon.model import (
     DEFAULT_HANDOFF_BELOW_PERCENT,
+    DEFAULT_QUEUE_MAX_AGE_SECONDS,
+    MAX_QUEUE_MAX_AGE_SECONDS,
+    MIN_QUEUE_MAX_AGE_SECONDS,
     DEFAULT_HANDOFF_SECONDS,
     MAX_ROLE_SEATS,
     MAX_RUN_ARGUMENT_BYTES,
@@ -117,7 +120,14 @@ LIMIT_KEYS: Final = frozenset(
 WAKE_KEYS: Final = frozenset({"every_ticks"})
 LEASE_KEYS: Final = frozenset({"names", "ttl_seconds"})
 RUN_KEYS: Final = frozenset(
-    {"commands", "commit_commands", "commit_refs", "parameters", "slot_lease"}
+    {
+        "commands",
+        "commit_commands",
+        "commit_refs",
+        "parameters",
+        "slot_lease",
+        "queue_max_age_seconds",
+    }
 )
 REF_KEYS: Final = frozenset({"patterns"})
 PARAMETER_KEYS: Final = frozenset({"pattern", "description"})
@@ -137,6 +147,8 @@ class RunTables:
     name, for the commands that declare any."""
     slot_lease: str | None = None
     """**Round 17, item 1.** The lease a run waits behind, or ``None``."""
+    queue_max_age_seconds: int = DEFAULT_QUEUE_MAX_AGE_SECONDS
+    """**Review of 883c00f, finding 1.** The longest a queued run waits."""
 
 
 MAX_RUN_COMMANDS: Final = 64
@@ -343,6 +355,9 @@ class ProjectConfig:
     run_slot_lease: str | None = None
     """**Round 17, item 1.** The declared lease that holds a line's run in the queue
     while another line has it, the project's gate slot, or ``None`` for none."""
+    run_queue_max_age_seconds: int = DEFAULT_QUEUE_MAX_AGE_SECONDS
+    """**Review of 883c00f, finding 1.** How long a queued run waits before it is
+    dropped with an event and a note."""
     read_only_paths: tuple[str, ...] = ()
     """Project-relative-path entries denied write access under every line's workdir."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
@@ -562,6 +577,7 @@ class _Reader:
             run_commit_refs=run_tables.commit_refs,
             run_parameters=run_tables.parameters,
             run_slot_lease=run_tables.slot_lease,
+            run_queue_max_age_seconds=run_tables.queue_max_age_seconds,
             read_only_paths=read_only_paths,
             lines=lines,
             roles=roles,
@@ -678,7 +694,16 @@ class _Reader:
             not isinstance(slot, str) or ID_PATTERN.fullmatch(slot) is None
         ):
             raise self.fail("runs.slot_lease", "must be a lease name")
-        return RunTables(commands, commit_commands, found, parameters, slot)
+        age = document.get("queue_max_age_seconds", DEFAULT_QUEUE_MAX_AGE_SECONDS)
+        if type(age) is not int or not (
+            MIN_QUEUE_MAX_AGE_SECONDS <= age <= MAX_QUEUE_MAX_AGE_SECONDS
+        ):
+            raise self.fail(
+                "runs.queue_max_age_seconds",
+                f"must be a whole number from {MIN_QUEUE_MAX_AGE_SECONDS} to"
+                f" {MAX_QUEUE_MAX_AGE_SECONDS}",
+            )
+        return RunTables(commands, commit_commands, found, parameters, slot, age)
 
     def run_parameters(
         self, value: object, argvs: Mapping[str, tuple[str, ...]]

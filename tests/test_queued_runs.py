@@ -17,10 +17,11 @@ from dromon import runs
 from dromon import scheduler as scheduler_module
 from dromon.driver import Strategy
 from dromon.engine import TurnReport
-from dromon.eventlog import EventLog
+from dromon.eventlog import Entry, EventLog
 from dromon.model import (
     HARNESS,
     MAX_QUEUED_RUNS,
+    Event,
     EventRejected,
     HoldCause,
     InvalidField,
@@ -340,6 +341,21 @@ def test_an_expired_slot_holds_nothing_back(rig: Rig) -> None:
 # Dropping it.
 
 
+def read_entries_of(rig: Rig) -> list[Any]:
+    from dromon.eventlog import read_entries
+
+    return list(read_entries(rig.root / "events.sqlite"))
+
+
+def dequeued(rig: Rig, queue_id: str) -> RunDequeued:
+    (event,) = [
+        entry.event
+        for entry in read_entries_of(rig)
+        if isinstance(entry.event, RunDequeued) and entry.event.queue_id == queue_id
+    ]
+    return event
+
+
 def dropped(rig: Rig, queue_id: str) -> RunDequeued:
     # The log is the record, so the event is read from it.
     from dromon.eventlog import read_entries
@@ -560,3 +576,216 @@ def test_the_project_file_refuses_a_slot_that_is_not_a_declared_lease(
 ) -> None:
     with pytest.raises(ConfigFileError, match=message):
         project(tmp_path, body)
+
+
+# Review of 883c00f. The age of a queued run, a credential in its values, the crash
+# window between the run and its dequeue, and the wake at its end.
+
+
+def test_a_queued_run_that_waits_past_the_age_is_dropped_with_an_event_and_a_note(
+    rig: Rig,
+) -> None:
+    """Confirmed against the code before the change, whose drop reasons had none for
+    age, so a status that never cleared kept the entry, and blocked the line's other
+    starts, for ever."""
+    queued = rig.queue()
+    limit = scheduler_module.DEFAULT_QUEUE_MAX_AGE_SECONDS
+    rig.clock.now += timedelta(seconds=limit - 1)
+    rig.advance()
+    assert rig.log.state.queued_runs, "it still has time"
+    rig.clock.now += timedelta(seconds=2)
+    rig.advance()
+    assert not rig.log.state.queued_runs and not rig.log.state.runs
+    reason = dropped(rig, queued.queue_id).reason
+    assert f"runs.queue_max_age_seconds of {limit}" in reason
+    assert "the machine status defers runs" in reason
+    (note,) = rig.notes("alpha")
+    assert "was dropped and will not start" in note and reason in note
+    rig.set_level("ok")
+    rig.finish(
+        asyncio.run(rig.scheduler.start_run("alpha", "gate", "none")).run_id,
+    )
+
+
+def test_the_project_sets_the_age_and_the_default_is_eight_quarter_hours() -> None:
+    assert scheduler_module.DEFAULT_QUEUE_MAX_AGE_SECONDS == (MAX_QUEUED_RUNS * 15 * 60)
+
+
+def test_a_set_age_is_used(rig: Rig) -> None:
+    rig.scheduler.set_runs(
+        {"gate": (sys.executable, "-c", "pass")},
+        slot_lease="slot",
+        queue_max_age_seconds=120,
+    )
+    queued = rig.queue()
+    rig.clock.now += timedelta(seconds=119)
+    rig.advance()
+    assert rig.log.state.queued_runs
+    rig.clock.now += timedelta(seconds=2)
+    rig.advance()
+    assert "of 120" in dropped(rig, queued.queue_id).reason
+
+
+def test_the_project_file_gives_the_age_and_refuses_one_out_of_bounds(
+    tmp_path: Path,
+) -> None:
+    from dromon.model import (
+        DEFAULT_QUEUE_MAX_AGE_SECONDS,
+        MAX_QUEUE_MAX_AGE_SECONDS,
+        MIN_QUEUE_MAX_AGE_SECONDS,
+    )
+
+    assert project(tmp_path, "").run_queue_max_age_seconds == (
+        DEFAULT_QUEUE_MAX_AGE_SECONDS
+    )
+    config = project(tmp_path, "[runs]\nqueue_max_age_seconds = 600\n")
+    assert config.run_queue_max_age_seconds == 600
+    for bad in (
+        MIN_QUEUE_MAX_AGE_SECONDS - 1,
+        MAX_QUEUE_MAX_AGE_SECONDS + 1,
+        '"600"',
+        "true",
+        "60.5",
+    ):
+        with pytest.raises(ConfigFileError, match="runs.queue_max_age_seconds"):
+            project(tmp_path, f"[runs]\nqueue_max_age_seconds = {bad}\n")
+
+
+def test_a_credential_shaped_value_is_not_queued_and_never_reaches_the_log(
+    rig: Rig,
+) -> None:
+    from dromon.runparams import RunParameter
+
+    token = "ghp_" + "a1B2" * 9
+    rig.scheduler.set_runs(
+        {"gate": (sys.executable, "-c", "pass", "{tag}")},
+        parameters={"gate": {"tag": RunParameter("tag", "[A-Za-z0-9_]+")}},
+        slot_lease="slot",
+    )
+    with pytest.raises(runs.RunRefused, match="looks like a credential"):
+        asyncio.run(
+            rig.scheduler.start_run(
+                "alpha", "gate", "none", arguments={"tag": token}, queue=True
+            )
+        )
+    assert not rig.log.state.queued_runs
+    assert token.encode() not in (rig.root / "events.sqlite").read_bytes()
+    queued = asyncio.run(
+        rig.scheduler.start_run(
+            "alpha", "gate", "none", arguments={"tag": "nightly"}, queue=True
+        )
+    )
+    assert isinstance(queued, RunQueued) and queued.arguments == (("tag", "nightly"),)
+
+
+def test_a_literal_secret_value_is_not_queued_either(rig: Rig) -> None:
+    from dromon.runparams import RunParameter
+
+    secret = "literal-value-" + "x9" * 4  # noqa: S105 - a stand-in, not a password
+    rig.log.secrets = lambda: [secret]
+    rig.scheduler.set_runs(
+        {"gate": (sys.executable, "-c", "pass", "{tag}")},
+        parameters={"gate": {"tag": RunParameter("tag", "[A-Za-z0-9_-]+")}},
+        slot_lease="slot",
+    )
+    with pytest.raises(runs.RunRefused, match="looks like a credential"):
+        asyncio.run(
+            rig.scheduler.start_run(
+                "alpha", "gate", "none", arguments={"tag": secret}, queue=True
+            )
+        )
+    assert not rig.log.state.queued_runs
+
+
+def crash_before_dequeue(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> RunQueued:
+    """Queue a run and begin it, with the daemon stopping after ``run_started`` is
+    logged and before ``run_dequeued`` is."""
+    queued = rig.queue()
+    rig.set_level("ok")
+    real = EventLog.append
+
+    def stopped(self: EventLog, event: Event) -> Entry:
+        if isinstance(event, RunDequeued) and event.outcome is QueueEnd.STARTED:
+            raise RuntimeError("the daemon stopped here")
+        return real(self, event)
+
+    monkeypatch.setattr(EventLog, "append", stopped)
+    rig.advance()
+    monkeypatch.setattr(EventLog, "append", real)
+    (run,) = rig.log.state.runs.values()
+    assert list(rig.log.state.queued_runs) == [queued.queue_id], "the crash window"
+    assert run.started.line_id == "alpha"
+    return queued
+
+
+def test_a_crash_between_the_run_and_its_dequeue_does_not_drop_it_on_restart(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Confirmed against the code before the change. The restarted daemon began the
+    entry again, was refused since a run of the line had not ended, and dropped it,
+    telling the line its run was dropped while it ran."""
+    queued = crash_before_dequeue(rig, monkeypatch)
+    (run,) = rig.log.state.runs.values()
+    rig.log.close()
+    reopened = EventLog(rig.root / "events.sqlite")
+    try:
+        again = rig.make(reopened)
+        rig.declare(again)
+        asyncio.run(again.advance_run_queue())
+        assert not reopened.state.queued_runs
+        assert len(reopened.state.runs) == 1, "no second run was begun"
+        ended = [
+            entry.event
+            for entry in read_entries_of(rig)
+            if isinstance(entry.event, RunDequeued)
+        ]
+        assert [(e.outcome, e.run_id) for e in ended] == [
+            (QueueEnd.STARTED, run.started.run_id)
+        ]
+        bodies = [
+            message.body
+            for message in reopened.state.messages.values()
+            if message.sender == HARNESS and str(message.recipient) == "alpha"
+        ]
+        (told,) = bodies
+        assert f"queued run {queued.queue_id}" in told
+        assert f"started as run {run.started.run_id}" in told
+        assert "before the daemon restarted, and it is not dropped" in told
+        assert "dropped and will not start" not in told
+        child = again._run_children.get(run.started.run_id)  # pyright: ignore[reportPrivateUsage]
+        if child is not None:
+            child.wait(timeout=20)
+    finally:
+        reopened.close()
+
+
+def test_the_next_look_of_the_same_daemon_settles_it_too(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queued = crash_before_dequeue(rig, monkeypatch)
+    (run,) = rig.log.state.runs.values()
+    rig.advance()
+    assert not rig.log.state.queued_runs and len(rig.log.state.runs) == 1
+    assert dequeued(rig, queued.queue_id).run_id == run.started.run_id
+    rig.finish(run.started.run_id)
+
+
+def test_the_end_of_a_queued_run_wakes_the_line_with_a_note_that_names_it(
+    rig: Rig,
+) -> None:
+    """The line is told when the queued run starts and again when it ends, each as a
+    note from the harness that the line reads, which is how a line is woken."""
+    queued = rig.queue()
+    rig.set_level("ok")
+    rig.advance()
+    (run,) = rig.log.state.runs.values()
+    before = rig.notes("alpha")
+    assert len(before) == 1 and f"started as run {run.started.run_id}" in before[0]
+    rig.finish(run.started.run_id)
+    after = rig.notes("alpha")
+    assert len(after) == 2
+    assert run.started.run_id in after[1] and "exited with exit code 0" in after[1]
+    assert queued.queue_id in after[0]
+    for message in rig.log.state.messages.values():
+        if message.sender == HARNESS and str(message.recipient) == "alpha":
+            assert not message.read, "still waiting to wake the line"
