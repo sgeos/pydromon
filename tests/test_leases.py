@@ -142,7 +142,7 @@ def test_the_holder_cannot_extend_a_lease_and_only_the_holder_releases(
     with pytest.raises(LeaseRefused, match="already, until 2026-10-26T09:10:00Z"):
         scheduler.acquire_lease("alpha", "gate")
     assert scheduler.leases_of("alpha") == [
-        {"name": "gate", "expires": "2026-10-26T09:10:00Z"}
+        {"name": "gate", "expires": "2026-10-26T09:10:00Z", "seconds": 600}
     ]
     with pytest.raises(LeaseRefused, match="line beta holds no lease 'gate'"):
         scheduler.release_lease("beta", "gate")
@@ -234,7 +234,9 @@ def test_a_restart_while_a_lease_is_held_keeps_it_until_it_expires(
         after = Scheduler(log, no_engine, hold_wakes=True, wall_clock=clock)
         after.set_leases(["gate", "ci"], 600)
         assert log.state.leases["gate"] == held
-        assert after.leases_of("alpha") == [{"name": "gate", "expires": expires}]
+        assert after.leases_of("alpha") == [
+            {"name": "gate", "expires": expires, "seconds": 600}
+        ]
         with pytest.raises(LeaseRefused, match=f"held by line alpha until {expires}"):
             after.acquire_lease("beta", "gate")
         with pytest.raises(LeaseRefused, match="already"):
@@ -451,7 +453,7 @@ def test_status_shows_held_leases(scheduler: Scheduler) -> None:
     summaries = {str(s["line_id"]): s for s in scheduler.line_summaries()}
     assert summaries["alpha"]["leases"] == []
     assert summaries["beta"]["leases"] == [
-        {"name": "gate", "expires": "2026-10-26T09:10:00Z"}
+        {"name": "gate", "expires": "2026-10-26T09:10:00Z", "seconds": 600}
     ]
 
 
@@ -525,10 +527,12 @@ def test_the_inventory_lists_every_live_lease_with_its_holder_and_note(
             "holder": "alpha",
             "acquired_at": "2026-10-26T09:00:00Z",
             "expires": "2026-10-26T09:10:00Z",
+            "seconds": 600,
             "holder_note_unverified": "the full gate",
         }
     ]
     assert listed["free"] == ["ci"]
+    assert listed["limit_seconds"] == 600
     assert listed["caveat"] == LEASE_INVENTORY_CAVEAT
     assert inventory(scheduler, "alpha") == listed
 
@@ -626,3 +630,113 @@ def test_a_note_passes_with_the_lease_on_a_change_of_owner() -> None:
     )
     assert state.leases["bench"].line_id == "beta"
     assert state.leases["bench"].note == note
+
+
+# Round 16, item 2. A line asks for a duration up to the project's limit.
+
+
+def test_a_lease_lasts_the_seconds_asked_for(
+    scheduler: Scheduler, clock: Clock
+) -> None:
+    """The expiry is the acquisition plus the seconds asked for, the lease ends then
+    rather than at the project's limit, and the inventory and the line's own list
+    give the seconds, derived from the two recorded times."""
+    assert scheduler.acquire_lease("alpha", "gate", seconds=120) == (
+        "2026-10-26T09:02:00Z"
+    )
+    held = scheduler.lease_inventory()[0]
+    assert held["seconds"] == 120
+    assert scheduler.leases_of("alpha")[0]["seconds"] == 120
+    clock.now += timedelta(seconds=119)
+    with pytest.raises(LeaseRefused, match="held by line alpha"):
+        scheduler.acquire_lease("beta", "gate")
+    clock.now += timedelta(seconds=1)
+    assert scheduler.leases_of("alpha") == []
+    assert scheduler.acquire_lease("beta", "gate") == "2026-10-26T09:12:00Z"
+
+
+def test_omitting_the_seconds_gives_the_whole_limit(scheduler: Scheduler) -> None:
+    scheduler.acquire_lease("alpha", "gate")
+    scheduler.acquire_lease("alpha", "ci", seconds=600)
+    assert [lease["seconds"] for lease in scheduler.leases_of("alpha")] == [600, 600]
+
+
+@pytest.mark.parametrize("seconds", [59, 0, -1, 601, True, 90.0])
+def test_a_duration_outside_the_limit_is_refused_and_takes_nothing(
+    scheduler: Scheduler, seconds: object
+) -> None:
+    with pytest.raises(LeaseRefused, match="from 60 to 600, the project's limit"):
+        scheduler.acquire_lease("alpha", "gate", seconds=cast(int, seconds))
+    assert scheduler.leases_of("alpha") == []
+    assert "gate" not in scheduler._state().leases  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_limit_follows_the_project_file(scheduler: Scheduler) -> None:
+    scheduler.set_leases(["gate", "ci"], 3600)
+    assert scheduler.acquire_lease("alpha", "gate", seconds=3600)
+    with pytest.raises(LeaseRefused, match="from 60 to 3600"):
+        scheduler.acquire_lease("alpha", "ci", seconds=3601)
+
+
+@pytest.mark.parametrize(
+    ("seconds", "message"),
+    [
+        ("3600", "seconds must be a whole number"),
+        (12.5, "seconds must be a whole number"),
+        (False, "seconds must be a whole number"),
+        (30, "from 60 to 600"),
+        (601, "from 60 to 600"),
+    ],
+)
+def test_the_tool_refuses_a_bad_duration(
+    scheduler: Scheduler, seconds: object, message: str
+) -> None:
+    text, error = call(
+        tools_of(scheduler, "alpha")[ACQUIRE_LEASE_TOOL_NAME],
+        {"name": "gate", "seconds": seconds},
+    )
+    assert error and message in text
+    assert inventory(scheduler)["leases"] == []
+
+
+def test_the_tool_takes_a_duration_and_list_leases_shows_it(
+    scheduler: Scheduler,
+) -> None:
+    text, error = call(
+        tools_of(scheduler, "alpha")[ACQUIRE_LEASE_TOOL_NAME],
+        {"name": "gate", "seconds": 300},
+    )
+    assert not error and "until 2026-10-26T09:05:00Z" in text
+    listed = inventory(scheduler)
+    (entry,) = listed["leases"]
+    assert (entry["seconds"], listed["limit_seconds"]) == (300, 600)
+
+
+def test_a_duration_survives_a_restart_and_a_change_of_owner(
+    tmp_path: Path, clock: Clock
+) -> None:
+    """The duration is recorded on the lease as its two times, so a restarted daemon
+    gives the same seconds, and so does the new owner after a change of seat."""
+    path = tmp_path / "durations.sqlite"
+    with EventLog(path) as log:
+        before = Scheduler(log, no_engine, hold_wakes=True, wall_clock=clock)
+        before.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        before.set_leases(["gate"], 600)
+        before.acquire_lease("alpha", "gate", seconds=240)
+    with EventLog(path) as log:
+        after = Scheduler(log, no_engine, hold_wakes=True, wall_clock=clock)
+        after.set_leases(["gate"], 600)
+        assert after.leases_of("alpha")[0]["seconds"] == 240
+    state = owned_role()
+    state.apply(LeaseAcquired("bench", "alpha", AT, "2026-10-27T05:04:00Z"))
+    state.apply(
+        OwnershipChanged(
+            "core", "beta", "alpha", OwnershipCause.OPERATOR, ANA, None, AT
+        )
+    )
+    moved = state.leases["bench"]
+    assert (moved.line_id, moved.acquired_at, moved.expires) == (
+        "beta",
+        AT,
+        "2026-10-27T05:04:00Z",
+    )

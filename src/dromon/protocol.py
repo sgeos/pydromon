@@ -82,6 +82,10 @@ class Operation(StrEnum):
     item 4."""
     RUNS = "runs"
     """Read only. Not offered to external agents or lines. Added in round 14."""
+    OVERVIEW = "overview"
+    """Read only. One line's task, checkpoint, leases, cost carried and ceilings, as
+    its ``overview`` tool gives them. Not offered to external agents, since it shows
+    a line's brief. Added in round 16, item 1."""
     START_CONTEXT = "start_context"
     """Read only. The interpreter and the environment variables a restart's
     successor starts with, for ``dromon restart``'s preflight. Not offered to

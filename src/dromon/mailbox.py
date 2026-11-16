@@ -293,6 +293,69 @@ def summary(state: State, owner: Address, new: int) -> MailSummary:
     )
 
 
+def _matches(
+    state: State,
+    owner: Address,
+    *,
+    unread_only: bool,
+    own_notes_only: bool,
+    unanswered_only: bool,
+    sender: Address | None,
+    issues_only: bool,
+) -> list[tuple[str, Message]]:
+    """The messages of ``owner``'s mailbox that every given filter selects, oldest
+    first. One place for the filters, so a page and the counts beside it, which
+    ``unread_outside`` gives, cannot select different messages."""
+    replied = replied_ids(state, owner) if own_notes_only or issues_only else set[str]()
+    return [
+        (message_id, message)
+        for message_id, message in mailbox(state, owner)
+        if (not unread_only or counts_unread(message, owner))
+        and (
+            not own_notes_only
+            or counts_own_note(state, message_id, message, owner, replied)
+        )
+        and (not unanswered_only or counts_unanswered(state, message))
+        and (sender is None or message.sender == sender)
+        and (not issues_only or is_open_issue(message_id, message, replied))
+    ]
+
+
+def unread_outside(
+    state: State,
+    owner: Address,
+    *,
+    unread_only: bool = False,
+    sender: Address | None = None,
+    issues_only: bool = False,
+    offset: int = 0,
+    limit: int = MAX_PAGE,
+) -> tuple[int, int]:
+    """The unread messages among the matches that fall before the page and after it,
+    as ``listing`` would page them, so a reader of one page learns that newer mail
+    waits beyond it. **Round 16, at the operator's request.** A page is the oldest
+    matches from ``offset``, so an operator who read its tail saw the middle of the
+    mailbox and missed the newest reports. Unread means what ``summary`` counts in
+    ``unread``. The page is clamped as ``listing`` clamps it, and a bad ``offset`` or
+    ``limit`` is refused in the same words."""
+    if offset < 0 or not 1 <= limit <= MAX_PAGE:
+        raise ValueError(f"offset must be at least 0 and limit in [1, {MAX_PAGE}]")
+    matches = _matches(
+        state,
+        owner,
+        unread_only=unread_only,
+        own_notes_only=False,
+        unanswered_only=False,
+        sender=sender,
+        issues_only=issues_only,
+    )
+    before = sum(1 for _, message in matches[:offset] if counts_unread(message, owner))
+    after = sum(
+        1 for _, message in matches[offset + limit :] if counts_unread(message, owner)
+    )
+    return before, after
+
+
 def listing(
     state: State,
     owner: Address,
@@ -328,19 +391,15 @@ def listing(
         raise ValueError(
             "unanswered_only and own_notes_only select different messages, so give one"
         )
-    replied = replied_ids(state, owner) if own_notes_only or issues_only else set[str]()
-    matches = [
-        (message_id, message)
-        for message_id, message in mailbox(state, owner)
-        if (not unread_only or counts_unread(message, owner))
-        and (
-            not own_notes_only
-            or counts_own_note(state, message_id, message, owner, replied)
-        )
-        and (not unanswered_only or counts_unanswered(state, message))
-        and (sender is None or message.sender == sender)
-        and (not issues_only or is_open_issue(message_id, message, replied))
-    ]
+    matches = _matches(
+        state,
+        owner,
+        unread_only=unread_only,
+        own_notes_only=own_notes_only,
+        unanswered_only=unanswered_only,
+        sender=sender,
+        issues_only=issues_only,
+    )
     return matches[offset : offset + limit], len(matches)
 
 

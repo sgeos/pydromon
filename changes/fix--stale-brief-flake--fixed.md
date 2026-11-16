@@ -1,0 +1,3 @@
+Type: Fixed
+
+- A turn whose worktree's `git status` cannot be read no longer reads its standing brief as current. The failed read had been skipped with no reason kept, so the turn said nothing. It now opens with `BRIEF CURRENCY UNKNOWN.` and the reason in one fixed word, `timed_out`, `not_started`, `failed`, `malformed`, `not_text` or `no_workdir`, and a `STALE BRIEF.` notice for a moved commit carries the same sentence. `set_brief` says with the same word when its own read failed, since such a brief can be compared by its commit alone. `git status` output that is not text is now reported as a failed read rather than raised.

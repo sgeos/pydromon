@@ -6,6 +6,7 @@ supervisor exits, ``run_status`` never shows a finished output as running,
 
 import asyncio
 import os
+import subprocess
 import sys
 import time
 from collections.abc import Generator, Sequence
@@ -21,10 +22,13 @@ from dromon.codec import encode
 from dromon.disclosure import load_terms
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog, read_entries
+from dromon.lineconfig import LineConfig
+from dromon.workdir import read_head_commit
 from dromon.model import (
     HARNESS,
     MAX_DISCLOSURE_CHECKS,
     MAX_RUN_TAIL_BYTES,
+    HoldCause,
     InvalidField,
     LineAddress,
     RunEnded,
@@ -33,6 +37,7 @@ from dromon.model import (
 )
 from dromon.scheduler import (
     RUN_STATUS_TOOL_NAME,
+    WORKDIR_HEAD_CLAIM,
     LineEngine,
     LineSpec,
     Scheduler,
@@ -93,6 +98,35 @@ LEAKING = python_command(
 never spells out, so only the output could carry it into the log."""
 
 
+def pytest_output(before: list[str], skip: str, after: int) -> tuple[str, ...]:
+    """A command printing ``before`` lines, pytest's short summary mark, one skip
+    line, ``after`` lines of filler and pytest's final line, and exiting 1. The skip
+    line falls outside the last 20 lines, the tail, when ``after`` is 20 or more. The
+    text ``@T@`` is printed as the listed term, which the command never spells out."""
+    lines = [
+        *before,
+        "=== short test summary info ===",
+        f"SKIPPED [1] tests/test_a.py:1: {skip}",
+        *[f"filler {number}" for number in range(after)],
+        "=== 1 failed, 5 passed, 1 skipped in 1.0s ===",
+    ]
+    return python_command(
+        "import sys\nfor line in "
+        + repr(lines)
+        + ":\n    print(line.replace('@T@', 'code' + 'name'))\nsys.exit(1)"
+    )
+
+
+TAIL_ONLY = pytest_output(["x/@T@/f.py:3: in test"], "plain", 0)
+"""A traceback line holding the listed term, in the last lines, and a clean summary."""
+
+SUMMARY_ONLY = pytest_output([], "a @T@ here", 25)
+"""A skip reason holding the term, which falls outside the last 20 lines."""
+
+BOTH = pytest_output([], "a @T@ here", 0)
+"""The term in a skip reason that the last lines also hold."""
+
+
 @pytest.fixture
 def project(tmp_path: Path) -> Generator[Path]:
     (tmp_path / "reports").mkdir()
@@ -115,10 +149,15 @@ def scheduler_on(log: EventLog, root: Path) -> Scheduler:
             "gate": python_command("print('gate passed')"),
             "failing": FAILING,
             "leaking": LEAKING,
+            "tail-only": TAIL_ONLY,
+            "summary-only": SUMMARY_ONLY,
+            "both": BOTH,
             "wait": python_command("import time; time.sleep(60)"),
         }
     )
-    found.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+    # A restarted daemon reads the line from the log rather than creating it.
+    if "alpha" not in log.state.lines:
+        found.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
     return found
 
 
@@ -240,15 +279,44 @@ def test_a_tail_holding_a_listed_term_is_withheld_and_counted(project: Path) -> 
         listed(scheduler, project)
         ended = end_of(scheduler, log, "leaking", "none")
         assert ended.exit_code == 1 and ended.output_tail is None
-        assert ended.note.endswith(runs.OUTPUT_WITHHELD)
+        assert ended.note.endswith(runs.TAIL_WITHHELD)
         assert len(log.state.disclosure_checks["alpha"]) == 1
         (note,) = harness_notes(log, "alpha")
-        assert runs.OUTPUT_WITHHELD in note and runs.TAIL_LABEL not in note
+        assert runs.TAIL_WITHHELD in note and runs.TAIL_LABEL not in note
         assert "codename" not in scheduler.run_status("alpha").casefold()
     encoded = [encode(entry.event) for entry in read_entries(project / "events.sqlite")]
     assert encoded and not any("codename" in line.casefold() for line in encoded)
     # The output file itself is unchanged, since only the record is screened.
     assert "codename" in (project / ended_output(project)).read_text()
+
+
+def test_only_the_part_holding_a_term_is_withheld(project: Path) -> None:
+    """Round 16, item 2. A failed run's tracebacks name paths under a user directory,
+    and a listed term in one withheld the clean summary with the tail. Each part is
+    screened on its own, and each match counts as one failing check."""
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        listed(scheduler, project)
+        tail_only = end_of(scheduler, log, "tail-only", "none")
+        assert tail_only.output_tail is None
+        assert runs.TAIL_WITHHELD in tail_only.note
+        assert runs.SUMMARY_LABEL in tail_only.note
+        assert "1 failed, 5 passed, 1 skipped" in tail_only.note
+        assert len(log.state.disclosure_checks["alpha"]) == 1
+        first = log.state.latest_runs[("line", "alpha")]
+        summary_only = end_of(scheduler, log, "summary-only", first)
+        assert summary_only.output_tail is not None
+        assert "filler 24" in summary_only.output_tail
+        assert summary_only.note.endswith(runs.SUMMARY_WITHHELD)
+        assert runs.SUMMARY_LABEL not in summary_only.note
+        assert len(log.state.disclosure_checks["alpha"]) == 2
+        second = log.state.latest_runs[("line", "alpha")]
+        both = end_of(scheduler, log, "both", second)
+        assert both.output_tail is None
+        assert both.note.endswith(runs.OUTPUT_WITHHELD)
+        assert len(log.state.disclosure_checks["alpha"]) == 3
+    encoded = [encode(entry.event) for entry in read_entries(project / "events.sqlite")]
+    assert not any("codename" in line.casefold() for line in encoded)
 
 
 def ended_output(project: Path) -> str:
@@ -426,3 +494,299 @@ def test_an_unknown_task_id_still_names_the_run_choice(project: Path) -> None:
             )
         )
         assert error and "an open run of your scope" in text
+
+
+def screened(scheduler: Scheduler, finding: runs.Finding) -> tuple[str, str | None]:
+    return scheduler._screened_output("alpha", finding)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("with_tail", [False, True])
+def test_a_term_spanning_the_join_of_the_note_and_the_summary_is_withheld(
+    project: Path, with_tail: bool
+) -> None:
+    """Round 16 review, point 5. Neither the note nor the clean summary holds the
+    listed term, which the recorded text holds across the join between them, so the
+    joined text is screened too. The check counts as a failing one."""
+    joint = "unchanged" if with_tail else "code 1"
+    lead = runs.note_withheld("exited with code 1", runs.TAIL_WITHHELD)
+    note = lead if with_tail else "exited with code 1"
+    term = f"{joint}. {runs.SUMMARY_LABEL.split(',')[0]}"
+    finding = runs.Finding(
+        "r-1",
+        RunStatus.EXITED,
+        1,
+        "exited with code 1",
+        None,
+        None,
+        "1 failed, 5 passed",
+        "a line about codename" if with_tail else None,
+    )
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        (project / "terms").write_text(f"{term.casefold()}\n")
+        scheduler.set_disclosure_terms(load_terms(project / "terms"))
+        # Premise, which the test derives and does not assume: the term is in the
+        # joined text, and in neither of its two parts alone.
+        assert scheduler.discloses(runs.note_with_summary(note, finding.summary))
+        assert not scheduler.discloses(note, finding.summary or "")
+        if with_tail:
+            (project / "terms").write_text(f"{term.casefold()}\ncodename\n")
+            scheduler.set_disclosure_terms(load_terms(project / "terms"))
+        text, tail = screened(scheduler, finding)
+        assert runs.SUMMARY_LABEL not in text and "1 failed" not in text
+        assert tail is None or "codename" not in tail
+        assert len(log.state.disclosure_checks["alpha"]) == 1
+
+
+def test_a_clean_join_keeps_the_summary(project: Path) -> None:
+    finding = runs.Finding(
+        "r-1", RunStatus.EXITED, 0, "exited", None, None, "5 passed", None
+    )
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        listed(scheduler, project)
+        text, tail = screened(scheduler, finding)
+        assert "5 passed" in text and runs.SUMMARY_LABEL in text and tail is None
+        assert "alpha" not in log.state.disclosure_checks
+
+
+# Round 16, item 3. One authoritative receipt, sent once, naming what ran.
+
+
+def git(directory: Path, *arguments: str) -> str:
+    done = subprocess.run(  # noqa: S603
+        ["git", "-C", str(directory), *arguments],  # noqa: S607
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(directory),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.invalid",
+        },
+    )
+    return done.stdout.strip()
+
+
+def checkout_at(directory: Path) -> str:
+    """Make ``directory`` a checkout with one commit, and return the commit."""
+    git(directory, "init", "-q")
+    (directory / "file.txt").write_text("one\n")
+    git(directory, "add", "file.txt")
+    git(directory, "commit", "-q", "-m", "one")
+    return git(directory, "rev-parse", "HEAD")
+
+
+def test_the_receipt_names_the_worktree_commit_and_is_sent_once(
+    project: Path,
+) -> None:
+    """The run's start records the commit its worktree had checked out, read by
+    the daemon, and the one note at its end names it with the exit, the summary and
+    the wake it cancels. No wake note fires, and a later reconciliation, as after a
+    restart, sends nothing more, so no second note confirms the first."""
+    head = checkout_at(project)
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        started = asyncio.run(scheduler.start_run("alpha", "gate", "none"))
+        assert started.workdir_commit == head and started.commit is None
+        _, error = asyncio.run(
+            call(
+                scheduler.wake_tool("alpha"),
+                {"seconds": 600, "note": "read it", "task_id": started.run_id},
+            )
+        )
+        assert not error
+        wake_id = log.state.scheduled["alpha"].message_id
+        wait_for_supervisor(scheduler, started.run_id)
+        asyncio.run(scheduler.reconcile_runs())
+        asyncio.run(scheduler.reconcile_runs())
+        (note,) = harness_notes(log, "alpha")
+        assert (
+            f"in its worktree at commit {head}, as the worktree's own"
+            f" {WORKDIR_HEAD_CLAIM}, with any uncommitted changes"
+        ) in note
+        assert "exited with exit code 0" in note
+        assert f"This end cancels your wake {wake_id}" in note
+        assert wake_id not in log.state.messages
+        assert scheduler.fire_due_wakes() == []
+        status = scheduler.run_status("alpha")
+        assert f"at commit {head}" in status
+        (view,) = scheduler.runs_view(started.run_id)
+        assert (view["workdir_commit"], view["commit"]) == (head, None)
+        # The merge of main at 48146cc. Main's tree and this branch's commit are
+        # both recorded on one run in a worktree, and both survive a reopened log.
+        assert started.tree is not None and view["tree"] == started.tree
+    with EventLog(project / "events.sqlite") as reopened:
+        (run,) = reopened.state.runs.values()
+        assert run.started == started
+
+
+def test_a_run_outside_a_checkout_names_no_commit(project: Path) -> None:
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        started = asyncio.run(scheduler.start_run("alpha", "gate", "none"))
+        assert started.workdir_commit is None
+        wait_for_supervisor(scheduler, started.run_id)
+        asyncio.run(scheduler.reconcile_runs())
+        (note,) = harness_notes(log, "alpha")
+        assert "in its worktree at commit" not in note
+
+
+def test_a_planted_git_entry_is_named_only_as_the_worktree_s_claim(
+    project: Path,
+) -> None:
+    """Review of 16de365. A line working in a subdirectory of a checkout can create a
+    ``.git`` there naming any commit, and the nearest ``.git`` is read. Reading only
+    one at the declared directory's root would not help, since the planted one is
+    exactly there, as this shows. So the receipt names the commit as the worktree's
+    own claim, which the line can move, and never as the daemon's observation."""
+    head = checkout_at(project)
+    planted = project / "sub"
+    (planted / ".git").mkdir(parents=True)
+    forged = "f" * 40
+    (planted / ".git" / "HEAD").write_text(forged + "\n")
+    assert read_head_commit(project) == head
+    assert read_head_commit(planted) == forged
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        scheduler.create_line(
+            "beta", HAIKU, Strategy.SUBSCRIPTION, LineConfig(workdir="sub")
+        )
+        started = asyncio.run(scheduler.start_run("beta", "gate", "none"))
+        assert started.workdir_commit == forged
+        wait_for_supervisor(scheduler, started.run_id)
+        asyncio.run(scheduler.reconcile_runs())
+        (note,) = harness_notes(log, "beta")
+        assert f"at commit {forged}, as the worktree's own {WORKDIR_HEAD_CLAIM}," in (
+            note
+        )
+        assert "which the line can move" in WORKDIR_HEAD_CLAIM
+        assert f"at commit {forged}, as the worktree's own" in (
+            scheduler.run_status("beta")
+        )
+
+
+@pytest.mark.parametrize(
+    ("commit", "workdir_commit", "message"),
+    [
+        (None, "not-a-commit", "workdir_commit must be null or a full"),
+        (None, "A" * 40, "workdir_commit must be null or a full"),
+        ("a" * 40, "b" * 40, "only for a run in a worktree"),
+    ],
+)
+def test_a_run_start_refuses_a_bad_worktree_commit(
+    commit: str | None, workdir_commit: str, message: str
+) -> None:
+    with pytest.raises(InvalidField, match=message):
+        RunStarted(
+            "r-1",
+            "alpha",
+            None,
+            None,
+            "gate",
+            ("x",),
+            "/work",
+            "tmp/runs/r-1.out",
+            4321,
+            AT,
+            AT,
+            commit,
+            None if commit is None else "/state/commit-runs/r-1",
+            workdir_commit=workdir_commit,
+        )
+
+
+# Round 16, item 4. A line that waits for a run keeps its wait across a restart
+# and across a hold at its limits, and the run's end reaches it.
+
+
+FLAG_WAIT = python_command(
+    "import os, time\n"
+    "for _ in range(600):\n"
+    "    if os.path.exists('release.flag'):\n"
+    "        break\n"
+    "    time.sleep(0.05)\n"
+    "print('5 passed in 1.00s')"
+)
+"""A run that ends once ``release.flag`` appears in its working directory, so a test
+can end it after a restart or a hold, and that gives up after 30 seconds."""
+
+
+def test_a_wait_on_a_run_survives_a_daemon_restart(project: Path) -> None:
+    path = project / "events.sqlite"
+    with EventLog(path) as log:
+        before = scheduler_on(log, project)
+        before.set_runs({"suite": FLAG_WAIT})
+        started = asyncio.run(before.start_run("alpha", "suite", "none"))
+        child = before._run_children[started.run_id]  # pyright: ignore[reportPrivateUsage]
+        _, error = asyncio.run(
+            call(
+                before.wake_tool("alpha"),
+                {"seconds": 3600, "note": "read it", "task_id": started.run_id},
+            )
+        )
+        assert not error
+        wake_id = log.state.scheduled["alpha"].message_id
+    try:
+        with EventLog(path) as log:
+            after = scheduler_on(log, project)
+            after.set_runs({"suite": FLAG_WAIT})
+            asyncio.run(after.reconcile_runs())
+            pending = log.state.scheduled["alpha"]
+            assert (pending.message_id, pending.task_id) == (wake_id, started.run_id)
+            assert log.state.runs[started.run_id].ended is None
+            (project / "release.flag").write_text("")
+            child.wait(timeout=WAIT_SECONDS)
+            asyncio.run(after.reconcile_runs())
+            assert "alpha" not in log.state.scheduled
+            (note,) = harness_notes(log, "alpha")
+            assert "exited with exit code 0" in note and "5 passed" in note
+            assert f"This end cancels your wake {wake_id}" in note
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+@pytest.mark.parametrize("cause", [HoldCause.AUTONOMOUS_TURNS, HoldCause.COST])
+def test_a_wait_on_a_run_survives_a_hold_at_the_lines_limits(
+    project: Path, cause: HoldCause
+) -> None:
+    """A hold at the turn or cost limit withdraws no wake, so the run's end still
+    reaches the held line as a note that waits for its release, and the release
+    leaves it to start the line's next turn."""
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        scheduler.set_runs({"suite": FLAG_WAIT})
+        started = asyncio.run(scheduler.start_run("alpha", "suite", "none"))
+        child = scheduler._run_children[started.run_id]  # pyright: ignore[reportPrivateUsage]
+        try:
+            asyncio.run(
+                call(
+                    scheduler.wake_tool("alpha"),
+                    {"seconds": 3600, "note": "x", "task_id": started.run_id},
+                )
+            )
+            wake_id = log.state.scheduled["alpha"].message_id
+            scheduler.hold("alpha", "passed a limit", cause=cause)
+            assert log.state.lines["alpha"].held_by is not None
+            assert log.state.scheduled["alpha"].message_id == wake_id
+            (project / "release.flag").write_text("")
+            child.wait(timeout=WAIT_SECONDS)
+            asyncio.run(scheduler.reconcile_runs())
+            (note,) = harness_notes(log, "alpha")
+            assert f"This end cancels your wake {wake_id}" in note
+            waiting = [message.body for _, message in scheduler.pending("alpha")]
+            assert note in waiting
+            scheduler.release("alpha")
+            assert log.state.lines["alpha"].held_by is None
+            assert note in [message.body for _, message in scheduler.pending("alpha")]
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()

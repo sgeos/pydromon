@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 import subprocess
@@ -38,6 +39,7 @@ from dromon.model import (
     LineAddress,
     LineConfigured,
     LineCreated,
+    LineTurnEnded,
     OperatorAddress,
     OperatorRegistered,
     RestartNoted,
@@ -89,6 +91,12 @@ class Scripted:
         after = self.world.after.get(line_id, [])
         if after:
             await after.pop(0).wait()
+        if line_id in self.world.raising:
+            raise RuntimeError("the engine ended the turn without a result")
+        if line_id in self.world.stopped_for:
+            # The engine was asked to end and reports the reason it kept, as one
+            # already stopped for another reason keeps that one.
+            reason = self.world.stopped_for[line_id]
         subtype = "success" if reason is None else "error_during_execution"
         return TurnReport(subtype, 1, "ok", (), reason, None, "session-1", None, None)
 
@@ -107,6 +115,10 @@ class World:
         self.prompts: dict[str, list[str]] = {}
         self.sessions: dict[str, list[str | None]] = {}
         self.reasons: dict[str, list[str | None]] = {}
+        self.raising: set[str] = set()
+        """Lines whose engine raises once it has reached its safe points."""
+        self.stopped_for: dict[str, str | None] = {}
+        """Lines whose engine reports this ``interrupted_for`` though it was asked."""
         self.log = EventLog(path)
         self.scheduler = self._scheduler()
         self.scheduler.ensure_operator("ana")
@@ -365,6 +377,97 @@ def test_a_turn_ended_for_a_restart_then_abandoned_is_told_so_and_woken(
     assert note.body == restart.ABANDONED_NOTE.format(operator="ana")
     assert len(world.prompts["alpha"]) == 2
     assert note.message_id in world.prompts["alpha"][1]
+
+
+def asked_to_end(target: World, abandon: bool = False) -> None:
+    """Run one turn of ``alpha`` that a restart in its interrupt mode asks to end,
+    abandoning the restart before the report arrives when ``abandon`` is set."""
+    gate = asyncio.Event()
+    after = asyncio.Event()
+    target.gates["alpha"] = [gate]
+    target.after["alpha"] = [after]
+
+    async def act() -> None:
+        target.scheduler.send(ANA, ALPHA, "work on it")
+        await until(lambda: target.scheduler.running_lines() == ["alpha"])
+        target.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60)
+        gate.set()
+        await until(lambda: "alpha" in target.reasons)
+        if abandon:
+            target.scheduler.abandon_restart("a test abandoned it")
+        after.set()
+        await until(lambda: not target.scheduler.running_lines())
+        target.monotonic = 10_000.0
+
+    run(target, act)
+    assert target.reasons["alpha"][0] == restart.REASON
+
+
+@pytest.mark.parametrize("abandon", [False, True])
+def test_a_turn_whose_report_names_another_stop_is_not_woken(
+    world: World, abandon: bool
+) -> None:
+    """**Round 16 review, finding 1.** A Pi turn past ``max_turns`` is aborted, and
+    a safe point dispatched after the abort records the restart's ask while the
+    report keeps ``max_turns``. A note would wake a line its driver stopped."""
+    world.stopped_for["alpha"] = "max_turns"
+    asked_to_end(world, abandon=abandon)
+    assert world.endings("alpha") == [
+        "error_during_execution, interrupted by its driver: max_turns"
+    ]
+    assert restart_notes(world) == []
+    line = world.log.state.lines["alpha"]
+    assert not line.failed and line.held_by is None
+    if not abandon:
+        world.restart()
+    run(world, nothing)
+    assert len(world.prompts["alpha"]) == 1
+
+
+@pytest.mark.parametrize("abandon", [False, True])
+def test_a_turn_asked_to_end_whose_report_names_no_stop_is_not_woken(
+    world: World, abandon: bool
+) -> None:
+    """Every engine records the restart's interrupt when it keeps none before it, so
+    a report that names none was not ended by the restart."""
+    world.stopped_for["alpha"] = None
+    asked_to_end(world, abandon=abandon)
+    assert world.endings("alpha") == ["success"]
+    assert restart_notes(world) == []
+    if not abandon:
+        world.restart()
+    run(world, nothing)
+    assert len(world.prompts["alpha"]) == 1
+
+
+def test_a_turn_asked_to_end_that_fails_is_held_and_not_woken(world: World) -> None:
+    """A note would clear the failure, as any new mail does, so the failure stands,
+    holds the line and asks an operator."""
+    world.raising.add("alpha")
+    asked_to_end(world)
+    assert restart_notes(world) == []
+    assert world.endings("alpha")[-1] == "failed"
+    line = world.log.state.lines["alpha"]
+    assert line.failed and line.held_by is not None
+    world.restart()
+    run(world, nothing)
+    assert len(world.prompts["alpha"]) == 1
+
+
+def test_the_note_of_a_restart_follows_the_turn_s_recorded_end(world: World) -> None:
+    """The note is newer than the turn's end, so a successor replaying the log
+    reads the line as reached by new mail."""
+    asked_to_end(world)
+    events = [entry.event for entry in read_entries(world.path)]
+    ended = max(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, LineTurnEnded) and event.line_id == "alpha"
+    )
+    noted = next(
+        index for index, event in enumerate(events) if isinstance(event, RestartNoted)
+    )
+    assert noted > ended
 
 
 def test_a_second_restart_is_refused_while_one_drains(world: World) -> None:
@@ -1329,7 +1432,11 @@ def test_the_check_passes_and_leaves_the_log_as_it_was(
     config_path(paths.state_dir).write_text(AGREEING)
     before = digest(paths.event_log)
     assert daemon.run(paths, check_only=True) == exits.OK
-    assert daemon.CHECK_PASSED in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert daemon.CHECK_PASSED in err
+    # Round 16 review, finding 2. As it ends, the check says whether the live
+    # snapshot is still the one it held, and this log has none.
+    assert "dromond: there is still no snapshot a start would use" in err
     assert digest(paths.event_log) == before
     assert "gamma" not in replay(paths.event_log).lines
     assert leftovers(paths) == []
@@ -1462,6 +1569,7 @@ def test_the_daemon_gives_its_interpreter_and_start_variables_on_the_client_sock
     assert response.result == {
         "interpreter": sys.executable,
         "environment": {REGISTRY_DIR_ENV: "/elsewhere/registry", "SSH_AUTH_SOCK": None},
+        "secret_names": [],
     }
     refused = target.respond(
         encode_request(Request("d", Operation.START_CONTEXT, {"extra": "x"}))
@@ -1470,6 +1578,337 @@ def test_the_daemon_gives_its_interpreter_and_start_variables_on_the_client_sock
     # Neither the status nor any agent tool carries it.
     status = target.status()
     assert "interpreter" not in status and "environment" not in status
+
+
+NONCE = "0f" * 32
+
+
+HEX_RUN = r"[0-9a-f]{64}"
+"""Any run of 64 hexadecimal digits, which a digest would be."""
+
+
+def test_the_daemon_answers_only_whether_each_secret_agrees(
+    world: World, paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 16, item 6, and the review of 16de365. The daemon lists the granted
+    names, and for the client's digests answers only same, differs or not granted,
+    so neither a value nor a digest that could test a guess offline leaves it."""
+    target = make_daemon(world, paths)
+    target.line_secrets.update({"alpha": ("TOKEN_B", "TOKEN_A"), "beta": ("TOKEN_A",)})
+    monkeypatch.setenv("TOKEN_A", "first-secret-value")
+    monkeypatch.delenv("TOKEN_B", raising=False)
+    monkeypatch.setenv("OTHER", "not-granted-value")
+    plain = target.respond(encode_request(Request("d", Operation.START_CONTEXT, {})))
+    assert plain.result is not None and "secrets" not in plain.result
+    assert plain.result["secret_names"] == ["TOKEN_A", "TOKEN_B"]
+    theirs = {
+        "TOKEN_A": restart.secret_digest(NONCE, "first-secret-value"),
+        "TOKEN_B": restart.secret_digest(NONCE, "exported-since"),
+        "OTHER": restart.secret_digest(NONCE, "not-granted-value"),
+    }
+    asked = Request("c", Operation.START_CONTEXT, {"nonce": NONCE, "secrets": theirs})
+    response = target.respond(encode_request(asked))
+    assert response.ok and response.result is not None
+    assert response.result["secrets"] == {
+        "TOKEN_A": "same",
+        "TOKEN_B": "differs",
+        "OTHER": "not_granted",
+    }
+    encoded = encode_response(response).decode()
+    assert "first-secret-value" not in encoded and "not-granted-value" not in encoded
+    assert re.search(HEX_RUN, encoded) is None
+
+
+@pytest.mark.parametrize(
+    ("daemon_value", "shell_value", "verdict"),
+    [
+        ("old-value", "new-value", restart.SecretVerdict.DIFFERS),
+        ("old-value", None, restart.SecretVerdict.DIFFERS),
+        (None, "new-value", restart.SecretVerdict.DIFFERS),
+        ("same-value", "same-value", restart.SecretVerdict.SAME),
+        (None, None, restart.SecretVerdict.SAME),
+    ],
+)
+def test_each_verdict_follows_both_values(
+    daemon_value: str | None, shell_value: str | None, verdict: restart.SecretVerdict
+) -> None:
+    held = {} if daemon_value is None else {"API_TOKEN": daemon_value}
+    theirs = {"API_TOKEN": restart.secret_digest(NONCE, shell_value)}
+    granted = {"alpha": ("API_TOKEN",)}
+    found = restart.compare_secrets(theirs, granted, held, NONCE)
+    assert found == {"API_TOKEN": verdict}
+    # A name no line is granted is never compared, whatever both sides hold.
+    assert restart.compare_secrets(theirs, {}, held, NONCE) == {
+        "API_TOKEN": restart.SecretVerdict.NOT_GRANTED
+    }
+
+
+GOOD_DIGEST = "ab" * 32
+
+COMPARED = {"API_TOKEN": GOOD_DIGEST}
+"""A granted name, so a nonce that passed the check would reach ``bytes.fromhex``."""
+
+BAD_START_CONTEXTS: Final[list[dict[str, object]]] = [
+    {"nonce": "0f" * 16, "secrets": COMPARED},
+    {"nonce": "a" * 33, "secrets": COMPARED},
+    {"nonce": "a" * 63, "secrets": COMPARED},
+    {"nonce": "a" * 65, "secrets": COMPARED},
+    {"nonce": "a" * 127, "secrets": COMPARED},
+    {"nonce": "0F" * 32, "secrets": COMPARED},
+    {"nonce": "zz" * 32, "secrets": COMPARED},
+    {"nonce": 3, "secrets": COMPARED},
+    {"nonce": NONCE},
+    {"secrets": {}},
+    {"nonce": NONCE, "secrets": {}, "extra": "x"},
+    {"nonce": NONCE, "secrets": []},
+    {"nonce": NONCE, "secrets": {"1A": None}},
+    {"nonce": NONCE, "secrets": {"A-B": None}},
+    {"nonce": NONCE, "secrets": {"A\nB": None}},
+    {"nonce": NONCE, "secrets": {"API_TOKEN": "ab" * 31}},
+    {"nonce": NONCE, "secrets": {"API_TOKEN": "a" * 65}},
+    {"nonce": NONCE, "secrets": {"API_TOKEN": "AB" * 32}},
+    {"nonce": NONCE, "secrets": {"API_TOKEN": 3}},
+    {"nonce": NONCE, "secrets": {f"V{i}": None for i in range(257)}},
+]
+
+
+@pytest.mark.parametrize("args", BAD_START_CONTEXTS)
+def test_a_start_context_in_another_form_is_a_bad_request(
+    world: World,
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    args: dict[str, object],
+) -> None:
+    """Review of 16de365. A granted secret is set, so a nonce that reached
+    ``bytes.fromhex`` would be digested. An odd length once raised there and dropped
+    the connection. Every form here is answered as a bad request instead."""
+    target = make_daemon(world, paths)
+    target.line_secrets.update({"alpha": ("API_TOKEN",)})
+    monkeypatch.setenv("API_TOKEN", "held")
+    asked = Request("c", Operation.START_CONTEXT, args)
+    refused = target.respond(encode_request(asked))
+    assert (refused.ok, refused.error_code) == (False, ErrorCode.BAD_REQUEST)
+    # The largest well formed request is answered.
+    widest = {f"V{i}": GOOD_DIGEST for i in range(restart.MAX_COMPARED_SECRETS)}
+    well = Request("d", Operation.START_CONTEXT, {"nonce": NONCE, "secrets": widest})
+    assert target.respond(encode_request(well)).ok
+
+
+@pytest.mark.parametrize("nonce", ["a" * 33, "a" * 63, "0f" * 16, "0F" * 32, ""])
+def test_a_digest_refuses_a_nonce_in_another_form(nonce: str) -> None:
+    with pytest.raises(ValueError, match="64 lowercase hexadecimal"):
+        restart.secret_digest(nonce, "value")
+
+
+def test_a_digest_depends_on_the_nonce_and_the_value() -> None:
+    digest = restart.secret_digest(NONCE, "value")
+    assert digest is not None and restart.DIGEST_PATTERN.fullmatch(digest)
+    assert restart.secret_digest("1e" * 32, "value") != digest
+    assert restart.secret_digest(NONCE, "other") != digest
+    assert restart.secret_digest(NONCE, None) is None
+    # A value Python decoded from undecodable bytes still digests.
+    assert restart.secret_digest(NONCE, "bad\udcff") is not None
+
+
+def test_the_names_compared_are_bounded_and_ordered() -> None:
+    granted = {
+        f"line{i}": tuple(f"V{j:04d}" for j in range(i * 100, i * 100 + 200))
+        for i in range(3)
+    }
+    # 400 names, with each of 100 to 299 granted twice.
+    names = restart.secret_names(granted)
+    assert len(names) == restart.MAX_COMPARED_SECRETS
+    assert list(names) == sorted(names) and len(set(names)) == len(names)
+    assert restart.secret_names({}) == ()
+
+
+@pytest.mark.parametrize(
+    ("daemon_value", "shell_value", "warned"),
+    [
+        ("old-value", "new-value", True),
+        ("old-value", None, True),
+        (None, "new-value", True),
+        ("same-value", "same-value", False),
+        (None, None, False),
+    ],
+)
+def test_a_restart_warns_of_a_secret_the_shell_holds_otherwise(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    daemon_value: str | None,
+    shell_value: str | None,
+    warned: bool,
+) -> None:
+    """Round 16, item 6. Another project replaced a secret in its shell and
+    restarted, and a line kept the old value, because the successor inherits the
+    daemon's environment. The client names the variable and never a value."""
+    held = {} if daemon_value is None else {"API_TOKEN": daemon_value}
+    if shell_value is None:
+        monkeypatch.delenv("API_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("API_TOKEN", shell_value)
+    theirs = restart.secret_digests(("API_TOKEN",), os.environ, NONCE)
+    granted = {"alpha": ("API_TOKEN",)}
+    answer = daemon.start_context(held, granted, (NONCE, theirs))
+    cli._warn_secrets("restart", ("API_TOKEN",), answer["secrets"])  # pyright: ignore[reportPrivateUsage]
+    out = capsys.readouterr().out
+    assert ("warning" in out and "API_TOKEN" in out) is warned
+    assert "dromon stop and then dromon start" in out if warned else out == ""
+    assert "old-value" not in out and "new-value" not in out
+
+
+def test_only_a_name_the_client_asked_about_is_warned_of(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The daemon's answer cannot add a name to the warning, so a name holding a
+    control character never reaches the operator's terminal from it."""
+    found = {"A": "same", "EVIL\x1b[2J": "differs", "B": "differs"}
+    cli._warn_secrets("restart", ("A",), found)  # pyright: ignore[reportPrivateUsage]
+    assert capsys.readouterr().out == ""
+    cli._warn_secrets("restart", ("A", "B"), found)  # pyright: ignore[reportPrivateUsage]
+    out = capsys.readouterr().out
+    assert "for B," in out and "EVIL" not in out
+
+
+@pytest.mark.parametrize("found", [None, [], "secrets", 3])
+def test_verdicts_in_another_form_compare_nothing(
+    capsys: pytest.CaptureFixture[str], found: object
+) -> None:
+    cli._warn_secrets("restart", ("A",), found)  # pyright: ignore[reportPrivateUsage]
+    out = capsys.readouterr().out
+    assert "did not compare its secrets" in out and "warning" not in out
+
+
+@pytest.mark.parametrize(
+    "found",
+    [
+        None,
+        "A",
+        {"A": "x"},
+        [3],
+        ["A", "1B"],
+        ["A\nB"],
+        [f"V{i}" for i in range(restart.MAX_COMPARED_SECRETS + 1)],
+    ],
+)
+def test_granted_names_in_another_form_are_not_used(found: object) -> None:
+    assert cli._secret_names_of(found) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_granted_names_are_taken_once_each() -> None:
+    assert cli._secret_names_of(["B", "A", "B"]) == ("B", "A")  # pyright: ignore[reportPrivateUsage]
+    assert cli._secret_names_of([]) == ()  # pyright: ignore[reportPrivateUsage]
+
+
+def scripted_daemon(
+    held: Mapping[str, str],
+    granted: Mapping[str, Sequence[str]],
+    asked: list[dict[str, object] | None],
+) -> Callable[..., Response]:
+    """A stand-in for ``client.call`` that answers ``start_context`` as the daemon's
+    own handler does, from ``held`` rather than this process's environment, which
+    the client shares in a test."""
+
+    def answer(
+        socket: Path, operation: Operation, *, args: dict[str, object] | None = None
+    ) -> Response:
+        del socket
+        assert operation is Operation.START_CONTEXT
+        asked.append(args)
+        if args is None:
+            return Response("r", ok=True, result=daemon.start_context(held, granted))
+        nonce = args["nonce"]
+        assert isinstance(nonce, str) and restart.NONCE_PATTERN.fullmatch(nonce)
+        compared = restart.check_compared(args["secrets"])
+        result = daemon.start_context(held, granted, (nonce, compared))
+        return Response("r", ok=True, result=result)
+
+    return answer
+
+
+def test_the_client_compares_under_a_fresh_nonce_and_warns(
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    asked: list[dict[str, object] | None] = []
+    granted = {"alpha": ("API_TOKEN", "KEPT_TOKEN")}
+    held = {"API_TOKEN": "old-value", "KEPT_TOKEN": "kept-value"}
+    monkeypatch.setattr(cli, "call", scripted_daemon(held, granted, asked))
+    monkeypatch.setenv("API_TOKEN", "new-value")
+    monkeypatch.setenv("KEPT_TOKEN", "kept-value")
+    assert cli._ask_start_context(paths, "restart") is not None  # pyright: ignore[reportPrivateUsage]
+    assert cli._ask_start_context(paths, "restart") is not None  # pyright: ignore[reportPrivateUsage]
+    assert [args is None for args in asked] == [True, False, True, False]
+    sent = [args for args in asked if args is not None]
+    nonces = [str(args["nonce"]) for args in sent]
+    assert nonces[0] != nonces[1]
+    assert "new-value" not in json.dumps(sent)
+    out = capsys.readouterr().out
+    assert out.count("differs from this shell's for API_TOKEN,") == 2
+    assert "KEPT_TOKEN" not in out
+
+
+def test_a_project_granting_no_secret_asks_once(
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    asked: list[dict[str, object] | None] = []
+    monkeypatch.setattr(cli, "call", scripted_daemon({}, {}, asked))
+    assert cli._ask_start_context(paths, "restart") is not None  # pyright: ignore[reportPrivateUsage]
+    assert asked == [None]
+    assert capsys.readouterr().out == ""
+
+
+def test_a_daemon_that_lists_no_secrets_is_said_to_compare_none(
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A daemon from before this change gives no ``secret_names``. The client keeps
+    the interpreter it gives, says a changed secret is not found, and asks nothing
+    more."""
+    asked: list[dict[str, object] | None] = []
+
+    def older(
+        socket: Path, operation: Operation, *, args: dict[str, object] | None = None
+    ) -> Response:
+        del socket, operation
+        asked.append(args)
+        result: dict[str, object] = {"interpreter": sys.executable, "environment": {}}
+        return Response("r", ok=True, result=result)
+
+    monkeypatch.setattr(cli, "call", older)
+    context = cli._ask_start_context(paths, "restart")  # pyright: ignore[reportPrivateUsage]
+    assert context is not None and context.interpreter == sys.executable
+    assert asked == [None]
+    assert "does not list the secrets it holds" in capsys.readouterr().out
+
+
+def test_a_refused_comparison_is_said_to_compare_none(
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    asked: list[dict[str, object] | None] = []
+
+    def refusing(
+        socket: Path, operation: Operation, *, args: dict[str, object] | None = None
+    ) -> Response:
+        del socket, operation
+        asked.append(args)
+        if args is None:
+            result = daemon.start_context({}, {"alpha": ("API_TOKEN",)})
+            return Response("r", ok=True, result=result)
+        return Response(
+            "r", ok=False, error_code=ErrorCode.BAD_REQUEST, error_message="refused"
+        )
+
+    monkeypatch.setattr(cli, "call", refusing)
+    assert cli._ask_start_context(paths, "restart") is not None  # pyright: ignore[reportPrivateUsage]
+    assert len(asked) == 2
+    assert "did not compare its secrets" in capsys.readouterr().out
 
 
 def test_the_preflight_takes_the_daemon_s_interpreter_and_variables(

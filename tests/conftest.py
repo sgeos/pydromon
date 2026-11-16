@@ -1,8 +1,10 @@
 """Fixtures shared across the test suite."""
 
 import gc
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -12,7 +14,7 @@ from pathlib import Path
 import pytest
 from typing import Any, cast
 
-from dromon import hookpolicy, linetemp, priority, spawn
+from dromon import hookpolicy, linetemp, priority, readiness, spawn
 from dromon import scheduler as scheduler_module
 from dromon.processes import ProcessInfo
 from dromon.fleet import HOSTS_FILE_ENV
@@ -189,7 +191,15 @@ SCENARIO: tuple[Event, ...] = (
     LineTurnEnded("beta", None, True),
     LineTurnEnded("beta", None, None, True),
     LineTurnEnded("beta", None, None, True, FailureCause.ENGINE_REPORTED),
-    LineTurnEnded("beta", None, True, True, FailureCause.ENGINE_ERROR, "RuntimeError"),
+    LineTurnEnded(
+        "beta",
+        None,
+        True,
+        True,
+        FailureCause.ENGINE_ERROR,
+        "RuntimeError",
+        "transport closed",
+    ),
     DisclosureChecked("beta", "2026-10-28T19:00:00Z", 2),
     DisclosureChecked("beta", "2026-10-28T19:01:00Z", 0, 4096),
     MessageSent("m5", BETA, PROBE, NOTE, "to an agent", reply_to="m4"),
@@ -317,6 +327,7 @@ SCENARIO: tuple[Event, ...] = (
         4321,
         AT,
         AT,
+        workdir_commit="b" * 40,
     ),
     RunEnded("r-1", RunStatus.EXITED, 0, "0" * 64, 2048, "", AT),
     RunStarted(
@@ -348,6 +359,9 @@ SCENARIO: tuple[Event, ...] = (
         4500,
         AT,
         AT,
+        None,
+        None,
+        "b" * 64,
     ),
     RunEnded("r-3", RunStatus.EXITED, 2, None, None, "", AT, "make: *** [all] Error 2"),
     CommitRunRefused("alpha", None, "build", "a" * 40, "no ref points at it", AT),
@@ -404,6 +418,102 @@ def _no_automatic_collection() -> Iterator[None]:
         gc.collect()
 
 
+REOPEN_DEPTH = 6
+"""How far below a directory ``reopen_directories`` looks."""
+
+
+def owned_by_running_pytest(base: Path) -> bool:
+    """Whether ``base``, a numbered directory of the pytest base, belongs to a pytest
+    that is still running. **Round 16 review, point 4.** Pytest writes its process
+    identifier to ``.lock`` in the directory it makes and removes it as it exits, so a
+    lock naming a live process is a running session, and one naming a process that is
+    gone, or no lock, is a session that is over. A process that cannot be signalled
+    for want of permission exists, and is kept as running. A lock that is not an
+    identifier names no process. Pytest's own lock is the evidence, and not an age,
+    since a gate can run for an hour. **Checked** against the pinned pytest 9.1.1,
+    whose ``create_cleanup_lock`` writes ``str(os.getpid())`` to ``.lock``, with no
+    newline, after it makes the directory, and whose exit hook removes it. A test pins
+    this. **Race.** The lock is made just after the directory, so a scan in that window
+    sees no lock, which can only repair a base that holds nothing yet, since no test has
+    run in it. A process identifier that a later process reuses keeps a dead session's
+    base unrepaired, which fails safe."""
+    try:
+        text = (base / ".lock").read_text()
+    except OSError:
+        return False
+    try:
+        pid = int(text.strip())
+    except ValueError:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def reopen_directories(
+    root: Path,
+    depth: int = REOPEN_DEPTH,
+    skip: Path | None = None,
+    keep: Callable[[Path], bool] | None = None,
+) -> int:
+    """Give the owner full access to every directory of this user below ``root``, down
+    to ``depth`` levels, and return how many were changed. **Round 16.** A test that
+    makes a directory unreadable on purpose restores it in a ``finally`` clause, which a
+    kill skips, and pytest then cannot delete the old base directory, so the next
+    session's gate exits 1 after every test has passed. The observed case was a leftover
+    of 2026-11-04 in the worktree test of an unreadable directory, found on 2026-11-11.
+    Symbolic links are neither followed nor changed, a path that
+    cannot be changed is left, ``skip`` is not entered, and the walk is bounded by
+    ``depth``. A directory for which ``keep`` is true is neither changed nor entered,
+    so a parallel session's deliberately unreadable test directory is not restored
+    under it."""
+    changed = 0
+    pending = [(root, depth)]
+    uid = os.getuid()
+    while pending:
+        directory, remaining = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                if keep is not None and keep(Path(entry.path)):
+                    continue
+                mode = entry.stat(follow_symlinks=False)
+                if mode.st_uid != uid:
+                    continue
+                if mode.st_mode & 0o700 != 0o700:
+                    os.chmod(entry.path, mode.st_mode | 0o700)
+                    changed += 1
+            except OSError:
+                continue
+            if remaining > 1 and Path(entry.path) != skip:
+                pending.append((Path(entry.path), remaining - 1))
+    return changed
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _reopen_old_temporary_directories(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Repair what an earlier killed session left, before pytest deletes it at the
+    end of this one. The current session's own base is left alone, and so is the base of
+    any other pytest that is running, which a parallel gate of the same user is."""
+    current = tmp_path_factory.getbasetemp()
+    reopen_directories(
+        current.parent, REOPEN_DEPTH + 1, skip=current, keep=owned_by_running_pytest
+    )
+
+
 @pytest.fixture(autouse=True)
 def _collect_on_the_main_thread() -> Iterator[None]:
     yield
@@ -442,8 +552,103 @@ def _no_real_process_table(
         monkeypatch.setattr(scheduler_module, "SystemProcesses", NoProcesses)
 
 
+def _worker_threads() -> list[threading.Thread]:
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "dromon-processes" and thread.is_alive()
+    ]
+
+
 @pytest.fixture(autouse=True)
-def _isolated_spawn_state(monkeypatch: pytest.MonkeyPatch) -> None:
+def _stopped_scheduler_workers(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Stop the process workers of every scheduler a test builds, when the test ends,
+    and fail the test if a worker thread it started is still alive. **Found on
+    2026-11-05.** A scheduler starts up to five ``dromon-processes`` threads on first
+    use and stops them only in ``stop_workers``, which the daemon calls and almost no
+    test did. In a run on a Linux runner a hang left 99 of them, idle, in one dump,
+    with ``faulthandler`` showing at most 100 threads, so the main thread was not in
+    it. Idle threads do no harm of themselves, but every child start copies a process
+    that holds them, a fork under a hundred threads is slower, and a dump that cannot
+    reach the main thread cannot be read. ``stop_workers`` is idempotent, so a test
+    that stops its own scheduler is not affected. **Porting note.** Python-only, since
+    a Rust worker would be dropped with its owner."""
+    before = set(_worker_threads())
+    built: list[scheduler_module.Scheduler] = []
+    original = scheduler_module.Scheduler.__init__
+
+    def record(self: scheduler_module.Scheduler, *args: Any, **kwargs: Any) -> None:  # noqa: ANN401
+        original(self, *args, **kwargs)
+        built.append(self)
+
+    monkeypatch.setattr(scheduler_module.Scheduler, "__init__", record)
+    yield
+    for each in built:
+        each.stop_workers()
+    left = [thread for thread in _worker_threads() if thread not in before]
+    for thread in left:
+        thread.join(2.0)
+    left = [thread for thread in left if thread.is_alive()]
+    assert not left, f"{len(left)} process worker threads outlived the test"
+
+
+SLOW_TEST_SECONDS = 5.0
+"""A test at least this long is named in the run's output, as it ends."""
+SLOW_STARTS_SEEN: list[str] = []
+"""Every start that took ``spawn.SLOW_START_SECONDS`` or more in any test, with the
+test's name. **Round 16.** The runs on Linux in continuous integration were slow and
+hung in places no one could see, and this list is printed at the end of a run, whether
+it passed or not, so the next run shows which starts were slow and how loaded the
+machine was."""
+
+
+STRESS_NOTES: list[str] = []
+"""One line for each run of ``tests/test_spawn_stress.py``, printed with the slow
+starts at the end of the run."""
+
+
+def pytest_terminal_summary(terminalreporter: Any) -> None:  # noqa: ANN401
+    if STRESS_NOTES:
+        terminalreporter.section("child start stress", sep="=")
+        for line in STRESS_NOTES:
+            terminalreporter.write_line(line)
+    if not SLOW_STARTS_SEEN:
+        return
+    terminalreporter.section("slow child starts and slow tests", sep="=")
+    for line in SLOW_STARTS_SEEN[:200]:
+        terminalreporter.write_line(line)
+    if len(SLOW_STARTS_SEEN) > 200:
+        terminalreporter.write_line(f"... and {len(SLOW_STARTS_SEEN) - 200} more")
+
+
+def _show_now(lines: list[str], request: pytest.FixtureRequest) -> None:
+    """Write ``lines`` to the real terminal at once, past pytest's capture, so that a
+    run that later hangs and is killed has already shown them, as its summary will
+    not. Never raises."""
+    if not lines:
+        return
+    try:
+        manager: Any = request.config.pluginmanager.getplugin("capturemanager")
+        with manager.global_and_fixture_disabled():
+            for line in lines[:5]:
+                print(line, file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
+def slow_test_line(current: str, took: float) -> str | None:
+    """The line that names a test that took ``SLOW_TEST_SECONDS`` or more, with the
+    load of the machine, or ``None`` for a quicker one."""
+    if took < SLOW_TEST_SECONDS:
+        return None
+    machine = spawn._machine_text()  # pyright: ignore[reportPrivateUsage]
+    return f"{current}: slow test, {took:.1f}s, {machine}"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_spawn_state(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Iterator[None]:
     """Every test starts with no stranded start, and the real list is put back when it
     ends. **Round 15.** ``dromon.spawn`` counts the starts that stalled past its bound
     in one list for the whole process. Under load a real ``git`` start can stall past
@@ -454,6 +659,32 @@ def _isolated_spawn_state(monkeypatch: pytest.MonkeyPatch) -> None:
     ``stalled_start`` or by patching ``MAX_STRANDED``. The list is replaced by name, as
     ``spawn`` reads it at each call, and ``monkeypatch`` puts the original back."""
     monkeypatch.setattr(spawn, "_stranded", [])
+    # Found on 2026-11-05. A real stall left its thread in the set of starts in flight,
+    # so every later test counted it, and the three that count the overlap failed. The
+    # stuck thread removes itself from whichever set is current when it ends.
+    monkeypatch.setattr(spawn, "_active", set[Any]())
+    monkeypatch.setattr(spawn, "_watched", set[Any]())
+    monkeypatch.setattr(spawn, "_armed", None)
+    # Round 16. The slow starts of this test, handed to the run's summary at its end.
+    own: list[str] = []
+    monkeypatch.setattr(spawn, "_slow_starts", own)
+    # Review of round 16, finding 3. The line writer and its rate limit are the test's
+    # own, so one test's line cannot suppress the next test's.
+    monkeypatch.setattr(spawn, "_log", spawn._Log())  # pyright: ignore[reportPrivateUsage]
+    current = os.environ.get("PYTEST_CURRENT_TEST", "a test").split(" ")[0]
+    began = time.monotonic()
+    yield
+    lines = [f"{current}: slow child start, {line}" for line in own]
+    # Round 16. A test that took long is named at once, past capture, because a run
+    # that is later killed by its timeout lists nothing at its end. On 2026-11-11 a
+    # Linux run spent three minutes in a file that takes under a second elsewhere, and
+    # the log could not say which test, since a file's line is written only when the
+    # next file begins.
+    slow = slow_test_line(current, time.monotonic() - began)
+    if slow is not None:
+        lines.append(slow)
+    SLOW_STARTS_SEEN.extend(lines)
+    _show_now(lines, request)
 
 
 class StalledStart:
@@ -477,14 +708,20 @@ class StalledStart:
             time.sleep(0.01)
 
     def until_reaped(self, seconds: float = 10.0) -> subprocess.Popen[Any]:
-        """The one child started, once its pipes are closed, which the late-start reap
-        does last. Fails the test when that takes longer than ``seconds``."""
+        """The one child started, once it has ended and its pipes are closed, which
+        the late-start reap does last. Fails the test when that takes longer than
+        ``seconds``."""
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             if self.started:
                 child = self.started[0]
                 pipes = [child.stdin, child.stdout, child.stderr]
-                if all(pipe is None or pipe.closed for pipe in pipes):
+                # Found on 2026-11-05. A child with no pipe has none to be closed, so
+                # the pipes alone said "reaped" before the late-start reap had
+                # killed it, and a test that then polled failed one run in six.
+                if child.poll() is not None and all(
+                    pipe is None or pipe.closed for pipe in pipes
+                ):
                     return child
             time.sleep(0.01)
         pytest.fail("the late child was not reaped in time")
@@ -589,3 +826,25 @@ def short_runtime() -> Iterator[Path]:
     parent = Path(tempfile.mkdtemp(prefix="dr"))
     yield parent / "run"
     shutil.rmtree(parent, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_git_status(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Answer every test's ``git status`` from ``dromon.readiness`` as a clean tree,
+    without starting git, unless the test is marked ``real_git_status``. **Round 16,
+    item 1.** Bisecting runs put a rise in stalled starts in continuous integration
+    at the change that read the worktree's state on every ``set_brief`` and every
+    turn of a kept session, so most tests started git for an answer none of them
+    checked. Only the start is replaced. A directory outside any checkout is still
+    refused by the real check, as it is in the daemon. Disjoint from the spawn
+    fixtures above, which the runtime line owns."""
+    node = cast(pytest.Item, request.node)  # pyright: ignore[reportUnknownMemberType]
+    if node.get_closest_marker("real_git_status") is None:
+
+        def clean(worktree: Path) -> str:
+            del worktree
+            return ""
+
+        monkeypatch.setattr(readiness, "_run_git_status", clean)

@@ -362,6 +362,21 @@ term. **Round 15 review, R1.** Both come from the command's output and would ent
 the event log and every copy of it in clear, so they are screened before the end is
 recorded, as a line's own text is, and dropped whole when either matches."""
 
+SUMMARY_WITHHELD: Final = (
+    "The output's test summary is withheld from this record, since it holds a term"
+    " from the project's disclosure list. The output file is unchanged"
+)
+TAIL_WITHHELD: Final = (
+    "The output's last lines are withheld from this record, since they hold a term"
+    " from the project's disclosure list. The output file is unchanged"
+)
+"""What a run's end says when only its summary, or only its last lines, hold a listed
+term, so the other is kept. **Round 16, item 2.** The summary of a failed run was
+withheld with a tail whose traceback named paths under a user directory, though the
+summary itself held nothing listed. Each part is now screened on its own and only the
+part that holds a term is dropped, which reveals no more than the writer of the output
+already chose, since a line that prints a candidate chooses which part holds it."""
+
 OUTPUT_WITHHELD_SPENT: Final = (
     "The output's test summary and last lines are withheld from this record, since"
     " the line that started it has spent its disclosure checks. The output file is"

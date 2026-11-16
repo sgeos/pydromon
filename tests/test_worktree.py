@@ -191,11 +191,15 @@ def _outside(directory: Path) -> worktree.Runner:
 
 @needs_git
 def test_an_unreadable_directory_makes_the_scan_incomplete_and_never_clean(
-    checkout: Path,
+    checkout: Path, request: pytest.FixtureRequest
 ) -> None:
     hidden = checkout / "hidden"
     hidden.mkdir()
     (hidden / "inside.txt").write_text("x")
+    # Registered before the directory is closed, so that a failure anywhere after it
+    # restores it. A kill still skips it, which the session fixture in conftest repairs
+    # when the next session starts. Round 16, after a leftover of 2026-11-04.
+    request.addfinalizer(lambda: os.chmod(hidden, 0o700))
     os.chmod(hidden, 0)
     try:
         if os.access(hidden, os.R_OK):
