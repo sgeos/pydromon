@@ -20,3 +20,10 @@ Any other entry, such as a merge tool's `base.txt.orig`, is left out, and the ga
 it in a warning, so a leftover file never stops the package from importing. A set that
 is empty, too large or unreadable makes the version `unusable`, and the daemon then
 replays the whole log rather than trusting any snapshot.
+
+Discovery reads at most 4097 directory entries and sorts at most 4096, including
+hidden entries and package files. It retains at most 128 ignored names. Exceeding
+either limit makes the set unusable, so an arbitrary prefix never becomes a trusted
+version. Within these limits, warnings are sorted by name. The limits bound entry
+counts rather than name bytes or filesystem latency. A directory changed during the
+read may still give an inconsistent view. Deployment must keep package files stable.

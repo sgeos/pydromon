@@ -38,3 +38,7 @@ Type: Fixed
   file in the floor or state change directories is left out with a warning rather
   than failing the gate or the package's import, and the pinned state history passes
   each cap on kept disclosure checks.
+- Round 17 re-review. The gate clears Git directory variables before selecting the
+  checkout, so `GIT_WORK_TREE` cannot redirect the scan to a decoy. State change
+  discovery bounds directory consumption before sorting and bounds ignored warning
+  names, refusing snapshots if either limit is exceeded.

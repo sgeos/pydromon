@@ -823,7 +823,11 @@ resumes.
      `NAME.txt`, such as a merge tool's leftover, is left out with a warning from the
      gate rather than stopping the package from importing. A set that is empty, too
      large or unreadable makes the version `unusable`, and every snapshot is then
-     refused and the log replayed. **Item 6 of that review.** The pinned history adds
+     refused and the log replayed. Discovery reads at most 4097 directory entries
+     before sorting at most 4096 and retains at most 128 ignored names. Either
+     overflow makes the set unusable rather than trusting an arbitrary prefix.
+     These limits bound counts rather than name bytes or filesystem latency.
+     **Item 6 of that review.** The pinned history adds
      enough disclosure checks to pass each of their three caps, since a changed cap
      changes which checks a replay keeps and was not caught. **Residual, inference.**
      The other caps of `State.apply`, of task records, correlations, request keys and

@@ -329,3 +329,19 @@ def test_a_refused_read_skips_and_says_why(
     assert "could not be read, with the error" in result.stdout
     assert "disclosure scan found no listed term" not in result.stdout
     assert TERM not in shown(result)
+
+
+@pytest.mark.parametrize(
+    "variables", [("GIT_WORK_TREE",), ("GIT_DIR", "GIT_WORK_TREE")]
+)
+def test_git_work_tree_cannot_redirect_the_initial_checkout(
+    worktree: Path, decoy: Path, variables: tuple[str, ...]
+) -> None:
+    environment = {
+        key: str(decoy / ".git" if key == "GIT_DIR" else decoy) for key in variables
+    }
+    result = check_with(worktree, environment)
+    assert result.returncode != 0, shown(result)
+    assert "src/example.py:1" in result.stderr
+    assert "found no listed term" not in result.stdout
+    assert TERM not in shown(result)

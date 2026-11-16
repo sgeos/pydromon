@@ -49,6 +49,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime
 from importlib.resources.abc import Traversable
+from itertools import islice
 from pathlib import Path
 from typing import Final, cast
 
@@ -67,6 +68,13 @@ STATE_CHANGE_NAME: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 
 MAX_STATE_CHANGES: Final = 1024
 """The most state changes read, so the read is bounded."""
+
+
+MAX_STATE_CHANGE_ENTRIES: Final = 4096
+"""The most directory entries sorted, including hidden and ignored entries."""
+
+MAX_IGNORED_STATE_CHANGES: Final = 128
+"""The most warning names retained before the set is declared unusable."""
 
 
 @dataclass(frozen=True)
@@ -94,10 +102,22 @@ def read_state_changes(directory: Traversable) -> StateChanges:
     passing as this code's. Residual. A state change file misnamed by its author, as
     ``Feat--x.txt``, is left out with the warning, and the pin test fails, since the
     set it names no longer matches."""
+    # Directory overflow refuses the set rather than hashing an arbitrary prefix.
+    # Warning overflow also refuses it, retaining only a bounded sorted prefix.
+    # Entry counts do not bound name bytes or the latency of filesystem calls.
     names: list[str] = []
     ignored: list[str] = []
     try:
-        entries = sorted(directory.iterdir(), key=lambda entry: entry.name)
+        # Bound consumption before sorting, including entries later ignored. The extra
+        # entry detects overflow without exhausting an arbitrarily large iterator.
+        entries = list(islice(directory.iterdir(), MAX_STATE_CHANGE_ENTRIES + 1))
+        if len(entries) > MAX_STATE_CHANGE_ENTRIES:
+            return StateChanges(
+                (),
+                (),
+                f"more than {MAX_STATE_CHANGE_ENTRIES} state change directory entries",
+            )
+        entries.sort(key=lambda entry: entry.name)
         for entry in entries:
             if entry.name in ("__init__.py", "__pycache__", "README.md"):
                 continue
@@ -109,6 +129,13 @@ def read_state_changes(directory: Traversable) -> StateChanges:
                 or not entry.name.endswith(".txt")
                 or STATE_CHANGE_NAME.fullmatch(name) is None
             ):
+                if len(ignored) == MAX_IGNORED_STATE_CHANGES:
+                    return StateChanges(
+                        (),
+                        tuple(ignored),
+                        f"more than {MAX_IGNORED_STATE_CHANGES} ignored state change"
+                        " entries",
+                    )
                 ignored.append(entry.name)
                 continue
             names.append(name)

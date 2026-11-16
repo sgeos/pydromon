@@ -33,7 +33,7 @@ import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -464,3 +464,55 @@ def test_a_different_replay_fails_the_pin(scenario: tuple[Event, ...]) -> None:
     assert replay_digest(history) == pinned.replay
     assert replay_digest(history[:-1]) != pinned.replay
     assert replay_digest(scenario) != pinned.replay
+
+
+@pytest.mark.parametrize("name", ["valid.txt", "stray.orig", ".hidden"])
+def test_directory_consumption_is_bounded_before_sorting(name: str) -> None:
+    class LargeDirectory:
+        consumed = 0
+
+        def iterdir(self) -> Iterator[Entry]:
+            for _ in range(10000):
+                self.consumed += 1
+                yield Entry(name)
+
+    directory = LargeDirectory()
+    found = statesnapshot.read_state_changes(directory)  # pyright: ignore[reportArgumentType]
+    assert directory.consumed == statesnapshot.MAX_STATE_CHANGE_ENTRIES + 1
+    assert found.names == () and found.ignored == ()
+    assert found.problem == (
+        f"more than {statesnapshot.MAX_STATE_CHANGE_ENTRIES} state change directory"
+        " entries"
+    )
+
+
+def test_ignored_names_are_bounded_and_overflow_refuses_the_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(statesnapshot, "MAX_IGNORED_STATE_CHANGES", 2)
+    accepted = read(Entry("base.txt"), Entry("b.orig"), Entry("a.orig"))
+    assert accepted == statesnapshot.StateChanges(("base",), ("a.orig", "b.orig"), None)
+    refused = read(Entry("base.txt"), Entry("c.orig"), Entry("b.orig"), Entry("a.orig"))
+    assert refused == statesnapshot.StateChanges(
+        (), ("a.orig", "b.orig"), "more than 2 ignored state change entries"
+    )
+
+
+def test_directory_entry_limit_accepts_the_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(statesnapshot, "MAX_STATE_CHANGE_ENTRIES", 2)
+    assert read(Entry("base.txt"), Entry(".hidden")) == statesnapshot.StateChanges(
+        ("base",), (), None
+    )
+
+
+def test_an_iterator_read_error_refuses_a_partial_set() -> None:
+    class InterruptedDirectory:
+        def iterdir(self) -> Iterator[Entry]:
+            yield Entry("base.txt")
+            raise PermissionError("directory iteration refused")
+
+    found = statesnapshot.read_state_changes(InterruptedDirectory())  # pyright: ignore[reportArgumentType]
+    assert found.names == () and found.ignored == ()
+    assert found.problem is not None and "directory iteration refused" in found.problem

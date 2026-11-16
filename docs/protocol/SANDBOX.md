@@ -322,3 +322,10 @@ succeeded and the one that wrote in the home directory was refused.
   [`CODEX.md`](CODEX.md) and [`GROK.md`](GROK.md) specify.
 - Linux and WSL2 behaviour is specified by Claude Code and has not been verified live
   by this line. Continuous integration runs the unit tests on Linux.
+
+The repository gate clears `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE` before
+its first Git call and before selecting its working directory. Clearing them only
+at disclosure lookup allows the initial directory selection to follow a decoy.
+This protects checkout selection from those environment variables. It assumes the
+Git executable and the checkout metadata are trusted, subject to the worktree
+back-pointer checks in the gate.

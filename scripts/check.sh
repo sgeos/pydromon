@@ -22,6 +22,10 @@
 
 set -euo pipefail
 
+# Git routing must be cleared before even the initial checkout lookup. Otherwise
+# GIT_WORK_TREE can redirect cd before the disclosure lookup clears its environment.
+unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE
+
 hygiene_only=false
 if [[ "${1:-}" == "--hygiene-only" ]]; then
     [[ $# -eq 1 ]] || { printf 'usage: %s --hygiene-only, alone\n' "$0" >&2; exit 2; }
