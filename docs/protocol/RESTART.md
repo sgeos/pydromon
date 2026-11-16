@@ -311,3 +311,8 @@ credential and tool evidence carried only by that later message. Checks after a
 prompt and real model responses remain turn time checks. Scripted regression
 servers cover rejected launch arguments and rejected Model Context Protocol
 configuration merges. These tests do not establish installed engine compatibility.
+
+A turn report naming the restart reason is recorded as ending at a safe point for
+the restart even if another redirect has since overwritten the pending reason.
+This produces the restart note without an additional driver-stop note. Reports
+naming another stop or no stop retain their own outcome.

@@ -55,6 +55,7 @@ from dromon.model import (
     MessageReceived,
     MessageSent,
     State,
+    RoleNoted,
     check_failure_class,
 )
 
@@ -165,6 +166,9 @@ class EventLog:
         except BaseException:
             self._connection.close()
             raise
+        self._newest_role_entries: dict[str, RoleNoted] = {}
+        for entry in self._state.role_entries.values():
+            self._newest_role_entries[entry.role_id] = entry
         self.start.seconds = time.monotonic() - started
         self.opened_seq = self._last_seq
         """The newest sequence number when this process opened the log."""
@@ -174,6 +178,12 @@ class EventLog:
         """Where the literal secret values come from, which the daemon sets, so that
         ``append`` masks them as ``credentials`` says. ``None`` masks by pattern
         only."""
+
+    def newest_role_entry(self, role_id: str) -> RoleNoted | None:
+        """Newest journal entry in constant time. Rebuilt once on open, including
+        snapshot restores, and updated only after a successful append. The index
+        holds one entry per role and does not alter the persisted format."""
+        return self._newest_role_entries.get(role_id)
 
     def __enter__(self) -> Self:
         return self
@@ -397,6 +407,8 @@ class EventLog:
             if cursor.lastrowid != expected:
                 raise LogCorrupt(f"the log assigned {cursor.lastrowid}, not {expected}")
         self._state.apply(event)
+        if isinstance(event, RoleNoted):
+            self._newest_role_entries[event.role_id] = event
         self._last_seq = expected
         entry = Entry(expected, recorded_at, event)
         self._times.note(entry, self._state)

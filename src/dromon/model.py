@@ -2236,11 +2236,13 @@ class LeaseAcquired:
 
 
 class LeaseEnd(StrEnum):
-    """Why ``lease_released`` ended a lease. An operator's reload or restart with a
-    project file that no longer declares the name ends it as ``undeclared``."""
+    """Why a lease ended, including observed expiry and a lowered reload limit.
+    A removed declaration ends it as ``undeclared``."""
 
     RELEASED = "released"
     UNDECLARED = "undeclared"
+    EXPIRED = "expired"
+    LIMIT_LOWERED = "limit_lowered"
 
 
 @dataclass(frozen=True, slots=True)

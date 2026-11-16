@@ -4093,7 +4093,8 @@ def _add_reply_flags(command: argparse.ArgumentParser) -> None:
         dest="asks_reply",
         action="store_false",
         default=None,
-        help="the note asks no reply, so it never counts as unanswered",
+        help="mark an informational note to a line as asking nothing"
+        " by sending asks_reply=false, so it does not count as unanswered",
     )
     replies.add_argument(
         "--ask-reply",

@@ -343,8 +343,9 @@ policy.
 
 **Lease rules.** **Task of 2026-10-31.** A lease is in the log from its
 `lease_acquired`, so a restart keeps its holder, its acquisition and its expiry. Expiry
-is its bound and needs no event. The daemon compares `expires` with its wall clock, and
-the next `lease_acquired` under the name replaces an expired lease. Three other events
+is its bound. The daemon compares `expires` with its wall clock. From round 17,
+maintenance records expiry through `lease_released` before the next acquisition.
+Three other events
 change leases as they apply, with no event of their own, so a replay agrees with the
 daemon that recorded them.
 
@@ -894,3 +895,18 @@ separate engine evidence files are unchanged.
 Rollback hazard. Older daemons refuse events carrying `closing_reason`. The floor
 table above records the first compatible commit and its pending main floor. Ports
 must preserve the character bound and screening order.
+
+### Round 17 lease endings
+
+`lease_released` additionally accepts causes `expired` and `limit_lowered`.
+The former records maintenance observing wall-clock expiry. The latter records a
+reload reducing a declared lease duration. The existing holder check applies to
+both. A future capped expiry is represented by a subsequent `lease_acquired` with
+the original acquisition time. Older daemons refuse these new enumeration values.
+The rollback floor is the first commit introducing these values in `LeaseEnd`.
+The newest-role journal index is derived after replay and is absent from the wire
+format and snapshots.
+
+State version 7 pins the added lease-end values. Snapshots written under version 6
+are discarded and the log is replayed. This does not make older code accept new
+lease-end values in the log.

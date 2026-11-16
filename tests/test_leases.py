@@ -14,7 +14,7 @@ from claude_agent_sdk import SdkMcpTool
 from dromon.configview import Overrides
 from dromon.daemon import Daemon
 from dromon.driver import Strategy
-from dromon.eventlog import EventLog
+from dromon.eventlog import EventLog, read_entries
 from dromon.lineconfig import LineConfig
 from dromon.model import (
     EventRejected,
@@ -262,10 +262,10 @@ def test_a_restart_that_no_longer_declares_a_name_ends_its_lease(
     with EventLog(path) as log:
         after = Scheduler(log, no_engine, hold_wakes=True, wall_clock=clock)
         after.set_leases(["ci"], 600)
-        assert set(log.state.leases) == {"ci"}
+        assert set(log.state.leases) == set()
     # The end is an event, so a later start sees it without applying the file.
     with EventLog(path) as log:
-        assert set(log.state.leases) == {"ci"}
+        assert set(log.state.leases) == set()
 
 
 def test_the_log_refuses_a_second_holder_before_expiry_by_the_events_times() -> None:
@@ -740,3 +740,36 @@ def test_a_duration_survives_a_restart_and_a_change_of_owner(
         AT,
         "2026-10-27T05:04:00Z",
     )
+
+
+def test_expiry_records_one_release(scheduler: Scheduler, clock: Clock) -> None:
+    scheduler.acquire_lease("alpha", "gate")
+    clock.now += timedelta(seconds=600)
+    scheduler.expire_leases()
+    scheduler.expire_leases()
+    log = scheduler._log  # pyright: ignore[reportPrivateUsage]
+    releases = [
+        entry.event
+        for entry in read_entries(log.path)
+        if isinstance(entry.event, LeaseReleased)
+    ]
+    assert len(releases) == 1 and releases[0].cause is LeaseEnd.EXPIRED
+    assert scheduler.leases_of("alpha") == []
+    # Acquisition by a new holder succeeds after the expiry event removed it.
+    assert scheduler.acquire_lease("beta", "gate")
+
+
+@pytest.mark.parametrize("elapsed", [0, 400])
+def test_reload_caps_running_leases(
+    scheduler: Scheduler, clock: Clock, elapsed: int
+) -> None:
+    scheduler.acquire_lease("alpha", "gate")
+    clock.now += timedelta(seconds=elapsed)
+    scheduler.set_leases(["gate", "ci"], 300)
+    held = scheduler.leases_of("alpha")
+    if elapsed < 300:
+        assert held[0]["expires"] == "2026-10-26T09:05:00Z"
+    else:
+        assert held == []
+    pending = scheduler.pending("alpha")
+    assert any("was capped at reload" in message.body for _, message in pending)

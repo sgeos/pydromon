@@ -2401,3 +2401,25 @@ def test_uncheckable_engines_are_not_launched_and_do_not_refuse_restart(
         assert f"line {line_id} engine {engine_name} not checkable" in output
     assert "passed" not in output
     assert not socket_path.exists()
+
+
+def test_restart_report_survives_redirect_overwrite(world: World) -> None:
+    gate = asyncio.Event()
+    after = asyncio.Event()
+    world.gates["alpha"] = [gate]
+    world.after["alpha"] = [after]
+
+    async def act() -> None:
+        world.scheduler.send(ANA, ALPHA, "work")
+        await until(lambda: world.scheduler.running_lines() == ["alpha"])
+        world.scheduler.begin_restart(restart.Mode.INTERRUPT, "ana", 60)
+        gate.set()
+        await until(lambda: "alpha" in world.reasons)
+        world.scheduler._redirected["alpha"] = "later redirect"  # pyright: ignore[reportPrivateUsage]
+        after.set()
+        await until(lambda: not world.scheduler.running_lines())
+
+    run(world, act)
+    assert "ended at a safe point for" in world.endings("alpha")[0]
+    assert "driver" not in world.endings("alpha")[0]
+    assert len(restart_notes(world)) == 1

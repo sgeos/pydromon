@@ -15,12 +15,15 @@ from claude_agent_sdk import SdkMcpTool
 
 from dromon import cli, exits
 from dromon.configview import Overrides
+from dromon.lineconfig import LineConfig
 from dromon.daemon import Daemon
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.model import (
     BriefSet,
     EventRejected,
+    LineAddress,
+    MessageDelivered,
     OperatorAddress,
     OperatorRegistered,
     OwnershipCause,
@@ -78,14 +81,16 @@ def scheduler(log: EventLog) -> Scheduler:
     return found
 
 
-def tool_text(scheduler: Scheduler, name: str, args: dict[str, object]) -> str:
+def tool_text(
+    scheduler: Scheduler, name: str, args: dict[str, object], *, error: bool = False
+) -> str:
     tools = {found.name: found for found in scheduler.own_tools("alpha")}
 
     async def invoke() -> dict[str, Any]:
         return await tools[name].handler(args)
 
     result = asyncio.run(invoke())
-    assert result.get("is_error") is not True, result
+    assert (result.get("is_error") is True) == error, result
     return cast(str, result["content"][0]["text"])
 
 
@@ -342,3 +347,71 @@ def test_the_command_passes_on_a_refusal(
 
     monkeypatch.setattr(cli, "_call", refuse)
     assert overview_command(tmp_path, short_runtime, "zeta") == exits.FAILURE
+
+
+def test_status_reports_unknown_integration_root(scheduler: Scheduler) -> None:
+    assert scheduler.line_status("alpha")["integration_root"] is None
+    assert scheduler.line_status("alpha", detail=True)["integration_root"] is None
+
+
+def test_status_distinguishes_integration_root_from_workdir(
+    log: EventLog, tmp_path: Path
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    scheduler = Scheduler(log, no_engine, root=root, hold_wakes=True)
+    workdir = root / "role"
+    workdir.mkdir()
+    scheduler.create_line(
+        "alpha", HAIKU, Strategy.SUBSCRIPTION, LineConfig(workdir="role")
+    )
+    status = scheduler.line_status("alpha")
+    assert status["integration_root"] == str(root)
+    assert status["workdir_path"] == str(workdir)
+
+
+@pytest.mark.parametrize("snapshots", [False, True])
+def test_newest_role_index_survives_reopen(tmp_path: Path, snapshots: bool) -> None:
+    path = tmp_path / "journal.sqlite"
+    with EventLog(path, snapshots=snapshots) as log:
+        scheduler = Scheduler(log, no_engine, hold_wakes=True)
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        log.append(RoleDeclared("core", "alpha"))
+        log.append(SeatBound("alpha", "core", True))
+        entry = RoleNoted(
+            "core", "e1", "alpha", RoleNoteKind.NOTE, "body", COMMIT, "", AT
+        )
+        log.append(entry)
+        assert log.newest_role_entry("core") == entry
+        assert log.newest_role_entry("unknown") is None
+        with pytest.raises(EventRejected):
+            log.append(entry)
+        assert log.newest_role_entry("core") == entry
+    with EventLog(path, snapshots=snapshots) as reopened:
+        assert reopened.newest_role_entry("core") == entry
+
+
+def test_task_mail_is_bounded_and_read_only(
+    scheduler: Scheduler, log: EventLog
+) -> None:
+    scheduler.ensure_operator("ana")
+    for index in range(12):
+        message_id = scheduler.send(
+            ANA,
+            LineAddress("alpha"),
+            str(index) * 1000,
+            asks_reply=False,
+        )
+        log.append(MessageDelivered(message_id))
+    before = log.last_seq
+    text = tool_text(scheduler, "list_mail", {"task_context": True})
+    context = json.loads(text)
+    assert len(context["threads"]) == 8
+    assert len(text.encode()) < 24000
+    assert log.last_seq == before
+    assert "task_context must" in tool_text(
+        scheduler, "list_mail", {"task_context": 1}, error=True
+    )
+    assert "must be used alone" in tool_text(
+        scheduler, "list_mail", {"task_context": True, "limit": 1}, error=True
+    )

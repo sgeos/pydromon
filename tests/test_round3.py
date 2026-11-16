@@ -1827,3 +1827,18 @@ def test_a_seat_sees_its_own_task_unscreened_and_a_peers_screened(
     assert shown(own, "alpha") == "grep codename"
     assert shown(peer, "alpha") == scheduler_module.WITHHELD_COMMAND
     assert shown(operator, "alpha") == scheduler_module.WITHHELD_COMMAND
+
+
+def test_idle_task_completions_share_one_autonomous_turn(world: World) -> None:
+    world.run("start")
+    messages = [
+        world.scheduler.background_ended(
+            "alpha", BackgroundEnd(f"batch-{index}", "true", "completed")
+        )
+        for index in range(3)
+    ]
+    world.run()
+    assert world.status()["autonomous_turns"]["used"] == 1
+    prompt = world.engines["alpha"].prompts[-1]
+    for message_id in messages:
+        assert message_id is not None and message_id in prompt

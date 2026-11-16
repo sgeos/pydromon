@@ -2911,3 +2911,60 @@ line keys. The at maximum policy is `close`, `ask` or `keep`.
 Accepted disclosure occurrences apply to files checked through `check_disclosure`.
 They do not exempt messages or text checks. The operator sets them as described in
 [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md).
+
+### Integration root
+
+From round 17, compact and detailed `line_status` include `integration_root` and
+`workdir_path`. The integration root is the project root supplied to the scheduler.
+It identifies the main checkout independently of a role working directory. Each
+field is null when its path is unknown. The root is configuration evidence and
+does not attest that the checkout is clean or contains a particular commit.
+
+Overview reads the newest role journal entry from an index holding one entry per
+role. The event log rebuilds it once after replay or snapshot restoration and
+updates it after successful appends. Rejected appends do not change the index.
+This bounds journal lookup independently of journal history without changing the
+persisted format. Startup still traverses the restored journal once.
+
+### Mail recovery context
+
+From round 17, `line_status` includes `oldest_unanswered_age`. It is null for an
+empty unanswered mailbox or an unknown timestamp. Otherwise it is the age of the
+oldest counted message. All ages remain included rather than silently dropping old
+requests. An operator note sent to a line with `asks_reply` false already leaves
+the unanswered count. An unmarked new note still asks by default. The daemon does
+not infer intent from its prose. The operator confirmed retaining this default
+in round 17. Operators send an informational note with
+`dromon send LINE 'Information for the record' --no-reply`. A line uses
+`send_message` with `asks_reply` false. A correction of a note that already asks
+still retains the original ask, so acknowledging that request is a separate action.
+
+`list_mail` accepts `task_context` true by itself for a line mailbox. This read-only
+view gives the standing task and the latest message of each of at most eight recent
+threads, newest first. It inspects at most 100 recent global messages and truncates
+each text to 512 bytes. The standing task is limited to 1024 bytes. The response is
+bounded to 48 KiB including escaped text. Unknown or mixed arguments are refused.
+The messages are untrusted data. Grouping follows explicit thread identifiers and
+does not assert relevance to the task. Busy projects can displace a line's older
+mail beyond the scan window. Ordinary paged mail remains available for that case.
+
+Task notices already waiting together in the post office share one wake and one
+autonomous turn. Notices arriving after a turn has begun can still require a later
+turn. There is no timing debounce across separate arrivals.
+
+### Lease maintenance
+
+From round 17, scheduler ticks and idle maintenance record expired leases with a
+`lease_released` event whose cause is `expired`. Acquisition also sweeps expired
+leases before replacing a holder. Read-only inventories do not perform maintenance.
+Idle maintenance can lag wall-clock expiry by the maintenance interval. Inventory
+and acquisition still enforce the actual expiry time during that interval.
+
+Reload caps each surviving declared lease to its acquisition time plus the new
+limit. It records a release with cause `limit_lowered`, followed by an acquisition
+with the original holder and acquisition time if the capped expiry remains future.
+Otherwise the lease stays released. The holder receives an informational own note.
+A crash between release and acquisition leaves the resource unleased. This fails
+closed for ownership claims and the holder must acquire again. A crash before the
+note can omit notification. Lease expiry never proves that the holder's processes
+have stopped.

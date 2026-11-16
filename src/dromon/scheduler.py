@@ -488,7 +488,8 @@ SEND_TOOL_SCHEMA: Final[dict[str, object]] = {
             "type": "boolean",
             "description": (
                 "Optional. Whether this note asks its recipient for a reply. A note"
-                " that asks nothing is not counted as unanswered. Left out, a note"
+                " that asks nothing is not counted as unanswered. Set asks_reply"
+                " to false for an informational note to a line. Left out, a note"
                 " asks a reply unless it is itself a reply. False is honoured only"
                 " for a note to a line, and a correction keeps the ask of the note"
                 " it corrects"
@@ -1609,6 +1610,13 @@ LIST_MAIL_TOOL_NAME: Final = "list_mail"
 LIST_MAIL_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
     "properties": {
+        "task_context": {
+            "type": "boolean",
+            "description": (
+                "Bounded recent mail grouped by thread beside the standing task."
+                " Line mailboxes only. Use alone."
+            ),
+        },
         "unread_only": {"type": "boolean", "description": "Only unread messages"},
         "own_notes_only": {
             "type": "boolean",
@@ -4980,6 +4988,7 @@ class Scheduler:
                 f"ttl_seconds must be a whole number from {MIN_LEASE_TTL_SECONDS}"
                 f" to {MAX_LEASE_TTL_SECONDS}"
             )
+        self.expire_leases()
         self._lease_names = frozenset(names)
         self._lease_ttl = ttl_seconds
         leases = self._state().leases
@@ -4988,9 +4997,44 @@ class Scheduler:
                 LeaseReleased(name, leases[name].line_id, LeaseEnd.UNDECLARED)
             )
 
+        for name, lease in list(self._state().leases.items()):
+            if parse_due(lease.expires) > parse_due(lease.acquired_at) + timedelta(
+                seconds=ttl_seconds
+            ):
+                self._log.append(
+                    LeaseReleased(name, lease.line_id, LeaseEnd.LIMIT_LOWERED)
+                )
+                capped = parse_due(lease.acquired_at) + timedelta(seconds=ttl_seconds)
+                if capped > self._wall_clock():
+                    self._log.append(
+                        LeaseAcquired(
+                            name,
+                            lease.line_id,
+                            lease.acquired_at,
+                            format_due(capped),
+                            lease.note,
+                        )
+                    )
+                self.send(
+                    LineAddress(lease.line_id),
+                    LineAddress(lease.line_id),
+                    f"Lease {name} was capped at reload to {format_due(capped)}"
+                    f" under the new limit of {ttl_seconds} seconds."
+                    " It has ended if that time has passed.",
+                    asks_reply=False,
+                )
+
+    def expire_leases(self) -> None:
+        """Record elapsed leases once. Called each tick and before acquisition so
+        event history records expiry even when a new holder immediately follows."""
+        now = self._wall_clock()
+        for name, lease in list(self._state().leases.items()):
+            if not _lease_live(lease, now):
+                self._log.append(LeaseReleased(name, lease.line_id, LeaseEnd.EXPIRED))
+
     def _live_lease(self, name: str) -> LeaseAcquired | None:
         """The lease held under ``name``, or ``None`` once its time has passed. An
-        expired lease needs no event, since the next acquisition replaces it."""
+        expired lease is recorded before another acquisition replaces it."""
         lease = self._state().leases.get(name)
         if lease is not None and not _lease_live(lease, self._wall_clock()):
             return None
@@ -5030,6 +5074,7 @@ class Scheduler:
                 f"seconds must be a whole number from {MIN_LEASE_TTL_SECONDS} to"
                 f" {self._lease_ttl}, the project's limit for a lease"
             )
+        self.expire_leases()
         held = self._live_lease(name)
         if held is not None and held.line_id == line_id:
             raise LeaseRefused(
@@ -6898,6 +6943,7 @@ class Scheduler:
             "strategy": line.strategy,
             "workdir": config.workdir,
             "workdir_path": workdir,
+            "integration_root": None if self._root is None else str(self._root),
             "sandbox": self._sandbox_status(line_id, workdir),
             "sandbox_facts": self.sandbox_facts(line_id),
             "engine_session": line.engine_session,
@@ -6924,6 +6970,44 @@ class Scheduler:
             },
             "other_line_count": len(state.lines) - 1,
             **({} if others_view is None else {"other_lines": others_view}),
+        }
+
+    def task_mail(self, line_id: str) -> dict[str, object]:
+        """Bounded recent thread context beside the active standing task. Messages
+        are untrusted data. Relevance to a task cannot be inferred from prose.
+        Inspect at most 100 recent global messages and retain eight threads."""
+        state = self._state()
+        threads: dict[str, dict[str, object]] = {}
+        scanned = 0
+        for message_id in reversed(state.messages):
+            if scanned >= 100:
+                break
+            scanned += 1
+            message = state.messages[message_id]
+            if (
+                not message.delivered
+                or message.recipient != LineAddress(line_id)
+                or message.sender == message.recipient
+            ):
+                continue
+            thread = message.thread or message_id
+            if thread in threads:
+                continue
+            threads[thread] = {
+                "thread": thread,
+                "message_id": message_id,
+                "sender": str(message.sender),
+                "kind": message.kind.value,
+                "text": _cut(message.body, 512),
+                "asks_reply": counts_unanswered(state, message),
+            }
+            if len(threads) == 8:
+                break
+        return {
+            "trust": "untrusted message data, grouped by thread, newest first",
+            "scope": "recent context for the standing task, relevance unverified",
+            "threads": list(threads.values()),
+            "scan_limit": 100,
         }
 
     def _unanswered_mail(self, state: State, line_id: str) -> dict[str, object]:
@@ -6954,6 +7038,7 @@ class Scheduler:
         return {
             "unanswered_mail": listed,
             "unanswered_omitted": total - len(listed),
+            "oldest_unanswered_age": None if not listed else listed[0]["waited"],
         }
 
     def _other_lines(self, state: State, line_id: str) -> list[dict[str, object]]:
@@ -8859,16 +8944,13 @@ class Scheduler:
 
     def _overview_role(self, state: State, line_id: str) -> dict[str, object] | None:
         """The role part of an overview, or ``None`` for a line that is no seat: the
-        role, its owner and its newest journal entry without the body. The entries
-        are scanned once, as ``role_view`` scans them."""
+        role, its owner and its newest journal entry without the body. A derived
+        event-log index avoids scanning the journal on the event loop."""
         seat = state.seats.get(line_id)
         if seat is None:
             return None
         role = state.roles[seat.role_id]
-        newest: RoleNoted | None = None
-        for entry in state.role_entries.values():
-            if entry.role_id == seat.role_id:
-                newest = entry
+        newest = self._log.newest_role_entry(seat.role_id)
         return {
             "role_id": seat.role_id,
             "owner": role.owner,
@@ -11522,6 +11604,18 @@ class Scheduler:
             unexpected = _unexpected(args, LIST_MAIL_SCHEMA)
             if unexpected:
                 return _tool_error(unexpected)
+            task_context: object = args.get("task_context", False)
+            if type(task_context) is not bool:
+                return _tool_error("task_context must be true or false")
+            if task_context:
+                if len(args) != 1 or not isinstance(mailbox_owner, LineAddress):
+                    return _tool_error(
+                        "task_context requires a line mailbox and must be used alone"
+                    )
+                context = self.task_mail(mailbox_owner.line_id)
+                brief = self._state().briefs.get(mailbox_owner.line_id)
+                context["task"] = None if brief is None else _cut(brief.task, 1024)
+                return _tool_text(json.dumps(context, ensure_ascii=False))
             unread_only: object = args.get("unread_only", False)
             own_notes_only: object = args.get("own_notes_only", False)
             unanswered_only: object = args.get("unanswered_only", False)
@@ -12108,6 +12202,7 @@ class Scheduler:
         its secret values ends alone, as ``_refusing_on_secrets`` says."""
         self.tick += 1
         self._tick_refused = False
+        self.expire_leases()
         self.fire_due_wakes()
         for line_id in sorted(self._state().lines):
             with self._refusing_on_secrets(f"the update of line {line_id}"):
@@ -12162,6 +12257,7 @@ class Scheduler:
                         with self._refusing_on_secrets("the sweep of left processes"):
                             self.collect_left()
                         self.note_stuck_starts()
+                        self.expire_leases()
                     except Exception as error:  # noqa: BLE001
                         await self._fault_found(error, stop)
                         continue
@@ -12171,7 +12267,11 @@ class Scheduler:
                     timeouts.append(min(self._tick_seconds, MAX_REST_SECONDS))
                 # Launch records and peer allowance expiry are maintenance work.
                 # Their bounded inspection remains due even with no periodic ticks.
-                if self._report_dir is not None or self._post_office:
+                if (
+                    self._report_dir is not None
+                    or self._post_office
+                    or self._state().leases
+                ):
                     timeouts.append(MAX_REST_SECONDS)
                 # Mail already in the post office may need another tick to reach
                 # its wake cadence. Advance only while that mail can make progress.
@@ -12538,8 +12638,10 @@ class Scheduler:
             self._record_session(line_id, report)
             ending = report.subtype
             redirected = self._redirected.get(line_id)
-            if redirected is not None and report.interrupted_for == redirected:
-                ending += f", ended at a safe point for {redirected}"
+            if report.interrupted_for == restart.REASON or (
+                redirected is not None and report.interrupted_for == redirected
+            ):
+                ending += f", ended at a safe point for {report.interrupted_for}"
             elif report.interrupted_for is not None:
                 stop_cause = f"The driver interrupted it for {report.interrupted_for}."
                 ending += f", interrupted by its driver: {report.interrupted_for}"
@@ -14067,8 +14169,10 @@ class Scheduler:
                 self._record_session(line_id, report)
                 ending = report.subtype
                 redirected = self._redirected.get(line_id)
-                if redirected is not None and report.interrupted_for == redirected:
-                    ending += f", ended at a safe point for {redirected}"
+                if report.interrupted_for == restart.REASON or (
+                    redirected is not None and report.interrupted_for == redirected
+                ):
+                    ending += f", ended at a safe point for {report.interrupted_for}"
                 elif report.interrupted_for is not None:
                     ending += f", interrupted by its driver: {report.interrupted_for}"
                 elif turn_outcome(report) == FAILED:
@@ -15019,6 +15123,8 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         cite += f", whose code under {package} is older than the worktree's"
     return {
         "line_id": full["line_id"],
+        "integration_root": full["integration_root"],
+        "workdir_path": full["workdir_path"],
         "state": full["state"],
         "condition": full["condition"],
         "held_by": full["held_by"],
@@ -15046,6 +15152,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         "unanswered": full["unanswered"],
         "unanswered_mail": full["unanswered_mail"],
         "unanswered_omitted": full["unanswered_omitted"],
+        "oldest_unanswered_age": full["oldest_unanswered_age"],
         "own_notes": full["own_notes"],
         "pending": full["pending"],
         "peers": full["peers"],

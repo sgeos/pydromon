@@ -61,6 +61,12 @@ PINS: tuple[tuple[int, str, str], ...] = (
         "7b73894d5fa3093c776fe2e0602549b2eb79e9b5997f52077c1fea6844347ebb",
         "28b583dc352b6c0554c5624dd1ffdb5f44279201d275d58cb65d7dc15a2505fe",
     ),
+    # Round 17 lease expiry and lowered-limit release causes.
+    (
+        7,
+        "c9ce446cd8063e3b2a53eaf18a6397a1c8ae8d96429b8a612eff69e2d950ad75",
+        "28b583dc352b6c0554c5624dd1ffdb5f44279201d275d58cb65d7dc15a2505fe",
+    ),
 )
 """Each ``STATE_VERSION`` with its ``codec_digest`` and its replay digest, oldest
 first, appended to and never edited."""
