@@ -220,8 +220,11 @@ def test_a_project_hook_makes_every_read_line_refused(
         # A read line with no server, allow-all policy or hook is allowed.
         "[lines.reader]\nmodel = 'claude-haiku-5-5'\nworkdir_access = 'read'\n"
         "builtin_tools = ['Read', 'Grep']\n",
-        # Other engines refuse a read line for other reasons, or never.
-        MCP_LINE.replace("claude-haiku-5-5", "gpt-6-luna"),
+        # A Codex read line with nothing its adapter refuses is allowed.
+        "[lines.reader]\nmodel = 'gpt-6-luna'\nworkdir_access = 'read'\n",
+        # A line with write access on an engine that cannot confine a reader is not
+        # refused, since it does not ask to be confined.
+        "[lines.writer]\nmodel = 'pi:openai/gpt-6-luna'\n",
     ],
 )
 def test_no_warning_where_a_turn_would_not_be_refused(
@@ -232,3 +235,99 @@ def test_no_warning_where_a_turn_would_not_be_refused(
 ) -> None:
     out = config_output(tmp_path, short_runtime, capsys, text)
     assert "will be refused" not in out
+
+
+# Round 17, item 7. Every engine, and the seats of a role.
+
+
+def warnings_of(out: str, marker: str) -> list[str]:
+    return [line for line in out.splitlines() if marker in line]
+
+
+@pytest.mark.parametrize(
+    ("model", "reason"),
+    [
+        ("gpt-6-luna", "Codex lines support only the built-in tools"),
+    ],
+)
+def test_a_read_line_on_codex_with_a_server_is_warned_of(
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    model: str,
+    reason: str,
+) -> None:
+    """Confirmed before the change. Round 16 warned of Claude Code lines only, and the
+    adapter of every other engine refuses the same line at each turn."""
+    text = MCP_LINE.replace("claude-haiku-5-5", model)
+    out = config_output(tmp_path, short_runtime, capsys, text)
+    (warning,) = warnings_of(out, "will be refused")
+    assert warning.startswith("warning: line player has workdir_access read")
+    assert reason in warning
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "pi:openai/gpt-6-luna",
+        "cursor-agent:gpt-5.6-luna-medium",
+        "antigravity:gemini-3.8-flash-high",
+    ],
+)
+def test_a_read_line_on_an_engine_that_cannot_confine_a_reader_is_warned_of(
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    model: str,
+) -> None:
+    text = f"[lines.reader]\nmodel = '{model}'\nworkdir_access = 'read'\n"
+    out = config_output(tmp_path, short_runtime, capsys, text)
+    (warning,) = warnings_of(out, "will be refused")
+    assert "line reader has workdir_access read" in warning
+    assert "read-only" in warning or "read only" in warning, warning
+
+
+def role_text(model: str, seat_extra: str = "") -> str:
+    return (
+        f"[lines.owner]\nmodel = '{model}'\n"
+        f"[lines.seat]\nmodel = '{model}'\n{seat_extra}"
+        "[roles.dev]\nworkdir = 'dev'\nseats = ['owner', 'seat']\n"
+    )
+
+
+def test_a_seat_whose_configuration_cannot_be_read_only_is_warned_of(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A seat that does not own its role is built with read access, and Claude Code
+    refuses that for a line with an MCP server, which only its turn showed before."""
+    (tmp_path / "dev").mkdir()
+    text = role_text(
+        "claude-haiku-5-5",
+        "[lines.seat.mcp_servers.game]\ntype = 'stdio'\ncommand = '/bin/true'\n",
+    )
+    out = config_output(tmp_path, short_runtime, capsys, text)
+    (warning,) = warnings_of(out, "will be refused")
+    assert warning.startswith("warning: line seat is a seat of role dev")
+    assert "while it does not own dev" in warning
+    assert "MCP" in warning or "mcp" in warning
+
+
+def test_a_seat_on_an_engine_that_cannot_confine_it_is_told_its_mail_waits(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "dev").mkdir()
+    out = config_output(
+        tmp_path, short_runtime, capsys, role_text("pi:openai/gpt-6-luna")
+    )
+    waits = warnings_of(out, "so its mail waits")
+    assert len(waits) == 2
+    assert all("cannot confine a seat to reading" in line for line in waits)
+    assert "will be refused" not in out
+
+
+def test_a_clean_seat_is_not_warned_of(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "dev").mkdir()
+    out = config_output(tmp_path, short_runtime, capsys, role_text("claude-haiku-5-5"))
+    assert "will be refused" not in out and "mail waits" not in out

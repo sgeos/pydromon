@@ -129,9 +129,11 @@ from typing import (
     Any,
     BinaryIO,
     Final,
+    Literal,
     NamedTuple,
     Protocol,
     cast,
+    overload,
     runtime_checkable,
 )
 
@@ -373,6 +375,11 @@ from dromon.model import (
     RunCleared,
     RunClearance,
     RunEnded,
+    MAX_QUEUE_REASON_BYTES,
+    MAX_QUEUED_RUNS,
+    QueueEnd,
+    RunDequeued,
+    RunQueued,
     RunStarted,
     RunStatus,
     run_scope,
@@ -821,8 +828,15 @@ MAX_CHECKED_TOTAL_BYTES: Final = disclosurecheck.MAX_CHECKED_TOTAL_BYTES
 memory and time, since the parts are held together before they are split."""
 MAX_CLEAN_CHECKED: Final = 64
 """How many passed contents a line keeps, oldest first out. Round 15, item 4."""
-MAX_CHECKED_PATHS: Final = 8
-"""The largest file list ``check_disclosure`` accepts, bounding path validation."""
+MAX_CHECKED_PATHS: Final = MAX_CLEAN_CHECKED
+"""The largest file list ``check_disclosure`` accepts. **Round 17, item 5.** It was 8,
+which a round of 71 changed files needed ten calls to cover, each one a check against
+the hourly budget. It equals ``MAX_CLEAN_CHECKED`` on purpose, so that a list which all
+passes is wholly remembered, and the same list checked again is answered from memory
+and spends nothing. A longer list would pass and then be remembered only in part. The
+bytes stay bounded by ``MAX_CHECKED_TOTAL_BYTES``, and a call is still one check, so
+the longer list gives a line no more tries at a term. Each path costs one validation
+and one open on the worker thread, which 64 of bounds that work."""
 DISCLOSURE_HELD: Final = (
     "Dromon held this line and asked an operator, since its disclosure checks and"
     " refusals reached their limit. Nothing was sent, written or checked, and"
@@ -1520,6 +1534,12 @@ swept at least this often while the daemon is idle. **Fourth live run of N1,
 2026-10-26.** The rest was unbounded when no wake was pending, so an idle daemon never
 swept a kept connection's dead launcher."""
 
+RUN_QUEUE_POLL_SECONDS: Final = 5.0
+"""How often the daemon looks at queued runs while any wait. **Round 17, item 1.** A
+queued run starts when the machine status allows runs or the slot is free, and neither
+sends the daemon an event, so it is read on this interval. It bounds how long a run
+waits after nothing holds it back, and costs one read of a status the daemon keeps for
+``MACHINE_READ_SECONDS`` and a state lookup for each queued run."""
 MACHINE_READ_SECONDS: Final = 15.0
 """How long one read of the machine status file is kept before it is read again, so
 the loop's ticks, which may come every half second, read a small file at most this
@@ -1544,6 +1564,8 @@ class _MachineRead:
         self.status = machinestatus.MachineStatus(
             "unreadable", problem="the read did not complete"
         )
+        self.read_epoch: float | None = None
+        """The wall clock, in Unix seconds, that the status's age was measured from."""
 
     def run(
         self,
@@ -1551,6 +1573,7 @@ class _MachineRead:
         path: Path,
         now_epoch: float,
     ) -> None:
+        self.read_epoch = now_epoch
         try:
             self.status = reader(path, now_epoch)
         except Exception:  # noqa: BLE001 - a read that fails is a status that cannot be relied on
@@ -1907,6 +1930,39 @@ def claude_read_only_refusal(
     return _claude_read_access_refusal(
         config, settings
     ) or _claude_read_sandbox_refusal([project_sandbox, config.sandbox])
+
+
+ENGINE_UNSUPPORTED: Final[dict[str, Callable[[LineConfig], str | None]]] = {
+    codex.ENGINE_NAME: codex.unsupported,
+    grok.ENGINE_NAME: grok.unsupported,
+    pi.ENGINE_NAME: pi.unsupported,
+    cursor.ENGINE_NAME: cursor.unsupported,
+    antigravity.ENGINE_NAME: antigravity.unsupported,
+}
+"""Each adapter's own check of a configuration, by engine name, which the adapter runs
+before every turn. **Round 17, item 7.** ``dromon config`` and the daemon read the same
+functions, so a warning and a turn's refusal cannot differ."""
+
+
+def read_only_refusal(
+    config: LineConfig,
+    engine: str | None,
+    project_settings: SettingsConfig | None,
+    project_sandbox: SandboxConfig | None,
+) -> str | None:
+    """Why a line on ``engine`` that runs with ``workdir_access = "read"``, as
+    ``config`` with that access, is refused at every turn, or ``None`` when it is not.
+    **Round 17, item 7.** Round 16 covered Claude Code, and the other engines refuse
+    a read-only working directory in their own ``unsupported``, as Pi, Cursor and
+    Antigravity cannot confine one and Grok has no probe that shows it can. Codex has
+    no refusal of its own for read access, and gives only those of its configuration.
+    An engine this table does not name, or none, gives ``None``, and its turn is not
+    judged here."""
+    access = replace(config, workdir_access=WorkdirAccess.READ)
+    if engine == ENGINE_NAME_CLAUDE:
+        return claude_read_only_refusal(access, project_settings, project_sandbox)
+    check = ENGINE_UNSUPPORTED.get(engine or "")
+    return None if check is None else check(access)
 
 
 def _claude_read_sandbox_refusal(layers: Sequence[SandboxConfig | None]) -> str | None:
@@ -2408,6 +2464,11 @@ def _no_operator_mail() -> None:
     wake."""
 
 
+def _queue_reason(reason: str) -> str:
+    """``reason`` cut to the bytes a queue event holds, at a character boundary."""
+    return reason.encode()[:MAX_QUEUE_REASON_BYTES].decode("utf-8", "ignore")
+
+
 def new_id(prefix: str) -> str:
     """A fresh identifier. Random, so identifiers never repeat across restarts."""
     return f"{prefix}-{secrets.token_hex(6)}"
@@ -2888,6 +2949,10 @@ class Scheduler:
         )
         """What reads the file. A seam for tests, which makes a read that hangs."""
         self._machine_untrusted_since: datetime | None = None
+        self._machine_read_epoch: float | None = None
+        self._machine_sampled_at: datetime | None = None
+        self._run_slot: str | None = None
+        self._queue_task: asyncio.Task[None] | None = None
         """When the monitor's file was first seen unusable in the present spell, a
         stale one by its last sample, or ``None`` while the file is fresh or none is
         configured. **Round 16 review, point 1.** In memory."""
@@ -3400,15 +3465,24 @@ class Scheduler:
         was read. **Round 16, item 3.**"""
         self._machine_path = path
         self._machine_read = None
+        self._machine_read_epoch = None
+        self._machine_sampled_at = None
         self._machine_pending = None
         self._machine_untrusted_since = None
         self._machine_noted.clear()
         self._machine_deferred.clear()
 
     def machine_status(self) -> machinestatus.MachineStatus | None:
-        """The machine's status, as ``_read_machine_status`` gives it, with the spell
-        in which the file cannot be relied on kept for the notes that name it."""
-        status = self._read_machine_status()
+        """The machine's status, as ``_read_machine_status`` gives it, with its age
+        brought to now and the spell in which the file cannot be relied on kept for
+        the notes that name it.
+
+        **Round 17, item 2.** The age was that at the read, which the daemon keeps for
+        ``MACHINE_READ_SECONDS``, and a note that quoted it said ``as of N seconds
+        ago`` of a moment nobody could place. The age is now measured from the
+        sample's own time to the moment the status is used, and ``sampled_at`` names
+        that time, so a line that reads a note later can place the reading."""
+        status = self._aged(self._read_machine_status())
         if status is None or status.level in machinestatus.KNOWN_LEVELS:
             self._machine_untrusted_since = None
         elif status.level == "stale" and status.age_seconds is not None:
@@ -3418,6 +3492,21 @@ class Scheduler:
         elif self._machine_untrusted_since is None:
             self._machine_untrusted_since = self._wall_clock()
         return status
+
+    def _aged(
+        self, status: machinestatus.MachineStatus | None
+    ) -> machinestatus.MachineStatus | None:
+        """``status`` with its age counted to the wall clock now, and the time of its
+        sample kept in ``_machine_sampled_at``. A status with no age, as a missing or
+        unreadable file has, is returned as it is, with no sample time."""
+        self._machine_sampled_at = None
+        epoch = self._machine_read_epoch
+        if status is None or status.age_seconds is None or epoch is None:
+            return status
+        sampled = epoch - status.age_seconds
+        wall = self._wall_clock()
+        self._machine_sampled_at = datetime.fromtimestamp(sampled, UTC)
+        return replace(status, age_seconds=max(0, int(wall.timestamp()) - int(sampled)))
 
     def _read_machine_status(self) -> machinestatus.MachineStatus | None:
         """The machine's status, read at most once every ``MACHINE_READ_SECONDS``, or
@@ -3467,6 +3556,7 @@ class Scheduler:
         status = pending.status
         self._machine_pending = None
         self._machine_read = (now, status)
+        self._machine_read_epoch = pending.read_epoch
         return status
 
     def machine_status_view(self) -> dict[str, object]:
@@ -3484,6 +3574,11 @@ class Scheduler:
             "level": status.level,
             "acted_on_as": status.effective,
             "age_seconds": status.age_seconds,
+            "sampled_at": (
+                None
+                if self._machine_sampled_at is None
+                else format_due(self._machine_sampled_at)
+            ),
             "reasons": [self._machine_screened(reason) for reason in status.reasons],
             "problem": (
                 None
@@ -3512,10 +3607,19 @@ class Scheduler:
         """``status`` in a sentence, with its reasons withheld should one hold a term
         of the disclosure list, since the file is the monitor's and its text is not
         the project's own."""
-        text = status.describe()
+        text = status.describe() + self._machine_sample_words()
         return (
             "the machine status cannot be shown here" if self.discloses(text) else text
         )
+
+    def _machine_sample_words(self) -> str:
+        """The time of the reading's sample, as a clause to append, or nothing for a
+        status with none. **Round 17, item 2.** A note reaches a line some time after
+        it is written, so the age it names, which is true when written, is anchored to
+        the sample's own time, which the line can compare with its own clock. Fixed
+        words and a time, with no text of the monitor's."""
+        sampled = self._machine_sampled_at
+        return "" if sampled is None else f", sampled at {format_due(sampled)}"
 
     def _machine_screened(self, text: str) -> str:
         """``text`` of the monitor's file, or a placeholder when it holds a term of the
@@ -3529,7 +3633,15 @@ class Scheduler:
         the monitor writes again, so a monitor that died closes every gate, and the
         cause is named where the deferral is. A stale file is dated by its last
         sample. A file first seen missing or unreadable is dated by the daemon's
-        first sight of it, since the daemon cannot know earlier."""
+        first sight of it, since the daemon cannot know earlier.
+
+        **Round 17, item 4.** The first sight is no earlier than the daemon's start,
+        so a monitor that died before a restart is dated by the restart, and the
+        sentence says "possibly earlier" so a line does not take the time for the
+        moment the monitor stopped. Carrying the start across a restart was not
+        done, since it needs an event of its own and a replay rule for a date that the
+        monitor's file, once it is written again, replaces. **Residual.** A stale file
+        is the exception, since its own last sample dates it truly."""
         if status.level in machinestatus.KNOWN_LEVELS:
             return None
         since = self._machine_untrusted_since
@@ -3539,7 +3651,11 @@ class Scheduler:
             else (
                 f"since its last sample at {format_due(since)}"
                 if status.level == "stale"
-                else f"since the daemon first saw it so at {format_due(since)}"
+                else (
+                    f"since the daemon first saw it so at {format_due(since)}, and"
+                    " possibly earlier, since the daemon cannot see before it started"
+                    " or before it was told of the file"
+                )
             )
         )
         return (
@@ -3554,6 +3670,30 @@ class Scheduler:
         or nothing while the file is fresh."""
         trouble = self._monitor_trouble(status)
         return "" if trouble is None else f" {trouble}"
+
+    def _run_wait_reason(self, line_id: str) -> str | None:
+        """Why a run of ``line_id`` waits now, or ``None`` when nothing holds it back.
+        **Round 17, item 1.** Two things hold a run back and both pass. The machine
+        status defers runs, which is read as ``machine_decision`` reads it and tells
+        nobody, since a queued run says so itself. And the project's slot, a lease
+        the project names in ``runs.slot_lease``, is held by another line, which is
+        the shared gate's one holder. The holder of the slot itself is never held
+        back by it. Nothing is recorded."""
+        status = self.machine_status()
+        if status is not None and self.machine_decision().defer_runs:
+            return (
+                f"the machine status defers runs, since {self._machine_words(status)}"
+                f"{self._machine_cause(status)}"
+            )
+        slot = self._run_slot
+        if slot is not None:
+            held = self._live_lease(slot)
+            if held is not None and held.line_id != line_id:
+                return (
+                    f"the slot, lease {slot}, is held by line {held.line_id} until"
+                    f" {held.expires}"
+                )
+        return None
 
     def _machine_run_refusal(self, line_id: str) -> str | None:
         """Why a run of ``line_id`` is deferred by the machine's status, or ``None``.
@@ -5207,6 +5347,7 @@ class Scheduler:
         commit_commands: Mapping[str, Sequence[str]] | None = None,
         commit_refs: Sequence[str] = (),
         parameters: Mapping[str, Mapping[str, runparams.RunParameter]] | None = None,
+        slot_lease: str | None = None,
     ) -> None:
         """Declare the commands lines may start as runs, and the commit commands
         with the refs their commits must be in, as the project file does at start
@@ -5228,6 +5369,7 @@ class Scheduler:
         self._commit_commands = commits_given
         self._commit_refs = tuple(commit_refs)
         self._run_parameters = declared
+        self._run_slot = slot_lease
 
     def _run_role(self, line_id: str) -> str | None:
         seat = self._state().seats.get(line_id)
@@ -5305,6 +5447,7 @@ class Scheduler:
             f" Commit commands: {commits}"
         )
 
+    @overload
     async def start_run(
         self,
         line_id: str,
@@ -5312,7 +5455,34 @@ class Scheduler:
         previous: str,
         commit: str | None = None,
         arguments: Mapping[str, object] | None = None,
-    ) -> RunStarted:
+        *,
+        queued: str | None = None,
+    ) -> RunStarted: ...
+
+    @overload
+    async def start_run(
+        self,
+        line_id: str,
+        command: str,
+        previous: str,
+        commit: str | None = None,
+        arguments: Mapping[str, object] | None = None,
+        *,
+        queue: Literal[True],
+        queued: str | None = None,
+    ) -> RunStarted | RunQueued: ...
+
+    async def start_run(
+        self,
+        line_id: str,
+        command: str,
+        previous: str,
+        commit: str | None = None,
+        arguments: Mapping[str, object] | None = None,
+        *,
+        queue: bool = False,
+        queued: str | None = None,
+    ) -> RunStarted | RunQueued:
         """Start the declared ``command`` for ``line_id`` as a supervised run.
         ``previous`` must name its scope's latest run, or be ``none`` when it has
         none, so that a successor seat has read its predecessor's record first.
@@ -5323,7 +5493,21 @@ class Scheduler:
         is, and the run records the command as it ran, with the values in place.
         **Round 15 review, P1.** The values are matched against their patterns by a
         child process under a deadline, as ``runparams.match`` says, so a pattern
-        that backtracks never holds the loop. Raises ``runs.RunRefused``."""
+        that backtracks never holds the loop.
+
+        **Round 17, item 1.** With ``queue``, a start that waits only because the
+        machine status defers runs or the slot is held is kept, as ``run_queued``,
+        and the queued run is returned, to begin when nothing holds it back. Every
+        other refusal stands. ``queued`` names the queue entry this call begins, which
+        the daemon gives when it starts one, and without it a line that has a queued
+        run starts no other. Raises ``runs.RunRefused``."""
+        if queued is None:
+            waiting = self._queued_of(line_id)
+            if waiting is not None:
+                raise runs.RunRefused(
+                    "a run of yours is queued, so no other starts:"
+                    f" {self._queue_line(waiting)}"
+                )
         try:
             prepared = runparams.prepare(
                 self._run_argv(command, commit),
@@ -5355,9 +5539,18 @@ class Scheduler:
                 f"previous must name the latest run, so you start one only after"
                 f" reading its record. The latest is {seen}"
             )
+        if queue and queued is None:
+            waits = self._run_wait_reason(line_id)
+            if waits is not None:
+                return self._enqueue_run(
+                    line_id, command, previous, commit, arguments, waits
+                )
         deferred = self._machine_run_refusal(line_id)
         if deferred is not None:
             raise runs.RunRefused(deferred)
+        slot_held = self._slot_refusal(line_id)
+        if slot_held is not None:
+            raise runs.RunRefused(slot_held)
         if self._report_dir is None:
             raise runs.RunRefused("this daemon has no report directory for receipts")
         directory = self._report_dir
@@ -5387,6 +5580,213 @@ class Scheduler:
             return await self._launch_run(start, commit)
         finally:
             self._commit_starting.discard(scope)
+
+    def _slot_refusal(self, line_id: str) -> str | None:
+        """Why the project's slot keeps ``line_id`` from starting a run now, or
+        ``None``. **Round 17, item 1.** A start without the queue is refused while
+        another line holds the slot, as it is while the machine defers runs, and
+        says how to be kept in the queue instead."""
+        slot = self._run_slot
+        if slot is None:
+            return None
+        held = self._live_lease(slot)
+        if held is None or held.line_id == line_id:
+            return None
+        return (
+            f"the slot, lease {slot}, is held by line {held.line_id} until"
+            f" {held.expires}, so the run is not started. Start it again with the"
+            " queue, which keeps it until the slot is free"
+        )
+
+    def _queued_of(self, line_id: str) -> RunQueued | None:
+        """The run of ``line_id`` that waits in the queue, or ``None``."""
+        for entry in self._state().queued_runs.values():
+            if entry.line_id == line_id:
+                return entry
+        return None
+
+    def _queue_line(self, entry: RunQueued) -> str:
+        """One queued run in a sentence, with its place and what holds it back."""
+        order = list(self._state().queued_runs)
+        position = order.index(entry.queue_id) + 1
+        waits = self._run_wait_reason(entry.line_id)
+        why = (
+            "nothing holds it back now, so it starts on the next look"
+            if (waits is None)
+            else f"it waits, since {waits}"
+        )
+        on = "" if entry.commit is None else f" on commit {entry.commit}"
+        return (
+            f"queued run {entry.queue_id} of {entry.command}{on}, position"
+            f" {position} of {len(order)}, queued at {entry.queued_at}. {why}"
+        )
+
+    def _enqueue_run(
+        self,
+        line_id: str,
+        command: str,
+        previous: str,
+        commit: str | None,
+        arguments: Mapping[str, object] | None,
+        reason: str,
+    ) -> RunQueued:
+        """Keep the start of ``command`` for ``line_id`` until nothing holds it
+        back. **Round 17, item 1.** Everything that is checked before the wait has
+        been checked, so what is queued is a start that would begin but for
+        ``reason``. The values of the parameters are stored as given and checked again
+        when the run begins. Raises ``runs.RunRefused`` for a full queue or a
+        working directory that cannot be read."""
+        if len(self._state().queued_runs) >= MAX_QUEUED_RUNS:
+            raise runs.RunRefused(
+                f"the queue of runs holds {MAX_QUEUED_RUNS}, its limit, so this one"
+                f" is not kept. It would wait, since {reason}. Start it again later"
+            )
+        try:
+            workdir = Path(os.path.realpath(self._workdir_of(line_id)))
+        except LineToolRefused as error:
+            raise runs.RunRefused(str(error)) from error
+        head = None if commit is not None else read_head_commit(workdir)
+        if head is not None and COMMIT_PATTERN.fullmatch(head) is None:
+            head = None
+        pairs = tuple(
+            sorted((name, str(value)) for name, value in (arguments or {}).items())
+        )
+        try:
+            event = RunQueued(
+                new_id("q"),
+                line_id,
+                command,
+                None if previous == "none" else previous,
+                commit,
+                pairs,
+                str(workdir),
+                head,
+                format_due(self._wall_clock()),
+                _queue_reason(reason),
+            )
+        except InvalidField as error:
+            raise runs.RunRefused(str(error)) from error
+        self._log.append(event)
+        self._work.set()
+        return event
+
+    def _drop_queued(self, entry: RunQueued, reason: str, tell: bool = True) -> None:
+        """Take ``entry`` out of the queue without starting it, with ``reason`` in
+        the event and, unless ``tell`` is false, in a note to its line."""
+        self._log.append(
+            RunDequeued(
+                entry.queue_id,
+                QueueEnd.DROPPED,
+                None,
+                _queue_reason(reason),
+                format_due(self._wall_clock()),
+            )
+        )
+        if tell and entry.line_id in self._state().lines:
+            self._harness_note(
+                LineAddress(entry.line_id),
+                f"Your queued run {entry.queue_id} of {entry.command} was dropped and"
+                f" will not start, since {reason}. Start it again if you still want"
+                " it.",
+            )
+
+    def _queue_drop_reason(self, entry: RunQueued) -> str | None:
+        """Why ``entry`` can no longer start, or ``None``. **Round 17, item 1.** The
+        line is gone, stopped or hibernated, it no longer owns what the run would
+        write, its working directory is another one, or the commit checked out there
+        moved. A change of the files there without a commit is not a reason, and the
+        run's receipt names the tree it ran. A release drops the line's entry as it
+        is made, in ``release``."""
+        line = self._state().lines.get(entry.line_id)
+        if line is None:
+            return "its line no longer exists"
+        if line.state is LineState.STOPPED:
+            return "its line was stopped"
+        if line.hibernated:
+            return "its line was hibernated"
+        refusal = self._run_refusal(entry.line_id, writes=entry.commit is None)
+        if refusal is not None:
+            return refusal
+        try:
+            workdir = os.path.realpath(self._workdir_of(entry.line_id))
+        except LineToolRefused as error:
+            return f"its working directory cannot be read, {error}"
+        if workdir != entry.workdir:
+            return f"its working directory changed from {entry.workdir} to {workdir}"
+        if entry.commit is None:
+            head = read_head_commit(Path(workdir))
+            if head is not None and COMMIT_PATTERN.fullmatch(head) is None:
+                head = None
+            if head != entry.workdir_commit:
+                return (
+                    "the commit checked out in its working directory changed from"
+                    f" {entry.workdir_commit} to {head}"
+                )
+        return None
+
+    def kick_run_queue(self) -> None:
+        """Look at the queued runs, in a task of their own, unless one look is under
+        way, none waits, or there is no event loop. **Round 17, item 1.**"""
+        if not self._state().queued_runs:
+            return
+        if self._queue_task is not None and not self._queue_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._queue_task = loop.create_task(self.advance_run_queue())
+
+    async def advance_run_queue(self) -> None:
+        """Drop each queued run that can no longer start, and begin the first that
+        nothing holds back. **Round 17, item 1.** At most one starts in a look, so
+        two lines do not both begin a heavy run in the same instant, and a start
+        that fails after the wait ended is dropped with its refusal as the reason,
+        except a refusal that the wait itself caused, which leaves it queued. Never
+        raises."""
+        try:
+            for entry in list(self._state().queued_runs.values()):
+                reason = self._queue_drop_reason(entry)
+                if reason is not None:
+                    self._drop_queued(entry, reason)
+            for entry in list(self._state().queued_runs.values()):
+                if self._run_wait_reason(entry.line_id) is not None:
+                    continue
+                await self._begin_queued(entry)
+                break
+        except Exception as error:  # noqa: BLE001 - a look that fails is tried again
+            print(f"dromond: the queue of runs waits, as {error}", file=sys.stderr)
+
+    async def _begin_queued(self, entry: RunQueued) -> None:
+        """Start ``entry``'s run and record that it left the queue."""
+        try:
+            started = await self.start_run(
+                entry.line_id,
+                entry.command,
+                "none" if entry.previous is None else entry.previous,
+                entry.commit,
+                dict(entry.arguments),
+                queued=entry.queue_id,
+            )
+        except (runs.RunRefused, ProcessRefused, EventRejected) as error:
+            if self._run_wait_reason(entry.line_id) is None:
+                self._drop_queued(entry, f"its start was refused, {error}")
+            return
+        self._log.append(
+            RunDequeued(
+                entry.queue_id,
+                QueueEnd.STARTED,
+                started.run_id,
+                "",
+                format_due(self._wall_clock()),
+            )
+        )
+        self._harness_note(
+            LineAddress(entry.line_id),
+            f"Your queued run {entry.queue_id} of {entry.command} started as run"
+            f" {started.run_id}, writing {started.output_file}. Its end is sent to"
+            " its scope's holder, and run_status shows it.",
+        )
 
     def _check_commit_start(self, scope: tuple[str, str]) -> None:
         """Refuse a commit run's start while another of ``scope``'s is in progress,
@@ -5594,7 +5994,12 @@ class Scheduler:
     async def stop_run(self, line_id: str, run_id: str) -> None:
         """Ask the supervisor of ``line_id``'s open run ``run_id`` to stop its
         command. Raises ``runs.RunRefused`` or ``runs.TableUnreadable``. A commit
-        run is stopped with reading access, as it was started."""
+        run is stopped with reading access, as it was started. **Round 17, item 1.**
+        The identifier of the line's queued run withdraws it instead."""
+        queued = self._state().queued_runs.get(run_id)
+        if queued is not None and queued.line_id == line_id:
+            self._drop_queued(queued, "you withdrew it", tell=False)
+            return
         latest = self._latest_run(line_id)
         writes = latest is None or latest.started.commit is None
         refusal = self._run_refusal(line_id, writes=writes)
@@ -5631,8 +6036,13 @@ class Scheduler:
                 f"{name}: {runparams.describe(parameters)}"
                 for name, parameters in sorted(self._run_parameters.items())
             )
+        waiting = self._queued_of(line_id)
+        queue_text = "" if waiting is None else f"\n{self._queue_line(waiting)}"
         if not found:
-            return f"no runs yet, so previous is none. Declared commands: {declared}"
+            return (
+                f"no runs yet, so previous is none. Declared commands: {declared}"
+                f"{queue_text}"
+            )
         corrected = runs.corrections(scope)
         corrected_by = {
             failed: passed for passed, ids in corrected.items() for failed in ids
@@ -5653,6 +6063,7 @@ class Scheduler:
         return (
             f"previous is {found[-1].started.run_id}. Declared commands: {declared}.\n"
             + "\n".join(lines)
+            + queue_text
         )
 
     def runs_view(self, run_id: str | None) -> list[dict[str, object]]:
@@ -5902,6 +6313,23 @@ class Scheduler:
     def _screened_output(
         self, line_id: str, finding: runs.Finding
     ) -> tuple[str, str | None]:
+        """The note and tail a run's end records, with the text that will be recorded
+        screened last. **Round 17, item 3.** The notice of what was withheld is joined
+        to the note, and a listed term can span that join while neither part holds
+        it, which round 16 left as a residual and screened only for the join with a
+        clean summary. A joined note that holds a term is replaced by
+        ``runs.NOTE_WITHHELD``, and if even that holds one, by the empty note. The
+        note is the daemon's words and the exit code, so the output cannot choose the
+        term, and no failing check is counted."""
+        note, tail = self._screened_parts(line_id, finding)
+        if not self.discloses(note):
+            return note, tail
+        replacement = runs.NOTE_WITHHELD
+        return ("" if self.discloses(replacement) else replacement), tail
+
+    def _screened_parts(
+        self, line_id: str, finding: runs.Finding
+    ) -> tuple[str, str | None]:
         """The note and tail a run's end records, with its output's summary and tail
         screened against the disclosure list first. **Round 15 review, R1, the
         operator's decision.** Either holding a term counts as a failing check of
@@ -6024,9 +6452,16 @@ class Scheduler:
                     previous,
                     commit,
                     cast("dict[str, object] | None", arguments),
+                    queue=True,
                 )
             except (runs.RunRefused, EventRejected, ProcessRefused) as error:
                 return _tool_error(str(error))
+            if isinstance(started, RunQueued):
+                return _tool_text(
+                    f"queued, not started: {self._queue_line(started)}. You are told"
+                    " when it starts or is dropped, and run_status shows its place."
+                    f" stop_run with {started.queue_id} withdraws it."
+                )
             on = "" if started.commit is None else f" on commit {started.commit}"
             return _tool_text(
                 f"started run {started.run_id} of {command}{on}, writing"
@@ -6075,7 +6510,9 @@ class Scheduler:
                     " command also takes commit, and runs on that commit in a"
                     " checkout Dromon makes, so a line that only reads may start it."
                     " A command with parameters, which run_status lists with their"
-                    " patterns, takes a value for each in arguments."
+                    " patterns, takes a value for each in arguments. A start that"
+                    " waits only for the machine status or the project's slot is"
+                    " queued, in order, and begins by itself."
                 ),
                 input_schema=START_RUN_SCHEMA,
                 handler=start,
@@ -12044,6 +12481,9 @@ class Scheduler:
         if line_id not in self._state().lines:
             raise EventRejected(f"no line {line_id}")
         self._log.append(LineReleased(line_id))
+        waiting = self._queued_of(line_id)
+        if waiting is not None:
+            self._drop_queued(waiting, "an operator released its line")
         self._autonomous.pop(line_id, None)
         self._cost.pop(line_id, None)
         self._cost_unknown.pop(line_id, None)
@@ -12141,6 +12581,7 @@ class Scheduler:
         try:
             while not stop.is_set():
                 self._work.clear()
+                self.kick_run_queue()
                 if self._work_waiting():
                     try:
                         self.step()
@@ -12173,6 +12614,8 @@ class Scheduler:
                 # Their bounded inspection remains due even with no periodic ticks.
                 if self._report_dir is not None or self._post_office:
                     timeouts.append(MAX_REST_SECONDS)
+                if self._state().queued_runs:
+                    timeouts.append(RUN_QUEUE_POLL_SECONDS)
                 # Mail already in the post office may need another tick to reach
                 # its wake cadence. Advance only while that mail can make progress.
                 for line_id in self._state().lines:

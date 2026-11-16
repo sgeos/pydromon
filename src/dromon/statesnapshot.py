@@ -54,7 +54,7 @@ from dromon.model import Event, State
 FORMAT_VERSION: Final = 1
 """The version of the file's own layout."""
 
-STATE_VERSION: Final = 6
+STATE_VERSION: Final = 7
 """Raised by hand whenever applying an event comes to mean something else for a state
 of the same shape, since the shape digest cannot see that. **Review of 49236ad, item
 3.** ``tests/test_state_version.py`` fails when the types ``codec_digest`` covers, or
@@ -66,7 +66,8 @@ a pass is kept apart from a failure, and ``run_ended`` gained ``output_tail``.
 Version 4 is round 16, item 5, where ``run_started`` gained ``tree``. Version 5 is
 round 16, item 3, merged after it, where ``run_started`` gained ``workdir_commit``.
 Version 6 adds round 16 closing diagnostics and their latest failure state,
-including a nonempty replay reason."""
+including a nonempty replay reason. Version 7 is round 17, item 1, where the events
+``run_queued`` and ``run_dequeued`` and the state's ``queued_runs`` were added."""
 
 SUFFIX: Final = ".snapshot"
 """The snapshot of ``events.sqlite`` is ``events.sqlite.snapshot``."""

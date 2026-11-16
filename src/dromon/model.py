@@ -2492,6 +2492,103 @@ class RunCleared:
         check_instant("cleared_at", self.cleared_at)
 
 
+MAX_QUEUED_RUNS: Final = 8
+"""The most runs that wait in the queue at once, and so the most lines with one.
+**Round 17, item 1.** A line has one run at a time, so a queued run is also its one, and
+the bound is the number of lines allowed to wait on the machine. Eight is the size of
+the fleets this daemon is run for. The queue never grows past it, and a start that
+would is refused with the queue's state, so no line waits unseen behind a full one."""
+
+MAX_QUEUE_REASON_BYTES: Final = 512
+
+
+class QueueEnd(StrEnum):
+    """How a queued run left the queue. ``started`` means its run began, and
+    ``dropped`` that it never will, with the reason in the event."""
+
+    STARTED = "started"
+    DROPPED = "dropped"
+
+
+@dataclass(frozen=True, slots=True)
+class RunQueued:
+    """A line's start of a declared run waited, for a reason that passes, so the
+    daemon keeps the start and begins it when nothing holds it back. **Round 17,
+    item 1.** It holds what ``start_run`` needs to begin the run later, the command,
+    the run the line had read as the latest, a commit for a commit command and the
+    values of its parameters, and what the line's working directory was when it asked.
+    ``arguments`` are the values as the line gave them, never the command as it will
+    run, which is built again at the start from the project's declaration, so a
+    command the file changed meanwhile runs as declared then.
+
+    A start is dropped, with ``run_dequeued``, when the line can no longer be the one
+    that asked, or its worktree is not the one it asked about, as ``workdir`` and
+    ``workdir_commit`` say. **Porting note.** The queue is a map from a queue
+    identifier to this record, ordered by arrival, so it is a bounded queue of plain
+    records in any language."""
+
+    queue_id: str
+    line_id: str
+    command: str
+    previous: str | None
+    commit: str | None
+    arguments: tuple[tuple[str, str], ...]
+    workdir: str
+    workdir_commit: str | None
+    queued_at: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        check_id("queue_id", self.queue_id)
+        check_id("line_id", self.line_id)
+        check_id("command", self.command)
+        check_optional_id("previous", self.previous)
+        if self.commit is not None and COMMIT_PATTERN.fullmatch(self.commit) is None:
+            raise InvalidField("commit must be null or a full hexadecimal commit")
+        if len(self.arguments) > MAX_RUN_ARGUMENTS:
+            raise InvalidField(f"at most {MAX_RUN_ARGUMENTS} arguments")
+        names: set[str] = set()
+        for name, value in self.arguments:
+            check_id("argument name", name)
+            check_text("argument value", value, MAX_RUN_ARGUMENT_BYTES)
+            if name in names:
+                raise InvalidField(f"argument {name} is given twice")
+            names.add(name)
+        if list(self.arguments) != sorted(self.arguments):
+            raise InvalidField("arguments are not sorted by name")
+        check_text("workdir", self.workdir, MAX_RUN_ARGUMENT_BYTES)
+        if self.workdir_commit is not None and (
+            COMMIT_PATTERN.fullmatch(self.workdir_commit) is None
+        ):
+            raise InvalidField("workdir_commit must be null or a full commit")
+        check_instant("queued_at", self.queued_at)
+        check_text("reason", self.reason, MAX_QUEUE_REASON_BYTES)
+
+
+@dataclass(frozen=True, slots=True)
+class RunDequeued:
+    """A queued run left the queue, because its run started, with ``run_id``, or
+    because it was dropped, with the reason the line is told. **Round 17, item 1.**
+    The event of ``started`` follows the run's own ``run_started``, so a daemon that
+    stopped between the two finds the line's latest run is not the one the queued
+    start read, and drops the start instead of beginning a second run."""
+
+    queue_id: str
+    outcome: QueueEnd
+    run_id: str | None
+    reason: str
+    at: str
+
+    def __post_init__(self) -> None:
+        check_id("queue_id", self.queue_id)
+        check_member("outcome", self.outcome, QueueEnd)
+        check_optional_id("run_id", self.run_id)
+        if (self.run_id is not None) != (self.outcome is QueueEnd.STARTED):
+            raise InvalidField("run_id is given exactly when the run started")
+        check_text("reason", self.reason, MAX_QUEUE_REASON_BYTES)
+        check_instant("at", self.at)
+
+
 type Event = (
     LineCreated
     | LineStateChanged
@@ -2552,6 +2649,8 @@ type Event = (
     | RunEnded
     | RunCleared
     | CommitRunRefused
+    | RunQueued
+    | RunDequeued
     | PeerDeclared
     | PeerRemoved
     | PeerKeyed
@@ -3051,6 +3150,9 @@ class State:
     line_costs: dict[str, LineCost] = field(default_factory=dict[str, LineCost])
     """Each line's whole cost and turns, from ``line_cost_recorded``, which no
     release resets. Bounded by the lines ever created. **Round 15, item 1.**"""
+    queued_runs: dict[str, RunQueued] = field(default_factory=dict[str, RunQueued])
+    """The runs that wait to start, by queue identifier, oldest first, which is the
+    order they start in. Bounded by ``MAX_QUEUED_RUNS``. **Round 17, item 1.**"""
 
     def holder_of(self, role_id: str) -> RoleHolder:
         """What decides ``role_id``'s terms and seats now."""
@@ -3137,6 +3239,7 @@ class State:
             dict(self.retired_lines),
             dict(self.commit_refusals),
             dict(self.line_costs),
+            dict(self.queued_runs),
         )
 
     def line_mail(self, line_id: str) -> LineMail:
@@ -3382,6 +3485,23 @@ class State:
                     raise EventRejected(
                         f"line {event.line_id}'s refused start belongs to its own scope"
                     )
+            case RunQueued():
+                self._live_line(event.line_id)
+                if event.queue_id in self.queued_runs or event.queue_id in self.runs:
+                    raise EventRejected(f"{event.queue_id} is in use")
+                if any(q.line_id == event.line_id for q in self.queued_runs.values()):
+                    raise EventRejected(
+                        f"line {event.line_id} has a queued run already"
+                    )
+                if len(self.queued_runs) >= MAX_QUEUED_RUNS:
+                    raise EventRejected(
+                        f"the queue holds {MAX_QUEUED_RUNS} runs, which is its limit"
+                    )
+            case RunDequeued():
+                if event.queue_id not in self.queued_runs:
+                    raise EventRejected(f"no queued run {event.queue_id}")
+                if event.run_id is not None and event.run_id not in self.runs:
+                    raise EventRejected(f"no run {event.run_id}")
             case PeerDeclared():
                 peer = self.peers.get(event.peer_id)
                 if (
@@ -3796,6 +3916,10 @@ class State:
             case CommitRunRefused():
                 scope = run_scope(event.line_id, event.role_id)
                 self.commit_refusals[scope] = event
+            case RunQueued():
+                self.queued_runs[event.queue_id] = event
+            case RunDequeued():
+                del self.queued_runs[event.queue_id]
             case PeerDeclared():
                 peer = self.peers.get(event.peer_id)
                 # A declared table replaces an open peer of its name whole, so its

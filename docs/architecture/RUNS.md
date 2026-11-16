@@ -445,7 +445,19 @@ deferral is. The refusal of a run, the note to the operator, the note to a line 
 warning a turn proceeds with each say that the monitor looks stopped, since when, and how
 the gates are restored. A stale file is dated by its last sample. A missing or unreadable
 one is dated by the daemon's first sight of it in the spell, which is all the daemon can
-know and which a restart resets. The operator restores the gates by restarting the
+know and which a restart resets. **Round 17, item 4.** The sentence now says "and
+possibly earlier, since the daemon cannot see before it started", wherever the dating is
+shown, so no line takes the daemon's first sight for the moment the monitor stopped.
+Carrying the start across a restart was weighed and left, since it would need an event
+and a replay rule for a date that the file replaces once the monitor writes again.
+**Round 17, item 2. The age of a reading.** The daemon keeps a read for 15 seconds, and
+a note reaches a line later still, so an age told as of the read said "10 seconds ago" of
+a moment no line could place. The age is now counted from the sample's own time to the
+moment the status is used, and each statement a line sees, the refusal of a run, the
+notes of a deferred turn and of a turn that proceeds, and `line_status`, names the sample
+as "sampled at" its time. `line_status` gives it as `sampled_at`, null for a file with no
+sample. A line compares that time with its own clock to learn how old the reading is by
+the time it reads. The operator restores the gates by restarting the
 monitor, or by removing `daemon.machine_status` from the project file and reloading, which
 reads nothing and defers nothing. `line_status` gives the same sentence as `monitor`. The file is the monitor's own and
 its reasons are untrusted text. Each is cut to a printable line of at most 160
@@ -604,7 +616,7 @@ reads every end without a tail and refuses the log once a failed run's tail is
 recorded. **Round 15 review.** `disclosure_checked` gained `checked_bytes` the same
 way, so a daemon from before it refuses the log once a `check_disclosure` call is
 recorded. **Round 16, item 5.** `run_started` gained `tree` the same way, so a daemon
-from before it refuses the log once a run records its tree.
+from before it refuses the log once a run records its tree. **Round 17, item 1.** `run_queued` and `run_dequeued` are new kinds, so a daemon from before them refuses the log once a start is queued.
 
 ## Descendants in a session of their own
 
@@ -1101,6 +1113,77 @@ that it is now tested and written down. **What is not fixed.**
   the end then reaches the holder as a note without a wake to cancel.
 - A held line's turn starts only after an operator releases it, so the wait ends in a
   turn only when the operator chooses.
+
+## Queued runs
+
+**Round 17, item 1, the request of operations and of this line in round 16.** A start
+that waits only for the machine status or for the project's slot was refused, and the
+line retried by hand or passed the slot by mail. It is now kept, in a bounded queue,
+and begins by itself.
+
+**What waits.** `start_run` from a line's tool is made with the queue. Every refusal
+that is not a wait stands, and is made before the wait is looked at, so a command the
+project does not declare, a `previous` that is not the latest run, a line that does not
+own its role, a parameter that fails its pattern and a line that already has a run
+open are refused as before. Two things are waits, and both pass.
+
+- The machine status defers runs, as [the machine's status](#the-machines-status) says.
+  The refusal that told the operator once is not made, since a queued run says why it
+  waits wherever it is shown.
+- The project's slot. `runs.slot_lease` names one lease the project declares. While
+  another line holds it, a start waits. The line that holds it is never held back by
+  it. **Inference.** The operator named a gate slot that lines passed by mail, and the
+  code had none. A declared lease is what the code has that holds one resource for one
+  line, so the slot is one. Nothing takes the lease for a queued run, so a project that
+  wants the queue to be the only way into the gate leaves the lease to its operator.
+  Without the key nothing but the machine waits. A start without the queue is refused
+  while the slot is held, naming the queue.
+
+**The queue.** It is the map `queued_runs` of the state, from a queue identifier to a
+`run_queued` event, oldest first, with at most `MAX_QUEUED_RUNS`, 8. A line has one run
+at a time, so it has at most one entry, and a second start while it waits is refused
+with its place. A full queue refuses with its size. The bound exists so that the daemon
+carries no work it has not agreed to, and so that no line waits unseen behind a long
+line of others. An entry holds the command, the run the line read as latest, a commit
+for a commit command, the parameter values as given, the real path of the working
+directory and the commit checked out there. It never holds the command as it will run,
+which is built again from the declaration when the run begins.
+
+**Seeing it.** The tool's answer says it queued, with the entry's place and what it
+waits for. `run_status` ends with the same sentence while the entry waits, so a line
+reads its position after a turn or a restart, and `previous` is unchanged until the run
+exists. `stop_run` with the queue identifier withdraws the entry, recorded as dropped
+and with no note, since the line asked.
+
+**Beginning it.** The daemon looks at the queue at each pass of its loop and at least
+every `RUN_QUEUE_POLL_SECONDS`, 5, while any entry waits. A look first drops each entry
+that cannot start, then begins the first in order that nothing holds back, **at most
+one in a look**, so two lines do not begin heavy runs in the same instant and the
+machine's status is read again before the next. The run is the one `start_run` would
+have made at that moment, with every check made again. The line is sent a note, which
+wakes it, saying the queued run started as the run it names. The run's end is sent as
+for any run, to the scope's holder. If the start is refused for a reason other than a
+wait, the entry is dropped with the refusal as its reason. If a wait returned between
+the look and the start, it stays queued. Because `run_dequeued` follows `run_started`, a
+daemon that stopped between them finds on restart that the line's latest run is not the
+`previous` it queued, and drops the entry instead of beginning a second run.
+
+**Dropping it.** Each drop is recorded as `run_dequeued` with its reason, and the line
+is sent a note with the reason unless it withdrew the entry. The reasons are that the
+line no longer exists, is stopped or is hibernated, that an operator released it, which
+is done as the release is made, that it no longer owns what the run would write, that
+its working directory is another path than the one asked about, and that the commit
+checked out there has moved. **Residual.** Edits without a commit are not a change that
+drops it. A line that edits while its run waits has the edited tree run, and the
+receipt names the tree that ran, as round 16 made it. A held line keeps its entry,
+which may start while it is held, since a hold stops turns and not runs.
+
+**Failure modes.** The event log refuses the new events in a daemon from before them,
+so rolling back after a queue entry is recorded needs the log's floor, which
+[`EVENT_LOG.md`](../protocol/EVENT_LOG.md) names. A daemon restart keeps the queue and
+begins it again, from the state alone. A queued start whose wait never ends stays in the
+queue until the line is stopped, hibernated, released or withdraws it. The slot's
+holder may keep the lease for its whole time to live, so a run may wait that long.
 
 ## Not implemented
 

@@ -117,7 +117,7 @@ LIMIT_KEYS: Final = frozenset(
 WAKE_KEYS: Final = frozenset({"every_ticks"})
 LEASE_KEYS: Final = frozenset({"names", "ttl_seconds"})
 RUN_KEYS: Final = frozenset(
-    {"commands", "commit_commands", "commit_refs", "parameters"}
+    {"commands", "commit_commands", "commit_refs", "parameters", "slot_lease"}
 )
 REF_KEYS: Final = frozenset({"patterns"})
 PARAMETER_KEYS: Final = frozenset({"pattern", "description"})
@@ -135,6 +135,8 @@ class RunTables:
     )
     """**Task of 2026-11-05, item 3.** Each command's parameters, by command and
     name, for the commands that declare any."""
+    slot_lease: str | None = None
+    """**Round 17, item 1.** The lease a run waits behind, or ``None``."""
 
 
 MAX_RUN_COMMANDS: Final = 64
@@ -338,6 +340,9 @@ class ProjectConfig:
     )
     """**Task of 2026-11-05, item 3.** The parameters a line supplies, by command
     and name, for the commands that declare any."""
+    run_slot_lease: str | None = None
+    """**Round 17, item 1.** The declared lease that holds a line's run in the queue
+    while another line has it, the project's gate slot, or ``None`` for none."""
     read_only_paths: tuple[str, ...] = ()
     """Project-relative-path entries denied write access under every line's workdir."""
     lines: dict[str, LineDefinition] = field(default_factory=dict[str, LineDefinition])
@@ -509,6 +514,14 @@ class _Reader:
                 raise self.fail(error.key, str(error)) from error
         lease_names, lease_ttl = self.leases(top.get("leases", {}))
         run_tables = self.runs(top.get("runs", {}))
+        if (
+            run_tables.slot_lease is not None
+            and run_tables.slot_lease not in lease_names
+        ):
+            raise self.fail(
+                "runs.slot_lease",
+                f"names {run_tables.slot_lease!r}, which leases.names does not declare",
+            )
         read_only_paths = self.read_only_paths(top.get("read_only_paths", []))
         profiles = self.profiles(top.get("profiles", {}))
         lines_table = top.get("lines", {})
@@ -548,6 +561,7 @@ class _Reader:
             run_commit_commands=run_tables.commit_commands,
             run_commit_refs=run_tables.commit_refs,
             run_parameters=run_tables.parameters,
+            run_slot_lease=run_tables.slot_lease,
             read_only_paths=read_only_paths,
             lines=lines,
             roles=roles,
@@ -659,7 +673,12 @@ class _Reader:
         parameters = self.run_parameters(
             document.get("parameters", {}), {**commands, **commit_commands}
         )
-        return RunTables(commands, commit_commands, found, parameters)
+        slot = document.get("slot_lease")
+        if slot is not None and (
+            not isinstance(slot, str) or ID_PATTERN.fullmatch(slot) is None
+        ):
+            raise self.fail("runs.slot_lease", "must be a lease name")
+        return RunTables(commands, commit_commands, found, parameters, slot)
 
     def run_parameters(
         self, value: object, argvs: Mapping[str, tuple[str, ...]]

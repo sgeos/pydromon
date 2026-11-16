@@ -87,6 +87,7 @@ from dromon.agents import (
     token_digest,
 )
 from dromon.disclosure import DisclosureError, load_terms
+from dromon.configwarnings import config_warnings
 from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
 from dromon.engine import EngineRefused, check_plugin, resolve_plugin
 from dromon.teacher import Teacher, TeacherError
@@ -1796,6 +1797,7 @@ class Daemon:
             config.run_commit_commands,
             config.run_commit_refs,
             config.run_parameters,
+            config.run_slot_lease,
         )
         self.project = config
         self.project_file_present = present
@@ -1809,6 +1811,7 @@ class Daemon:
             "lines": sorted(config.lines),
             "roles": sorted(config.roles),
             "role_notices": list(notices),
+            "warnings": config_warnings(config, self.paths.root),
         }
 
     def _agent_add(self, args: dict[str, object]) -> dict[str, object]:
@@ -4187,6 +4190,7 @@ def run(
                 config.run_commit_commands,
                 config.run_commit_refs,
                 config.run_parameters,
+                config.run_slot_lease,
             )
             check_lines_sandboxed(config, log, scheduler)
             check_roles(scheduler, log, config)
@@ -4222,6 +4226,8 @@ def run(
                 daemon.apply_project_values()
                 for notice in apply_roles(scheduler, log, config):
                     print(f"dromond: {notice}", file=sys.stderr)
+                for warning in config_warnings(config, paths.root):
+                    print(f"dromond: warning: {warning}", file=sys.stderr)
                 # Checked here as well as in ``serve``, so a refused relay stops the
                 # start before any socket is made.
                 daemon.relay_routes(config)

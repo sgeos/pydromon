@@ -289,6 +289,23 @@ def test_reload_applies_lines_and_limits_from_the_file(paths: ProjectPaths) -> N
         )
 
 
+def test_a_reload_returns_the_warnings_dromon_config_gives(paths: ProjectPaths) -> None:
+    """Round 17, items 6 and 7. The file loads, so nothing is refused, and the answer
+    says what a turn would otherwise show, as ``dromon config`` does."""
+    with attached(paths) as client:
+        write_file(
+            paths,
+            '[lines.beta]\nmodel = "claude-haiku-5-5"\nworkdir_access = "read"\n'
+            'builtin_tools = ["Read"]\n[lines.beta.mcp_servers.game]\n'
+            'type = "stdio"\ncommand = "/bin/true"\n',
+        )
+        result = client.ok("reload_project")
+        (warning,) = cast(list[str], result["warnings"])
+        assert "line beta has workdir_access read" in warning
+        write_file(paths, '[lines.beta]\nmodel = "claude-haiku-5-5"\n')
+        assert client.ok("reload_project")["warnings"] == []
+
+
 def test_a_reload_that_needs_a_restart_or_is_invalid_changes_nothing(
     paths: ProjectPaths,
 ) -> None:

@@ -61,6 +61,12 @@ PINS: tuple[tuple[int, str, str], ...] = (
         "7b73894d5fa3093c776fe2e0602549b2eb79e9b5997f52077c1fea6844347ebb",
         "28b583dc352b6c0554c5624dd1ffdb5f44279201d275d58cb65d7dc15a2505fe",
     ),
+    # Round 17, item 1, run_queued and run_dequeued and the state's queued runs.
+    (
+        7,
+        "8ffaa8a087b54f40b5eaed495eaa3111dbbd7128e1b3dff93b316163a727a86c",
+        "80da6db4a7aa60c897cebd5126c8ca0249d2abbef8c24fc7bebcea7d4b3eec6f",
+    ),
 )
 """Each ``STATE_VERSION`` with its ``codec_digest`` and its replay digest, oldest
 first, appended to and never edited."""
