@@ -61,6 +61,12 @@ PINS: tuple[tuple[int, str, str], ...] = (
         "7b73894d5fa3093c776fe2e0602549b2eb79e9b5997f52077c1fea6844347ebb",
         "28b583dc352b6c0554c5624dd1ffdb5f44279201d275d58cb65d7dc15a2505fe",
     ),
+    # Round 17 partial cost subtotals preserve uncertainty in the event log.
+    (
+        7,
+        "8a27e515009147d90b06d740bb0fabcad862db2af374944bf6b4c60c5014a595",
+        "4517d8002ab6260bb90e54fce846681267427e8902fb58363876f9d906e61015",
+    ),
 )
 """Each ``STATE_VERSION`` with its ``codec_digest`` and its replay digest, oldest
 first, appended to and never edited."""

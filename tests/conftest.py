@@ -242,7 +242,7 @@ SCENARIO: tuple[Event, ...] = (
     ),
     RestartNoted("beta", "n2", "Your last turn ended at a safe point for a restart."),
     LineCostMarked("beta", "session-b", 1_250_000),
-    LineCostRecorded("beta", 1_250_000),
+    LineCostRecorded("beta", 1_250_000, partial=True),
     LineCostRecorded("beta", 40_000, estimated=True),
     LineCostRecorded("beta", None, between=True),
     ProcessesLeft("beta", "stopped", (4242, 4243), ("sleep 600", "make watch"), 1),

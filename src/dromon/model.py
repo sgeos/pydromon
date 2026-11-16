@@ -692,13 +692,16 @@ class LineCostRecorded:
     counts and its price table, as ``dromon.prices`` gives it, and ``None`` when the
     engine reported the cost or none is known. ``between`` is ``True`` for a spend
     outside a turn of Dromon's, which is not counted as a turn, and ``None`` for a
-    turn. ``False`` is refused for both, so each fact has one encoding and the wire
-    omits it when null."""
+    turn. ``partial`` is ``True`` when a known subtotal omits unpriced calls.
+    ``False`` is refused for these flags, so each fact has one encoding and the
+    wire omits it when null."""
 
     line_id: str
     cost_micro_usd: int | None
     estimated: bool | None = None
     between: bool | None = None
+    partial: bool | None = None
+    """True when the numeric cost is only the known subtotal. Null otherwise."""
 
     def __post_init__(self) -> None:
         check_id("line_id", self.line_id)
@@ -714,6 +717,10 @@ class LineCostRecorded:
             raise InvalidField("estimated must be true or null")
         if self.between is not None and self.between is not True:
             raise InvalidField("between must be true or null")
+        if self.partial is not None and self.partial is not True:
+            raise InvalidField("partial must be true or null")
+        if self.partial is True and cost is None:
+            raise InvalidField("a partial cost needs a cost")
         if self.estimated is True and cost is None:
             raise InvalidField("an estimated cost needs a cost")
 
@@ -4151,7 +4158,7 @@ class State:
             total.between + (1 if event.between else 0),
             min(total.reported_micro_usd + reported, MAX_COST_MICRO_USD),
             min(total.estimated_micro_usd + estimated, MAX_COST_MICRO_USD),
-            total.unknown + (1 if known is None else 0),
+            total.unknown + (1 if known is None or event.partial else 0),
         )
 
     def _total_correlated(self, event: TurnCorrelated) -> None:

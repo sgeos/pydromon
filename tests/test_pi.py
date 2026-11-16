@@ -33,6 +33,9 @@ from dromon.driver import (
     driver_resource,
 )
 from dromon.engine import EngineRefused, TurnReport
+from dromon.eventlog import EventLog
+from dromon.peering import TurnCause
+from dromon.scheduler import Scheduler
 from dromon.priority import SteeredDriver
 from dromon.grok import bridge_command
 from dromon.jsonlines import Connection, json_lines_factory
@@ -1109,6 +1112,7 @@ def test_unpriced_pi_usage_is_unknown_instead_of_free(
     server = FakePi([TURN_START, assistant("done", spent=spent)])
     report = run(line(server, home))
     assert report.cost_estimate_usd is None
+    assert report.cost_partial
     assert (
         report.usage_note is not None and "Cost total is partial" in report.usage_note
     )
@@ -1122,6 +1126,22 @@ def test_mixed_pi_cost_keeps_the_known_part(home: Path, unpriced_first: bool) ->
     report = run(line(FakePi([TURN_START, *calls]), home))
     assert report.cost_estimate_usd == pytest.approx(0.2)
     assert report.usage_note is not None and "partial" in report.usage_note
+    assert report.cost_partial
+    with EventLog(home / "cost.sqlite") as log:
+        scheduler = Scheduler(log, engine_factory(str(home)), tick_seconds=0)
+        scheduler.create_line("pi", "pi:openai/gpt-6-sol", Strategy.SUBSCRIPTION)
+        scheduler._apply_limits(  # pyright: ignore[reportPrivateUsage]
+            "pi", TurnCause.OPERATOR, False, report
+        )
+        status = scheduler.cost_status("pi")
+        assert status["estimate"] == "0.2000"
+        assert status["basis"] == "lower_bound"
+        assert status["unknown_turns"] == 1
+        assert scheduler.whole_cost("pi")["unknown_cost"] == 1
+        assert scheduler.whole_cost("pi")["turns"] == 1
+    with EventLog(home / "cost.sqlite") as log:
+        assert log.state.line_costs["pi"].unknown == 1
+        assert log.state.line_costs["pi"].reported_micro_usd == 200_000
 
 
 @pytest.mark.parametrize("known", [False, True])
@@ -1143,7 +1163,19 @@ def test_interrupted_unpriced_pi_keeps_known_cost(home: Path, known: bool) -> No
             await task
 
     asyncio.run(go())
-    assert target.take_interrupted_cost() == (pytest.approx(0.2) if known else None)
+    with EventLog(home / "interrupted.sqlite") as log:
+        scheduler = Scheduler(log, engine_factory(str(home)), tick_seconds=0)
+        scheduler.create_line("pi", "pi:openai/gpt-6-sol", Strategy.SUBSCRIPTION)
+        scheduler._count_interrupted("pi", target)  # pyright: ignore[reportPrivateUsage]
+        status = scheduler.cost_status("pi")
+        assert status["estimate"] == ("0.2000" if known else "unknown")
+        assert status["basis"] == ("lower_bound" if known else "unknown")
+        assert status["unknown_turns"] == 1
+        assert scheduler.whole_cost("pi")["unknown_cost"] == 1
+        assert scheduler.whole_cost("pi")["between_turns"] == 1
+        scheduler._count_interrupted("pi", target)  # pyright: ignore[reportPrivateUsage]
+        assert scheduler.whole_cost("pi")["between_turns"] == 1
+    assert target.take_interrupted_partial_cost() == (None, False)
     assert target.take_interrupted_cost() is None
 
 
@@ -1166,5 +1198,6 @@ def test_priced_google_argon_turn_reports_catalogue_cost(home: Path) -> None:
     target.driver = Driver.for_model("pi:google/gemini-4-argon", Strategy.API)
     report = run(target)
     assert report.credential is Credential.API
+    assert not report.cost_partial
     assert report.cost_estimate_usd == pytest.approx(expected)
     assert report.usage_note == pi.PI_USAGE_NOTE

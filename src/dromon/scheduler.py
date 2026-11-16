@@ -742,10 +742,10 @@ UNKNOWN: Final = "unknown"
 """What a status entry says where a fact is not known, in place of ``None``."""
 UNKNOWN_TURN_COST_USD: Final = 0.0
 UNKNOWN_COST_RULE: Final = (
-    "A turn that reported no cost, or ended without a report, is counted apart in"
-    " unknown_turns and adds nothing to the estimate, so it counts as 0 toward the"
-    " limit. The limit holds the line only on the costs reported, so a line whose"
-    " turns report none is not held by it."
+    "A turn with missing or partial cost is counted apart in unknown_turns."
+    " Its known subtotal counts toward the estimate and limit. Its unreported"
+    " remainder counts as 0 toward the limit, so the limit cannot bound"
+    " unreported spending."
 )
 COST_UNREPORTED_ENGINES: Final = frozenset(
     {codex.ENGINE_NAME, grok.ENGINE_NAME, cursor.ENGINE_NAME}
@@ -1745,6 +1745,13 @@ class InterruptedCostEngine(Protocol):
     result later, which ``spent_between`` counts."""
 
     def take_interrupted_cost(self) -> float | None: ...
+
+
+@runtime_checkable
+class PartialInterruptedCostEngine(Protocol):
+    """An engine that consumes an interrupted subtotal and its uncertainty together."""
+
+    def take_interrupted_partial_cost(self) -> tuple[float | None, bool]: ...
 
 
 @runtime_checkable
@@ -2946,8 +2953,8 @@ class Scheduler:
         """Turns each line took in a row without mail from an operator."""
         self._cost: dict[str, float] = {}
         self._cost_unknown: dict[str, int] = {}
-        """How many turns since each line's release reported no cost, so an unknown
-        cost is never shown as zero. Row 8 of the T3 Code review."""
+        """How many turns since each line's release reported missing or partial cost,
+        so unknown spending is never shown as zero. Row 8 of the T3 Code review."""
         self._cost_estimated: dict[str, int] = {}
         """How many turns since each line's release had a cost Dromon estimated
         from tokens. Round 15, item 1."""
@@ -6129,6 +6136,7 @@ class Scheduler:
             f"${cost:.2f}"
             if not unknown
             else f"${cost:.2f} and {unknown} turns of unknown cost, counted as $0.00"
+            " for their missing remainder, including partial costs"
         )
         if self._estimates_cost(line_id):
             # Round 15, item 1. Every estimate from tokens says that it is one.
@@ -6528,6 +6536,8 @@ class Scheduler:
         kind: str,
         cost: float | None,
         usage: Mapping[str, int] | None,
+        *,
+        partial: bool = False,
     ) -> None:
         """Record the cost of a turn outside Dromon's own, as its own entry in
         ``recent_turns``, and count it toward the line's budget, holding the line
@@ -6536,7 +6546,7 @@ class Scheduler:
             return
         costs = self._turn_costs.setdefault(line_id, deque(maxlen=RECENT_TURN_COSTS))
         costs.append(_between_entry(kind, cost, usage))
-        if not self._count_cost(line_id, cost, usage, between=True):
+        if not self._count_cost(line_id, cost, usage, between=True, partial=partial):
             return
         limits = self.limits_for(line_id)
         total = self._cost[line_id]
@@ -6556,6 +6566,7 @@ class Scheduler:
         usage: Mapping[str, int] | None,
         *,
         between: bool,
+        partial: bool = False,
     ) -> bool:
         """Count one turn's or one spend's cost toward the line's window since its
         release, and record it in ``line_cost_recorded`` for the line's whole cost,
@@ -6575,12 +6586,19 @@ class Scheduler:
                 micro = min(found, MAX_COST_MICRO_USD)
                 estimated = True
         self._log.append(
-            LineCostRecorded(line_id, micro, estimated, True if between else None)
+            LineCostRecorded(
+                line_id,
+                micro,
+                estimated,
+                True if between else None,
+                True if partial and micro is not None else None,
+            )
         )
-        if micro is None:
-            # A turn that reported no cost, or ended without a report, may still
-            # have cost something, so it is counted apart rather than as zero.
+        if micro is None or partial:
+            # Missing cost may remain beyond a known subtotal, so the turn is
+            # counted apart without discarding the known amount.
             self._cost_unknown[line_id] = self._cost_unknown.get(line_id, 0) + 1
+        if micro is None:
             return False
         added = reported if reported is not None else micro / 1_000_000
         self._cost[line_id] = self._cost.get(line_id, 0.0) + added
@@ -7285,7 +7303,8 @@ class Scheduler:
             if enforced and not unknown
             else UNREPORTED_ENGINE_NOTE
             if not enforced
-            else f"{unknown} turns since the last release reported no cost, so"
+            else f"{unknown} turns since the last release reported no cost or only"
+            " partial cost, so"
             " the budget holds the line only on what the others reported"
         )
         if pi_cost:
@@ -12089,6 +12108,7 @@ class Scheduler:
             None if report is None else report.cost_estimate_usd,
             None if report is None else report.usage,
             between=False,
+            partial=report is not None and report.cost_partial,
         )
         cost = self._cost.get(line_id, 0.0)
         limits = self.limits_for(line_id)
@@ -13399,19 +13419,23 @@ class Scheduler:
     def _count_interrupted(self, line_id: str, engine: LineEngine | None) -> None:
         """Count the cost a cancelled turn's engine measured before it ended toward
         the line's budget, as a turn outside Dromon's own. **Review N8.** An engine
-        that measured none counts nothing, and a failure to ask is reported and
-        counts nothing."""
+        that measured none counts nothing unless it reports unpriced usage, which
+        counts once as unknown. A failure to ask is reported and counts nothing."""
         if not isinstance(engine, InterruptedCostEngine):
             return
         try:
-            cost = engine.take_interrupted_cost()
+            partial = False
+            if isinstance(engine, PartialInterruptedCostEngine):
+                cost, partial = engine.take_interrupted_partial_cost()
+            else:
+                cost = engine.take_interrupted_cost()
         except Exception as error:  # noqa: BLE001
             print(
                 f"dromond: an interrupted turn's cost failed: {error}", file=sys.stderr
             )
             return
-        if cost is not None:
-            self.spent_between(line_id, INTERRUPTED_KIND, cost, None)
+        if cost is not None or partial:
+            self.spent_between(line_id, INTERRUPTED_KIND, cost, None, partial=partial)
 
     def _start_token(self, line_id: str, engine: LineEngine) -> None:
         """Give a turn its line token. A turn on an engine process that outlived the

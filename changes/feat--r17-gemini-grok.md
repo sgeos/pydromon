@@ -9,3 +9,6 @@ Type: Added
 - Preserve the known part of mixed Pi costs and interrupted turns, label partial
   totals, mark the Pi dollar limit unable to bound total spend, test priced Argon
   usage and list the Gemini bindings in the project configuration reference.
+
+- Retain Pi partial cost uncertainty in scheduler aggregates and event log replay,
+  including interrupted turns.

@@ -258,7 +258,10 @@ cache-read dollars per million tokens, with zero cache-write price.
 Dromon retains the known cost when Pi omits another call's cost or reports zero for
 nonzero usage. The report labels the total as partial and preserves the token counts.
 A turn with no priced call reports unknown cost. Interrupted turns retain the known
-part too. Pi status always marks `limit_enforced` false because the dollar limit
+part too. An explicit partial marker reaches scheduler accounting and the persisted
+cost record. The aggregate basis is a lower bound when a subtotal is known, and
+the unknown counts include the missing remainder once per turn or interrupted spend.
+Pi status always marks `limit_enforced` false because the dollar limit
 cannot bound unreported spend. Known costs still count toward the limit. This is a
 conservative engine-wide status policy, including priced models, because a future
 call may omit its cost. An operator must supply a separate billing bound rather
