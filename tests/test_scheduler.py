@@ -728,11 +728,14 @@ def test_an_engine_failure_holds_the_line_and_asks_an_operator(
     assert line.state is LineState.IDLE
     assert len(target.engines["alpha"].prompts) == 1
     err = capsys.readouterr().err
-    assert "turn failed: the engine broke" in err
+    assert "turn failed" in err
+    assert "the engine broke" not in err
     (question_id,) = questions_for(target)
     assert line.held_by == question_id
     question = target.log.state.messages[question_id]
-    assert "failed: the engine broke" in question.body
+    assert "failed" in question.body
+    assert "the engine broke" not in question.body
+    assert line.last_closing_reason == "the engine broke"
     target.engines["alpha"].fail = False
     run(target, send(target, "alpha", "again"))
     assert len(target.engines["alpha"].prompts) == 1
@@ -1642,14 +1645,15 @@ def test_each_turn_is_bracketed_in_the_line_activity(make_world: MakeWorld) -> N
     assert recorded[1][1] == "success"
 
 
-def test_a_failed_turn_says_why_in_the_activity(make_world: MakeWorld) -> None:
+def test_a_failed_turn_keeps_diagnostic_in_status(make_world: MakeWorld) -> None:
     target = make_world({"alpha": [[]]})
     target.engine("alpha").fail = True
     run(target, send(target, "alpha", "hello"))
     assert activity(target, "alpha")[-1] == (
         ActivityKind.TURN_ENDED,
-        "failed: the engine broke",
+        "failed",
     )
+    assert target.log.state.lines["alpha"].last_closing_reason == "the engine broke"
 
 
 def test_an_operator_interrupts_a_turn_in_flight(make_world: MakeWorld) -> None:

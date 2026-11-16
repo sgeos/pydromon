@@ -321,6 +321,41 @@ bounded to 8,192 UTF-8 bytes. If a response exceeds that bound, it returns a sma
 object with `status_truncated`. A truncated list response also sets `lists_truncated`
 and suggests `detail: true, lists: false` to omit the lists.
 
+**Round 16, item 3. The machine's status.** Where the project names a status file with
+`daemon.machine_status`, `line_status` in detail gives `machine_status`, with `configured`,
+`level`, `acted_on_as`, `age_seconds`, `reasons`, `problem`, `monitor`, `defers_runs` and
+`defers_turns`, never the file's path. `reasons` and `problem` are screened against the
+disclosure list one by one. `monitor` is a sentence saying that the monitor looks stopped, since
+when and how the operator restores the gates, or `null` while the file is fresh. `level` is `ok`, `elevated` or `critical`, or
+`stale`, `missing` or `unreadable`, which are acted on as `elevated`. A line is affected in
+three ways, as [`RUNS.md`](../architecture/RUNS.md) sets out. Its `start_run` is refused
+as deferred, saying nothing was started and that it should wait with `wake_after`, when the
+status is `elevated` for memory, swap, load or an unknown reason, `critical`, or not to be
+relied on, and not when only free disk space raised it, since a gate uses processor and
+memory and not disk. A turn proceeds at `elevated` with a note leading its prompt, which
+says the machine is shared and asks the line to start nothing heavy, such as a full gate,
+and to say so in its report if it waits. A turn is not started at `critical`, and the
+line's mail waits. The line is told once by a note from the harness and the operator is
+told once, and the line's next prompt says how long its turn waited. A running turn and a
+running run are never stopped by the status. The file is read on a worker thread that the
+loop waits for at most half a second, so a file on a mount that hangs gives `unreadable`,
+with `problem` saying that reading it is taking too long, and never holds the loop.
+
+**Round 16, the status file is guarded, and its stated limits.** No line's sandbox or
+built-in file tools may write the status file, as [`RUNS.md`](../architecture/RUNS.md)
+sets out. Three limits are stated and not built around, since a line without a sandbox can
+already write whatever the operator can. First, with a line's sandbox off, nothing stops
+its shell from writing the file, and only the built-in file tools are denied. Second, the
+status file's directory is not denied when it is, holds or lies in the line's working
+directory, and the sandbox that would confine the line to its working directory is the
+only thing that then keeps it from writing an ancestor, so with the sandbox off the
+ancestor is writable too. Third, a Codex line has the guard as `read` entries of the
+profile Dromon writes, for each path that exists when the profile is made. **Fact, by
+reading and by a test.** The adapter writes those entries. **Not verified.** That Codex
+enforces a `read` entry for a file, which no test of this project can check, and a status
+file the monitor has not yet written is left out, since it does not exist. Another engine
+takes no sandbox or settings and has no guard.
+
 **Round 14, items 3 and 4. Unknown is a named entry, never null.** The compact answer
 and the detailed one also give three entries, each of which says `unknown` where a
 fact is unknown, so no reader mistakes a missing value for a fact. `provider_budget` is

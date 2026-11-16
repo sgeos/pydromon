@@ -98,6 +98,35 @@ LEAKING = python_command(
 never spells out, so only the output could carry it into the log."""
 
 
+def pytest_output(before: list[str], skip: str, after: int) -> tuple[str, ...]:
+    """A command printing ``before`` lines, pytest's short summary mark, one skip
+    line, ``after`` lines of filler and pytest's final line, and exiting 1. The skip
+    line falls outside the last 20 lines, the tail, when ``after`` is 20 or more. The
+    text ``@T@`` is printed as the listed term, which the command never spells out."""
+    lines = [
+        *before,
+        "=== short test summary info ===",
+        f"SKIPPED [1] tests/test_a.py:1: {skip}",
+        *[f"filler {number}" for number in range(after)],
+        "=== 1 failed, 5 passed, 1 skipped in 1.0s ===",
+    ]
+    return python_command(
+        "import sys\nfor line in "
+        + repr(lines)
+        + ":\n    print(line.replace('@T@', 'code' + 'name'))\nsys.exit(1)"
+    )
+
+
+TAIL_ONLY = pytest_output(["x/@T@/f.py:3: in test"], "plain", 0)
+"""A traceback line holding the listed term, in the last lines, and a clean summary."""
+
+SUMMARY_ONLY = pytest_output([], "a @T@ here", 25)
+"""A skip reason holding the term, which falls outside the last 20 lines."""
+
+BOTH = pytest_output([], "a @T@ here", 0)
+"""The term in a skip reason that the last lines also hold."""
+
+
 @pytest.fixture
 def project(tmp_path: Path) -> Generator[Path]:
     (tmp_path / "reports").mkdir()
@@ -120,6 +149,9 @@ def scheduler_on(log: EventLog, root: Path) -> Scheduler:
             "gate": python_command("print('gate passed')"),
             "failing": FAILING,
             "leaking": LEAKING,
+            "tail-only": TAIL_ONLY,
+            "summary-only": SUMMARY_ONLY,
+            "both": BOTH,
             "wait": python_command("import time; time.sleep(60)"),
         }
     )
@@ -247,15 +279,44 @@ def test_a_tail_holding_a_listed_term_is_withheld_and_counted(project: Path) -> 
         listed(scheduler, project)
         ended = end_of(scheduler, log, "leaking", "none")
         assert ended.exit_code == 1 and ended.output_tail is None
-        assert ended.note.endswith(runs.OUTPUT_WITHHELD)
+        assert ended.note.endswith(runs.TAIL_WITHHELD)
         assert len(log.state.disclosure_checks["alpha"]) == 1
         (note,) = harness_notes(log, "alpha")
-        assert runs.OUTPUT_WITHHELD in note and runs.TAIL_LABEL not in note
+        assert runs.TAIL_WITHHELD in note and runs.TAIL_LABEL not in note
         assert "codename" not in scheduler.run_status("alpha").casefold()
     encoded = [encode(entry.event) for entry in read_entries(project / "events.sqlite")]
     assert encoded and not any("codename" in line.casefold() for line in encoded)
     # The output file itself is unchanged, since only the record is screened.
     assert "codename" in (project / ended_output(project)).read_text()
+
+
+def test_only_the_part_holding_a_term_is_withheld(project: Path) -> None:
+    """Round 16, item 2. A failed run's tracebacks name paths under a user directory,
+    and a listed term in one withheld the clean summary with the tail. Each part is
+    screened on its own, and each match counts as one failing check."""
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        listed(scheduler, project)
+        tail_only = end_of(scheduler, log, "tail-only", "none")
+        assert tail_only.output_tail is None
+        assert runs.TAIL_WITHHELD in tail_only.note
+        assert runs.SUMMARY_LABEL in tail_only.note
+        assert "1 failed, 5 passed, 1 skipped" in tail_only.note
+        assert len(log.state.disclosure_checks["alpha"]) == 1
+        first = log.state.latest_runs[("line", "alpha")]
+        summary_only = end_of(scheduler, log, "summary-only", first)
+        assert summary_only.output_tail is not None
+        assert "filler 24" in summary_only.output_tail
+        assert summary_only.note.endswith(runs.SUMMARY_WITHHELD)
+        assert runs.SUMMARY_LABEL not in summary_only.note
+        assert len(log.state.disclosure_checks["alpha"]) == 2
+        second = log.state.latest_runs[("line", "alpha")]
+        both = end_of(scheduler, log, "both", second)
+        assert both.output_tail is None
+        assert both.note.endswith(runs.OUTPUT_WITHHELD)
+        assert len(log.state.disclosure_checks["alpha"]) == 3
+    encoded = [encode(entry.event) for entry in read_entries(project / "events.sqlite")]
+    assert not any("codename" in line.casefold() for line in encoded)
 
 
 def ended_output(project: Path) -> str:
@@ -433,6 +494,60 @@ def test_an_unknown_task_id_still_names_the_run_choice(project: Path) -> None:
             )
         )
         assert error and "an open run of your scope" in text
+
+
+def screened(scheduler: Scheduler, finding: runs.Finding) -> tuple[str, str | None]:
+    return scheduler._screened_output("alpha", finding)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("with_tail", [False, True])
+def test_a_term_spanning_the_join_of_the_note_and_the_summary_is_withheld(
+    project: Path, with_tail: bool
+) -> None:
+    """Round 16 review, point 5. Neither the note nor the clean summary holds the
+    listed term, which the recorded text holds across the join between them, so the
+    joined text is screened too. The check counts as a failing one."""
+    joint = "unchanged" if with_tail else "code 1"
+    lead = runs.note_withheld("exited with code 1", runs.TAIL_WITHHELD)
+    note = lead if with_tail else "exited with code 1"
+    term = f"{joint}. {runs.SUMMARY_LABEL.split(',')[0]}"
+    finding = runs.Finding(
+        "r-1",
+        RunStatus.EXITED,
+        1,
+        "exited with code 1",
+        None,
+        None,
+        "1 failed, 5 passed",
+        "a line about codename" if with_tail else None,
+    )
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        (project / "terms").write_text(f"{term.casefold()}\n")
+        scheduler.set_disclosure_terms(load_terms(project / "terms"))
+        # Premise, which the test derives and does not assume: the term is in the
+        # joined text, and in neither of its two parts alone.
+        assert scheduler.discloses(runs.note_with_summary(note, finding.summary))
+        assert not scheduler.discloses(note, finding.summary or "")
+        if with_tail:
+            (project / "terms").write_text(f"{term.casefold()}\ncodename\n")
+            scheduler.set_disclosure_terms(load_terms(project / "terms"))
+        text, tail = screened(scheduler, finding)
+        assert runs.SUMMARY_LABEL not in text and "1 failed" not in text
+        assert tail is None or "codename" not in tail
+        assert len(log.state.disclosure_checks["alpha"]) == 1
+
+
+def test_a_clean_join_keeps_the_summary(project: Path) -> None:
+    finding = runs.Finding(
+        "r-1", RunStatus.EXITED, 0, "exited", None, None, "5 passed", None
+    )
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        listed(scheduler, project)
+        text, tail = screened(scheduler, finding)
+        assert "5 passed" in text and runs.SUMMARY_LABEL in text and tail is None
+        assert "alpha" not in log.state.disclosure_checks
 
 
 # Round 16, item 3. One authoritative receipt, sent once, naming what ran.

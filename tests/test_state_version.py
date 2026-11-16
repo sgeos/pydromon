@@ -55,6 +55,12 @@ PINS: tuple[tuple[int, str, str], ...] = (
         "1b2d4fe2cbfbce6648d9fbbf553f135e3412219f7117bc19d93604f246567272",
         "7a85e2cc9cfd3487fbc006854a179768899fb05aacd71d163a7ee1f1425c74ce",
     ),
+    # Round 16 closing diagnostics, including a nonempty replay reason.
+    (
+        6,
+        "7b73894d5fa3093c776fe2e0602549b2eb79e9b5997f52077c1fea6844347ebb",
+        "28b583dc352b6c0554c5624dd1ffdb5f44279201d275d58cb65d7dc15a2505fe",
+    ),
 )
 """Each ``STATE_VERSION`` with its ``codec_digest`` and its replay digest, oldest
 first, appended to and never edited."""

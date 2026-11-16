@@ -407,6 +407,31 @@ keeps anything it may write under ``HOME`` where a turn finds it. ``GROK_HOME`` 
 first, so both expand the operator's ``HOME`` in any POSIX shell. Dromon never writes,
 reads or copies the credential this stores."""
 
+HOOK_DENIED_TOOLS: Final = (
+    "todo_write",
+    "spawn_subagent",
+    "scheduler_create",
+    "scheduler_delete",
+    "scheduler_list",
+    "monitor",
+    "update_goal",
+    "enter_plan_mode",
+    "exit_plan_mode",
+)
+
+
+def hook_execution_reported(fields: Mapping[str, Any]) -> bool:
+    """Treat execution status or output as evidence that the fixed hook failed.
+
+    A failed status alone may be the hook denial. Output is conservatively treated
+    as execution evidence even when it could be a denial explanation.
+    """
+    return fields.get("status") in ("in_progress", "completed") or any(
+        fields.get(key) is not None and fields.get(key) != []
+        for key in ("rawOutput", "content")
+    )
+
+
 HOOK_PROGRAM: Final = Path("/usr/bin/printf")
 """A system-owned program, never a script loaded from a line's worktree."""
 HOOK_REPLY: Final = json.dumps(
@@ -431,8 +456,7 @@ HOME_CONFIG: Final = (
     "hooks = false\n"
     "\n"
     "[[hooks.PreToolUse]]\n"
-    'matcher = "todo_write|spawn_subagent|scheduler_create|scheduler_delete|'
-    'scheduler_list|monitor|update_goal|enter_plan_mode|exit_plan_mode"\n'
+    'matcher = "' + "|".join(HOOK_DENIED_TOOLS) + '"\n'
     'hooks = [{ type = "command", command = '
     + json.dumps(str(HOOK_PROGRAM))
     + ', args = ["%s\\n", '
@@ -1063,6 +1087,7 @@ def session_digest(
     """Bind a resumed session to its rules, switches and complete tool grants."""
     settings = {
         "instructions": instructions,
+        "report_rules_version": 1,
         "tool_environment": tool_environment(config),
         "builtin_tools": sorted(config.builtin_tools),
         "allowed_tools": sorted(config.allowed_tools),
@@ -1405,6 +1430,9 @@ class _Turn:
     """Each tool call's identity as first recorded, by its identifier."""
     announced_calls: set[str] = field(default_factory=set[str])
     """Identifiers first announced by a ``tool_call`` update."""
+    hook_calls: set[str] = field(default_factory=set[str])
+    hook_blocked: set[str] = field(default_factory=set[str])
+    hook_confirmed: set[str] = field(default_factory=set[str])
     blocked_calls: set[str] = field(default_factory=set[str])
     rejected_calls: set[str] = field(default_factory=set[str])
     confirmed_rejections: set[str] = field(default_factory=set[str])
@@ -1427,7 +1455,16 @@ class _Turn:
     """Whether the opened session was confirmed to use the driver's model."""
 
     def unconfirmed_refusal(self) -> str | None:
-        unconfirmed = self.rejected_calls - self.confirmed_rejections
+        pending_hooks = self.hook_calls - self.hook_confirmed
+        if pending_hooks:
+            names = sorted(
+                str(self.calls[item].get(GROK_TOOL_META, "covered tool"))
+                for item in pending_hooks
+            )
+            return acp.REJECTION_UNCONFIRMED + ": " + ", ".join(names)
+        unconfirmed = (
+            self.rejected_calls - self.confirmed_rejections - self.hook_confirmed
+        )
         if not unconfirmed:
             return None
         names = sorted(self.rejected_labels[item] for item in unconfirmed)
@@ -1690,6 +1727,16 @@ class GrokLine:
             refusal = self._notice_refusal(extension_method(method), params, turn)
             if refusal is not None:
                 await self._cancel(turn, refusal)
+            elif extension_method(method) == SESSION_NOTIFICATION:
+                update = params.get("update")
+                if isinstance(update, dict):
+                    notice = cast(dict[str, Any], update)
+                    if notice.get("sessionUpdate") in (
+                        "hook_run_started",
+                        "hook_execution",
+                        "hook_annotation",
+                    ):
+                        await self._update(notice, turn)
 
     def _allowed_servers(self) -> frozenset[str]:
         return frozenset(
@@ -2006,6 +2053,38 @@ class GrokLine:
 
     async def _update(self, update: dict[str, Any], turn: _Turn) -> None:
         kind = update.get("sessionUpdate")
+        if kind == "hook_execution":
+            name = update.get("tool_name")
+            pending = [
+                item
+                for item in turn.hook_calls - turn.hook_confirmed
+                if turn.calls[item].get(GROK_TOOL_META) == name
+            ]
+            runs = update.get("runs")
+            blocked = (
+                isinstance(runs, list)
+                and bool(cast(list[object], runs))
+                and all(
+                    isinstance(run, dict)
+                    and isinstance(cast(dict[str, Any], run).get("status"), dict)
+                    and cast(dict[str, Any], run)["status"].get("status") == "failed"
+                    and cast(dict[str, Any], run)["status"].get("blocked") is True
+                    for run in cast(list[object], runs)
+                )
+            )
+            if update.get("event_name") == "pre_tool_use" and blocked:
+                if len(pending) != 1:
+                    await self._cancel(turn, "ambiguous hook denial")
+                else:
+                    turn.hook_blocked.add(pending[0])
+            return
+        if kind in ("agent_message_chunk", "agent_thought_chunk") and (
+            turn.hook_calls - turn.hook_confirmed
+        ):
+            await self._cancel(
+                turn, turn.unconfirmed_refusal() or acp.REJECTION_UNCONFIRMED
+            )
+            return
         if kind == "agent_message_chunk":
             content = cast(dict[str, Any], update.get("content") or {})
             text = str(content.get("text") or "")
@@ -2046,6 +2125,8 @@ class GrokLine:
                 await self._cancel(turn, why)
                 return
             await self._record(str(identifier), update, turn)
+            if str(identifier) in turn.hook_calls:
+                return
             if str(identifier) in turn.rejected_calls:
                 if not acp.rejected_call_not_run(update):
                     await self._cancel(
@@ -2075,6 +2156,40 @@ class GrokLine:
         An unauthorized call that starts cancels the turn. A later update or
         permission request for it has passed ``acp.identity_refusal``, so it is the
         call already judged."""
+        if identifier in turn.hook_calls:
+            content = fields.get("content")
+            denial = (
+                identifier in turn.hook_blocked
+                and fields.get("status") == "failed"
+                and fields.get("rawOutput") in (None, [])
+                and isinstance(content, list)
+                and len(cast(list[object], content)) == 1
+                and isinstance(cast(list[object], content)[0], dict)
+                and cast(list[dict[str, Any]], content)[0].get("type") == "content"
+                and isinstance(
+                    cast(list[dict[str, Any]], content)[0].get("content"), dict
+                )
+                and cast(list[dict[str, Any]], content)[0]["content"].get("type")
+                == "text"
+                and isinstance(
+                    cast(list[dict[str, Any]], content)[0]["content"].get("text"), str
+                )
+                and cast(list[dict[str, Any]], content)[0]["content"][
+                    "text"
+                ].startswith("Hook denied: ")
+            )
+            if denial or (
+                acp.rejected_call_not_run(fields)
+                and not hook_execution_reported(fields)
+            ):
+                turn.hook_confirmed.add(identifier)
+            else:
+                await self._cancel(
+                    turn,
+                    "the engine started a tool the line was not given; "
+                    + acp.REJECTION_UNCONFIRMED,
+                )
+            return
         if identifier in turn.calls:
             if (
                 identifier in turn.blocked_calls
@@ -2100,12 +2215,30 @@ class GrokLine:
         permitted, name = self._permits(fields)
         if not permitted:
             turn.blocked_calls.add(identifier)
+            if (grok_name or fields.get("toolName")) in HOOK_DENIED_TOOLS:
+                turn.hook_calls.add(identifier)
+                if acp.rejected_call_not_run(fields) and not hook_execution_reported(
+                    fields
+                ):
+                    turn.hook_confirmed.add(identifier)
+                elif (
+                    hook_execution_reported(fields) or fields.get("status") == "failed"
+                ):
+                    await self._cancel(
+                        turn, "the engine started a tool the line was not given"
+                    )
+                return
             if rejected or acp.waiting_for_permission(fields):
                 return
             await self._cancel(
                 turn,
                 f"the engine used a tool the line was not given: {name}"
                 + use_tool_advice(fields),
+            )
+            return
+        if turn.hook_calls - turn.hook_confirmed:
+            await self._cancel(
+                turn, turn.unconfirmed_refusal() or acp.REJECTION_UNCONFIRMED
             )
             return
         turn.tool_uses.append(name)
@@ -2247,6 +2380,11 @@ class GrokLine:
                 resumable = candidate
             else:
                 self._rules_replaced = True
+        instructions += (
+            "\nReports go through write_scratch called through use_tool with inline "
+            "tool_input arguments. Pass the report text inline rather than a file "
+            "argument."
+        )
         if instructions:
             meta["rules"] = instructions
         params: dict[str, object] = {

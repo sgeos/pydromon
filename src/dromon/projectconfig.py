@@ -108,6 +108,7 @@ DAEMON_KEYS: Final = frozenset(
         "require_sandbox",
         "disclosure_terms",
         "disclosure_accepted",
+        "machine_status",
     }
 )
 LIMIT_KEYS: Final = frozenset(
@@ -307,6 +308,12 @@ class ProjectConfig:
     disclosure_terms: str | None = None
     """The project's disclosure list, a path relative to the project root, or
     ``None``. Only the path is held here. The daemon reads the terms."""
+    machine_status: str | None = None
+    """The path of the file the machine's monitor writes its status to, which Dromon
+    reads before it starts a run or a turn, or ``None`` to read none. A leading ``~``
+    is the home directory and a relative path is relative to the project root.
+    **Round 16, item 3.** Off unless named, since a machine without the monitor would
+    otherwise be treated as elevated for ever."""
     disclosure_accepted: dict[str, tuple[str, ...]] = field(
         default_factory=dict[str, tuple[str, ...]]
     )
@@ -462,6 +469,13 @@ class _Reader:
             not isinstance(terms, str) or not terms or "\x00" in terms
         ):
             raise self.fail("daemon.disclosure_terms", "must be a path to a file")
+        machine_status = daemon.get("machine_status")
+        if machine_status is not None and (
+            not isinstance(machine_status, str)
+            or not machine_status
+            or "\x00" in machine_status
+        ):
+            raise self.fail("daemon.machine_status", "must be a path to a file")
         try:
             accepted = accepted_entries(daemon.get("disclosure_accepted", {}))
         except DisclosureError as error:
@@ -527,6 +541,7 @@ class _Reader:
             require_sandbox=require_sandbox,
             disclosure_terms=terms,
             disclosure_accepted=accepted,
+            machine_status=machine_status,
             lease_names=lease_names,
             lease_ttl_seconds=lease_ttl,
             run_commands=run_tables.commands,

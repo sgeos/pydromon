@@ -371,6 +371,57 @@ def _merged(name: str, base: object, over: object) -> object:
     return combined
 
 
+FILE_TOOLS: Final = frozenset(
+    {"Read", "Edit", "Write", "NotebookEdit", "MultiEdit", "Glob", "Grep"}
+)
+"""The tools whose rule specifier is a path pattern, as Claude Code reads them."""
+
+FILE_RULE: Final = re.compile(r"([A-Za-z]+)\((.*)\)", re.DOTALL)
+
+
+def single_slash_rules(
+    document: Mapping[str, object], root: str = "/"
+) -> list[tuple[str, str, str]]:
+    """The rules of ``document`` that name a path as if it were absolute but begin
+    with one slash, as ``(list, rule, corrected)`` in the order of the document.
+    **Round 16, at the operator's request, from another project's report.** In a
+    permission rule of Claude Code a path that begins with one slash is relative to
+    the settings file's project, and an absolute path begins with two, as in
+    ``Read(//abs/path)``. A rule written with one never matches the file it names, and
+    nothing says so, which for a ``deny`` rule leaves the file unprotected.
+
+    **Which rules.** Only the tools that name files, and only a path whose first
+    segment is a directory of ``root``, the filesystem's own, which is the sign of an
+    absolute path written with one slash. A path such as ``/src/**`` that is relative
+    to the project on purpose names no directory of ``root`` and is not reported.
+    **Residual.** A project that has a directory by the name of one at the filesystem
+    root, such as ``/tmp``, and means its own, is reported wrongly, which the warning's
+    wording allows for. A rule on a machine whose root differs from the one the
+    settings will run on is judged by this machine's. The check never refuses."""
+    found: list[tuple[str, str, str]] = []
+    permissions = document.get("permissions", {})
+    if not isinstance(permissions, dict):
+        return found
+    table = cast(dict[str, object], permissions)
+    for name in PERMISSION_KEYS:
+        rules = table.get(name, [])
+        if not isinstance(rules, list):
+            continue
+        for rule in cast(list[object], rules):
+            if not isinstance(rule, str):
+                continue
+            match = FILE_RULE.fullmatch(rule)
+            if match is None or match.group(1) not in FILE_TOOLS:
+                continue
+            specifier = match.group(2)
+            if not specifier.startswith("/") or specifier.startswith("//"):
+                continue
+            first = specifier[1:].split("/", 1)[0]
+            if first and os.path.isdir(os.path.join(root, first)):
+                found.append((name, rule, f"{match.group(1)}(/{specifier})"))
+    return found
+
+
 def merge(layers: Sequence[SettingsConfig | None]) -> SettingsConfig | None:
     """The layers merged from least to most specific, or ``None`` if none is set.
 

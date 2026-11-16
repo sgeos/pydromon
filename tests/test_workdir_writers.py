@@ -138,3 +138,97 @@ def test_dromon_config_warns_only_about_lines_that_can_write(
     assert "warning: writing lines builder, other share workdir" in (
         capsys.readouterr().out
     )
+
+
+# Round 16, at the operator's request. A line asking for read access that Claude Code
+# cannot confine is refused at every turn, so ``dromon config`` says so at once.
+
+
+def config_output(
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    text: str,
+) -> str:
+    state = tmp_path / ".dromon"
+    state.mkdir(exist_ok=True)
+    (state / "dromon.toml").write_text("version = 1\n" + text)
+    runtime = ["--runtime-dir", str(short_runtime)]
+    assert cli.main(["--project", str(tmp_path), *runtime, "config"]) == 0
+    return capsys.readouterr().out
+
+
+MCP_LINE = (
+    "[lines.player]\nmodel = 'claude-haiku-5-5'\nworkdir_access = 'read'\n"
+    "builtin_tools = ['Read']\n"
+    "[lines.player.mcp_servers.game]\ntype = 'stdio'\ncommand = '/bin/true'\n"
+)
+
+
+def test_dromon_config_warns_of_a_read_line_with_an_mcp_server(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = config_output(tmp_path, short_runtime, capsys, MCP_LINE)
+    (warning,) = [line for line in out.splitlines() if "will be refused" in line]
+    assert warning.startswith("warning: line player has workdir_access read")
+    assert "cannot confine configured MCP servers" in warning
+
+
+def test_the_warning_is_the_refusal_the_engine_builder_raises() -> None:
+    """One function gives both, so the warning cannot promise less than a turn
+    refuses. Each reason it can give is one the builder gives."""
+    from dromon.scheduler import claude_read_only_refusal
+
+    reads = {"workdir_access": "read", "builtin_tools": ["Read"]}
+    cases: dict[str, dict[str, object]] = {
+        "MCP servers": {
+            "mcp_servers": {"g": {"type": "stdio", "command": "/bin/true"}}
+        },
+        "an allow-all policy": {"tool_policy": "allow_all"},
+        "additional MCP tools": {
+            "tool_policy": "allowlist",
+            "allowed_tools": ["mcp__g__*"],
+        },
+        "project settings or plugins": {"project_settings": True},
+    }
+    for reason, extra in cases.items():
+        refusal = claude_read_only_refusal(
+            config_from_document({**reads, **extra}), None, None
+        )
+        assert refusal is not None and reason in refusal, reason
+    clean = config_from_document(reads)
+    assert claude_read_only_refusal(clean, None, None) is None
+
+
+def test_a_project_hook_makes_every_read_line_refused(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    text = (
+        "[settings.hooks]\nPreToolUse = []\n"
+        "[lines.reader]\nmodel = 'claude-haiku-5-5'\nworkdir_access = 'read'\n"
+        "builtin_tools = ['Read']\n"
+    )
+    out = config_output(tmp_path, short_runtime, capsys, text)
+    assert "command hooks" in out and "line reader has workdir_access read" in out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Write access with an MCP server is not a read line, so nothing is refused.
+        MCP_LINE.replace("workdir_access = 'read'\n", ""),
+        # A read line with no server, allow-all policy or hook is allowed.
+        "[lines.reader]\nmodel = 'claude-haiku-5-5'\nworkdir_access = 'read'\n"
+        "builtin_tools = ['Read', 'Grep']\n",
+        # Other engines refuse a read line for other reasons, or never.
+        MCP_LINE.replace("claude-haiku-5-5", "gpt-6-luna"),
+    ],
+)
+def test_no_warning_where_a_turn_would_not_be_refused(
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    text: str,
+) -> None:
+    out = config_output(tmp_path, short_runtime, capsys, text)
+    assert "will be refused" not in out

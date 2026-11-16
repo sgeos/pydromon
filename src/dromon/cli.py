@@ -51,11 +51,11 @@ from dromon import antigravity, capabilities, codex, cursor, evidence, grok, pi
 from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
 from dromon.engine import EngineRefused
 from dromon.agents import LINE_TOKEN_ENV, TOKEN_ENV
-from dromon.lineconfig import EFFORTS, can_write_workdir
+from dromon.lineconfig import EFFORTS, WorkdirAccess, can_write_workdir
 from dromon.projectconfig import ProjectConfig
 from dromon.model import AgentAccess
 from dromon.protocol import Operation, ProtocolError
-from dromon.scheduler import LineSpec, engine_factory
+from dromon.scheduler import LineSpec, claude_read_only_refusal, engine_factory
 from dromon import settings as engine_settings
 from dromon.sandbox import (
     SandboxConfig,
@@ -1245,7 +1245,37 @@ def _mail(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         if entry.get("outcome") != "unanswered":
             parts.append(str(entry.get("outcome")))
         print(", ".join(parts))
+    for note in _page_notes(result, arguments.offset, len(entries)):
+        print(note)
     return exits.OK
+
+
+def _page_notes(result: dict[str, object], offset: int, shown: int) -> list[str]:
+    """Lines telling a reader of one page of mail what lies outside it. **Round 16, at
+    the operator's request.** A page is the oldest matches from ``--offset``, so an
+    operator who read its tail missed the newest reports without a sign of them. The
+    lines say which matches the page holds, and how many unread ones come after it and
+    before it, with the ``--offset`` that shows each. A daemon that does not send the
+    unread counts gives the first line only, so the notes still say that more exists."""
+    total = result.get("total")
+    if type(total) is not int:
+        return []
+    end = offset + shown
+    notes: list[str] = []
+    if shown == 0 and total > 0:
+        notes.append(f"this page is empty, the {total} matches are all before --offset")
+    elif shown > 0 and (offset > 0 or end < total):
+        notes.append(f"showing matches {offset + 1} to {end} of {total}, oldest first")
+    after = result.get("unread_after")
+    before = result.get("unread_before")
+    if type(after) is int and after > 0:
+        notes.append(
+            f"{after} unread after this page, the newest of them among them."
+            f" --offset {end} shows them"
+        )
+    if type(before) is int and before > 0:
+        notes.append(f"{before} unread before this page. --offset 0 shows them")
+    return notes
 
 
 def _replies(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
@@ -1590,6 +1620,28 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         print(f"role {name}: {role}")
     for name, peer in sorted(config.federation.peers.items()):
         print(f"peer {name}: {peer}")
+    for place, layer in (
+        ("the project's settings", config.settings),
+        *(
+            (f"line {line_id}'s settings", line.config.settings)
+            for line_id, line in sorted(config.lines.items())
+        ),
+    ):
+        if layer is None:
+            continue
+        for kind, rule, corrected in engine_settings.single_slash_rules(
+            layer.document()
+        ):
+            print(
+                f"warning: {place} {kind} rule {rule} has an absolute path with one"
+                " leading slash, which Claude Code reads as relative to the project,"
+                f" so it matches nothing there. For an absolute path write {corrected}"
+                + (
+                    ". A deny rule that matches nothing protects nothing"
+                    if kind == "deny"
+                    else ""
+                )
+            )
     for line_id, line in sorted(config.lines.items()):
         line_settings = engine_settings.merge([config.settings, line.config.settings])
         line_sandbox = merge([config.sandbox, line.config.sandbox])
@@ -1633,6 +1685,18 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             + (", git ssh" if line.git_ssh else "")
         )
         print(f"  effective sandbox allowWrite: {writes}")
+        refusal = (
+            claude_read_only_refusal(line.config, config.settings, config.sandbox)
+            if line.config.workdir_access is WorkdirAccess.READ
+            and ENGINE_OF.get(line.model) == CLAUDE_CODE_ENGINE
+            else None
+        )
+        if refusal is not None:
+            print(
+                f"warning: line {line_id} has workdir_access read, and every turn of"
+                f" it will be refused, since {refusal}. Remove what that names, or"
+                " change the line's workdir_access"
+            )
     shared_workdirs: dict[str, list[str]] = {}
     for line_id, line in sorted(config.lines.items()):
         if not can_write_workdir(line.config, ENGINE_OF.get(line.model)):
@@ -3085,6 +3149,8 @@ def _fleet_mail(arguments: argparse.Namespace, issues: bool) -> int:
                 f"{entry.name}:{message.get('message_id')} from"
                 f" {message.get('sender')}, {message.get('kind')}, {state}"
             )
+        for note in _page_notes(result, 0, len(messages)):
+            print(f"{entry.name}: {note}")
 
     return _fleet_each(command, found, ask)
 

@@ -37,6 +37,35 @@ so one that writes the working directory itself is not detected. This is a warni
 only because tool names do not establish the full write capability of an engine or
 remote tool.
 
+**Round 16, at the operator's request, from another project's reports.** `dromon config`
+gives two more warnings, neither of which refuses the file.
+
+- **A read line a turn would refuse.** A Claude Code line with `workdir_access = "read"`
+  and a configured MCP server, an allow-all policy or an allowed `mcp__` tool, project
+  settings, plugins, or command hooks in its own settings or the project's, is refused at
+  every turn, because Claude Code cannot confine those to a read-only directory. The
+  refusal appeared only when a turn was tried. The warning gives the same reason, from
+  `scheduler.claude_read_only_refusal`, the one function the engine builder uses, so
+  the warning cannot differ from the refusal. **Inference.** Other engines refuse a read
+  line for reasons of their own, in their own builders, and are not covered, which is
+  recorded as a residual. A seat of a role that does not own it is built read-only by
+  the scheduler without any `workdir_access` in the file, and is not warned of either.
+- **A one-slash absolute path in a permission rule.** In a Claude Code rule a path that
+  begins with one slash is relative to the project, and an absolute one begins with two,
+  as in `Read(//abs/path)`. A rule with one matches nothing, silently, and a `deny` rule
+  that matches nothing protects nothing. `dromon config` warns of each rule of the
+  project's `settings` and of each line's, for a tool that names files, `Read`, `Edit`,
+  `Write`, `NotebookEdit`, `MultiEdit`, `Glob` or `Grep`, whose path starts with one
+  slash and whose first segment is a directory of the filesystem root. It names the rule
+  and the corrected one. **Residual.** A project that has a directory by the name of one
+  at the root, such as `/tmp`, and means its own, is warned of wrongly, which the wording
+  allows for. `/src/**`, which names no directory of the root, is taken as project
+  relative and not reported. Only `dromon config` checks, the daemon does not.
+
+The warning of two writing lines that share a workdir, above, already leaves out a line
+that cannot write, as the operator's item of the same round asked. It did so from round
+9, so the report came from a daemon older than that.
+
 ## Format
 
 The file is TOML version 1.0, encoded in UTF-8, at most 4 MiB.
@@ -112,6 +141,7 @@ relay = "tail"          # the route of operator ana's mail
 | `daemon.tick_seconds` | number in [0, 60] | 1 | The maximum tick wait in seconds. Zero waits for events and due timers |
 | `daemon.require_sandbox` | boolean | `false` | Whether every Claude Code line must run with an enabled sandbox, as below |
 | `daemon.disclosure_terms` | path | none | The project's disclosure list, relative to the project root, as below |
+| `daemon.machine_status` | path | none | The file the machine's monitor writes its status to, read before a run or a turn starts, as [`RUNS.md`](../architecture/RUNS.md) specifies. A leading `~` is the home directory and a relative path is relative to the project root. Nothing is read, and nothing is deferred, unless it is set. A reload applies it. No line's sandbox or file tools may write the file or its directory. A status that is stale, missing or unreadable defers runs until the monitor writes again, so the operator restores gates by restarting the monitor or removing this key and reloading. Added on 2026-11-11 |
 | `read_only_paths` | list of relative paths | empty | Existing files or directories denied writes under every line's resolved workdir. Symbolic links are resolved and targets must remain inside that workdir |
 | `leases.names` | list of identifiers | none | The leases lines may acquire, each named once, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies |
 | `leases.ttl_seconds` | integer in [60, 86400] | 10800 | How long an acquired lease lasts unless released first, and from round 16 the longest a line may ask for with `acquire_lease`'s `seconds` |
