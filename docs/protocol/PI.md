@@ -253,8 +253,16 @@ GPT-6 model packaged for Pi. Input and output dollars per million tokens are
 6.1-Sol and 1 and 5 for 6.1 Terra. Cache and larger input tiers have separate prices.
 These are Pi catalogue estimates and do not establish actual billing.
 
-**Fact.** Dromon reports unknown cost when Pi omits a cost or reports zero for
-nonzero usage. The report labels that uncertainty and preserves the token counts.
+**Fact.** The bundled Google table prices Argon at 2 input, 10 output and 0.1
+cache-read dollars per million tokens, with zero cache-write price.
+Dromon retains the known cost when Pi omits another call's cost or reports zero for
+nonzero usage. The report labels the total as partial and preserves the token counts.
+A turn with no priced call reports unknown cost. Interrupted turns retain the known
+part too. Pi status always marks `limit_enforced` false because the dollar limit
+cannot bound unreported spend. Known costs still count toward the limit. This is a
+conservative engine-wide status policy, including priced models, because a future
+call may omit its cost. An operator must supply a separate billing bound rather
+than rely on this estimate to cap total spending.
 **Inference.** Zero with nonzero usage may indicate an unpriced model. It may also
 reflect legitimately free usage. Dromon cannot distinguish these from the total.
 Verify first with an operator turn that checks the selected provider and model,

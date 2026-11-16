@@ -6,3 +6,6 @@ Type: Added
   notification limit and existing resumed model pin distinction.
 - Expose unpriced Pi usage as unknown cost and document model catalogue prices,
   inherited context limits and the observed Claude Fable model warning.
+- Preserve the known part of mixed Pi costs and interrupted turns, label partial
+  totals, mark the Pi dollar limit unable to bound total spend, test priced Argon
+  usage and list the Gemini bindings in the project configuration reference.

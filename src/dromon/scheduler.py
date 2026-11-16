@@ -7277,7 +7277,8 @@ class Scheduler:
         known = line_id in self._cost
         unknown = self._cost_unknown.get(line_id, 0)
         basis = "exact" if not unknown else "lower_bound" if known else "unknown"
-        enforced = self._cost_reported(line_id)
+        pi_cost = ENGINE_OF.get(self.model_of(line_id)) == "pi"
+        enforced = self._cost_reported(line_id) and not pi_cost
         estimated = self._cost_estimated.get(line_id, 0)
         note = (
             None
@@ -7287,6 +7288,11 @@ class Scheduler:
             else f"{unknown} turns since the last release reported no cost, so"
             " the budget holds the line only on what the others reported"
         )
+        if pi_cost:
+            note = (
+                "Pi may report partial costs. The dollar limit cannot bound total"
+                " spend. Known costs still count toward the limit."
+            )
         if estimated:
             # Round 15, item 1. An estimate is always labelled as one.
             told = f"{estimated} turns since the last release were {ESTIMATE_NOTE}"

@@ -324,3 +324,8 @@ sign-in. No credential file was read.
 **Not verified live.** Every new Gemini binding requires an operator verify-first
 turn to check model identity, credential source, tool routing and effective context
 limit. Cursor and Pi retain their existing isolation restrictions.
+
+**Fact, audit follow-up on 2026-11-16.** Pi's bundled Google table prices Argon.
+A scripted priced Argon turn checks cost propagation. Pi can still omit call costs,
+so its dollar limit is labelled unenforceable for total spend. Known parts are
+retained and partial totals are labelled. This is not a live billing verification.

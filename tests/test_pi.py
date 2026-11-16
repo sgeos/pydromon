@@ -1109,4 +1109,62 @@ def test_unpriced_pi_usage_is_unknown_instead_of_free(
     server = FakePi([TURN_START, assistant("done", spent=spent)])
     report = run(line(server, home))
     assert report.cost_estimate_usd is None
-    assert report.usage_note is not None and "Cost is unknown" in report.usage_note
+    assert (
+        report.usage_note is not None and "Cost total is partial" in report.usage_note
+    )
+
+
+@pytest.mark.parametrize("unpriced_first", [False, True])
+def test_mixed_pi_cost_keeps_the_known_part(home: Path, unpriced_first: bool) -> None:
+    priced = assistant("priced", spent=usage(100, 20, cost=0.2))
+    unpriced = assistant("unpriced", spent=usage(100, 20, cost=0))
+    calls = [unpriced, priced] if unpriced_first else [priced, unpriced]
+    report = run(line(FakePi([TURN_START, *calls]), home))
+    assert report.cost_estimate_usd == pytest.approx(0.2)
+    assert report.usage_note is not None and "partial" in report.usage_note
+
+
+@pytest.mark.parametrize("known", [False, True])
+def test_interrupted_unpriced_pi_keeps_known_cost(home: Path, known: bool) -> None:
+    calls = [assistant("unpriced", spent=usage(100, 20, cost=0))]
+    if known:
+        calls.insert(0, assistant("priced", spent=usage(100, 20, cost=0.2)))
+    server = FakePi([TURN_START, *calls], hang=True)
+    target = line(server, home)
+
+    async def go() -> None:
+        task = asyncio.ensure_future(target.run_turn("long work"))
+        for _ in range(1000):
+            if server.started and not server.queue and "prompt" in server.commands():
+                break
+            await asyncio.sleep(0.001)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(go())
+    assert target.take_interrupted_cost() == (pytest.approx(0.2) if known else None)
+    assert target.take_interrupted_cost() is None
+
+
+def test_priced_google_argon_turn_reports_catalogue_cost(home: Path) -> None:
+    # Pi 1.5.2's bundled Google table prices Argon at 2 input, 10 output and
+    # 0.1 cache-read dollars per million tokens. Cache writes are zero.
+    spent = usage(100, 20)
+    expected = (100 * 2 + 20 * 10 + 100 * 0.1) / 1_000_000
+    spent["cost"]["total"] = expected
+    server = FakePi(
+        [TURN_START, assistant("done", spent=spent)],
+        model={"provider": "google", "id": "gemini-4-argon"},
+    )
+    target = line(
+        server,
+        home,
+        strategy=Strategy.API,
+        answer={"provider": "google", "status": "ready", "authType": "api_key"},
+    )
+    target.driver = Driver.for_model("pi:google/gemini-4-argon", Strategy.API)
+    report = run(target)
+    assert report.credential is Credential.API
+    assert report.cost_estimate_usd == pytest.approx(expected)
+    assert report.usage_note == pi.PI_USAGE_NOTE

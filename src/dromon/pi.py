@@ -572,14 +572,14 @@ def _count_usage(usage: Mapping[str, object], turn: _Turn) -> dict[str, int | bo
     turn.calls.append(call)
     cost = usage.get("cost")
     total = cast(dict[str, Any], cost).get("total") if isinstance(cost, dict) else None
-    if isinstance(total, int | float) and not isinstance(total, bool) and total >= 0:
-        turn.cost = (turn.cost or 0.0) + float(total)
     if (
-        not isinstance(total, int | float)
-        or isinstance(total, bool)
-        or total < 0
-        or (total == 0 and any(call.get(key, 0) for key in USAGE_KEYS.values()))
+        isinstance(total, int | float)
+        and not isinstance(total, bool)
+        and total >= 0
+        and not (total == 0 and any(call.get(key, 0) for key in USAGE_KEYS.values()))
     ):
+        turn.cost = (turn.cost or 0.0) + float(total)
+    else:
         turn.cost_unknown = True
     return call
 
@@ -719,7 +719,7 @@ class PiLine:
                 finally:
                     self._connection = None
         except asyncio.CancelledError:
-            self._interrupted_cost = None if turn.cost_unknown else turn.cost
+            self._interrupted_cost = turn.cost
             raise
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
@@ -791,12 +791,14 @@ class PiLine:
             credential=credential,
             session_id=self.session_id or "",
             capabilities=None,
-            cost_estimate_usd=None if turn.cost_unknown else turn.cost,
+            cost_estimate_usd=turn.cost,
             usage=usage,
             calls=tuple(dict(call) for call in turn.calls[-50:]),
             context_tokens=turn.context,
             usage_note=(
-                PI_USAGE_NOTE + " Cost is unknown because Pi reported unpriced usage."
+                PI_USAGE_NOTE
+                + " Cost total is partial because Pi reported unpriced usage."
+                " The known part is reported when available."
                 if turn.cost_unknown
                 else PI_USAGE_NOTE
                 if turn.calls

@@ -236,3 +236,12 @@ def test_the_line_and_strategy_fields_are_still_identifiers() -> None:
         LineCreated("alpha", HAIKU, "sub/scription")
     with pytest.raises(InvalidField, match="line_id is not a valid identifier"):
         LineRebound("a/b", HAIKU, "subscription")
+
+
+def test_pi_dollar_limit_does_not_claim_to_bound_unknown_spend(
+    scheduler: Scheduler,
+) -> None:
+    scheduler.create_line("alpha", "pi:google/gemini-4-argon", Strategy.API)
+    cost = scheduler.cost_status("alpha")
+    assert cost["limit_enforced"] is False
+    assert "cannot bound total" in str(cost["note"])
