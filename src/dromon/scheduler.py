@@ -5820,18 +5820,29 @@ class Scheduler:
         A run began from an entry when it is the line's, of the entry's command and
         commit, and names as its predecessor the run the line read when it queued,
         since no other start of the line is allowed while an entry waits, so no
-        other run has that predecessor. It is also not older than the entry."""
-        queued_at = parse_due(entry.queued_at)
-        for run in self._state().runs.values():
-            started = run.started
-            if (
-                started.line_id == entry.line_id
-                and started.command == entry.command
-                and started.commit == entry.commit
-                and started.previous == entry.previous
-                and parse_due(started.started_at) >= queued_at
+        other run has that predecessor. Its event must follow the queue event in log
+        sequence, since a backward clock step can make its timestamp older. Only
+        plausible candidates cause a log read. The reader loads the whole log, so
+        recovery cost grows with log size until a paged reader or index is added."""
+        candidates = {
+            run.started.run_id
+            for run in self._state().runs.values()
+            if run.started.line_id == entry.line_id
+            and run.started.command == entry.command
+            and run.started.commit == entry.commit
+            and run.started.previous == entry.previous
+        }
+        if not candidates:
+            return None
+        queued = False
+        for recorded in read_entries(self._log.path):
+            event = recorded.event
+            if isinstance(event, RunQueued) and event.queue_id == entry.queue_id:
+                queued = True
+            elif (
+                queued and isinstance(event, RunStarted) and event.run_id in candidates
             ):
-                return started
+                return event
         return None
 
     def _settle_if_started(self, entry: RunQueued) -> bool:

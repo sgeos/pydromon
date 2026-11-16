@@ -1171,7 +1171,11 @@ the two events finds the run and the entry together. Before it drops or begins a
 a look closes each whose run the log shows, as started, with that run, and tells the line
 that the run started before the restart and is not dropped. A run is the entry's when it
 is the line's, of its command and commit, names as predecessor the run the entry read,
-and is not older than the entry. No other start of the line is allowed while an entry
+and its `run_started` follows this `run_queued` in event log sequence. Wall clock
+ordering is insufficient because the clock can step backwards between these events.
+Only a plausible matching run causes a log read. **Residual.** The reader loads the
+whole log, so recovery time and memory grow with log size until a paged reader or an
+index is added. No other start of the line is allowed while an entry
 waits, so no other run has that predecessor. Without this a restart tried to begin the
 entry again, was refused since the line's run had not ended, and told the line it was
 dropped while it ran.
@@ -1203,7 +1207,12 @@ values as given, since the run is started from them, so they cannot be masked as
 changes under credential scrubbing, by pattern or by the literal secret values of the
 project, and says why, so a permissive parameter pattern cannot put a token in the log
 through the queue. The refusal means the line starts the run when nothing defers it, or
-does not pass a credential as a parameter. **Residual.** A credential that neither the
+does not pass a credential as a parameter. Credential patterns also refuse ordinary
+values that have the same shape. For example, a public example label consisting of
+`ghp_` followed by 36 letters is refused even with no configured literal secrets.
+The operator can choose a label that does not match, or wait until both deferrals
+clear and start directly without queuing. Configured literal secret matches remain
+intentional refusals because the queued event would carry the secret. **Residual.** A credential that neither the
 patterns nor the literal values recognise is recorded, as in any text.
 
 **Failure modes.** The event log refuses the new events in a daemon from before them,

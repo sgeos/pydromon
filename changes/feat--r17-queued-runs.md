@@ -15,7 +15,9 @@ Type: Added
   parameter value looks like a credential is not queued, since the log cannot mask what
   the run starts from. A daemon that stopped between a queued run's start and its
   dequeue closes the entry as started on restart and tells the line the run is not
-  dropped.
+  dropped. Recovery uses event log sequence so a backward clock step does not hide
+  the start. The run documentation records that credential patterns can refuse an
+  ordinary example value and explains how to start it without queuing.
 - The daemon says what `dromon config` says. It prints each warning about a file that
   loads to its standard error at a start, and `reload_project` gives them as `warnings`,
   which `dromon reload` prints.

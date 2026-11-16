@@ -697,10 +697,13 @@ def test_a_literal_secret_value_is_not_queued_either(rig: Rig) -> None:
     assert not rig.log.state.queued_runs
 
 
-def crash_before_dequeue(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> RunQueued:
+def crash_before_dequeue(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, clock_step: int = 0
+) -> RunQueued:
     """Queue a run and begin it, with the daemon stopping after ``run_started`` is
     logged and before ``run_dequeued`` is."""
     queued = rig.queue()
+    rig.clock.now += timedelta(seconds=clock_step)
     rig.set_level("ok")
     real = EventLog.append
 
@@ -718,13 +721,14 @@ def crash_before_dequeue(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> RunQueued
     return queued
 
 
+@pytest.mark.parametrize("clock_step", [0, -3600])
 def test_a_crash_between_the_run_and_its_dequeue_does_not_drop_it_on_restart(
-    rig: Rig, monkeypatch: pytest.MonkeyPatch
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, clock_step: int
 ) -> None:
     """Confirmed against the code before the change. The restarted daemon began the
     entry again, was refused since a run of the line had not ended, and dropped it,
     telling the line its run was dropped while it ran."""
-    queued = crash_before_dequeue(rig, monkeypatch)
+    queued = crash_before_dequeue(rig, monkeypatch, clock_step)
     (run,) = rig.log.state.runs.values()
     rig.log.close()
     reopened = EventLog(rig.root / "events.sqlite")
@@ -789,3 +793,33 @@ def test_the_end_of_a_queued_run_wakes_the_line_with_a_note_that_names_it(
     for message in rig.log.state.messages.values():
         if message.sender == HARNESS and str(message.recipient) == "alpha":
             assert not message.read, "still waiting to wake the line"
+
+
+def test_an_ordinary_example_matching_a_credential_pattern_cannot_queue(
+    rig: Rig,
+) -> None:
+    from dromon.runparams import RunParameter
+
+    # A public example label, deliberately shaped like a token, with no secret source.
+    label = "ghp_" + "a" * 36
+    rig.log.secrets = lambda: []
+    rig.scheduler.set_runs(
+        {"gate": (sys.executable, "-c", "pass", "{tag}")},
+        parameters={"gate": {"tag": RunParameter("tag", "[A-Za-z0-9_-]+")}},
+        slot_lease="slot",
+    )
+    with pytest.raises(runs.RunRefused, match="looks like a credential"):
+        asyncio.run(
+            rig.scheduler.start_run(
+                "alpha", "gate", "none", arguments={"tag": label}, queue=True
+            )
+        )
+    assert not rig.log.state.queued_runs
+    assert label.encode() not in (rig.root / "events.sqlite").read_bytes()
+    # The documented workaround starts directly once the deferral clears.
+    rig.set_level("ok")
+    started = asyncio.run(
+        rig.scheduler.start_run("alpha", "gate", "none", arguments={"tag": label})
+    )
+    assert isinstance(started, RunStarted)
+    rig.finish(started.run_id)
