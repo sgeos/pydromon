@@ -52,6 +52,24 @@ def stderr_with(
     return seen
 
 
+def log_quiet(seconds: float = 10.0) -> bool:
+    """Wait, within ``seconds``, until no start thread is running and the log writer
+    has ended with nothing queued, and say whether that happened. A line a start thread
+    is yet to queue, or the writer is yet to write, can then no longer arrive, so a
+    test that counts lines does not rely on a bare sleep for the lines that did not
+    come. **Review of audit, round 17.**"""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        starting = any(t.name == "dromon-spawn" for t in threading.enumerate())
+        log = spawn._log  # pyright: ignore[reportPrivateUsage]
+        with log.lock:
+            idle = log.writer is None and not log.pending
+        if idle and not starting:
+            return True
+        time.sleep(0.01)
+    return False
+
+
 PROJECT = Path(__file__).resolve().parent.parent
 
 
@@ -1694,7 +1712,8 @@ def test_the_slow_start_line_is_written_at_most_once_in_the_interval(
     for _ in range(3):
         spawn.start(TRUE).wait(10)
     written = stderr_with(capsys, "dromond: slow start, ")
-    time.sleep(0.2)  # a second line, if the interval were not kept, would follow
+    # A second line, if the interval were not kept, would be queued by now or soon.
+    assert log_quiet(), "the log writer did not end"
     written += capsys.readouterr().err
     assert written.count("dromond: slow start, ") == 1
     assert len(spawn.slow_starts()) == 3
@@ -1911,7 +1930,7 @@ def test_a_slow_fork_call_is_recorded_whoever_started_it(
     assert notes[0].startswith("fork call ")
     assert "of its own processor time" in notes[0]
     assert "waiting for the fork lock" in notes[0] and "thread " in notes[0]
-    assert "dromond: slow fork, " in capsys.readouterr().err
+    assert "dromond: slow fork, " in stderr_with(capsys, "dromond: slow fork, ")
     spawn.clear_slow_starts()
     subprocess.run(TRUE, check=True, timeout=30)  # noqa: S603  # direct on purpose
     assert len(spawn.slow_starts()) == 1, "a subprocess.run start was not recorded"
