@@ -33,6 +33,25 @@ SLEEP = ["/bin/sleep", "60"]
 BOUND = 0.2
 """The start bound the stall tests use, in seconds."""
 
+
+def stderr_with(
+    capsys: pytest.CaptureFixture[str], needle: str, seconds: float = 10.0
+) -> str:
+    """Everything written to standard error until ``needle`` is in it, within
+    ``seconds``, and what was written by then if it never is. **Review of round 16.**
+    The slow-start line is written by the start's own thread after the outcome has
+    been handed over, so a test that read the stream the moment the child ended raced
+    the writer, and failed on a loaded Linux runner."""
+    seen = ""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        seen += capsys.readouterr().err
+        if needle in seen:
+            break
+        time.sleep(0.01)
+    return seen
+
+
 PROJECT = Path(__file__).resolve().parent.parent
 
 
@@ -481,6 +500,28 @@ def test_a_late_child_that_leads_a_group_is_reaped_with_its_group(
         assert not alive(grandchild)
 
 
+def test_a_late_child_is_awaited_until_it_is_dead_however_slow_the_reap(
+    stalled: "StalledStart", monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of round 16. ``until_reaped`` once judged a child with no pipe reaped as
+    soon as it existed, and the test above then polled a child that the late-start
+    reap had not yet killed, which failed on macOS in pull requests 147 and 148. The
+    kill is delayed here, so that the race is always lost unless the helper waits."""
+    real_kill = spawn._kill  # pyright: ignore[reportPrivateUsage]
+
+    def slow_kill(process: "subprocess.Popen[bytes]") -> None:
+        time.sleep(0.5)
+        real_kill(process)
+
+    monkeypatch.setattr(spawn, "_kill", slow_kill)
+    with pytest.raises(spawn.StartStalled):
+        spawn.start(SLEEP, start_new_session=True)
+    stalled.stall = False
+    stalled.gate.set()
+    child = stalled.until_reaped()
+    assert child.poll() is not None
+
+
 def test_a_timed_out_command_keeps_the_tail_of_what_it_wrote() -> None:
     with pytest.raises(subprocess.TimeoutExpired) as caught:
         spawn.run(
@@ -917,7 +958,9 @@ def test_a_slow_start_is_recorded_with_where_the_time_went(
     assert note.startswith("sh ok after ")
     assert "waiting for the fork lock" in note and "in the fork call" in note
     assert "starts overlapped" in note and "threads" in note
-    assert f"dromond: slow start, {note}" in capsys.readouterr().err
+    assert f"dromond: slow start, {note}" in stderr_with(
+        capsys, f"dromond: slow start, {note}"
+    )
     spawn.clear_slow_starts()
     assert spawn.slow_starts() == []
 
@@ -1650,7 +1693,10 @@ def test_the_slow_start_line_is_written_at_most_once_in_the_interval(
     monkeypatch.setattr(spawn, "LOG_INTERVAL_SECONDS", 60.0)
     for _ in range(3):
         spawn.start(TRUE).wait(10)
-    assert capsys.readouterr().err.count("dromond: slow start, ") == 1
+    written = stderr_with(capsys, "dromond: slow start, ")
+    time.sleep(0.2)  # a second line, if the interval were not kept, would follow
+    written += capsys.readouterr().err
+    assert written.count("dromond: slow start, ") == 1
     assert len(spawn.slow_starts()) == 3
     spawn.clear_slow_starts()
 
