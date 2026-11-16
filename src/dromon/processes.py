@@ -242,7 +242,25 @@ class ProcessWorker:
             return await future
         except asyncio.CancelledError:
             call.cancelled.set()
+            # Review of round 17, finding 1. A task cancelled after the result was set
+            # but before it resumed gets ``CancelledError`` at the await although the
+            # future holds the result, and neither the worker nor ``finish`` sees it
+            # again. It is ended here, on an executor and not on the loop. Taken from
+            # the future only when it holds a result, so a result is handed on once.
+            self._discard_late(call, future)
             raise
+
+    @staticmethod
+    def _discard_late(
+        call: _ProcessCall[_Result], future: asyncio.Future[_Result]
+    ) -> None:
+        if call.discard is None or not future.done() or future.cancelled():
+            return
+        if future.exception() is not None:
+            return
+        kept = future.result()
+        with contextlib.suppress(RuntimeError):
+            call.loop.run_in_executor(None, ProcessWorker._discard, call, kept)
 
     def close(self, timeout: float = PROCESS_WORKER_JOIN_SECONDS) -> bool:
         """Reject new calls, cancel queued calls and join the worker for a bounded time.

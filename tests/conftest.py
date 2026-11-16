@@ -677,7 +677,7 @@ def _isolated_spawn_state(
     # Round 17. A start that stalled samples the children that look stuck on a thread
     # of its own, which writes the ledger and the log when it ends. It is waited for
     # here, so that its entry lands in this test's list and not in the next test's.
-    deadline = time.monotonic() + 20.0
+    deadline = time.monotonic() + spawn.STALL_SAMPLE_WAIT_SECONDS
     while time.monotonic() < deadline and any(
         t.name == "dromon-spawn-sample" for t in threading.enumerate()
     ):

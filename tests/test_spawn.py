@@ -2651,7 +2651,15 @@ def test_the_macos_sampler_gives_the_stack_of_a_real_child() -> None:
         child.kill()
         child.wait()
     if not text.startswith("stack "):
-        pytest.skip(f"the sampler gave no stack here, it said: {text}")
+        refused = ("not permitted", "cannot examine", "could not run", "denied")
+        if any(word in text.lower() for word in refused):
+            # Review of round 17. Said in the reason, which the run lists, so a runner
+            # whose sampler is refused is told that this test did not test it.
+            pytest.skip(
+                "the macOS sampler was REFUSED here, so the sampler was not tested,"
+                f" and it said: {text}"
+            )
+        pytest.fail(f"the sampler ran and gave no stack, it said: {text}")
     assert "time_sleep" in text or "nanosleep" in text or "__semwait" in text
     assert len(text) <= spawn.MAX_SAMPLE_CHARS
 
@@ -2926,3 +2934,75 @@ def test_a_sweep_that_cannot_list_fails_a_start_on_the_loop_and_makes_no_child(
 
     asyncio.run(go())
     assert spawn._fork_slot.__dict__.get("sweep") is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_fork_hook_takes_the_sweep_out_of_the_slot_as_it_uses_it(
+    hygiene: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of round 17, finding 2. Failing before the hook consumed the sweep, when
+    the second fork on the thread ran it again."""
+    ran: list[object] = []
+    monkeypatch.setattr(spawn, "_sweep_inheritable", ran.append)
+
+    def unmark(sweep: object) -> None:
+        del sweep
+
+    monkeypatch.setattr(spawn, "_unmark_inheritable", unmark)
+    sweep = spawn._Sweep(())  # pyright: ignore[reportPrivateUsage]
+    spawn._fork_slot.sweep = sweep  # pyright: ignore[reportPrivateUsage]
+    try:
+        with spawn.forking():
+            assert spawn._fork_slot.sweep is None  # pyright: ignore[reportPrivateUsage]
+        with spawn.forking():
+            pass
+    finally:
+        spawn._fork_slot.sweep = None  # pyright: ignore[reportPrivateUsage]
+    assert ran == [sweep], "the sweep ran for one fork and not for the next"
+
+
+def test_a_plain_start_beside_a_start_on_the_loop_does_not_run_its_sweep(
+    hygiene: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case the review observed, two starts on one loop thread, the first of which
+    passes a descriptor. The sweep is for the first start's fork alone."""
+    read, write = os.pipe()
+    ran: list[object] = []
+    real = spawn._sweep_inheritable  # pyright: ignore[reportPrivateUsage]
+
+    def count(sweep: spawn._Sweep) -> None:  # pyright: ignore[reportPrivateUsage]
+        ran.append(sweep)
+        real(sweep)
+
+    monkeypatch.setattr(spawn, "_sweep_inheritable", count)
+
+    async def go() -> None:
+        first = asyncio.ensure_future(spawn.subprocess_exec(*TRUE, pass_fds=(write,)))
+        second = asyncio.ensure_future(asyncio.create_subprocess_exec(*TRUE))
+        for process in await asyncio.gather(first, second):
+            assert await process.wait() == 0
+
+    try:
+        asyncio.run(go())
+    finally:
+        os.close(read)
+        os.close(write)
+    assert len(ran) == 1, "only the start that asked for a sweep ran one"
+
+
+def test_the_wait_for_the_stall_sample_thread_covers_the_worst_case_with_a_margin() -> (
+    None
+):
+    """Review of round 17. The fixture waits for the thread that samples a stalled
+    start, so its wait is derived from the thread's own bounds. Two children, each
+    taking the sampler's wait, the join slack and a log wait, and a last log wait."""
+    worst = (
+        spawn.MAX_SAMPLED
+        * (
+            spawn.SAMPLE_WAIT_SECONDS
+            + spawn.SAMPLE_JOIN_SLACK_SECONDS
+            + spawn.SAMPLE_LOG_WAIT_SECONDS
+        )
+        + spawn.SAMPLE_LOG_WAIT_SECONDS
+    )
+    assert worst + spawn.STALL_SAMPLE_SLACK_SECONDS <= spawn.STALL_SAMPLE_WAIT_SECONDS
+    assert spawn.STALL_SAMPLE_SLACK_SECONDS >= 5.0

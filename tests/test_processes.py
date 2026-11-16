@@ -1278,3 +1278,89 @@ def test_a_queued_call_that_is_cancelled_never_runs_and_has_nothing_to_discard()
     finally:
         worker.close(5.0)
     assert ran == [] and ended == []
+
+
+def _deliver_then_cancel(
+    holder: list["asyncio.Task[object]"],
+) -> Any:  # noqa: ANN401
+    """A ``_deliver`` that sets the result and cancels the caller in the same loop
+    iteration, so the caller's task wakes with ``CancelledError`` although the future
+    it awaited holds a result. Nothing but a patched delivery can choose that
+    iteration, since a real cancellation lands before or after it by chance."""
+
+    def deliver(
+        call: Any,  # noqa: ANN401
+        *,
+        result: object = None,
+        error: BaseException | None = None,
+    ) -> None:
+        def finish() -> None:
+            if error is not None:
+                call.future.set_exception(error)
+            else:
+                call.future.set_result(result)
+            holder[0].cancel()
+
+        call.loop.call_soon_threadsafe(finish)
+
+    return staticmethod(deliver)
+
+
+def test_a_cancellation_that_lands_after_the_result_is_set_still_discards_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of round 17, finding 1. Failing without ``_discard_late``, which the
+    review observed as ``discarded []``."""
+    ended: list[str] = []
+    got = threading.Event()
+
+    def discard(result: str) -> None:
+        ended.append(result)
+        got.set()
+
+    holder: list[asyncio.Task[object]] = []
+    monkeypatch.setattr(ProcessWorker, "_deliver", _deliver_then_cancel(holder))
+    worker = ProcessWorker()
+
+    async def scenario() -> None:
+        task: asyncio.Task[object] = asyncio.ensure_future(
+            worker.run(lambda: "a process", discard)
+        )
+        holder.append(task)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await asyncio.to_thread(got.wait, 30)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        worker.close(5.0)
+    assert ended == ["a process"], "ended once, and not twice"
+
+
+def test_a_late_cancellation_after_an_error_or_without_a_discard_ends_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ended: list[object] = []
+    holder: list[asyncio.Task[object]] = []
+    monkeypatch.setattr(ProcessWorker, "_deliver", _deliver_then_cancel(holder))
+
+    def fail() -> str:
+        raise ProcessRefused("no")
+
+    async def scenario(function: Any, discard: Any) -> None:  # noqa: ANN401
+        worker = ProcessWorker()
+        task: asyncio.Task[object] = asyncio.ensure_future(
+            worker.run(function, discard)
+        )
+        holder[:] = [task]
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0.2)
+        finally:
+            worker.close(5.0)
+
+    asyncio.run(scenario(fail, ended.append))
+    asyncio.run(scenario(lambda: "x", None))
+    assert ended == []

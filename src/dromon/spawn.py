@@ -311,12 +311,28 @@ SAMPLE_INTERVAL_MS: Final = 10
 SAMPLE_WAIT_SECONDS: Final = 6.0
 """The most a sample waits for the sampler, or for a read of ``/proc``, before it is
 left behind. The wait is on a thread of its own, so the caller never waits past it."""
+SAMPLE_JOIN_SLACK_SECONDS: Final = 2.0
+"""How long past ``wait`` a sample waits for the thread that runs the sampler, which
+itself kills the sampler at ``wait`` and allows it a second to end."""
+SAMPLE_LOG_WAIT_SECONDS: Final = 0.5
+"""How long a stall sample waits for the log writer for each line."""
 MAX_SAMPLED: Final = 2
 """The most children a stalled start samples. The children that look stuck are the
 ones forked and not executed, so more than a few would be a different problem."""
 MAX_SAMPLE_CHARS: Final = 1500
 """The most of one sample kept in the ledger and written to the log."""
 MAX_SAMPLE_FRAMES: Final = 40
+STALL_SAMPLE_SLACK_SECONDS: Final = 5.0
+"""Allowed for reading the children, starting the thread and a loaded machine."""
+STALL_SAMPLE_WAIT_SECONDS: Final = (
+    MAX_SAMPLED
+    * (SAMPLE_WAIT_SECONDS + SAMPLE_JOIN_SLACK_SECONDS + SAMPLE_LOG_WAIT_SECONDS)
+    + SAMPLE_LOG_WAIT_SECONDS
+    + STALL_SAMPLE_SLACK_SECONDS
+)
+"""The longest to wait for the thread that samples a stalled start, derived from the
+bounds of each step it takes, so that a caller which must see its entry, as the test
+fixture does, waits for as long as the thread can take and a margin."""
 MAX_STALL_SAMPLES_KEPT: Final = 8
 """Room the ledger keeps beyond ``MAX_SLOW_STARTS_KEPT`` for stall samples, so a ledger
 full of slow starts, which a loaded machine makes, cannot drop the evidence of a
@@ -589,6 +605,12 @@ def forking() -> Generator[None]:
     _watch(watched)
     cpu_began = _thread_cpu()
     sweep: _Sweep | None = getattr(_fork_slot, "sweep", None)
+    # Review of round 17, finding 2. Taken out of the slot as it is used, so only the
+    # one fork it was set for runs it. A start on the loop leaves the slot set while
+    # it waits for its transport, and another start on the same loop thread, which
+    # may be a library's, would otherwise run a sweep for descriptors that are not
+    # its own, and fail with ``EBADF`` if the first start had closed one.
+    _fork_slot.sweep = None
     try:
         if sweep is not None:
             _sweep_inheritable(sweep)
@@ -1304,7 +1326,7 @@ def _run_sampler(pid: int, program: str, wait: float) -> str:
 
     reader = threading.Thread(target=read, name="dromon-spawn-sample", daemon=True)
     reader.start()
-    reader.join(wait + 2.0)
+    reader.join(wait + SAMPLE_JOIN_SLACK_SECONDS)
     return result[0] if result else "the sampler did not return"
 
 
@@ -1415,7 +1437,7 @@ def _sample_stalled(shown: str, bound: float) -> None:
                 " daemon that was forked and not executed was found"
             )
             _keep_slow(text, reserved=True)
-            _say(f"dromond: {text}", limited=False, wait=0.5)
+            _say(f"dromond: {text}", limited=False, wait=SAMPLE_LOG_WAIT_SECONDS)
             return
         for child in children:
             sample = sample_process(child.pid)
@@ -1427,7 +1449,7 @@ def _sample_stalled(shown: str, bound: float) -> None:
                 MAX_SAMPLE_CHARS + 300,
             )
             _keep_slow(text, reserved=True)
-            _say(f"dromond: {text}", limited=False, wait=0.5)
+            _say(f"dromond: {text}", limited=False, wait=SAMPLE_LOG_WAIT_SECONDS)
     except Exception:  # noqa: BLE001, S110
         pass
 

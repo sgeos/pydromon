@@ -68,6 +68,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
+from urllib.parse import quote
 
 from claude_agent_sdk import SdkMcpTool
 
@@ -352,6 +353,26 @@ SERVERS_UPDATED: Final = "x.ai/mcp/servers_updated"
 Dromon passed none."""
 MCP_PROGRESS: Final = "x.ai/mcp/init_progress"
 """Grok's count of the MCP servers a session is connecting, as ``total``."""
+BRIDGE_LOG_DIR: Final = "bridge-logs"
+"""The directory of Grok's home where each line's tool server writes its log."""
+SESSION_EVENTS_NAME: Final = "events.jsonl"
+"""Grok's own record of a session, in its home under ``sessions``, in a directory named
+for the working directory with every character that is not a letter or digit written
+as ``%`` and its hexadecimal value, and one named for the session. **Round 17, item 3.**
+It holds ``mcp_server_failed``, with ``error_type`` and ``error_message``, and
+``mcp_init_completed``, with ``failed_servers``, which no ACP notice carries. **Fact,
+read on 2026-11-16.** A Grok session whose Dromon server closed before it answered
+``initialize`` recorded both, 113 to 211 milliseconds after it began. **Inference.**
+The file is Grok's own, not a documented interface, so a change in its shape means no
+failure is found and the turn goes on as it did before this check."""
+MAX_SESSION_EVENTS_BYTES: Final = 262144
+"""The most of that file read, from its start. A longer file is not read further."""
+MCP_EVENTS_WAIT_SECONDS: Final = 2.0
+"""How long a session waits for Grok to record that its servers finished, after
+``session/new`` answered. Without the record the turn goes on."""
+SESSION_ID_CHARS: Final = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
 MODELS_UPDATE: Final = "x.ai/models/update"
 """Grok's models, as ``currentModelId`` and ``availableModels``."""
 SESSION_NOTIFICATION: Final = "x.ai/session_notification"
@@ -1519,6 +1540,74 @@ class _MissingResumedModel(EngineRefused):
     """A resumed session has a stale model catalog. No turn has started."""
 
 
+def session_events_path(home: Path, cwd: Path, session_id: str) -> Path | None:
+    """Where Grok keeps the events of a session, or ``None`` for an identifier that is
+    not a plain name, since Grok's answer is untrusted and could otherwise name a
+    path."""
+    if (
+        not session_id
+        or len(session_id) > 128
+        or not set(session_id) <= SESSION_ID_CHARS
+    ):
+        return None
+    directory = quote(str(cwd), safe="")
+    return home / HOME_DIR / "sessions" / directory / session_id / SESSION_EVENTS_NAME
+
+
+def _printable(value: object, limit: int = 200) -> str:
+    text = value if isinstance(value, str) else repr(value)
+    return "".join(c if " " <= c <= "~" else "?" for c in text[:limit])
+
+
+def read_mcp_failure(events: Path, name: str) -> tuple[bool, str | None]:
+    """Whether Grok has recorded that its MCP servers finished starting, and why the
+    server ``name`` failed if it did. **Round 17, item 3.** Reads at most
+    ``MAX_SESSION_EVENTS_BYTES`` of a regular file that is not a link, takes the last
+    ``mcp_config_resolved`` as the start of the record, and never raises. A file that
+    is missing, unreadable, or not in the shape described gives ``(False, None)``."""
+    try:
+        descriptor = os.open(events, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False, None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return False, None
+        data = os.read(descriptor, MAX_SESSION_EVENTS_BYTES)
+    except OSError:
+        return False, None
+    finally:
+        os.close(descriptor)
+    completed = False
+    failures: dict[str, str] = {}
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        record = cast(dict[str, Any], event)
+        kind = record.get("type")
+        if kind == "mcp_config_resolved":
+            completed, failures = False, {}
+        elif kind == "mcp_server_failed":
+            server = record.get("server_name")
+            if isinstance(server, str):
+                failures[server] = (
+                    f"Grok said {_printable(record.get('error_type'), 40)}, "
+                    f"{_printable(record.get('error_message'))}"
+                )
+        elif kind == "mcp_init_completed":
+            completed = True
+            listed = record.get("failed_servers")
+            for server in cast(list[Any], listed) if isinstance(listed, list) else []:
+                if isinstance(server, str):
+                    failures.setdefault(
+                        server, "Grok listed it among its failed servers"
+                    )
+    return completed, failures.get(name)
+
+
 class GrokLine:
     """One session line on the Grok Build engine, with its driver."""
 
@@ -2389,7 +2478,9 @@ class GrokLine:
             meta["rules"] = instructions
         params: dict[str, object] = {
             "cwd": str(self.cwd),
-            "mcpServers": acp.mcp_servers(self.bridge, self.line_token),
+            "mcpServers": acp.mcp_servers(
+                self.bridge, self.line_token, self._bridge_log_path()
+            ),
             "_meta": meta,
         }
         if resumable is None:
@@ -2428,6 +2519,13 @@ class GrokLine:
             turn.refusal = (
                 "Grok did not report its MCP servers, so Dromon cannot confirm that"
                 " a Grok line has only Dromon's tools"
+            )
+            return session_id
+        failure = await self._server_failure(session_id)
+        if failure is not None:
+            turn.refusal = (
+                "Grok could not start Dromon's own MCP server, so the line has none of"
+                f" Dromon's tools. {failure}"
             )
             return session_id
         if not self._has_model_option(result):
@@ -2525,6 +2623,51 @@ class GrokLine:
         if refusal is not None:
             turn.refusal = refusal
         return session_id
+
+    def _bridge_log_path(self) -> Path | None:
+        """Where Dromon's tool server for this line writes its standard error and its
+        end, in a directory of Grok's home that the line's profile allows it to write.
+        **Round 17, item 1.** One file for each working directory, so that two Grok
+        lines do not truncate each other's. ``None`` where the directory cannot be
+        made, which leaves the server to run without a log."""
+        if not self.bridge or self.line_token is None:
+            return None
+        directory = self._home / HOME_DIR / BRIDGE_LOG_DIR
+        digest = hashlib.sha256(str(self.cwd).encode()).hexdigest()[:16]
+        try:
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except OSError:
+            return None
+        return directory / f"bridge-{digest}.log"
+
+    async def _server_failure(self, session_id: str) -> str | None:
+        """Why Grok failed to start Dromon's MCP server, read from its own record of the
+        session, or ``None`` when it did not fail, when there is no bridge to fail, or
+        when Grok has a record that does not say its servers finished within
+        ``MCP_EVENTS_WAIT_SECONDS``. **Round 17, item 3.** Before this a server that
+        closed at its handshake left the line with no tools, and the first call to one
+        was reported as a tool the line was not given. **Not covered.** A record that
+        is absent or reshaped, which the turn then goes on without, as before."""
+        if not self.bridge or self.line_token is None:
+            return None
+        path = session_events_path(self._home, self.cwd, session_id)
+        if path is None:
+            return None
+        if not await asyncio.to_thread(path.is_file):
+            # Grok keeps no record of this session, which is the case in every test of
+            # the adapter, so there is nothing to wait for.
+            return None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + MCP_EVENTS_WAIT_SECONDS
+        while True:
+            completed, failure = await asyncio.to_thread(
+                read_mcp_failure, path, acp.MCP_SERVER_NAME
+            )
+            if failure is not None:
+                return failure
+            if completed or loop.time() >= deadline:
+                return None
+            await asyncio.sleep(0.05)
 
     async def _prompt(self, session_id: str, prompt: str, turn: _Turn) -> str:
         if self._model_replaced:

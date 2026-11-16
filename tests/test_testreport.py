@@ -248,10 +248,20 @@ def test_the_report_time_comes_from_the_environment_or_the_default(
     )
 
 
-def test_the_default_report_comes_well_before_the_jobs_limit() -> None:
-    """The workflow's gate step is bounded at 25 minutes and the job at 30, so a run
-    that is still going at 20 minutes has said where it is before either ends."""
-    assert testreport.SESSION_REPORT_SECONDS < 25 * 60
+def test_the_default_report_comes_after_a_healthy_gate_and_before_the_step_limit() -> (
+    None
+):
+    """The workflow's gate step is bounded at 40 minutes and the job at 45. A Linux
+    gate that passed took 28, so a healthy run says nothing, and a run that is still
+    going at 30 minutes has said where it is, with room for several repeats, before
+    the step ends."""
+    healthy, step = 28 * 60, 40 * 60
+    assert healthy < testreport.SESSION_REPORT_SECONDS < step
+    assert (
+        step
+        > testreport.SESSION_REPORT_SECONDS
+        + 3 * testreport.SESSION_REPORT_REPEAT_SECONDS
+    )
     assert (
         testreport.SESSION_REPORT_REPEAT_SECONDS * testreport.MAX_SESSION_REPORTS
         < 4 * 3600

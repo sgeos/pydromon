@@ -40,7 +40,7 @@ jobs:
   test:
     name: test (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     # pykeleusma must install from a published wheel. Ubuntu runners ship Rust, so
@@ -83,15 +83,30 @@ jobs:
       # Socket tests run here, since runners allow Unix domain sockets. UV_PYTHON makes
       # the gate's locked sync install for this job's interpreter.
       #
-      # The step is bounded at 25 minutes, five before the job's own limit. A job that
-      # the runner cancels at its limit left no log on macOS in round 16, so the step
-      # ends first, with a failure and its output. PYTHONUNBUFFERED keeps Python's own
-      # output out of a buffer that a kill would drop, and the run reports where it is
-      # from 20 minutes on, naming the test, as dromon.testreport does. That the step
-      # limit keeps the log is an inference from the runner's documentation and is
-      # to be confirmed by the first run that reaches it.
+      # The step is bounded at 40 minutes, five before the job's own limit of 45. A
+      # job that the runner cancels at its limit left no log on macOS in round 16, so
+      # the step ends first, with a failure and its output. PYTHONUNBUFFERED keeps
+      # Python's own output out of a buffer that a kill would drop, and the run
+      # reports where it is from 30 minutes on, naming the test, as dromon.testreport
+      # does. That the step limit keeps the log is an inference from the runner's
+      # documentation and is to be confirmed by the first run that reaches it.
+      #
+      # Why these numbers. They come from the timings of pull request 143 on
+      # 2026-11-16. The Linux job on Python 3.15 passed in 28 minutes, and the macOS
+      # job on Python 3.12 was cancelled at 36 minutes, which is the run these limits
+      # exist to explain. An earlier limit of 30 minutes for the job, and 25 for the
+      # step, would have failed the Linux gate that passed. Forty minutes is the
+      # slowest passing gate seen plus about forty percent, so a slow runner does not
+      # fail a healthy gate, and it is past the 36 minutes at which a stalled gate was
+      # seen to be still going, so a stall still ends here and not at the job. The
+      # five minutes between the step and the job are for the runner to flush and
+      # upload the log, which nothing in this repository measures, so that margin is a
+      # judgement. If a healthy gate on some runner comes within five minutes of 40,
+      # raise this limit and the job's together by the same amount, and keep the
+      # five minutes between them. The cost of the longer limit is that a stalled job
+      # holds a runner for up to forty minutes, two at a time by max-parallel.
       - name: The local gate
-        timeout-minutes: 25
+        timeout-minutes: 40
         env:
           UV_PYTHON: ${{ steps.python.outputs.python-path }}
           PYTHONUNBUFFERED: "1"

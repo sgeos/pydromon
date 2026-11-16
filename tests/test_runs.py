@@ -2005,3 +2005,93 @@ def test_a_cancelled_run_start_ends_the_supervisor_it_had_launched(
         asyncio.run(scenario())
         assert children and children[0].returncode == 0, "the supervisor was left"
         assert not log.state.runs, "no run was recorded"
+
+
+def _waiting_supervisor() -> subprocess.Popen[bytes]:
+    """A stand-in for the supervisor, which ends when its input does."""
+    return spawn.start(
+        [sys.executable, "-I", "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+    )
+
+
+def test_a_second_cancellation_does_not_skip_the_abandon_that_is_queued(
+    project: Path,
+) -> None:
+    """Review of round 17, finding 1. The abandon runs on the process worker, which
+    skips a call whose caller was cancelled before it ran. Cancelled again while the
+    abandon waited behind another call, the supervisor was left running, its input
+    open. Failing before ``_end_run_child`` made the abandon a task of its own."""
+    hold = threading.Event()
+    path = project / "events.sqlite"
+    with EventLog(path) as log:
+        scheduler = scheduler_on(log, project)
+        child = _waiting_supervisor()
+
+        async def scenario() -> None:
+            busy = asyncio.ensure_future(
+                scheduler._process_worker.run(  # pyright: ignore[reportPrivateUsage]
+                    lambda: hold.wait(30)
+                )
+            )
+            await asyncio.sleep(0.05)
+            ending = asyncio.ensure_future(
+                scheduler._end_run_child(child)  # pyright: ignore[reportPrivateUsage]
+            )
+            await asyncio.sleep(0.05)
+            ending.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ending
+            hold.set()
+            await busy
+            deadline = time.monotonic() + 30
+            while child.poll() is None and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+
+        try:
+            asyncio.run(scenario())
+            assert child.returncode == 0, "the supervisor was left running"
+        finally:
+            hold.set()
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+
+def test_a_run_record_that_cannot_be_built_ends_the_supervisor(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of round 17, finding 1, the smaller one. ``RunStarted`` was built
+    outside the guard that ends the supervisor."""
+    children: list[subprocess.Popen[bytes]] = []
+
+    def launch(*arguments: object, **options: object) -> runs.Launched:
+        child = _waiting_supervisor()
+        children.append(child)
+        return runs.Launched(child, str(project / "out"), "started")
+
+    def refuse(*arguments: object) -> object:
+        raise ValueError("stand-in for a validation error")
+
+    monkeypatch.setattr(runs, "launch", launch)
+    monkeypatch.setattr("dromon.scheduler.RunStarted", refuse)
+    path = project / "events.sqlite"
+    with EventLog(path) as log:
+        scheduler = scheduler_on(log, project)
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+
+        async def scenario() -> None:
+            with pytest.raises(ValueError, match="stand-in"):
+                await scheduler.start_run("alpha", "gate", "none")
+
+        try:
+            asyncio.run(scenario())
+            deadline = time.monotonic() + 30
+            while children[0].poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert children[0].returncode == 0, "the supervisor was left running"
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()

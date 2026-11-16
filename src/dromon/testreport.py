@@ -33,12 +33,13 @@ _kinds: Counter[str] = Counter()
 _why: dict[str, str] = {}
 
 
-SESSION_REPORT_SECONDS: Final = 1200.0
+SESSION_REPORT_SECONDS: Final = 1800.0
 """When the run first says where it is, in seconds after it began. **Round 17, item 7.**
-A macOS job was cancelled at the job's limit of 30 minutes and left no log that named
-the test it was in, since the summary comes at the end and the per-test fault bound of
-five minutes does not fire for a run made of many tests that are each only slow. Twenty
-minutes leaves the report well before the limit and after a run that takes ten."""
+A macOS job was cancelled at the job's limit and left no log that named the test it
+was in, since the summary comes at the end and the per-test fault bound of five
+minutes does not fire for a run made of many tests that are each only slow. Thirty
+minutes is after the slowest healthy gate seen, 28 minutes on Linux, so a healthy run
+says nothing, and ten minutes before the workflow's step limit of 40."""
 
 SESSION_REPORT_REPEAT_SECONDS: Final = 120.0
 """How often it says so again."""

@@ -2808,6 +2808,8 @@ class Scheduler:
         self._checkout_dir = checkout_dir
         """Where commit runs' checkouts are made, or ``None``, which refuses them."""
         self._checkouts_starting: set[str] = set()
+        # Review of round 17. Supervisors being ended after a cancellation.
+        self._abandoning: set[asyncio.Future[None]] = set()
         """Runs whose checkout is made but whose start is not yet recorded, which a
         tidy keeps."""
         self._ref_anchor: commitruns.RefAnchor | str = "no project root was given"
@@ -5480,27 +5482,30 @@ class Scheduler:
                 ),
                 lambda late: runs.abandon(late.child),
             )
-            started = RunStarted(
-                run_id,
-                line_id,
-                self._run_role(line_id),
-                latest_id,
-                command,
-                argv,
-                str(workdir),
-                launched.output_file,
-                launched.child.pid,
-                launched.process_started,
-                format_due(self._wall_clock()),
-                commit,
-                None if command_dir is None else str(command_dir),
-                tree,
-                head,
-            )
             try:
+                # Review of round 17, finding 1. Built inside the guard, so a
+                # validation error here ends the supervisor and does not leave it to
+                # the collector.
+                started = RunStarted(
+                    run_id,
+                    line_id,
+                    self._run_role(line_id),
+                    latest_id,
+                    command,
+                    argv,
+                    str(workdir),
+                    launched.output_file,
+                    launched.child.pid,
+                    launched.process_started,
+                    format_due(self._wall_clock()),
+                    commit,
+                    None if command_dir is None else str(command_dir),
+                    tree,
+                    head,
+                )
                 self._log.append(started)
             except BaseException:
-                await self._process_worker.run(lambda: runs.abandon(launched.child))
+                await self._end_run_child(launched.child)
                 raise
         except BaseException:
             if checkout is not None:
@@ -5510,7 +5515,7 @@ class Scheduler:
             self._checkouts_starting.discard(run_id)
         self._run_children[run_id] = launched.child
         if not runs.release(launched):
-            await self._process_worker.run(lambda: runs.abandon(launched.child))
+            await self._end_run_child(launched.child)
             self._record_run_end(
                 runs.Finding(
                     run_id,
@@ -5529,6 +5534,29 @@ class Scheduler:
             )
         self._watch_run(run_id, launched.child)
         return started
+
+    async def _end_run_child(self, child: subprocess.Popen[Any]) -> None:
+        """End a supervisor that was launched and will not be used, and finish doing
+        so even if this task is cancelled again. **Review of round 17, finding 1.** The
+        abandon is queued on the process worker, which skips a call whose caller was
+        cancelled before it ran, so a second cancellation while it waited would leave
+        the supervisor running with its input open. The call is a task of its own that
+        a cancellation of this one does not reach. The reference held in
+        ``_abandoning`` keeps it from being collected before it runs."""
+        task = asyncio.ensure_future(
+            self._process_worker.run(lambda: runs.abandon(child))
+        )
+        self._abandoning.add(task)
+
+        def done(finished: asyncio.Future[None]) -> None:
+            self._abandoning.discard(finished)
+            if not finished.cancelled():
+                # Read, so that a refusal is not reported as never retrieved. The
+                # abandon of a refused call is the collector's, as it was before.
+                finished.exception()
+
+        task.add_done_callback(done)
+        await asyncio.shield(task)
 
     async def _make_checkout(
         self, line_id: str, command: str, run_id: str, commit: str
