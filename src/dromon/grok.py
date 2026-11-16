@@ -71,7 +71,7 @@ from typing import Any, Final, Protocol, cast
 
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import acp, evidence
+from dromon import acp, evidence, spawn
 from dromon.model import MAX_SESSION_BYTES
 from dromon.acp import bridge_command as bridge_command
 from dromon.activity import ActivityKind, Observer, ignore
@@ -1400,7 +1400,7 @@ async def _grok_agent(
         raise EngineRefused("the grok command is not installed or not on PATH")
     command, launched, policy = launcher.wrap([found, *arguments], environment)
     recording = evidence.RECORDING.get()
-    process = await asyncio.create_subprocess_exec(
+    process = await spawn.subprocess_exec(
         *command,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,

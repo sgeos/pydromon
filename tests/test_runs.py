@@ -1962,3 +1962,46 @@ def test_a_real_stop_ends_a_command_child_that_called_setsid(tmp_path: Path) -> 
     finally:
         with contextlib.suppress(ProcessLookupError):
             os.kill(stray, 9)
+
+
+def test_a_cancelled_run_start_ends_the_supervisor_it_had_launched(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 17, item 3. The start runs on the process worker, so a cancellation that
+    arrives while the supervisor starts never receives it. It used to be dropped
+    running, with its input open and a warning at its collection. The worker now
+    ends it. The supervisor here stands in with a program that ends when its input
+    does, as the real one ends without ``GO``."""
+    began, finish = threading.Event(), threading.Event()
+    children: list[subprocess.Popen[bytes]] = []
+
+    def slow_launch(*arguments: object, **options: object) -> runs.Launched:
+        child = spawn.start(
+            [sys.executable, "-I", "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.PIPE,
+        )
+        children.append(child)
+        began.set()
+        finish.wait(30)
+        return runs.Launched(child, str(project / "out"), "started")
+
+    monkeypatch.setattr(runs, "launch", slow_launch)
+    path = project / "events.sqlite"
+    with EventLog(path) as log:
+        scheduler = scheduler_on(log, project)
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+
+        async def scenario() -> None:
+            task = asyncio.ensure_future(scheduler.start_run("alpha", "gate", "none"))
+            assert await asyncio.to_thread(began.wait, 30)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            finish.set()
+            deadline = time.monotonic() + 30
+            while children[0].poll() is None and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+
+        asyncio.run(scenario())
+        assert children and children[0].returncode == 0, "the supervisor was left"
+        assert not log.state.runs, "no run was recorded"

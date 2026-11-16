@@ -82,9 +82,19 @@ jobs:
 
       # Socket tests run here, since runners allow Unix domain sockets. UV_PYTHON makes
       # the gate's locked sync install for this job's interpreter.
+      #
+      # The step is bounded at 25 minutes, five before the job's own limit. A job that
+      # the runner cancels at its limit left no log on macOS in round 16, so the step
+      # ends first, with a failure and its output. PYTHONUNBUFFERED keeps Python's own
+      # output out of a buffer that a kill would drop, and the run reports where it is
+      # from 20 minutes on, naming the test, as dromon.testreport does. That the step
+      # limit keeps the log is an inference from the runner's documentation and is
+      # to be confirmed by the first run that reaches it.
       - name: The local gate
+        timeout-minutes: 25
         env:
           UV_PYTHON: ${{ steps.python.outputs.python-path }}
+          PYTHONUNBUFFERED: "1"
         run: ./scripts/check.sh
 
   # Lints the workflows themselves. actionlint checks syntax, expressions and the

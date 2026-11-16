@@ -347,6 +347,16 @@ def walk_gap(platform: str = sys.platform) -> str | None:
     return None if platform.startswith("linux") else WALK_GAP
 
 
+class SilentWalk(str):
+    """A reason that is a timeout of every attempt and not a refusal of ``ps``. **Round
+    17, item 5.** A ``ps`` that cannot run or fails answers the same way every time, so
+    a turn that needs the walk is refused and the line is held for an operator. A
+    ``ps`` that was only silent, on a machine too loaded to answer in
+    ``CHECK_DEADLINE_SECONDS``, may answer the next time, so the turn is deferred and
+    the line is not held. A subclass of ``str``, so every caller that takes the reason
+    as text is unchanged."""
+
+
 def walk_unavailable(
     read: Callable[[int, float], list[TreeRow] | TreeReadFailure] | None = None,
     pause: Callable[[float], None] = time.sleep,
@@ -367,8 +377,10 @@ def walk_unavailable(
     its reason is returned at once. The reason after a timeout names each attempt's
     measured time, so that the hold message says how slow the table was and not only
     that it was too slow. **Residual.** The check runs on the process worker, so a
-    worst case of about ``CHECK_DEADLINE_SECONDS`` delays other process tools, and a
-    machine that never answers still holds the line."""
+    worst case of about ``CHECK_DEADLINE_SECONDS`` delays other process tools.
+    **Round 17, item 5.** A machine that never answered held the line for an operator
+    each time. The reason after timeouts alone is now a ``SilentWalk``, which the
+    scheduler defers and does not hold for."""
     reader = tree_or_reason if read is None else read
     started = clock()
     measured: list[float] = []
@@ -391,7 +403,7 @@ def walk_unavailable(
                 break
             pause(pause_seconds)
             pause_seconds *= 2
-    return walk_timeout_reason(measured, clock() - started)
+    return SilentWalk(walk_timeout_reason(measured, clock() - started))
 
 
 def walk_timeout_reason(measured: Sequence[float], total: float) -> str:

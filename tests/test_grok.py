@@ -2378,6 +2378,7 @@ def test_the_line_socket_serves_only_the_lines_own_tools(
             "propose_change",
             "list_processes",
             "stop_process",
+            "sample_process",
             "worktree_status",
             "sandbox_probe",
             "list_mail",

@@ -106,7 +106,19 @@ granted by its real path, since the operator chose it and a line does not write 
 that names it. **Residual.** A line with write access to the directory that holds another
 line's working directory can still replace that working directory by a link, and the grant
 follows it. Placing worktrees where no line can write their parent is the operator's
-protection. A
+protection. **The one-writer bound, round 17, item 6.** The protection is a bound that
+this document names and the daemon does not enforce. (1) A working directory is written
+by one line at a time, the owner of its role, and a role's other seats are read only,
+as [`ROLES.md`](../architecture/ROLES.md) says. (2) No line is given write access to the
+parent of any line's working directory, or to any directory above it, since a line that
+can write there can replace the working directory by a link, and the grant of its real
+path then follows the link to wherever the writing line chose. (3) The parent is
+therefore the operator's own, and a worktree is created by the operator, never by a line.
+**Inference, not shown by a test.** Two writers to one working directory, or a line that
+can write a parent, would let one line widen another's write access to a directory of
+its choice. Nothing in the daemon checks (2) today, and a check at the building of a
+line's sandbox, which would refuse a working directory whose parent lies in another
+line's write list, is the follow-up if the layout ever changes. A
 `denyWrite` entry for the working directory still wins over the grant, so a read line
 stays read only. **Failure modes.** The real path is read once, when the line's sandbox
 is built, so a link changed afterwards, or created below an entry, is not followed. A

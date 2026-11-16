@@ -168,9 +168,10 @@ excluded. A traceback of every thread at the next hang is what would settle it.
 
 **Not covered.** ``asyncio.create_subprocess_exec`` runs ``Popen`` on the event loop's
 own thread and cannot be moved to another, so its callers in the engine drivers are
-still unbounded, and a stall there stops the daemon's loop. The follow-up is an
-asynchronous process adapter built on ``start``, which is a larger change than this
-one.
+still unbounded, and a stall there stops the daemon's loop. **Round 17.** They now
+start through ``subprocess_exec``, which gives them the descriptor handling of
+``start`` and not its bound. The follow-up is an asynchronous process adapter built on
+``start``, which is a larger change than this one.
 
 Porting note. A start is one external effect with a deadline, which maps onto
 ``std::process::Command`` spawned from a thread with a channel in the Rust port, and
@@ -183,6 +184,7 @@ import asyncio
 import contextlib
 import faulthandler
 import os
+import re
 import resource
 import signal
 import subprocess
@@ -296,6 +298,29 @@ MAX_SLOW_STARTS_KEPT: Final = 64
 of every thread. It is after the bound, so a start that stalls is already reported by
 ``StartStalled`` when the dump is written, and the dump is of the state the report
 describes."""
+
+SAMPLE_PROGRAM: Final = "/usr/bin/sample"
+"""The operating system's own sampler on macOS. **Round 17.** It reads a process's
+stack through the kernel and needs no cooperation from the process, so it works on a
+child that was forked and never ran its program, which is the stuck child of the stall
+this module records. It was run against a plain child inside an agent's sandbox and
+printed a call graph there."""
+SAMPLE_SECONDS: Final = 1
+"""How long the sampler watches, in seconds, at ``SAMPLE_INTERVAL_MS`` steps."""
+SAMPLE_INTERVAL_MS: Final = 10
+SAMPLE_WAIT_SECONDS: Final = 6.0
+"""The most a sample waits for the sampler, or for a read of ``/proc``, before it is
+left behind. The wait is on a thread of its own, so the caller never waits past it."""
+MAX_SAMPLED: Final = 2
+"""The most children a stalled start samples. The children that look stuck are the
+ones forked and not executed, so more than a few would be a different problem."""
+MAX_SAMPLE_CHARS: Final = 1500
+"""The most of one sample kept in the ledger and written to the log."""
+MAX_SAMPLE_FRAMES: Final = 40
+MAX_STALL_SAMPLES_KEPT: Final = 8
+"""Room the ledger keeps beyond ``MAX_SLOW_STARTS_KEPT`` for stall samples, so a ledger
+full of slow starts, which a loaded machine makes, cannot drop the evidence of a
+stall."""
 
 _REAL_POPEN: Final = subprocess.Popen
 """``subprocess.Popen`` as it was when this module was loaded. The report of a stalled
@@ -1201,6 +1226,212 @@ def stall_report(
         return f"the report failed, {type(error).__name__}"
 
 
+_FRAME = re.compile(r"^\s*\d+\s+(\S+)")
+_PROC_SAMPLE_FILES: Final = ("wchan", "syscall", "stack")
+
+
+def condense_sample(report: str) -> str:
+    """The part of a macOS ``sample`` report that says where a process is, bounded to
+    ``MAX_SAMPLE_CHARS``. **Round 17.** The call graph's function names in order, at
+    most ``MAX_SAMPLE_FRAMES``, then the function on top of each stack, with no address,
+    library path or argument, since the full report runs to thousands of lines. A report
+    with no call graph, such as the sampler's refusal, gives its first two lines. Never
+    raises."""
+    try:
+        lines = report.splitlines()
+        if "Call graph:" not in lines:
+            head = [line.strip() for line in lines if line.strip()][:2]
+            return _clean("; ".join(head) or "the sampler printed nothing", 300)
+        start = lines.index("Call graph:") + 1
+        frames: list[str] = []
+        for line in lines[start:]:
+            if not line.strip():
+                break
+            match = _FRAME.match(line)
+            if match is not None and len(frames) < MAX_SAMPLE_FRAMES:
+                frames.append(match.group(1))
+        tops: list[str] = []
+        if "Sort by top of stack, same collapsed (when >= 5):" in lines:
+            at = lines.index("Sort by top of stack, same collapsed (when >= 5):") + 1
+            for line in lines[at:]:
+                if not line.strip():
+                    break
+                tops.append(" ".join(line.split()[:1] + line.split()[-1:]))
+        text = "stack " + " > ".join(frames)
+        if tops:
+            text += "; on top, " + ", ".join(tops[:3])
+        return _clean(text, MAX_SAMPLE_CHARS)
+    except Exception:  # noqa: BLE001
+        return "the sample could not be read"
+
+
+def _run_sampler(pid: int, program: str, wait: float) -> str:
+    """Run the sampler on ``pid`` on a thread of its own, left behind after ``wait``,
+    since the process that stalled may be unable to start another and a sample must not
+    hold the report. The sampler is started with the usual ``Popen``, so it waits for
+    the fork lock, which a start stuck inside the fork call holds, and then the sample
+    says so. A stall after the fork, which the read of the exec pipe is, leaves it
+    free."""
+    result: list[str] = []
+
+    def read() -> None:
+        try:
+            done = _REAL_POPEN(  # noqa: S603
+                [
+                    program,
+                    str(pid),
+                    str(SAMPLE_SECONDS),
+                    str(SAMPLE_INTERVAL_MS),
+                    "-mayDie",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+            )
+            try:
+                out, _ = done.communicate(timeout=wait)
+            except subprocess.TimeoutExpired:
+                _kill(done)
+                with contextlib.suppress(subprocess.SubprocessError, OSError):
+                    done.communicate(timeout=1.0)
+                result.append("the sampler did not end in time")
+                return
+            result.append(condense_sample(out))
+        except (OSError, subprocess.SubprocessError) as error:
+            result.append(f"the sampler could not run, {type(error).__name__}")
+
+    reader = threading.Thread(target=read, name="dromon-spawn-sample", daemon=True)
+    reader.start()
+    reader.join(wait + 2.0)
+    return result[0] if result else "the sampler did not return"
+
+
+def _proc_sample(proc: Path, pid: int, wait: float) -> str:
+    """Where a Linux process waits, from ``status``, ``wchan``, ``syscall`` and
+    ``stack`` of its ``/proc`` entry, which start no process. A read of some of these
+    can wait for ever on a child in the middle of ``exec``, so the reads run on a thread
+    of their own, left behind after ``wait``, and the text then names the file that did
+    not return. ``syscall`` and ``stack`` may be refused to a process that is not
+    permitted to trace the target, which the text says."""
+    parts: list[str] = []
+    at = [""]
+    ended = threading.Event()
+
+    def read() -> None:
+        try:
+            at[0] = f"{pid}/status"
+            status = _read_text(proc / str(pid) / "status")
+            if status is None:
+                parts.append("status unreadable, the process may have ended")
+            else:
+                for line in status.splitlines():
+                    if line.startswith(("State:", "Threads:")):
+                        parts.append(" ".join(line.split()))
+            for name in _PROC_SAMPLE_FILES:
+                at[0] = f"{pid}/{name}"
+                value = _read_text(proc / str(pid) / name)
+                parts.append(
+                    f"{name} unreadable" if value is None else f"{name} {value}"
+                )
+        except Exception:  # noqa: BLE001, S110
+            pass
+        finally:
+            ended.set()
+
+    reader = threading.Thread(target=read, name="dromon-spawn-sample", daemon=True)
+    reader.start()
+    if not ended.wait(wait):
+        parts.append(
+            f"reading /proc/{_clean(at[0], 40)} did not return within {wait:g}s"
+        )
+    return _clean("; ".join(parts), MAX_SAMPLE_CHARS)
+
+
+def sample_process(
+    pid: int,
+    *,
+    proc: Path = Path("/proc"),
+    program: str = SAMPLE_PROGRAM,
+    wait: float = SAMPLE_WAIT_SECONDS,
+) -> str:
+    """Where a process is, as text bounded to ``MAX_SAMPLE_CHARS``, or why that cannot
+    be told. **Round 17, the evidence the stall needed.** On macOS it runs the
+    operating system's sampler, which gives the call stack of each thread, and on Linux
+    it reads the process's ``status``, ``wchan`` and, where permitted, ``syscall`` and
+    ``stack``. It waits at most about ``wait`` plus two seconds, on a thread of its own,
+    and never raises. **The caller chooses the pid.** Nothing here checks that it is a
+    child of this process, so a caller that takes a pid from a line must check it
+    against the ledger first, as ``Scheduler`` does. The sampler only reads, and it is
+    run by the daemon's own user, so it cannot reach a process of another user.
+    **Not known.** Whether a process stuck between ``fork`` and ``exec`` can be
+    sampled on every macOS version, which the sampler's text says when it cannot.
+    **Porting hazard.** It runs an external program, and a Rust port may read the
+    stack through the same program or the platform's debugging interface."""
+    try:
+        if type(pid) is not int or pid <= 1 or pid == os.getpid():
+            return "refused, not the pid of another process"
+        if (proc / "self" / "stat").exists():
+            return _proc_sample(proc, pid, wait)
+        if sys.platform == "darwin" and os.access(program, os.X_OK):
+            return _run_sampler(pid, program, wait)
+        return "no sampler on this platform"
+    except Exception as error:  # noqa: BLE001
+        return f"the sample failed, {type(error).__name__}"
+
+
+def _stall_candidates() -> list[_Child]:
+    """The children of this process that look like the stuck one, those forked and not
+    executed or in the state of a process being created, at most ``MAX_SAMPLED``, read
+    without starting a process. Where the table cannot be read, or cannot tell, none. A
+    child that has executed is not a start that stalled."""
+    try:
+        if Path("/proc/self/stat").exists():
+            table: list[_Child] | str = _proc_children_bounded(
+                Path("/proc"), os.getpid()
+            )
+        else:
+            table = _libproc_children(os.getpid())
+    except Exception:  # noqa: BLE001
+        return []
+    if isinstance(table, str):
+        return []
+    stuck = [c for c in table if c.execed is False or c.state in ("I", "D")]
+    return stuck[:MAX_SAMPLED]
+
+
+def _sample_stalled(shown: str, bound: float) -> None:
+    """Sample each child that looks stuck, and keep one ledger entry and one log line
+    for it, so a stall leaves a stack to read after the fact. **Round 17.** Called on a
+    thread of its own after ``StartStalled`` is raised, so the caller does not wait for
+    it. The late child is killed only when its start ends, which is after this, and a
+    child that is killed first is sampled as ``status unreadable``. Never raises."""
+    try:
+        children = _stall_candidates()
+        if not children:
+            text = (
+                f"stall sample, {shown} not started within {bound:g}s, no child of the"
+                " daemon that was forked and not executed was found"
+            )
+            _keep_slow(text, reserved=True)
+            _say(f"dromond: {text}", limited=False, wait=0.5)
+            return
+        for child in children:
+            sample = sample_process(child.pid)
+            text = _clean(
+                f"stall sample, {shown} not started within {bound:g}s,"
+                f" child {child.pid} state {_clean(child.state, 8)}"
+                f" program {_clean(child.program, 40)}"
+                f", {sample}",
+                MAX_SAMPLE_CHARS + 300,
+            )
+            _keep_slow(text, reserved=True)
+            _say(f"dromond: {text}", limited=False, wait=0.5)
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
 def _kill(process: subprocess.Popen[Any]) -> None:
     """Send ``SIGKILL`` to a child that has not been reaped, and to its process group
     when the child leads one of its own, as it does with ``start_new_session`` or
@@ -1354,6 +1585,18 @@ def clear_slow_starts() -> None:
         _slow_starts.clear()
 
 
+def _keep_slow(text: str, *, reserved: bool = False) -> bool:
+    """Append ``text`` to the ledger unless it is full, and say whether it was kept. A
+    stall sample is kept up to ``MAX_STALL_SAMPLES_KEPT`` entries beyond the limit, so
+    that slow starts cannot crowd it out."""
+    limit = MAX_SLOW_STARTS_KEPT + (MAX_STALL_SAMPLES_KEPT if reserved else 0)
+    with _slow_lock:
+        if len(_slow_starts) >= limit:
+            return False
+        _slow_starts.append(text)
+        return True
+
+
 def _since(handoff: _Handoff, moment: float) -> str:
     return "never" if moment == 0.0 else f"+{moment - handoff.began:.2f}s"
 
@@ -1504,9 +1747,7 @@ def _note_slow_start(
         )
         if handoff.snapshot is not None:
             text = f"{text}, threads at {SNAPSHOT_SECONDS:g}s: {handoff.snapshot}"
-        with _slow_lock:
-            if len(_slow_starts) < MAX_SLOW_STARTS_KEPT:
-                _slow_starts.append(text)
+        _keep_slow(text)
         return f"dromond: slow start, {text}"
     except Exception:  # noqa: BLE001, S110
         # A record must not disturb the start it describes.
@@ -1647,10 +1888,66 @@ def _begin(
             f" Report, {report}"
         )
         _say(f"dromond: {message}", limited=False)
+        with contextlib.suppress(RuntimeError):
+            threading.Thread(
+                target=_sample_stalled,
+                args=(shown, bound),
+                name="dromon-spawn-sample",
+                daemon=True,
+            ).start()
         raise StartStalled(message)
     if isinstance(outcome, BaseException):
         raise outcome
     return outcome
+
+
+async def subprocess_exec(
+    program: str | os.PathLike[str],
+    *args: str | os.PathLike[str],
+    **kwargs: Any,  # noqa: ANN401
+) -> asyncio.subprocess.Process:
+    """``asyncio.create_subprocess_exec`` with the descriptor handling of ``start``.
+    **Round 17, item 2.** The engine drivers and the relay start children on the event
+    loop, where ``Popen`` runs on the loop's own thread, so they cannot use ``start``,
+    whose thread is the bound. What they can share is the rest. Where ``start`` leaves
+    the closing of descriptors to the parent, this does too, by the same sweep inside
+    the same fork lock, so no child of the daemon enumerates ``/dev/fd`` after its fork
+    on macOS and none inherits a stray descriptor. ``pass_fds`` is honoured as it is by
+    ``start``. A failed sweep raises ``OSError`` and starts no child.
+
+    **Not bounded, and why.** ``asyncio`` makes the ``Popen`` inside the loop's own
+    ``subprocess_exec``, before its first suspension, so moving it to another thread
+    needs ``asyncio``'s private transport, or an adapter that gives ``Process`` over a
+    ``Popen`` that ``start`` made. The second is the follow-up, since five modules use
+    ``stdin``, ``stdout``, ``wait`` and ``communicate`` of a ``Process``. Until then a
+    stall in one of these starts stops the daemon's loop, which the fork lock's
+    five-second bound on a loop, the faulthandler watchdog and the slow-fork ledger
+    report and do not end. **Porting hazard.** It sets a
+    thread-local that the fork lock reads, which only a language with thread-locals and
+    a fork hook allows."""
+    chosen: dict[str, Any] = kwargs
+    sweep: _Sweep | None = None
+    if (
+        not children_close_descriptors()
+        and _FORK_INSTALLED[0]
+        and _open_descriptors() is not None
+    ):
+        sweep = _Sweep(kwargs.get("pass_fds", ()))
+        chosen = {**kwargs, "close_fds": False, "pass_fds": ()}
+        _fork_slot.sweep = sweep
+    try:
+        process = await asyncio.create_subprocess_exec(program, *args, **chosen)
+    finally:
+        _fork_slot.sweep = None
+    if sweep is not None and sweep.cleared is None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            process.kill()
+        await process.wait()
+        raise OSError(
+            f"{Path(os.fspath(program)).name} was not started: the descriptor sweep did"
+            " not run before the fork"
+        )
+    return process
 
 
 def _options(

@@ -862,10 +862,14 @@ def test_where_processes_cannot_be_identified_the_tools_explain(
         ]
         for name, args in cases:
             text, error = call(blind, "alpha", name, args)
-            assert (text, error) == (
-                processes.unavailable(name, processes.UNIDENTIFIABLE),
-                True,
+            # Round 17, item 4. The listing also says that no launch record roots
+            # the ledger, which this scheduler, with no reports directory, has none of.
+            reason = (
+                f"{processes.UNIDENTIFIABLE} {processes.NO_LAUNCH_RECORD}"
+                if name == "list_processes"
+                else processes.UNIDENTIFIABLE
             )
+            assert (text, error) == (processes.unavailable(name, reason), True)
         status = blind.line_status("alpha")["processes"]
         assert status == {
             "identifiable": False,
@@ -1120,3 +1124,157 @@ def test_a_stop_does_not_wait_behind_a_kill_all_walk_check(
             found.stop_workers()
     assert (text, error) == ("sent SIGTERM to process 2001", False)
     assert still_walking
+
+
+# Round 17, item 3. A result no caller will receive is ended by the worker.
+
+
+def _worker_scenario(
+    function: Any,  # noqa: ANN401
+    discard: Any = None,  # noqa: ANN401
+    *,
+    cancel: bool = False,
+    started: threading.Event | None = None,
+    finish: threading.Event | None = None,
+) -> tuple[ProcessWorker, list[object]]:
+    worker = ProcessWorker()
+    results: list[object] = []
+
+    async def scenario() -> None:
+        task = asyncio.ensure_future(worker.run(function, discard))
+        if started is not None:
+            assert await asyncio.to_thread(started.wait, 30)
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        if finish is not None:
+            finish.set()
+        if not cancel:
+            results.append(await task)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        worker.close(5.0)
+    return worker, results
+
+
+def test_a_result_the_cancelled_caller_never_receives_goes_to_discard() -> None:
+    started, finish = threading.Event(), threading.Event()
+    ended: list[str] = []
+    got = threading.Event()
+
+    def make() -> str:
+        started.set()
+        finish.wait(30)
+        return "a process"
+
+    def discard(result: str) -> None:
+        ended.append(result)
+        got.set()
+
+    _worker_scenario(make, discard, cancel=True, started=started, finish=finish)
+    assert got.wait(30)
+    assert ended == ["a process"]
+
+
+def test_a_delivered_result_is_not_discarded() -> None:
+    ended: list[str] = []
+    _, results = _worker_scenario(lambda: "kept", ended.append)
+    assert results == ["kept"] and ended == []
+
+
+def test_an_error_is_delivered_and_not_discarded() -> None:
+    ended: list[object] = []
+
+    def fail() -> str:
+        raise ProcessRefused("no")
+
+    with pytest.raises(ProcessRefused):
+        _worker_scenario(fail, ended.append)
+    assert ended == []
+
+
+def test_a_discard_that_raises_leaves_the_worker_working(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    started, finish = threading.Event(), threading.Event()
+    seen = threading.Event()
+
+    def make() -> str:
+        started.set()
+        finish.wait(30)
+        return "x"
+
+    def discard(result: str) -> None:
+        seen.set()
+        raise RuntimeError("stand-in")
+
+    worker = ProcessWorker()
+
+    async def scenario() -> str:
+        task = asyncio.ensure_future(worker.run(make, discard))
+        assert await asyncio.to_thread(started.wait, 30)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        finish.set()
+        assert await asyncio.to_thread(seen.wait, 30)
+        return await worker.run(lambda: "still working")
+
+    try:
+        assert asyncio.run(scenario()) == "still working"
+    finally:
+        worker.close(5.0)
+    assert "failed to end: stand-in" in capsys.readouterr().err
+
+
+def test_a_result_that_arrives_after_the_caller_was_cancelled_is_discarded() -> None:
+    """The window between the worker's check and the delivery on the loop."""
+    ended: list[str] = []
+    got = threading.Event()
+
+    def discard(result: str) -> None:
+        ended.append(result)
+        got.set()
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        future.cancel()
+        call = processes._ProcessCall(  # pyright: ignore[reportPrivateUsage]
+            lambda: "late", loop, future, threading.Event(), discard
+        )
+        ProcessWorker._deliver(call, result="late")  # pyright: ignore[reportPrivateUsage]
+        assert await asyncio.to_thread(got.wait, 30)
+
+    asyncio.run(scenario())
+    assert ended == ["late"]
+
+
+def test_a_queued_call_that_is_cancelled_never_runs_and_has_nothing_to_discard() -> (
+    None
+):
+    ran: list[int] = []
+    ended: list[object] = []
+    hold = threading.Event()
+    worker = ProcessWorker()
+
+    async def scenario() -> None:
+        first = asyncio.ensure_future(worker.run(lambda: hold.wait(30)))
+        second = asyncio.ensure_future(
+            worker.run(lambda: ran.append(1) or "x", ended.append)
+        )
+        await asyncio.sleep(0.05)
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+        hold.set()
+        await first
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        worker.close(5.0)
+    assert ran == [] and ended == []

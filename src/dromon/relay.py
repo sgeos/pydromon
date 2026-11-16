@@ -228,7 +228,7 @@ class CommandRelay:
         try:
             # As in ``forward``, the argument vector is operator configuration and no
             # shell is involved.
-            process = await asyncio.create_subprocess_exec(
+            process = await spawn.subprocess_exec(
                 *self._argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,

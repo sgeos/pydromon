@@ -735,7 +735,7 @@ async def _app_server(
 ) -> AsyncGenerator[Connection]:
     command, launched, policy = launcher.wrap([codex_path(), *arguments], environment)
     recording = evidence.RECORDING.get()
-    process = await asyncio.create_subprocess_exec(
+    process = await spawn.subprocess_exec(
         *command,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,

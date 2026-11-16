@@ -37,7 +37,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
-from dromon import evidence, launcher
+from dromon import evidence, launcher, spawn
 from dromon.engine import EngineRefused
 from dromon.launcher import StopPolicy
 
@@ -191,7 +191,7 @@ def json_lines_factory(command: str, *, keep_input: bool) -> ConnectionFactory:
             )
         argv, launched, policy = launcher.wrap([found, *arguments], environment)
         recording = evidence.RECORDING.get()
-        process = await asyncio.create_subprocess_exec(
+        process = await spawn.subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE if keep_input else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
