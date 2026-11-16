@@ -13,7 +13,8 @@ holds, with no new network call and no new process.
   turn, which Claude Code gives as each server's ``status``. It is ``unknown`` until
   the line runs a turn under this daemon, and for an engine that reports no status.
 * **callable** comes from the tools the same report offers the model. A server is
-  callable when at least one tool named ``mcp__SERVER__...`` is offered. It is
+  callable when at least one tool named ``mcp__SERVER__...`` is offered, counting
+  each tool for the longest server name it begins with, as ``owner_of`` gives. It is
   ``unknown`` where the report gave no tool list.
 
 **Residuals.** Both reports are the latest turn's, kept in memory, so they are
@@ -91,8 +92,14 @@ def server_states(
     reported = dict(report.servers) if report and report.servers is not None else None
     tools = report.tools if report is not None else None
     others = sorted(set(reported or ()) - set(names))
+    shown = [*names, *others][:MAX_SERVERS]
+    owners = (
+        set[str]()
+        if tools is None
+        else {owner for tool in tools if (owner := owner_of(tool, shown)) is not None}
+    )
     states: list[dict[str, str]] = []
-    for name in [*names, *others][:MAX_SERVERS]:
+    for name in shown:
         status = UNKNOWN if reported is None else reported.get(name)
         states.append(
             {
@@ -109,15 +116,26 @@ def server_states(
                     "not reported by the engine" if status is None else status
                 ),
                 "callable": (
-                    UNKNOWN
-                    if tools is None
-                    else "yes"
-                    if any(tool.startswith(f"mcp__{name}__") for tool in tools)
-                    else "no"
+                    UNKNOWN if tools is None else "yes" if name in owners else "no"
                 ),
             }
         )
     return states
+
+
+def owner_of(tool: str, names: Iterable[str]) -> str | None:
+    """The server among ``names`` whose prefix ``mcp__NAME__`` the tool's name
+    begins with, the longest where several do, or ``None``. **Review of 0db077c,
+    finding 5.** Server names may hold ``_``, so with servers ``a`` and ``a__b`` the
+    tool ``mcp__a__b__tool`` begins with both prefixes, and it showed both servers
+    callable. It is taken as the longer name's tool, which is an inference, since
+    the name alone cannot say that ``a`` has no tool ``b__tool``. Only the servers
+    shown are candidates, so a tool of a server neither configured nor reported is
+    taken as a shorter shown name's. **Hypothesis, not tested against the
+    engine.** If Claude Code rewrites other characters of a server's name in its tool
+    names, such a server reads as offering no tool."""
+    matching = [name for name in names if tool.startswith(f"mcp__{name}__")]
+    return max(matching, key=len, default=None)
 
 
 def _connected(status: str | None) -> str:

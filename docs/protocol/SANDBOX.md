@@ -205,6 +205,21 @@ project settings.
    refused, after `~` expansion and symbolic link resolution. `dromond` checks the
    project file's documents before it starts, and a line whose document fails the check
    at its first turn has that turn end before any command runs.
+   **Round 17, review of 0db077c, finding 1, decided by the operator.** The project's
+   `secret` directories, at the project root and in the line's working directory, are
+   protected in the same way for every Claude Code line, by real path, where they
+   exist when the line's engine is built. Codex and Grok lines have had them since
+   round 9. So the disclosure list under `secret/` is closed to every line, and the
+   gate a line runs in its own sandbox skips the disclosure scan with its reason,
+   while `full-gate`, which runs outside every sandbox, scans. **Where a line's own
+   documents could remove it.** A sandbox document's `allowRead` or `allowWrite`
+   entry inside one of them is refused as above, at `dromond`'s start for the project
+   file and at the line's build for an override. A settings `allow` rule does not
+   reopen it, since Claude Code applies a `deny` rule first. A document that leaves the
+   sandbox disabled removes the shell's denial, as for every protected directory,
+   while the file tools stay denied by the settings. **Residuals.** A directory made
+   after the build is denied from the line's next build. A line whose sandbox is
+   disabled can read them with its shell.
 4. **Git hooks and configuration.** When the line's working directory lies in a git
    checkout, an enabled sandbox also denies writes to the hooks and configuration git
    would act on there, whether or not any layer grants the git directory. A command

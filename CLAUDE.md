@@ -152,8 +152,10 @@ its marker, is tracked. If `secret/disclosure-terms.txt` exists, one term per li
 gate also fails when a tracked file contains any of those terms, and it prints only the
 file and line. The scan cannot run in a clone or in continuous integration, which do not
 have the list, and the gate says so when it skips. A linked worktree without its own list
-reads the main checkout's list and acceptances, and a sandbox that refuses that read
-makes the gate skip with the reason, so full-gate scans where a sandboxed gate cannot.
+reads the main checkout's list and acceptances, found through git with git's own
+variables cleared, and refuses a common directory that is not that checkout's. Dromon
+denies every line the project's `secret/` directories, so a line's own gate run skips
+the scan with the reason, and full-gate, which runs outside every sandbox, scans.
 
 ## Coding Conventions
 

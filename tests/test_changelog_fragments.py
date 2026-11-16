@@ -790,10 +790,14 @@ case "$*" in *pyright*) echo "$*" >> "$UV_LOG" ;; esac
 if [ -n "$UV_FAIL" ]; then
     case "$*" in *"$UV_FAIL"*) exit 3 ;; esac
 fi
+case "$*" in
+    *" python "*) [ -z "$UV_PYTHON_OUTPUT" ] || printf '%s\\n' "$UV_PYTHON_OUTPUT" ;;
+esac
 exit 0
 """
 """A `uv` that records each pyright call in `$UV_LOG`, fails a call containing
-`$UV_FAIL`, and succeeds for everything else, so check.sh runs end to end."""
+`$UV_FAIL`, prints `$UV_PYTHON_OUTPUT` for a `python` call, and succeeds for
+everything else, so check.sh runs end to end."""
 
 
 def gate_repository(tmp_path: Path, workflow: str | None = None) -> tuple[Path, Path]:
@@ -1000,3 +1004,37 @@ def test_the_gate_fails_when_the_reader_succeeds_with_no_version(
     assert done.returncode != 0
     assert "lists no Python version" in done.stdout + done.stderr
     assert not log.exists() and "ok: pyright" not in done.stdout
+
+
+def test_the_gate_warns_of_an_ignored_state_change_file_and_passes(
+    tmp_path: Path,
+) -> None:
+    """Review of 0db077c, finding 4. The package names what it left out, and the gate
+    prints it as a warning without failing."""
+    root, stand_in = gate_repository(tmp_path)
+    log = tmp_path / "uv.log"
+    done = run_gate(
+        root, stand_in, UV_LOG=str(log), UV_PYTHON_OUTPUT="ignored base.txt.orig"
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert (
+        "check.sh: warning: ignored src/dromon/statechanges/base.txt.orig,"
+        in done.stdout
+    )
+    assert "ok: the state change files are read" in done.stdout
+
+
+def test_the_gate_fails_when_the_state_changes_cannot_be_used(tmp_path: Path) -> None:
+    root, stand_in = gate_repository(tmp_path)
+    done = run_gate(
+        root,
+        stand_in,
+        UV_LOG=str(tmp_path / "uv.log"),
+        UV_PYTHON_OUTPUT="problem no state change is recorded, not even the base",
+    )
+    assert done.returncode != 0
+    assert (
+        "the state changes cannot be used, because no state change is recorded"
+        in done.stderr
+    )
+    assert "ok: pytest" not in done.stdout

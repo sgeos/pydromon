@@ -163,6 +163,78 @@ def test_a_worktree_scans_with_the_main_checkout_s_list(worktree: Path) -> None:
     assert TERM not in shown(result)
 
 
+@pytest.fixture
+def decoy(tmp_path: Path) -> Path:
+    """A repository with a harmless list, which a scan steered to it would pass."""
+    root = tmp_path / "decoy"
+    (root / "secret").mkdir(parents=True)
+    (root / "secret/disclosure-terms.txt").write_text("absent\n", encoding="utf-8")
+    (root / "README.md").write_text("# Decoy\n", encoding="utf-8")
+    git_in(root, "init", "-q")
+    git_in(root, "config", "user.name", "Test")
+    git_in(root, "config", "user.email", "test@example.invalid")
+    git_in(root, "add", ".")
+    git_in(root, "commit", "-qm", "decoy")
+    return root
+
+
+def check_with(
+    root: Path, environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603
+        [executable("bash"), "scripts/check.sh", "--hygiene-only"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, **environment},
+    )
+
+
+def test_git_s_variables_do_not_steer_the_scan(worktree: Path, decoy: Path) -> None:
+    """Review of 0db077c, finding 2, the first decoy. With ``GIT_COMMON_DIR`` naming
+    the decoy, the gate passed. The variable is cleared for the lookup, so the scan
+    reads the real main checkout's list and fails."""
+    result = check_with(worktree, {"GIT_COMMON_DIR": str(decoy / ".git")})
+    assert result.returncode != 0, shown(result)
+    assert "src/example.py:1" in result.stderr
+    assert str(decoy) not in result.stdout
+    assert TERM not in shown(result)
+
+
+def test_a_worktree_pointed_at_a_copied_git_directory_fails(
+    worktree: Path, decoy: Path, tmp_path: Path
+) -> None:
+    """Review of 0db077c, finding 2, the second decoy. The worktree's ``.git`` file
+    names a copy of its git directory whose ``commondir`` names the decoy. The copy
+    is not under the decoy's ``worktrees``, so the gate refuses it and fails."""
+    pointer = worktree / ".git"
+    original = Path(pointer.read_text(encoding="utf-8").split(":", 1)[1].strip())
+    copy = tmp_path / "copied-gitdir"
+    shutil.copytree(original, copy)
+    (copy / "commondir").write_text(f"{decoy / '.git'}\n", encoding="utf-8")
+    pointer.write_text(f"gitdir: {copy}\n", encoding="utf-8")
+    result = check_project(worktree)
+    assert result.returncode != 0, shown(result)
+    assert "refused this worktree's common git directory" in result.stderr
+    assert "is not under" in result.stderr
+    assert TERM not in shown(result)
+
+
+def test_a_worktree_whose_back_pointer_names_another_checkout_fails(
+    main_checkout: Path, worktree: Path
+) -> None:
+    """The git directory is where git put it, but git's back-pointer there names
+    another checkout's ``.git`` file, so this checkout is not that worktree."""
+    git_dir = main_checkout / ".git" / "worktrees" / worktree.name
+    (git_dir / "gitdir").write_text(
+        f"{main_checkout.parent / 'elsewhere' / '.git'}\n", encoding="utf-8"
+    )
+    result = check_project(worktree)
+    assert result.returncode != 0, shown(result)
+    assert "does not name" in result.stderr
+
+
 def test_a_worktree_uses_the_main_checkout_s_acceptance(
     main_checkout: Path, worktree: Path
 ) -> None:

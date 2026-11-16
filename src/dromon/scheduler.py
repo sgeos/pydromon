@@ -2295,7 +2295,11 @@ def engine_factory(
                         ),
                     ]
                 )
-        sandbox = effective(merged, workdir, protected_now, guarded)
+        # Round 17, review of 0db077c, finding 1. The project's secret directories are
+        # denied to Claude Code lines as they have been to Codex and Grok lines since
+        # round 9, in the sandbox for the shell and in the settings for the file tools.
+        # A layer that grants one of them back is refused, as for any protected path.
+        sandbox = effective(merged, workdir, engine_protected, guarded)
         if enabled and git_ssh is not None and sandbox is not None:
             denied = unreadable(git_ssh, sandbox)
             if denied is not None:
@@ -2332,7 +2336,7 @@ def engine_factory(
             session_id=spec.session_id,
             sandbox=sandbox,
             settings=engine_settings.effective(
-                settings, protected_now, write_protected
+                settings, engine_protected, write_protected
             ),
             observe=spec.observe,
             mark=spec.mark,

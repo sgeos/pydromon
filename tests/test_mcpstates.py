@@ -78,6 +78,35 @@ def test_a_tool_of_a_server_with_a_longer_name_is_not_counted() -> None:
     assert state["callable"] == "no"
 
 
+def test_a_tool_belongs_to_the_longest_server_name_it_begins_with() -> None:
+    """Review of 0db077c, finding 5, the audit's case. Both ``a`` and ``a__b`` read
+    as callable from the one tool ``mcp__a__b__tool``."""
+    servers = (("a", "connected"), ("a__b", "connected"))
+    states = {
+        s["name"]: s["callable"]
+        for s in server_states(
+            {"a", "a__b"}, EngineReport(servers, ("mcp__a__b__tool",))
+        )
+    }
+    assert states == {"a": "no", "a__b": "yes"}
+    both = EngineReport(servers, ("mcp__a__b__tool", "mcp__a__read"))
+    assert {s["callable"] for s in server_states({"a", "a__b"}, both)} == {"yes"}
+
+
+@pytest.mark.parametrize(
+    ("tool", "owner"),
+    [
+        ("mcp__a__b__tool", "a__b"),
+        ("mcp__a__read", "a"),
+        ("mcp__a__b", "a"),
+        ("mcp__c__read", None),
+        ("a__b__tool", None),
+    ],
+)
+def test_the_owner_of_a_tool(tool: str, owner: str | None) -> None:
+    assert mcpstates.owner_of(tool, ["a", "a__b"]) == owner
+
+
 def test_servers_from_the_account_and_dromon_s_own_are_named_so() -> None:
     report = EngineReport((("dromon", "connected"), ("drive", "pending")), ())
     states = {s["name"]: s for s in server_states(set(), report)}

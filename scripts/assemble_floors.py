@@ -53,7 +53,7 @@ import argparse
 import re
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Final, NamedTuple
 
 DIRECTORY: Final = Path("docs/protocol/floors")
@@ -133,10 +133,54 @@ def parse(path: Path) -> list[Entry]:
                 stem,
                 fields["Change"],
                 fields["Search"],
-                fields.get("Path", DEFAULT_PATH),
+                relative(path, fields.get("Path", DEFAULT_PATH)),
             )
         )
     return entries
+
+
+def relative(fragment: Path, value: str) -> str:
+    """A fragment's ``Path``, which must name a file of the repository by a relative
+    path without ``..``. **Review of 0db077c, finding 3.** An absolute path or a
+    ``..`` part let a fragment ask the gate whether any readable file on the machine
+    holds a string, one bit for each run in continuous integration. ``check`` also
+    refuses a path whose real form lies outside the repository, as through a link."""
+    pure = PurePosixPath(value)
+    if (
+        pure.is_absolute()
+        or value.startswith("~")
+        or "\\" in value
+        or any(part == ".." for part in pure.parts)
+    ):
+        raise FloorError(
+            f"{fragment}: Path must be relative to the repository, without .."
+        )
+    return value
+
+
+def is_fragment(path: Path) -> bool:
+    stem = path.name.removesuffix(".md")
+    return (
+        path.name.endswith(".md")
+        and NAME.fullmatch(stem) is not None
+        and path.is_file()
+    )
+
+
+def ignored(base: Path) -> list[str]:
+    """The entries of the fragment directory that are neither its README nor named
+    as a fragment, such as ``.DS_Store`` or an editor's backup. **Review of 0db077c,
+    finding 4.** They are left out with a warning, rather than failing the gate,
+    since git need not know of them. Residual. A fragment misnamed in another case,
+    as ``Feat--b.md``, is also left out, and the warning is what shows it."""
+    directory = base / DIRECTORY
+    if not directory.is_dir():
+        return []
+    return sorted(
+        path.name
+        for path in directory.iterdir()
+        if path.name != "README.md" and not is_fragment(path)
+    )
 
 
 def fragments(base: Path) -> list[Entry]:
@@ -145,7 +189,7 @@ def fragments(base: Path) -> list[Entry]:
         return []
     entries: list[Entry] = []
     for path in sorted(directory.iterdir()):
-        if path.name != "README.md":
+        if path.name != "README.md" and is_fragment(path):
             entries.extend(parse(path))
     return entries
 
@@ -164,6 +208,10 @@ def table_bounds(lines: list[str]) -> tuple[int, int]:
 def check(base: Path) -> None:
     for entry in fragments(base):
         target = base / entry.path
+        if not target.resolve().is_relative_to(base.resolve()):
+            raise FloorError(
+                f"{entry.fragment}: {entry.path} lies outside the repository"
+            )
         if not target.is_file():
             raise FloorError(f"{entry.fragment}: {entry.path} is not a file")
         if entry.search not in target.read_text(encoding="utf-8"):
@@ -268,6 +316,12 @@ def main(arguments: list[str]) -> int:
     options = parser.parse_args(arguments)
     try:
         base = root()
+        for name in ignored(base):
+            print(
+                f"assemble_floors: warning: ignored {DIRECTORY / name}, which is not"
+                " named BRANCH.md in lowercase",
+                file=sys.stderr,
+            )
         if options.command == "check":
             check(base)
         elif options.command == "preview":

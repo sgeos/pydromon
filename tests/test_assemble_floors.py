@@ -204,6 +204,65 @@ def test_no_base_is_said(repository: Path) -> None:
         rows(repository, "absent")
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/etc/hosts",
+        "../../etc/hosts",
+        "src/../../outside.py",
+        "~/notes.txt",
+        "src\\dromon\\codec.py",
+    ],
+)
+def test_a_path_outside_the_repository_is_refused(tmp_path: Path, value: str) -> None:
+    """Review of 0db077c, finding 3. The audit's two forms, and two more spellings."""
+    path = fragment(
+        tmp_path, "feat--x", f"Change: a\nSearch: localhost\nPath: {value}\n"
+    )
+    with pytest.raises(FloorError, match="relative to the repository, without"):
+        parse(path)
+
+
+def test_a_path_that_leads_out_through_a_link_is_refused(
+    repository: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("localhost\n", encoding="utf-8")
+    (repository / "src/linked.txt").symlink_to(outside)
+    fragment(
+        repository, "feat--x", "Change: a\nSearch: localhost\nPath: src/linked.txt\n"
+    )
+    with pytest.raises(FloorError, match="lies outside the repository"):
+        check(repository)
+
+
+@pytest.mark.parametrize(
+    "name", [".DS_Store", "feat--b.md~", "feat--b.md.orig", "Feat--b.md", "notes.txt"]
+)
+def test_a_stray_file_is_ignored_with_a_warning(
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    name: str,
+) -> None:
+    """Review of 0db077c, finding 4. A file git need not know of, as Finder or an
+    editor or a merge tool leaves, no longer fails the check, and is named."""
+    directory = repository / "docs/protocol/floors"
+    directory.mkdir(parents=True)
+    (directory / name).write_text("not a fragment\n", encoding="utf-8")
+    (directory / "README.md").write_text("# Floors\n", encoding="utf-8")
+    monkeypatch.chdir(repository)
+    assert main(["check"]) == 0
+    error = capsys.readouterr().err
+    assert f"warning: ignored docs/protocol/floors/{name}," in error
+    assert "README.md" not in error
+
+
+def test_a_directory_in_the_fragments_is_ignored(repository: Path) -> None:
+    (repository / "docs/protocol/floors/feat--x.md").mkdir(parents=True)
+    check(repository)
+
+
 def test_the_command_reports_an_error_and_exits_1(
     repository: Path,
     monkeypatch: pytest.MonkeyPatch,

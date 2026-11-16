@@ -15,3 +15,8 @@ content when it fails. A pin is also one new file, so adding it cannot conflict 
 `base.txt` holds the history of the whole numbers 1 to 6 that this set replaced in round
 17. A file is never renamed or removed, since that would change the version of code that
 did not change.
+
+Any other entry, such as a merge tool's `base.txt.orig`, is left out, and the gate names
+it in a warning, so a leftover file never stops the package from importing. A set that
+is empty, too large or unreadable makes the version `unusable`, and the daemon then
+replays the whole log rather than trusting any snapshot.

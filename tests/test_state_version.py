@@ -9,21 +9,30 @@ so a change to either fails here until the version changes and a pin is added.
 ``src/dromon/statechanges/``, and each pin is one file in ``tests/state_pins/`` named
 for the version it pins, so two branches that change the state add different files
 and never conflict. The whole numbers 1 to 6 and their pins in one tuple, which
-conflicted at every merge of two such branches, are replaced. Version 6's digests are
-the base set's pin, since no change came between.
+conflicted at every merge of two such branches, are replaced. Version 6's codec digest
+is the base set's pin, since no change came between. Its replay digest is of the longer
+history the review of 0db077c called for, which ``disclosure_history`` gives, and was
+written once, before the pin reached ``main``.
 
 How to answer a failure. A branch that changed the codec's types or the replayed state
 adds ``src/dromon/statechanges/BRANCH.txt``, and then the pin file the failure names,
 with the content it gives. A merge of two such branches needs a pin for the set they
 make together, which the failure also names. A pin is never edited, since editing one
 would accept a change without a new version. The history replayed is ``SCENARIO``
-from ``conftest.py``, which the codec's tests keep covering every event kind, so a
-change of meaning for an event it does not reach is left to ``dromond --check`` and to
-the check after each start from a snapshot."""
+from ``conftest.py``, which the codec's tests keep covering every event kind, and then
+enough disclosure checks to pass each of their caps. A change of meaning for an event
+the history does not reach is left to ``dromond --check`` and to the check after each
+start from a snapshot. **Residual, inference from reading ``State.apply``.** Its other
+caps, ``MAX_TASK_RECORDS``, ``MAX_CORRELATIONS`` and
+``MAX_REQUEST_KEYS_PER_PARTY``, and the saturation at ``MAX_COST_MICRO_USD``, are not
+reached by the history either, so a change to one is not caught here."""
 
 import enum
 import hashlib
 import re
+import shutil
+import subprocess
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,8 +40,8 @@ from typing import Literal
 
 import pytest
 
-from dromon import statesnapshot
-from dromon.model import Event, HoldCause, State
+from dromon import model, statesnapshot
+from dromon.model import DisclosureChecked, Event, HoldCause, State
 
 PIN_DIRECTORY = Path(__file__).parent / "state_pins"
 
@@ -80,12 +89,49 @@ def parse_pin(text: str) -> Pin:
     return pin
 
 
-def replay_digest(scenario: tuple[Event, ...]) -> str:
+RETAINED_FAILURES = 30
+RETAINED_PASSES = 150
+"""How many failing and passing disclosure checks the pinned history adds for one
+line. They are fixed numbers, not derived from the caps, so a change of a cap changes
+which checks the state keeps, and so the replay digest. A test fails if a cap is
+raised to or past them."""
+
+
+def disclosure_history() -> tuple[DisclosureChecked, ...]:
+    """**Review of 0db077c, informational, decided by the operator as item 6.** How
+    many disclosure checks the state keeps for a line is part of what applying an
+    event means, since a snapshot kept under one cap and restored under another
+    differs from a full replay. ``SCENARIO`` held two checks, which reach no cap, so a
+    changed cap left the pin unmoved. These reach past ``MAX_DISCLOSURE_CHECKS``,
+    ``MAX_DISCLOSURE_PASSES`` and ``MAX_DISCLOSURE_SIZES``, and every fourth pass
+    has no byte count, as a tool's refusal has none."""
+    events: list[DisclosureChecked] = []
+    for number in range(RETAINED_FAILURES + RETAINED_PASSES):
+        failed = number % 6 == 0
+        hour, rest = divmod(number, 3600)
+        at = f"2026-10-29T{hour:02d}:{rest // 60:02d}:{rest % 60:02d}Z"
+        size = None if not failed and number % 4 == 1 else 1000 + number
+        events.append(DisclosureChecked("alpha", at, 3 if failed else 0, size))
+    return tuple(events)
+
+
+def pinned_history(scenario: tuple[Event, ...]) -> tuple[Event, ...]:
+    """The history the pin replays, ``SCENARIO`` and then ``disclosure_history``."""
+    return (*scenario, *disclosure_history())
+
+
+def replay(history: tuple[Event, ...]) -> State:
     state = State()
-    for event in scenario:
+    for event in history:
         state.check(event)
         state.apply(event)
-    encoded = statesnapshot.canonical(statesnapshot.encode_value(state, State))
+    return state
+
+
+def replay_digest(history: tuple[Event, ...]) -> str:
+    encoded = statesnapshot.canonical(
+        statesnapshot.encode_value(replay(history), State)
+    )
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -93,9 +139,38 @@ def current(scenario: tuple[Event, ...]) -> Pin:
     return Pin(
         statesnapshot.STATE_VERSION,
         statesnapshot.codec_digest(),
-        replay_digest(scenario),
+        replay_digest(pinned_history(scenario)),
         statesnapshot.STATE_CHANGES,
     )
+
+
+def test_the_history_reaches_past_every_disclosure_cap(
+    scenario: tuple[Event, ...],
+) -> None:
+    added = disclosure_history()
+    failures = sum(1 for e in added if e.matched_lines > 0)
+    passes = len(added) - failures
+    sized = sum(1 for e in added if e.checked_bytes is not None)
+    assert (failures, passes) == (RETAINED_FAILURES, RETAINED_PASSES)
+    assert failures > model.MAX_DISCLOSURE_CHECKS, "raise RETAINED_FAILURES"
+    assert passes > model.MAX_DISCLOSURE_PASSES, "raise RETAINED_PASSES"
+    assert sized > model.MAX_DISCLOSURE_SIZES, "raise both"
+    state = replay(pinned_history(scenario))
+    assert len(state.disclosure_checks["alpha"]) == model.MAX_DISCLOSURE_CHECKS
+    assert len(state.disclosure_passes["alpha"]) == model.MAX_DISCLOSURE_PASSES
+    assert len(state.disclosure_sizes["alpha"]) == model.MAX_DISCLOSURE_SIZES
+
+
+@pytest.mark.parametrize(
+    "cap", ["MAX_DISCLOSURE_CHECKS", "MAX_DISCLOSURE_PASSES", "MAX_DISCLOSURE_SIZES"]
+)
+def test_a_changed_disclosure_cap_moves_the_replay(
+    scenario: tuple[Event, ...], monkeypatch: pytest.MonkeyPatch, cap: str
+) -> None:
+    """The audit's mutation, which the pin did not catch."""
+    before = replay_digest(pinned_history(scenario))
+    monkeypatch.setattr(model, cap, getattr(model, cap) + 1)
+    assert replay_digest(pinned_history(scenario)) != before
 
 
 def test_the_state_version_is_pinned_with_the_codec_and_a_replay(
@@ -191,19 +266,19 @@ class Directory:
         return self.entries
 
 
-def read(*entries: Entry) -> tuple[str, ...]:
+def read(*entries: Entry) -> statesnapshot.StateChanges:
     return statesnapshot.read_state_changes(Directory(*entries))  # pyright: ignore[reportArgumentType]
 
 
 def test_the_state_changes_are_read_sorted_without_the_readme() -> None:
-    names = read(
+    found = read(
         Entry("fix--b.txt"),
         Entry("README.md"),
         Entry("base.txt"),
         Entry(".DS_Store"),
         Entry("__pycache__", is_file=False),
     )
-    assert names == ("base", "fix--b")
+    assert found == statesnapshot.StateChanges(("base", "fix--b"), (), None)
 
 
 @pytest.mark.parametrize(
@@ -215,21 +290,75 @@ def test_the_state_changes_are_read_sorted_without_the_readme() -> None:
         Entry("sub.txt", is_file=False),
         Entry("a b.txt"),
         Entry("-leading.txt"),
+        Entry("base.txt.orig"),
+        Entry("fix--b.txt~"),
     ],
 )
-def test_a_state_change_of_another_form_is_refused(entry: Entry) -> None:
-    with pytest.raises(ValueError, match="not a state change file"):
-        read(Entry("base.txt"), entry)
+def test_a_state_change_of_another_form_is_left_out_and_named(entry: Entry) -> None:
+    """Review of 0db077c, finding 4. Such an entry raised at import, which stopped
+    every command. It is now left out, and named for the gate's warning."""
+    found = read(Entry("base.txt"), entry)
+    assert found == statesnapshot.StateChanges(("base",), (entry.name,), None)
 
 
-def test_no_state_change_or_too_many_is_refused(
+def test_no_state_change_or_too_many_is_a_problem_and_not_an_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with pytest.raises(ValueError, match="not even the base"):
-        read()
+    empty = read(Entry("base.txt.orig"))
+    assert empty.problem is not None and "not even the base" in empty.problem
+    assert empty.ignored == ("base.txt.orig",)
     monkeypatch.setattr(statesnapshot, "MAX_STATE_CHANGES", 2)
-    with pytest.raises(ValueError, match="more than 2"):
-        read(Entry("a.txt"), Entry("b.txt"), Entry("c.txt"))
+    many = read(Entry("a.txt"), Entry("b.txt"), Entry("c.txt"))
+    assert many.problem == "more than 2 state changes"
+    assert many.names == ()
+
+
+class Unreadable:
+    def iterdir(self) -> tuple[Entry, ...]:
+        raise PermissionError(13, "Permission denied")
+
+
+def test_a_directory_that_cannot_be_read_is_a_problem() -> None:
+    found = statesnapshot.read_state_changes(Unreadable())  # pyright: ignore[reportArgumentType]
+    assert found.problem is not None and "Permission denied" in found.problem
+
+
+def test_an_unusable_set_refuses_every_snapshot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The log is replayed instead, which is always correct."""
+    monkeypatch.setattr(
+        statesnapshot,
+        "FOUND_STATE_CHANGES",
+        statesnapshot.StateChanges((), (), "no state change is recorded"),
+    )
+    with pytest.raises(
+        statesnapshot.SnapshotRefused, match="state version is unusable"
+    ):
+        statesnapshot.read(tmp_path / "absent.snapshot", 1, lambda _: None)
+
+
+def test_a_stray_file_does_not_stop_the_package_importing(tmp_path: Path) -> None:
+    """The audit's case. A copy of the package with a merge tool's leftover in
+    ``statechanges`` imports, gives the same version, and names the leftover."""
+    package = Path(statesnapshot.__file__).parent
+    copy = tmp_path / "tree" / "dromon"
+    shutil.copytree(package, copy, ignore=shutil.ignore_patterns("__pycache__"))
+    (copy / statesnapshot.STATE_CHANGES_PACKAGE / "base.txt.orig").write_text("")
+    probe = (
+        "import sys; sys.path.insert(0, sys.argv[1]);"
+        " from dromon import statesnapshot as s;"
+        " print(s.STATE_VERSION, s.FOUND_STATE_CHANGES.ignored, s.__file__)"
+    )
+    found = subprocess.run(  # noqa: S603
+        [sys.executable, "-I", "-c", probe, str(copy.parent)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert found[0] == statesnapshot.STATE_VERSION
+    assert found[1] == "('base.txt.orig',)"
+    assert Path(found[2]).is_relative_to(copy)
 
 
 def test_the_installed_set_is_read_from_the_package() -> None:
@@ -331,5 +460,7 @@ def test_a_change_to_an_enumeration_s_values_changes_its_line() -> None:
 
 def test_a_different_replay_fails_the_pin(scenario: tuple[Event, ...]) -> None:
     pinned = parse_pin(pin_path(statesnapshot.STATE_VERSION).read_text("utf-8"))
-    assert replay_digest(scenario) == pinned.replay
-    assert replay_digest(scenario[:-1]) != pinned.replay
+    history = pinned_history(scenario)
+    assert replay_digest(history) == pinned.replay
+    assert replay_digest(history[:-1]) != pinned.replay
+    assert replay_digest(scenario) != pinned.replay

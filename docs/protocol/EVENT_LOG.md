@@ -819,6 +819,15 @@ resumes.
      slipped in, so the pin of a merge is written only after reading what it merged.
      A snapshot written by a daemon from before this change carries a whole number,
      which is never this code's version, so it is ignored once and replay is whole.
+     **Review of `0db077c`, finding 4.** An entry of `statechanges/` not named
+     `NAME.txt`, such as a merge tool's leftover, is left out with a warning from the
+     gate rather than stopping the package from importing. A set that is empty, too
+     large or unreadable makes the version `unusable`, and every snapshot is then
+     refused and the log replayed. **Item 6 of that review.** The pinned history adds
+     enough disclosure checks to pass each of their three caps, since a changed cap
+     changes which checks a replay keeps and was not caught. **Residual, inference.**
+     The other caps of `State.apply`, of task records, correlations, request keys and
+     the saturated cost totals, are still not reached by the pinned history.
      **Fact, observed on 2026-11-05.** The shape digest of item
      2 differs between Python 3.12 and 3.15, since it uses Python's own text of a type,
      which is why the pin uses another digest.

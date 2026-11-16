@@ -69,32 +69,60 @@ MAX_STATE_CHANGES: Final = 1024
 """The most state changes read, so the read is bounded."""
 
 
-def read_state_changes(directory: Traversable) -> tuple[str, ...]:
-    """The names of the state changes in ``directory``, sorted. Raises
-    ``ValueError`` for a file of another form or more than ``MAX_STATE_CHANGES``,
-    since a version read from a set the daemon cannot trust would let a snapshot of
-    other code pass as this code's."""
+@dataclass(frozen=True)
+class StateChanges:
+    """What ``read_state_changes`` found. ``problem`` is why the set cannot be
+    trusted, or ``None`` when it can."""
+
+    names: tuple[str, ...]
+    ignored: tuple[str, ...]
+    problem: str | None
+
+
+def read_state_changes(directory: Traversable) -> StateChanges:
+    """The names of the state changes in ``directory``, sorted, and the entries left
+    out. It never raises, since it runs when this module is imported.
+
+    **Review of 0db077c, finding 4.** It raised ``ValueError`` for any entry not
+    named ``NAME.txt``, so one leftover file, such as a merge tool's ``base.txt.orig``,
+    stopped every command that imports the package. Such an entry is now left out
+    and named in ``ignored``, which the gate prints as a warning. Hidden entries,
+    such as a file browser's ``.DS_Store``, and the package's own files are left out
+    without being named. A set that is empty, larger than ``MAX_STATE_CHANGES``, or
+    unreadable gives a ``problem``, and then ``read`` refuses every snapshot, so the
+    log is replayed, which is always correct, rather than a snapshot of other code
+    passing as this code's. Residual. A state change file misnamed by its author, as
+    ``Feat--x.txt``, is left out with the warning, and the pin test fails, since the
+    set it names no longer matches."""
     names: list[str] = []
-    for entry in directory.iterdir():
-        # A hidden entry, such as the .DS_Store a file browser leaves, is no
-        # change, and refusing it would stop the daemon importing this module.
-        if entry.name in ("__init__.py", "__pycache__", "README.md"):
-            continue
-        if entry.name.startswith("."):
-            continue
-        name = entry.name.removesuffix(".txt")
-        if (
-            not entry.is_file()
-            or not entry.name.endswith(".txt")
-            or STATE_CHANGE_NAME.fullmatch(name) is None
-        ):
-            raise ValueError(f"{entry.name} is not a state change file NAME.txt")
-        names.append(name)
-        if len(names) > MAX_STATE_CHANGES:
-            raise ValueError(f"more than {MAX_STATE_CHANGES} state changes")
+    ignored: list[str] = []
+    try:
+        entries = sorted(directory.iterdir(), key=lambda entry: entry.name)
+        for entry in entries:
+            if entry.name in ("__init__.py", "__pycache__", "README.md"):
+                continue
+            if entry.name.startswith("."):
+                continue
+            name = entry.name.removesuffix(".txt")
+            if (
+                not entry.is_file()
+                or not entry.name.endswith(".txt")
+                or STATE_CHANGE_NAME.fullmatch(name) is None
+            ):
+                ignored.append(entry.name)
+                continue
+            names.append(name)
+            if len(names) > MAX_STATE_CHANGES:
+                return StateChanges(
+                    (), tuple(ignored), f"more than {MAX_STATE_CHANGES} state changes"
+                )
+    except OSError as error:
+        return StateChanges((), (), f"the state changes could not be read: {error}")
     if not names:
-        raise ValueError("no state change is recorded, not even the base")
-    return tuple(sorted(names))
+        return StateChanges(
+            (), tuple(ignored), "no state change is recorded, not even the base"
+        )
+    return StateChanges(tuple(sorted(names)), tuple(ignored), None)
 
 
 def state_version_of(changes: tuple[str, ...]) -> str:
@@ -103,12 +131,24 @@ def state_version_of(changes: tuple[str, ...]) -> str:
     return hashlib.sha256("".join(f"{name}\n" for name in changes).encode()).hexdigest()
 
 
-STATE_CHANGES: Final = read_state_changes(
+FOUND_STATE_CHANGES: Final = read_state_changes(
     importlib.resources.files("dromon").joinpath(STATE_CHANGES_PACKAGE)
 )
+"""What was read of this code's state changes, with any entries left out."""
+
+STATE_CHANGES: Final = FOUND_STATE_CHANGES.names
 """Every change to what applying an event means that this code holds."""
 
-STATE_VERSION: Final = state_version_of(STATE_CHANGES)
+UNUSABLE_STATE_VERSION: Final = "unusable"
+"""The version written when the set cannot be trusted. It is no digest, so no code
+with a usable set accepts a snapshot that carries it, and ``read`` refuses every
+snapshot while the set is unusable."""
+
+STATE_VERSION: Final = (
+    state_version_of(STATE_CHANGES)
+    if FOUND_STATE_CHANGES.problem is None
+    else UNUSABLE_STATE_VERSION
+)
 """Changes whenever applying an event comes to mean something else for a state of the
 same shape, since the shape digest cannot see that. **Review of 49236ad, item 3.**
 ``tests/test_state_version.py`` fails when the types ``codec_digest`` covers, or the
@@ -723,6 +763,11 @@ def read(
     owner's alone within the bound, its digest verifies, its versions and shape are
     this code's, its ``seq`` lies within the log, and the log's rows 1 and ``seq``
     have the digests it names."""
+    if FOUND_STATE_CHANGES.problem is not None:
+        raise SnapshotRefused(
+            f"this code's state version is unusable, because"
+            f" {FOUND_STATE_CHANGES.problem}, so the log is replayed"
+        )
     raw = _read_file(path)
     try:
         body = json.loads(raw.decode("utf-8"))

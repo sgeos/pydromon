@@ -27,4 +27,14 @@ Type: Fixed
   that tree in every child.
 - Round 17, item 7. `dromon settings LINE` shows each MCP server as configured,
   connected and callable, from the configuration and the engine's report at the
-  line's latest turn, with no new network call.
+  line's latest turn, with no new network call. A tool counts for the longest server
+  name it begins with.
+- Round 17 review. Claude Code lines are denied the project's `secret/` directories
+  for reading and writing, as Codex and Grok lines are, so the disclosure list is
+  closed to every line, and a document granting one back is refused.
+- Round 17 review. The gate's disclosure lookup ignores git's directory variables and
+  fails on a worktree whose git directory is not where its main checkout put it.
+- Round 17 review. A floor fragment's `Path` must lie inside the repository, a stray
+  file in the floor or state change directories is left out with a warning rather
+  than failing the gate or the package's import, and the pinned state history passes
+  each cap on kept disclosure checks.

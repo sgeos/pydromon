@@ -243,16 +243,63 @@ pass "shellcheck is clean on ${#shell_files[@]} shell files"
 # the scan and why, and does not fail, since a refused read says nothing about the
 # tracked files. Residual. A skip is not a pass, so only a gate run where the read is
 # allowed, such as full-gate, shows the scan ran.
+#
+# Round 17, review of 0db077c, finding 2. The lookup must not be steered to a decoy
+# list that passes. git's GIT_DIR, GIT_COMMON_DIR and GIT_WORK_TREE are cleared for the
+# rev-parse, so the checkout is found from the working directory alone. A linked
+# worktree is trusted only when its git directory is COMMON/worktrees/ID and git's own
+# back-pointer, COMMON/worktrees/ID/gitdir, names this checkout's .git file, as git
+# writes them at `git worktree add`. A worktree whose .git file was pointed at a copy
+# elsewhere fails that test, and the gate fails, rather than scanning another list.
+# Residual. A decoy repository whose worktrees/ID holds a matching back-pointer, with
+# this checkout's .git file edited to name it, passes, which needs a write to that
+# .git file, which Dromon's sandbox denies to a line.
+linked_main() {
+    python3 -I -c '
+import os
+import sys
+
+git_dir, common_dir, top = (os.path.realpath(p) for p in sys.argv[1:4])
+if os.path.basename(common_dir) != ".git" or git_dir == common_dir:
+    sys.exit(0)
+pointer = os.path.join(top, ".git")
+expected = os.path.join(common_dir, "worktrees", os.path.basename(git_dir))
+try:
+    with open(os.path.join(git_dir, "gitdir"), encoding="utf-8") as handle:
+        back = handle.read().strip()
+except OSError as error:
+    back = None
+    reason = f"its gitdir file could not be read, with the error {error.strerror}"
+if git_dir != expected:
+    print(f"refused {git_dir} is not under {common_dir}/worktrees")
+elif back is None:
+    print(f"refused {reason}")
+elif os.path.realpath(os.path.join(git_dir, back)) != os.path.realpath(pointer):
+    print(f"refused {git_dir}/gitdir does not name {pointer}")
+else:
+    print("main", os.path.dirname(common_dir))
+' "$@"
+}
 disclosure_root=""
 disclosure_source="this checkout"
 if [[ ! -e "secret/disclosure-terms.txt" ]]; then
-    common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
-    if [[ -n "$common_dir" && "$(basename "$common_dir")" == ".git" ]]; then
-        main_root="$(cd "$(dirname "$common_dir")" 2>/dev/null && pwd -P || true)"
-        if [[ -n "$main_root" && "$main_root" != "$(pwd -P)" ]]; then
+    git_paths="$(env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE \
+        git rev-parse --path-format=absolute --git-dir --git-common-dir 2>/dev/null ||
+        true)"
+    git_dir="$(sed -n 1p <<<"$git_paths")"
+    common_dir="$(sed -n 2p <<<"$git_paths")"
+    if [[ -n "$git_dir" && -n "$common_dir" ]]; then
+        linked="$(linked_main "$git_dir" "$common_dir" "$(pwd -P)")"
+        case "$linked" in
+        refused\ *)
+            fail "the disclosure scan refused this worktree's common git directory $common_dir, because ${linked#refused }, so it is not this worktree's main checkout"
+            ;;
+        main\ *)
+            main_root="${linked#main }"
             disclosure_root="$main_root/"
             disclosure_source="the main checkout at $main_root"
-        fi
+            ;;
+        esac
     fi
 fi
 terms_file="${disclosure_root}secret/disclosure-terms.txt"
@@ -419,6 +466,25 @@ pass "rollback floor fragments are valid and the table holds no pending row"
 # A stale environment tests old code, so the installed environment must match the lock.
 uv sync --locked
 pass "the environment matches uv.lock"
+
+# Review of 0db077c, finding 4. The package leaves out an entry of
+# src/dromon/statechanges/ that is not named NAME.txt rather than refusing to import,
+# so the gate names each one here, read by the package's own reader so the two never
+# differ, and fails when the set cannot be used at all.
+state_changes="$(uv run --no-sync python -I -c '
+from dromon.statesnapshot import FOUND_STATE_CHANGES as found
+for name in found.ignored:
+    print("ignored", name)
+if found.problem is not None:
+    print("problem", found.problem)
+')" || fail "the state changes could not be read, explained above"
+while IFS= read -r finding; do
+    case "$finding" in
+    ignored\ *) printf 'check.sh: warning: ignored src/dromon/statechanges/%s, which is not named NAME.txt in lowercase\n' "${finding#ignored }" ;;
+    problem\ *) fail "the state changes cannot be used, because ${finding#problem }" ;;
+    esac
+done <<<"$state_changes"
+pass "the state change files are read"
 
 uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .

@@ -103,8 +103,10 @@ from the configuration, or says the server came from the account or is Dromon's 
 `connected` comes from the status the engine reported for the server at the start of
 the line's latest turn, `connected` or another word such as `failed`, `pending` or
 `needs-auth`, and a configured server the report left out was not loaded. `callable`
-says whether that report offered the model at least one tool `mcp__SERVER__...`.
-Before the line's first turn under the running daemon, and for an engine that reports
+says whether that report offered the model at least one tool `mcp__SERVER__...`. A
+server name may hold `_`, so a tool is counted for the longest server name it begins
+with, and `mcp__a__b__tool` is the tool of `a__b`, not of `a`, which the review of
+`0db077c` found counted for both. Before the line's first turn under the running daemon, and for an engine that reports
 neither list, each is unknown. **Residuals.** The reports are the latest turn's, kept
 in memory, so a restart makes them unknown until the line runs, and a server that
 failed after its turn began still shows as it was. A tool offered may still fail when
