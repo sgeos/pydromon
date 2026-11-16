@@ -87,6 +87,7 @@ from dromon.model import (
     BudgetHandoffRequested,
     BudgetSource,
     LeaseAcquired,
+    LeaseCapped,
     LeaseEnd,
     LeaseReleased,
     RunCleared,
@@ -266,6 +267,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "requested_at",
     ),
     "lease_acquired": ("name", "line_id", "acquired_at", "expires", "note"),
+    "lease_capped": ("name", "line_id", "expires"),
     "lease_released": ("name", "line_id", "cause"),
     "run_started": (
         "run_id",
@@ -801,6 +803,12 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "expires": event.expires,
                 "note": event.note,
             }
+        case LeaseCapped():
+            return "lease_capped", {
+                "name": event.name,
+                "line_id": event.line_id,
+                "expires": event.expires,
+            }
         case LeaseReleased():
             return "lease_released", {
                 "name": event.name,
@@ -1170,6 +1178,12 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "acquired_at"),
                 _str(data, "expires"),
                 _optional_str(data, "note"),
+            )
+        case "lease_capped":
+            return LeaseCapped(
+                _str(data, "name"),
+                _str(data, "line_id"),
+                _str(data, "expires"),
             )
         case "lease_released":
             return LeaseReleased(

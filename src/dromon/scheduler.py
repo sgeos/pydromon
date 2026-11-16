@@ -260,6 +260,7 @@ from dromon.worktree import (
 )
 from dromon.workdir import (
     git_common_directory,
+    integration_root,
     git_write_guards,
     read_head_commit,
     resolve_read_only_paths,
@@ -366,6 +367,7 @@ from dromon.model import (
     LineOverridden,
     LineReleased,
     LeaseAcquired,
+    LeaseCapped,
     LeaseEnd,
     LeaseReleased,
     CommitRunRefused,
@@ -5001,20 +5003,8 @@ class Scheduler:
             if parse_due(lease.expires) > parse_due(lease.acquired_at) + timedelta(
                 seconds=ttl_seconds
             ):
-                self._log.append(
-                    LeaseReleased(name, lease.line_id, LeaseEnd.LIMIT_LOWERED)
-                )
                 capped = parse_due(lease.acquired_at) + timedelta(seconds=ttl_seconds)
-                if capped > self._wall_clock():
-                    self._log.append(
-                        LeaseAcquired(
-                            name,
-                            lease.line_id,
-                            lease.acquired_at,
-                            format_due(capped),
-                            lease.note,
-                        )
-                    )
+                self._log.append(LeaseCapped(name, lease.line_id, format_due(capped)))
                 self.send(
                     LineAddress(lease.line_id),
                     LineAddress(lease.line_id),
@@ -6943,7 +6933,7 @@ class Scheduler:
             "strategy": line.strategy,
             "workdir": config.workdir,
             "workdir_path": workdir,
-            "integration_root": None if self._root is None else str(self._root),
+            "integration_root": self._integration_root(),
             "sandbox": self._sandbox_status(line_id, workdir),
             "sandbox_facts": self.sandbox_facts(line_id),
             "engine_session": line.engine_session,
@@ -7129,6 +7119,15 @@ class Scheduler:
             return {"required": True, "path": select(environment), "reason": None}
         except ShellSelectionError as error:
             return {"required": True, "path": None, "reason": str(error)}
+
+    def _integration_root(self) -> str | None:
+        if self._root is None:
+            return None
+        try:
+            root = integration_root(self._root)
+        except (OSError, RuntimeError, SandboxError):
+            return None
+        return None if root is None else str(root)
 
     def _sandbox_status(self, line_id: str, workdir: str | None) -> dict[str, object]:
         """Show the caller's full effective Claude Code sandbox and its Git write

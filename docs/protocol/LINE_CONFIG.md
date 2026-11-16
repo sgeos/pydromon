@@ -2915,10 +2915,16 @@ They do not exempt messages or text checks. The operator sets them as described 
 ### Integration root
 
 From round 17, compact and detailed `line_status` include `integration_root` and
-`workdir_path`. The integration root is the project root supplied to the scheduler.
-It identifies the main checkout independently of a role working directory. Each
-field is null when its path is unknown. The root is configuration evidence and
-does not attest that the checkout is clean or contains a particular commit.
+`workdir_path`. For a Git checkout, the integration root is the main checkout
+resolved from the common Git directory. A linked worktree must have its Git
+directory under `COMMON/worktrees/ID` and a matching `gitdir` back-pointer.
+The lookup does not consult Git environment variables. A copied Git directory
+pointing at a decoy is refused. A forged common directory with a matching
+back-pointer remains possible for an actor able to rewrite the protected Git
+pointers. Unsupported layouts and unreadable or inconsistent pointers yield null.
+When the project is outside a Git checkout, the field is the resolved project
+directory supplied to the scheduler. Each field is null when its path is unknown.
+The root does not attest that the checkout is clean or contains a particular commit.
 
 Overview reads the newest role journal entry from an index holding one entry per
 role. The event log rebuilds it once after replay or snapshot restoration and
@@ -2961,10 +2967,10 @@ Idle maintenance can lag wall-clock expiry by the maintenance interval. Inventor
 and acquisition still enforce the actual expiry time during that interval.
 
 Reload caps each surviving declared lease to its acquisition time plus the new
-limit. It records a release with cause `limit_lowered`, followed by an acquisition
-with the original holder and acquisition time if the capped expiry remains future.
-Otherwise the lease stays released. The holder receives an informational own note.
-A crash between release and acquisition leaves the resource unleased. This fails
-closed for ownership claims and the holder must acquire again. A crash before the
-note can omit notification. Lease expiry never proves that the holder's processes
-have stopped.
+limit. One `lease_capped` event shortens the expiry in place and retains the
+original holder, acquisition time and note. Replay before or after that event
+retains the holder, without an intermediate release. A cap already in the past
+is treated as expired by inventory and acquisition, and expiry maintenance later
+records its release. The holder receives an informational own note. A crash before
+the note can omit notification. Lease expiry never proves that the holder's
+processes have stopped.

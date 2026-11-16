@@ -5,6 +5,7 @@ nothing."""
 
 import asyncio
 import json
+import os
 from collections.abc import Generator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,7 +14,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import cli, exits
+from dromon import cli, exits, spawn
 from dromon.configview import Overrides
 from dromon.lineconfig import LineConfig
 from dromon.daemon import Daemon
@@ -415,3 +416,72 @@ def test_task_mail_is_bounded_and_read_only(
     assert "must be used alone" in tool_text(
         scheduler, "list_mail", {"task_context": True, "limit": 1}, error=True
     )
+
+
+def test_linked_project_reports_main_checkout(
+    log: EventLog, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main = tmp_path / "main"
+    linked = tmp_path / "linked"
+    decoy = tmp_path / "decoy"
+    environment = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    for path in (main, decoy):
+        spawn.run(
+            ["git", "init", "-q", str(path)], env=environment, check=True, timeout=10
+        )
+    spawn.run(
+        [
+            "git",
+            "-C",
+            str(main),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "seed",
+        ],
+        env=environment,
+        check=True,
+        timeout=10,
+    )
+    spawn.run(
+        ["git", "-C", str(main), "worktree", "add", "-qb", "linked", str(linked)],
+        env=environment,
+        check=True,
+        timeout=10,
+    )
+    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+    monkeypatch.setenv("GIT_COMMON_DIR", str(decoy / ".git"))
+    scheduler = Scheduler(log, no_engine, root=linked, hold_wakes=True)
+    scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+    for detail in (False, True):
+        status = scheduler.line_status("alpha", detail=detail)
+        assert status["integration_root"] == str(main.resolve())
+        assert status["workdir_path"] == str(linked.resolve())
+
+    # A copied gitdir pointing at a decoy is outside COMMON/worktrees/ID.
+    fake = tmp_path / "copied-gitdir"
+    fake.mkdir()
+    (fake / "commondir").write_text(str(decoy / ".git"))
+    (fake / "gitdir").write_text(str(linked / ".git"))
+    (linked / ".git").write_text(f"gitdir: {fake}\n")
+    assert scheduler.line_status("alpha")["integration_root"] is None
+
+
+def test_linked_project_refuses_wrong_back_pointer(
+    log: EventLog, tmp_path: Path
+) -> None:
+    common = tmp_path / "main" / ".git"
+    gitdir = common / "worktrees" / "linked"
+    gitdir.mkdir(parents=True)
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / ".git").write_text(f"gitdir: {gitdir}\n")
+    (gitdir / "commondir").write_text("../..\n")
+    (gitdir / "gitdir").write_text(str(tmp_path / "wrong" / ".git"))
+    scheduler = Scheduler(log, no_engine, root=linked, hold_wakes=True)
+    scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+    assert scheduler.line_status("alpha")["integration_root"] is None

@@ -300,3 +300,29 @@ def read_head_commit(directory: Path) -> str | None:
         if value == ref and OBJECT_NAME.fullmatch(name):
             return name
     return None
+
+
+def integration_root(directory: Path) -> Path | None:
+    """Find the main checkout without consulting Git environment variables.
+
+    Match the gate's common-directory and back-pointer checks. A decoy gitdir
+    outside COMMON/worktrees/ID is refused. A forged repository with a matching
+    back-pointer remains outside this check's trust boundary, so sandbox guards
+    must continue to protect the pointer files. Non-checkout projects use their
+    supplied directory. Unsupported or inconsistent Git layouts return unknown.
+    """
+    real = directory.resolve()
+    found = _git_dirs(real)
+    if found is None:
+        return real
+    gitdir, common, dot, linked = found
+    if common.name != ".git" or not common.is_dir():
+        return None
+    if linked:
+        if gitdir.parent != common / "worktrees":
+            return None
+        if _against(_pointer(gitdir / "gitdir", ""), gitdir) != dot.resolve():
+            return None
+    elif gitdir != common:
+        return None
+    return common.parent
