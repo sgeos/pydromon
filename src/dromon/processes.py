@@ -47,9 +47,9 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Generic, Protocol, TypeVar, cast
+from typing import Any, Final, Generic, Literal, Protocol, TypeVar, cast
 
 from dromon import spawn
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
@@ -127,6 +127,17 @@ PROBE_ATTEMPTS: Final = 20
 PROBE_PAUSE_SECONDS: Final = 0.05
 
 MAX_COMMAND_CHARACTERS: Final = 200
+type CommandMarker = Literal[
+    "dromon.launcher", "dromon-launch", "<defunct>", "pid=,ppid=,pgid="
+]
+
+LAUNCHER_NAMES: Final[tuple[CommandMarker, ...]] = ("dromon.launcher", "dromon-launch")
+"""Launcher markers checked before a process command is shortened for display."""
+TREE_COMMAND_MARKERS: Final[tuple[CommandMarker, ...]] = (
+    *LAUNCHER_NAMES,
+    "<defunct>",
+    PS_LISTING_MARK,
+)
 PS_TIMEOUT_SECONDS: Final = 10.0
 
 MAX_PENDING_PROCESS_CALLS: Final = 8
@@ -581,6 +592,21 @@ class TreeRow:
     """The process's start time as ``ps`` prints it, or empty when the listing did not
     ask. **Round 15, re-review.** A pid is reused, and a process is the same one only
     if its start time is also unchanged, so a caller that signals a row checks this."""
+    command_markers: frozenset[CommandMarker] | None = field(
+        default=None, compare=False
+    )
+    """Recognised markers in the full command. None means the
+    row was supplied directly and its command has not been shortened by parse_tree.
+    This derived metadata is not part of process identity. A display prefix cannot
+    decide liveness since an isolated module bootstrap can precede the marker.
+    The set has at most four entries and does not retain arbitrary command text.
+    Marker checks retain their existing limits and are not authentication."""
+
+    def has_marker(self, marker: CommandMarker) -> bool:
+        """Check a known marker before display truncation, or in a supplied row."""
+        if self.command_markers is None:
+            return marker in self.command
+        return marker in self.command_markers
 
 
 def parse_tree(output: str, with_start: bool = False) -> list[TreeRow]:
@@ -598,7 +624,19 @@ def parse_tree(output: str, with_start: bool = False) -> list[TreeRow]:
             continue
         started = " ".join(fields[3:first])
         command = fields[first] if len(fields) == first + 1 else ""
-        rows.append(TreeRow(pid, ppid, pgid, command[:MAX_COMMAND_CHARACTERS], started))
+        command_markers: frozenset[CommandMarker] = frozenset(
+            marker for marker in TREE_COMMAND_MARKERS if marker in command
+        )
+        rows.append(
+            TreeRow(
+                pid,
+                ppid,
+                pgid,
+                command[:MAX_COMMAND_CHARACTERS],
+                started,
+                command_markers,
+            )
+        )
     return rows
 
 
@@ -771,7 +809,7 @@ def root_is_harness(rows: Sequence[TreeRow], harness: LaunchedHarness) -> bool:
     record with no time, or a start that cannot be read, is not accepted, since not
     knowing is not a match."""
     row = next((row for row in rows if row.pid == harness.pid), None)
-    if row is None or "<defunct>" in row.command:
+    if row is None or row.has_marker("<defunct>"):
         return False
     if not runs_command(row.command, harness.command):
         return False
@@ -798,7 +836,7 @@ def _is_own_listing(row: TreeRow, me: int) -> bool:
     of the caller and lists itself, so a walk from the caller would find it among its
     descendants, count it as one outside the command's group and signal a process that
     is gone. **Round 15.** Found when a receipt named a descendant that was this."""
-    return row.ppid == me and PS_LISTING_MARK in row.command
+    return row.ppid == me and row.has_marker(PS_LISTING_MARK)
 
 
 def _require_readable(
@@ -1164,7 +1202,7 @@ class ChildLedger:
             held = self._entries.setdefault(line_id, {})
         changed = 0
         for row in rows:
-            if row.started == "" or "<defunct>" in row.command or row.pid <= 1:
+            if row.started == "" or row.has_marker("<defunct>") or row.pid <= 1:
                 continue
             entry = LedgerEntry(row.pid, row.started, row.command)
             if held.get(row.pid) != entry:
