@@ -2689,7 +2689,11 @@ class GrokLine:
 
         reader = threading.Thread(target=read, name="dromon-grok-events", daemon=True)
         self._mcp_events_reader = reader
-        reader.start()
+        try:
+            reader.start()
+        except RuntimeError:
+            self._mcp_events_reader = None
+            return None
         while not finished.is_set():
             remaining = deadline - time.monotonic()
             if remaining <= 0:

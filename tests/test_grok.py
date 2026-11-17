@@ -4414,6 +4414,29 @@ def test_session_event_deadline_includes_filesystem_waits(
     asyncio.run(go())
 
 
+def test_an_unstartable_session_reader_returns_no_diagnostic_and_can_retry(
+    project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    workspace, home, _ = project
+    _write_events(home, workspace, "s1", FAILED_START)
+    target = line(FakeGrok(), project)
+
+    def fail(_thread: threading.Thread) -> None:
+        raise RuntimeError("synthetic thread exhaustion")
+
+    async def go() -> None:
+        with monkeypatch.context() as patch:
+            patch.setattr(threading.Thread, "start", fail)
+            assert await target._server_failure("s1") is None  # pyright: ignore[reportPrivateUsage]
+        assert target._mcp_events_reader is None  # pyright: ignore[reportPrivateUsage]
+        failure = await target._server_failure("s1")  # pyright: ignore[reportPrivateUsage]
+        assert failure is not None and "handshake_failed" in failure
+
+    asyncio.run(go())
+
+
 FAILED_START: Final[list[dict[str, object]]] = [
     {"type": "mcp_config_resolved", "servers": [{"name": "dromon"}]},
     {"type": "mcp_server_starting", "server_name": "dromon"},

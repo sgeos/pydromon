@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from dromon import BRIDGE_LOG_VARIABLE, acp
+from dromon.bridgelog import MAX_LOG_BYTES, MAX_RECORD_BYTES
 from dromon.privatefiles import open_log
 
 INITIALIZE = json.dumps(
@@ -203,6 +204,44 @@ def test_a_log_worker_that_cannot_start_preserves_stderr(tmp_path: Path) -> None
     )
     assert result.returncode == 0
     assert result.stderr.strip() == "still served"
+
+
+@pytest.mark.parametrize("offset", [17 * 4096, MAX_RECORD_BYTES - 8])
+def test_a_private_key_header_after_or_across_the_record_cap_hides_the_body(
+    tmp_path: Path, offset: int
+) -> None:
+    log = tmp_path / "bridge.log"
+    result = _python(
+        "import dromon, os\n"
+        "os.set_blocking(2, True)\n"
+        f"os.write(2, b'x' * {offset})\n"
+        "os.write(2, b'-----BEGIN PRIVATE KEY-----\\n')\n"
+        "os.write(2, b'synthetic-private-body\\n-----END PRIVATE KEY-----\\n')\n"
+        "print('served')",
+        log,
+    )
+    assert result.returncode == 0 and result.stdout.strip() == "served"
+    text = log.read_text(encoding="utf-8")
+    assert "bridge started" in text
+    assert "synthetic-private-body" not in text
+
+
+def test_the_total_log_cap_stops_many_individually_small_records(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "bridge.log"
+    result = _python(
+        "import dromon, os\n"
+        "os.set_blocking(2, True)\n"
+        f"for _ in range({MAX_LOG_BYTES // 4096 + 8}):\n"
+        "    os.write(2, b'x' * 4095 + b'\\n')\n"
+        "os.write(2, b'after-the-log-cap\\n')\n"
+        "print('served')",
+        log,
+    )
+    assert result.returncode == 0 and result.stdout.strip() == "served"
+    data = log.read_bytes()
+    assert MAX_LOG_BYTES // 2 < len(data) <= MAX_LOG_BYTES
 
 
 @pytest.fixture

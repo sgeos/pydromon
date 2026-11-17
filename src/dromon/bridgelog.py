@@ -1,7 +1,8 @@
 """Private bridge diagnostics filtered before disk writes.
 
 Native and Python stderr enter a pipe. Only its reader holds the log descriptor.
-Records and the whole log are bounded. Oversized records are omitted. Writes to a
+Records and the whole log are bounded. An oversized record suppresses the remaining
+stderr stream because its discarded bytes may contain a private-key header. Writes to a
 full pipe fail instead of blocking startup. Abrupt termination may lose pending
 diagnostics. Unrecognised credentials have the limits described in credentials.
 """
@@ -64,34 +65,38 @@ def capture(path: str, *, descriptor: int = 2) -> bool:
 
     def drain() -> None:
         pending = bytearray()
-        oversized = False
+        suppressed = False
         private_key = False
         try:
             while True:
                 chunk = os.read(reader, 4096)
                 if not chunk:
                     break
+                if suppressed:
+                    continue
                 for byte in chunk:
+                    if suppressed:
+                        break
                     if byte == 10:
                         text = pending.decode("utf-8", errors="replace")
                         if "-----BEGIN " in text and "PRIVATE KEY-----" in text:
                             private_key = True
                             write("[private key omitted]\n")
                         elif not private_key:
-                            write(
-                                "[oversized diagnostic omitted]\n"
-                                if oversized
-                                else text + "\n"
-                            )
+                            write(text + "\n")
                         if "-----END " in text and "PRIVATE KEY-----" in text:
                             private_key = False
                         pending.clear()
-                        oversized = False
                     elif len(pending) < MAX_RECORD_BYTES:
                         pending.append(byte)
                     else:
-                        oversized = True
-            if pending and not oversized and not private_key:
+                        # The discarded suffix could hide a key header. There is
+                        # no safe boundary at the next newline, which may begin
+                        # the key body. Drain without logging until process exit.
+                        suppressed = True
+                        pending.clear()
+                        write("[stderr suppressed after oversized diagnostic]\n")
+            if pending and not suppressed and not private_key:
                 write(pending.decode("utf-8", errors="replace"))
         except OSError:
             pass
