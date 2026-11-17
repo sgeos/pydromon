@@ -75,7 +75,12 @@ line `Type: Added`, `Type: Changed` or `Type: Fixed`, a blank line, and its bull
 Unreleased section other than a release or a lossless regrouping of its headings. A release runs
 `python3 -I scripts/assemble_changelog.py release VERSION DATE`, in the operator's
 session and in one commit with the deleted fragments, after `preview` shows the
-entries. [`changes/README.md`](changes/README.md) is the convention in full.
+entries. [`changes/README.md`](changes/README.md) is the convention in full. In the same
+way a one-way change of the event log adds `docs/protocol/floors/BRANCH.md` rather than
+a pending row of the rollback floor table, and a change to what applying an event means
+adds `src/dromon/statechanges/BRANCH.txt` rather than raising a number, as
+[`docs/protocol/floors/README.md`](docs/protocol/floors/README.md) and
+[`src/dromon/statechanges/README.md`](src/dromon/statechanges/README.md) say.
 
 The remote is `https://github.com/sgeos/pydromon`, a public repository. Its git
 configuration uses the GitHub command-line tool as the credential helper, because SSH
@@ -146,7 +151,11 @@ pull requests.
 its marker, is tracked. If `secret/disclosure-terms.txt` exists, one term per line, the
 gate also fails when a tracked file contains any of those terms, and it prints only the
 file and line. The scan cannot run in a clone or in continuous integration, which do not
-have the list, and the gate says so when it skips.
+have the list, and the gate says so when it skips. A linked worktree without its own list
+reads the main checkout's list and acceptances, found through git with git's own
+variables cleared, and refuses a common directory that is not that checkout's. Dromon
+denies every line the project's `secret/` directories, so a line's own gate run skips
+the scan with the reason, and full-gate, which runs outside every sandbox, scans.
 
 ## Coding Conventions
 

@@ -1,0 +1,10 @@
+Every change to what applying an event means, up to and including the whole number
+STATE_VERSION 6 that the set of these files replaced in round 17.
+
+Version 1 was the snapshot of round 15, at 49236ad. Version 2 was the round 15
+follow-up, whose events line_turn_ended and brief_set gained fields. Version 3 was the
+merge of feat/r15-runs-disclosure, where disclosure_checked gained checked_bytes and a
+pass is kept apart from a failure, and run_ended gained output_tail. Version 4 was
+round 16, item 5, where run_started gained tree. Version 5 was round 16, item 3, merged
+after it, where run_started gained workdir_commit. Version 6 added the round 16 closing
+diagnostics and their latest failure state, including a nonempty replay reason.

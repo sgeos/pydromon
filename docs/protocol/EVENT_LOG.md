@@ -194,12 +194,16 @@ from the floor of every change the log holds, so the floor of a log is the newes
 among the changes it holds. Each other document that names a rollback hazard refers
 here. A row names the first commit to write and read the change, or the first of each where it names several changes, and the merge that
 brought it into `main`, which is the oldest commit of `main` that opens it.
-A pending row is on a branch not yet merged, and its floor on `main` will be that
-branch's merge.
+**Round 17, item 3.** A branch no longer adds a pending row here, since every such
+row was appended at the same place and two branches conflicted at every merge. It adds
+a fragment under [`floors/`](floors/README.md), and a release writes its row with the
+commits git names, through `scripts/assemble_floors.py`. The gate refuses a row here
+that still says pending or uncommitted. The state version that a snapshot carries
+changed the same way, to one file per branch under `src/dromon/statechanges/`, as
+`dromon.statesnapshot.STATE_VERSION` records.
 
 | Change | First commit | Floor on `main` | Branch |
 |---|---|---|---|
-| `line_turn_ended.closing_reason`, `STATE_VERSION` 6 | `b73c57d` | Pending | `fix/r16-grok-continue` |
 | `operator_registered`, operator addresses, `note` and `question` kinds | `4d9b3ff` | `621d6db` | `feat/operator-addresses`, #5 |
 | `line_configured` | `7040c16` | `2d04603` | `feat/ticks-and-line-tools`, #11 |
 | `line_session` | `885540c` | `2e413c8` | `feat/operator-questions`, #12 |
@@ -238,14 +242,15 @@ branch's merge.
 | A commit run, a `run_started` with `commit` and `checkout` | `1449c5c` | `8b2c508` | `feat/operator-r14`, #129 |
 | `commit_run_refused` | `522c146` | `8b2c508` | `feat/operator-r14`, #129 |
 | `line_configured.sealed`, written when a configuration holds a literal value | `025149b` | `8ca4ead` | `feat/eventlog-r14`, #134 |
-| `line_cost_recorded`, written after every turn and every spend between turns | `49236ad` | Pending | `feat/r15-mail-cost-log` |
-| `role_declared.reviews`, written when a role names a role it reviews | `49236ad` | Pending | `feat/r15-mail-cost-log` |
-| `line_turn_ended.failure` and `failure_class`, written with every failed turn | Uncommitted | Pending | `feat/r15-mail-cost-log` |
-| `brief_set.workdir_dirty`, written whenever git can read the worktree as a brief is set | Uncommitted | Pending | `feat/r15-mail-cost-log` |
-| `run_ended.output_tail`, written when a failed run's output has a tail | `172f9b9` | Pending | `feat/r15-runs-disclosure` |
-| `disclosure_checked.checked_bytes`, written with every `check_disclosure` call and screened `write_scratch` | `da29483` | Pending | `feat/r15-runs-disclosure` |
+| `line_cost_recorded`, written after every turn and every spend between turns | `49236ad` | `b41fc7f` | `feat/r15-mail-cost-log`, #138 |
+| `role_declared.reviews`, written when a role names a role it reviews | `49236ad` | `b41fc7f` | `feat/r15-mail-cost-log`, #138 |
+| `line_turn_ended.failure` and `failure_class`, written with every failed turn, and the failure causes | `2cede6e` | `b41fc7f` | `feat/r15-mail-cost-log`, #138 |
+| `brief_set.workdir_dirty`, written whenever git can read the worktree as a brief is set | `2cede6e` | `b41fc7f` | `feat/r15-mail-cost-log`, #138 |
+| `run_ended.output_tail`, written when a failed run's output has a tail | `172f9b9` | `b4d5481` | `feat/r15-runs-disclosure`, #139 |
+| `disclosure_checked.checked_bytes`, written with every `check_disclosure` call and screened `write_scratch` | `da29483` | `b4d5481` | `feat/r15-runs-disclosure`, #139 |
 | `run_started.tree`, written whenever a run in a working directory starts with its tree readable, `STATE_VERSION` 4 | `2902990` | `48146cc` | `fix/r16-fewer-starts`, #147 |
-| `run_started.workdir_commit`, written whenever a run in a worktree starts with its commit readable, `STATE_VERSION` 5 | `16de365` | Pending | `feat/r16-overview-leases`, #148 |
+| `run_started.workdir_commit`, written whenever a run in a worktree starts with its commit readable, `STATE_VERSION` 5 | `16de365` | `cf962a7` | `feat/r16-overview-leases`, #148 |
+| `line_turn_ended.closing_reason`, `STATE_VERSION` 6 | `b73c57d` | `e90ac4d` | `fix/r16-grok-continue`, #152 |
 
 **Fact, from the history.** The table was built from the history of `HEAD` on
 `feat/mail-and-roles` at `5a1603f`. A kind's first commit is the oldest whose
@@ -275,7 +280,15 @@ daemon from this branch runs passes its floor, and from then a rollback to older
 refuses the log until the operator restores it from a copy taken before. The round's
 other changes, the thread rule for unanswered mail and the stale brief lead, add no
 kind, field or value, since each is derived as events apply or composed in the
-prompt.
+prompt. **Updated in round 17 on `fix/r17-operator-tooling`, from `main` at
+`f28ba7a`.** **Fact, from `git log -S` and `git merge-base --is-ancestor` along
+`git rev-list --first-parent`.** Every row that was pending is merged, and each floor
+is the first merge on `main` that contains the row's first commit. The two rows that
+said uncommitted were first written in `2cede6e`, which adds `failure`,
+`failure_class`, `workdir_dirty` and the values of the failure cause together. The
+`closing_reason` row moved to the end, in the order of its merge. Between `8ca4ead`
+and `f28ba7a`, `dromon.codec` gained no field and `dromon.model` no enumeration value
+outside these rows, and #150, #151, #153, #154 and #155 change neither for any event.
 
 **Inference.** The search reads the codec and the model, not every rule of the
 applying code. A rule that a newer daemon applies and an older one refuses, such as a
@@ -795,7 +808,31 @@ resumes.
      replays to. A change to either fails the test until the version is raised and a
      pin appended, and a pin under a version already pinned is refused. Version 2 is
      the round 15 follow-up. Version 3 is the merge of `feat/r15-runs-disclosure`,
-     whose disclosure passes, bytes and run tails failed the pin of version 2. **Fact, observed on 2026-11-05.** The shape digest of item
+     whose disclosure passes, bytes and run tails failed the pin of version 2.
+     **Round 17, item 3.** The whole number became the SHA-256 of the names of the
+     files in `src/dromon/statechanges/`, one per branch that changed the state, and
+     each pin became one file in `tests/state_pins/` named for the version it pins, so
+     two such branches add different files and never conflict. Their merge holds both
+     names, so its version is neither branch's and a snapshot either wrote is ignored.
+     The merge needs one new pin, which the failing test names with its content.
+     **Residual.** The test cannot tell a merge from a merge with a further change
+     slipped in, so the pin of a merge is written only after reading what it merged.
+     A snapshot written by a daemon from before this change carries a whole number,
+     which is never this code's version, so it is ignored once and replay is whole.
+     **Review of `0db077c`, finding 4.** An entry of `statechanges/` not named
+     `NAME.txt`, such as a merge tool's leftover, is left out with a warning from the
+     gate rather than stopping the package from importing. A set that is empty, too
+     large or unreadable makes the version `unusable`, and every snapshot is then
+     refused and the log replayed. Discovery reads at most 4097 directory entries
+     before sorting at most 4096 and retains at most 128 ignored names. Either
+     overflow makes the set unusable rather than trusting an arbitrary prefix.
+     These limits bound counts rather than name bytes or filesystem latency.
+     **Item 6 of that review.** The pinned history adds
+     enough disclosure checks to pass each of their three caps, since a changed cap
+     changes which checks a replay keeps and was not caught. **Residual, inference.**
+     The other caps of `State.apply`, of task records, correlations, request keys and
+     the saturated cost totals, are still not reached by the pinned history.
+     **Fact, observed on 2026-11-05.** The shape digest of item
      2 differs between Python 3.12 and 3.15, since it uses Python's own text of a type,
      which is why the pin uses another digest.
 7. **What it does not bound.** Memory. A snapshot bounds the start time by the events
@@ -895,7 +932,14 @@ Rollback hazard. Older daemons refuse events carrying `closing_reason`. The floo
 table above records the first compatible commit and its pending main floor. Ports
 must preserve the character bound and screening order.
 
-Fact. Snapshot version 7 adds the optional partial cost marker to cost records.
+Fact. The branch state change file records the optional partial cost marker.
 The reducer retains its numeric subtotal and increments the unknown count once.
 Older snapshot caches are rebuilt from the event log. Older daemons refuse cost
 records with this marker, so rollback requires code that understands the field.
+
+State change discovery slices `os.scandir` directly and closes the scanner after
+reading, including on overflow or a read error. It does not use `Path.iterdir`, which
+can allocate the full directory before yielding on supported Python versions.
+Non-filesystem package resources make snapshots unusable because their enumeration
+bounds are unknown. The entry limits are unchanged. The event log remains usable
+through full replay in that case.

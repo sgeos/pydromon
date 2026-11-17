@@ -96,6 +96,26 @@ engine process environment or the event log.
   and a turn is refused when the engine offers a built-in tool not in `builtin_tools`
   or a tool of a server not in `mcp_servers`.
 
+**Round 17, item 7, from another project's reports. A server's three states.**
+`dromon settings LINE` shows each server as configured, connected and callable, as far
+as Dromon knows, with no network call and no process of its own. `configured` comes
+from the configuration, or says the server came from the account or is Dromon's own.
+`connected` comes from the status the engine reported for the server at the start of
+the line's latest turn, `connected` or another word such as `failed`, `pending` or
+`needs-auth`, and a configured server the report left out was not loaded. `callable`
+says whether that report offered the model at least one tool `mcp__SERVER__...`. A
+server name may hold `_`, so a tool is counted for the longest server name it begins
+with, and `mcp__a__b__tool` is the tool of `a__b`, not of `a`, which the review of
+`0db077c` found counted for both. Before the line's first turn under the running daemon, and for an engine that reports
+neither list, each is unknown. **Residuals.** The reports are the latest turn's, kept
+in memory, so a restart makes them unknown until the line runs, and a server that
+failed after its turn began still shows as it was. A tool offered may still fail when
+called. The engine's names and statuses are untrusted and read in a strict form, and
+anything else is left out. A line's own `line_status` names none of its servers, as
+before. **Fact, from the adapters.** Only the Claude Code adapter builds the start
+report these are read from, so a line on another engine shows `connected` and
+`callable` as unknown.
+
 ## Viewing images
 
 `ViewImage` in `builtin_tools` lets a line look at a local image. It is Dromon's name,
@@ -367,8 +387,10 @@ figure carried forward could not be told from a fresh one, so beside it stand
 `observed_at`, the time it was stated or reported, the same as `stated_at`,
 `age_seconds`, its age in whole seconds at the daemon's time, and `age`, the same in
 words, such as `observed 2 hours 5 minutes ago`. An observation after the daemon's
-time, as when the clock was set back, gives a negative `age_seconds` and says its age
-is unknown, so an old figure never reads as fresh. Each is `unknown` where no budget
+time, as when the clock was set back, gives `age_seconds` as `unknown` and says in
+`age` how far after the daemon's time it was observed and that its age is unknown, so
+an old figure never reads as fresh. **Round 17, item 4.** It gave a negative
+`age_seconds` beside those words until then, so the number and the words disagreed. Each is `unknown` where no budget
 is stated. Dromon moves no role and holds no line on a budget it does
 not know. `disclosure` says whether the project has a disclosure list, `list` being
 `configured` or `none`, with a `note`, so a line learns early that `check_disclosure`
