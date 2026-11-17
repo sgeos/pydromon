@@ -129,6 +129,7 @@ from typing import Final, cast
 
 from dromon.modulecommand import module_command
 from dromon.processes import (
+    LAUNCHER_NAMES,
     MARK_VARIABLE,
     TreeReadFailure,
     TreeRow,
@@ -299,10 +300,6 @@ LAUNCH_SUFFIX: Final = ".launch"
 MAX_LAUNCHES: Final = 256
 """The most launch records one sweep reads. The rest wait for the next sweep."""
 MAX_LAUNCH_BYTES: Final = 4096
-
-LAUNCHER_NAMES: Final = ("dromon.launcher", SCRIPT_NAME)
-"""What a running launcher's command line holds, as ``python -m dromon.launcher`` or
-as the ``dromon-launch`` script, by which the sweep tells that one still runs."""
 
 EXITED: Final = "exited"
 STOPPED: Final = "stopped"
@@ -830,9 +827,9 @@ def launcher_running(
     another parent, since a running launcher stays its harness's parent until it
     reaps it. **Third live run of N1, 2026-10-26.**"""
     row = next((row for row in rows if row.pid == pid), None)
-    if row is None or DEFUNCT in row.command:
+    if row is None or row.has_marker("<defunct>"):
         return False
-    if not any(name in row.command for name in LAUNCHER_NAMES):
+    if not any(row.has_marker(name) for name in LAUNCHER_NAMES):
         return False
     held = next((row for row in rows if row.pid == harness), None)
     if held is None or command not in held.command:

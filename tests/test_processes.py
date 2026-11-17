@@ -905,7 +905,7 @@ def test_attached_leaves_out_the_ps_that_listed_it(
     me = os.getpid()
     rows = [
         TreeRow(me, 1, me, "daemon"),
-        TreeRow(900, me, me, f"ps -ww -U 501 -o {PS_FIELDS}"),
+        *parse_tree(f"900 {me} {me} /{'x' * 300}/ps -ww -U 501 -o {PS_FIELDS}\n"),
         TreeRow(901, me, 901, "sleep 60"),
         TreeRow(902, 901, 902, "ps aux"),
         TreeRow(903, 901, 903, f"ps -ww -U 501 -o {PS_FIELDS}"),

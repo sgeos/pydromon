@@ -143,7 +143,9 @@ def test_the_ledger_keeps_children_with_a_start_time_and_nothing_else() -> None:
         [
             row(2001),
             row(2002, started=""),
-            row(2003, command="<defunct>"),
+            *processes.parse_tree(
+                f"2003 1 2003 {FIRST} claude {'x' * 300} <defunct>\n", with_start=True
+            ),
             row(1, started=FIRST),
         ],
     )
@@ -558,6 +560,13 @@ def test_a_root_is_the_harness_with_its_command_and_a_start_before_the_record() 
     # Not there, exited and not reaped, or a start that cannot be read.
     assert not root_is_harness([row(2001, 1, "claude", FIRST)], record)
     assert not root_is_harness([row(HARNESS, 1, "<defunct>", FIRST)], record)
+    assert not root_is_harness(
+        processes.parse_tree(
+            f"{HARNESS} 1 {HARNESS} {FIRST} claude {'x' * 300} <defunct>\n",
+            with_start=True,
+        ),
+        record,
+    )
     assert not root_is_harness([row(HARNESS, 1, "claude", "not a time")], record)
     assert not root_is_harness([row(HARNESS, 1, "claude", "")], record)
     # A record that carries no time, or no command, proves nothing.

@@ -32,7 +32,7 @@ from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
 from dromon import launcher, processes, spawn
-from dromon.modulecommand import BOOT, package_root
+from dromon.modulecommand import BOOT, module_command, package_root
 from dromon.launcher import (
     LAUNCH_MARK_VARIABLE,
     LAUNCH_VARIABLES,
@@ -1685,13 +1685,114 @@ def test_a_launcher_is_running_only_while_it_holds_its_harness() -> None:
 
 def test_the_launcher_started_through_the_boot_command_is_recognised() -> None:
     """Round 17, item 6. The launcher now starts as ``python -I -c BOOT ROOT
-    dromon.launcher``, with the boot code before the module's name. ``ps`` is read
-    with ``-ww``, so the whole command reaches the table and the name still matches."""
+    dromon.launcher``, with the boot code before the module's name. Recognition
+    must happen before the process parser shortens the command for display."""
     command = " ".join(wrap(["/opt/claude", "-p"], {})[0])
     assert command.index(BOOT) < command.index("dromon.launcher")
-    held = [TreeRow(7, 1, 7, command), TreeRow(40, 7, 40, "/opt/claude -p")]
+    held = parse_tree(f"7 1 7 {command}\n40 7 40 /opt/claude -p\n")
     assert launcher_running(held, 7, 40, "/opt/claude")
     assert not launcher_running([TreeRow(7, 1, 7, command[:80])], 7)
+
+
+@pytest.mark.parametrize("with_start", [False, True])
+@pytest.mark.parametrize(
+    ("module", "suffix", "expected"),
+    [
+        ("dromon.launcher", "", True),
+        ("dromon.runs", "", False),
+        ("dromon.launcher", " <defunct>", False),
+    ],
+)
+def test_full_launcher_recognition_keeps_the_display_bound(
+    with_start: bool, module: str, suffix: str, expected: bool
+) -> None:
+    """Long interpreter paths and a supervisor's shared bootstrap are distinct.
+    A defunct marker beyond the display prefix must also remain effective.
+    """
+    command = " ".join(module_command(module))
+    command = "/long/" + "x" * 1000 + command + suffix
+    started = "Sun Nov 1 00:00:01 2026 " if with_start else ""
+    rows = parse_tree(f"7 1 7 {started}{command}\n", with_start=with_start)
+    assert len(rows[0].command) == processes.MAX_COMMAND_CHARACTERS
+    assert launcher_running(rows, 7) is expected
+
+
+@pytest.mark.parametrize("target", ["/opt/claude", "/opt/grok", "/opt/codex"])
+def test_a_bootstrap_launcher_record_is_not_swept_for_any_engine(
+    target: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    command = " ".join(wrap([target, "--synthetic"], {})[0])
+    rows = parse_tree(f"7 1 7 {command}\n40 7 40 {target}\n")
+    record = write_record(
+        tmp_path, 40, StopPolicy.KILL_ALL, launcher_pid=7, command=target
+    )
+
+    async def unexpected_sweep(
+        record: LaunchRecord, rows: list[TreeRow], claimed: bool
+    ) -> Swept:
+        pytest.fail("the running launcher's engine must not reach the signal path")
+
+    monkeypatch.setattr(launcher, "_sweep_one", unexpected_sweep)
+    assert asyncio.run(sweep_launches(tmp_path, lambda: rows)) == []
+    assert record.exists()
+
+
+def test_a_filtered_launcher_survives_thirty_seconds_of_sweeps(tmp_path: Path) -> None:
+    """Use the SDK's script entry and environment re-exec with a sleeping engine.
+
+    The sandbox cannot read ps. Supply its rows from the real launch record and
+    the command the re-exec uses, through the real parser. The sweep may signal
+    only this test's own engine. No model or socket is involved.
+    """
+    arguments = ["-c", "import os,time; print(os.getpid(),flush=True); time.sleep(90)"]
+    environment = {
+        **os.environ,
+        **launcher.launch_environment(sys.executable, StopPolicy.KILL_ALL),
+    }
+    environment[launcher.FILTER_ENVIRONMENT_VARIABLE] = "1"
+    environment[REPORT_VARIABLE] = str(tmp_path)
+    process = spawn.start(
+        [launcher.script_path(), *arguments],
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert process.stdout is not None
+        assert select.select([process.stdout], [], [], 15)[0], "engine did not start"
+        harness = int(process.stdout.readline())
+        deadline = time.monotonic() + 15
+        records = launcher.read_launches(tmp_path)
+        while not records and time.monotonic() < deadline:
+            time.sleep(0.05)
+            records = launcher.read_launches(tmp_path)
+        assert len(records) == 1
+        record = records[0]
+        assert record.launcher == process.pid and record.harness == harness
+        command = " ".join(wrap([sys.executable, *arguments], {})[0])
+        rows = parse_tree(
+            f"{process.pid} {os.getpid()} {process.pid} {command}\n"
+            f"{harness} {process.pid} {harness} {sys.executable} -c stand-in\n"
+        )
+        started = time.monotonic()
+        deadline = started + 30
+        while True:
+            assert asyncio.run(sweep_launches(tmp_path, lambda: rows)) == []
+            assert process.poll() is None
+            assert alive(harness)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(1, remaining))
+        assert time.monotonic() - started >= 30
+    finally:
+        process.terminate()
+        try:
+            process.communicate(timeout=launcher.LAUNCHER_EXIT_SECONDS + 10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=10)
 
 
 def test_a_sweep_reads_the_table_while_a_record_is_unfinished(tmp_path: Path) -> None:
