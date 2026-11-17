@@ -83,6 +83,17 @@ Darwin 27, where neither ``ps -E`` nor ``KERN_PROCARGS2`` showed another process
 environment."""
 
 
+NO_LAUNCH_RECORD: Final = (
+    "The daemon also holds no launch record for your engine, so it has no root from"
+    " which to find its children, which is why no child of yours is listed. A launch"
+    " record is written only when your engine is started through the daemon's launcher."
+)
+"""Added after ``UNIDENTIFIABLE`` when the ledger of a line is empty and no launch
+record names its engine. **Round 17, item 4.** An empty ledger had one answer whether
+the engine's children were none or could not be looked for, and a line could not tell
+which. The record is the only root the ledger has."""
+
+
 PID_TASK_PREFIX: Final = "pid:"
 """What a process identifier written as a ``wake_after`` task identifier begins with."""
 
@@ -133,6 +144,7 @@ class _ProcessCall(Generic[_Result]):
     loop: asyncio.AbstractEventLoop
     future: asyncio.Future[_Result]
     cancelled: threading.Event
+    discard: Callable[[_Result], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,11 +211,21 @@ class ProcessWorker:
         self._lock = threading.Lock()
         self._closed = False
 
-    async def run(self, function: Callable[[], _Result]) -> _Result:
-        """Run ``function`` with its arguments, or refuse if the queue is full."""
+    async def run(
+        self,
+        function: Callable[[], _Result],
+        discard: Callable[[_Result], None] | None = None,
+    ) -> _Result:
+        """Run ``function`` with its arguments, or refuse if the queue is full.
+
+        **Round 17, item 3.** ``discard`` is for a function that returns something a
+        caller must end, such as a process it started. A caller that is cancelled
+        while the function runs never receives the result, so the worker hands it to
+        ``discard``, on the worker's thread or an executor's, never on the loop. It
+        is not called for a result that was delivered, nor for an error."""
         loop = asyncio.get_running_loop()
         future: asyncio.Future[_Result] = loop.create_future()
-        call = _ProcessCall(function, loop, future, threading.Event())
+        call = _ProcessCall(function, loop, future, threading.Event(), discard)
         with self._lock:
             if self._closed:
                 raise ProcessRefused("the process worker is stopped")
@@ -220,7 +242,25 @@ class ProcessWorker:
             return await future
         except asyncio.CancelledError:
             call.cancelled.set()
+            # Review of round 17, finding 1. A task cancelled after the result was set
+            # but before it resumed gets ``CancelledError`` at the await although the
+            # future holds the result, and neither the worker nor ``finish`` sees it
+            # again. It is ended here, on an executor and not on the loop. Taken from
+            # the future only when it holds a result, so a result is handed on once.
+            self._discard_late(call, future)
             raise
+
+    @staticmethod
+    def _discard_late(
+        call: _ProcessCall[_Result], future: asyncio.Future[_Result]
+    ) -> None:
+        if call.discard is None or not future.done() or future.cancelled():
+            return
+        if future.exception() is not None:
+            return
+        kept = future.result()
+        with contextlib.suppress(RuntimeError):
+            call.loop.run_in_executor(None, ProcessWorker._discard, call, kept)
 
     def close(self, timeout: float = PROCESS_WORKER_JOIN_SECONDS) -> bool:
         """Reject new calls, cancel queued calls and join the worker for a bounded time.
@@ -270,9 +310,27 @@ class ProcessWorker:
             except BaseException as error:
                 self._deliver(call, error=error)
             else:
-                self._deliver(call, result=result)
+                if call.cancelled.is_set() and call.discard is not None:
+                    # The caller went away while the function ran, so nothing will
+                    # receive the result, and it is ended here, off the loop.
+                    self._discard(call, result)
+                else:
+                    self._deliver(call, result=result)
             finally:
                 self._queue.task_done()
+
+    @staticmethod
+    def _discard(call: _ProcessCall[_Result], result: _Result) -> None:
+        """Hand ``result`` to the call's ``discard``, and never raise from it."""
+        if call.discard is None:
+            return
+        try:
+            call.discard(result)
+        except Exception as error:  # noqa: BLE001
+            print(
+                f"dromond: a discarded process result failed to end: {error}",
+                file=sys.stderr,
+            )
 
     @staticmethod
     def _deliver(
@@ -283,6 +341,18 @@ class ProcessWorker:
     ) -> None:
         def finish() -> None:
             if call.future.done():
+                # Cancelled between the worker's check and here. A result that must
+                # be ended is ended on an executor, not on the loop.
+                if (
+                    error is None
+                    and call.discard is not None
+                    and result is not _MISSING
+                ):
+                    kept = cast(_Result, result)
+                    with contextlib.suppress(RuntimeError):
+                        call.loop.run_in_executor(
+                            None, ProcessWorker._discard, call, kept
+                        )
                 return
             if error is not None:
                 call.future.set_exception(error)
@@ -1159,6 +1229,45 @@ def ledger_listing(
     ]
 
 
+def verified_child(
+    ledger: ChildLedger,
+    line_id: str,
+    pid: int,
+    read_rows: Callable[[], list[TreeRow] | TreeReadFailure],
+    identity: Callable[[int], tuple[int, str] | None],
+    forbidden: Callable[[int], bool],
+    verb: str,
+) -> LedgerEntry:
+    """The ledger's entry for ``pid`` once it is shown to be the process recorded, or
+    ``ProcessRefused`` saying why not. The checks are those of ``stop_ledgered`` and
+    are shared with ``sample_ledgered``, so that a process is read or signalled only
+    when it is still the child that was recorded for the line. ``verb`` is the word
+    for what was not done."""
+    if type(pid) is not int or pid <= 1:
+        raise ProcessRefused("pid must be a whole number above 1")
+    entry = ledger.find(line_id, pid)
+    if entry is None or forbidden(pid):
+        raise ProcessRefused(f"process {pid} is not one of yours")
+    rows = read_rows()
+    if isinstance(rows, TreeReadFailure):
+        raise ProcessRefused(f"the process table could not be read: {rows}")
+    row = next((row for row in rows if row.pid == pid), None)
+    if row is None:
+        ledger.forget(line_id, pid)
+        raise ProcessRefused(f"process {pid} has already ended")
+    if row.started != entry.started or row.command != entry.command:
+        ledger.forget(line_id, pid)
+        raise ProcessRefused(
+            f"process {pid} is no longer the one recorded, so it was not {verb}"
+        )
+    now = identity(pid)
+    if now is None or now[1] != entry.started:
+        raise ProcessRefused(
+            f"process {pid} changed while it was checked, so it was not {verb}"
+        )
+    return entry
+
+
 def stop_ledgered(
     ledger: ChildLedger,
     line_id: str,
@@ -1183,28 +1292,7 @@ def stop_ledgered(
     and the signal is not seen, a window of microseconds. A table that cannot be read
     refuses the stop, since not knowing is not a match. ``forbidden`` names pids that
     are never signalled, such as the daemon's own."""
-    if type(pid) is not int or pid <= 1:
-        raise ProcessRefused("pid must be a whole number above 1")
-    entry = ledger.find(line_id, pid)
-    if entry is None or forbidden(pid):
-        raise ProcessRefused(f"process {pid} is not one of yours")
-    rows = read_rows()
-    if isinstance(rows, TreeReadFailure):
-        raise ProcessRefused(f"the process table could not be read: {rows}")
-    row = next((row for row in rows if row.pid == pid), None)
-    if row is None:
-        ledger.forget(line_id, pid)
-        raise ProcessRefused(f"process {pid} has already ended")
-    if row.started != entry.started or row.command != entry.command:
-        ledger.forget(line_id, pid)
-        raise ProcessRefused(
-            f"process {pid} is no longer the one recorded, so it was not signalled"
-        )
-    now = identity(pid)
-    if now is None or now[1] != entry.started:
-        raise ProcessRefused(
-            f"process {pid} changed while it was checked, so it was not signalled"
-        )
+    verified_child(ledger, line_id, pid, read_rows, identity, forbidden, "signalled")
     chosen = signal.SIGKILL if force else signal.SIGTERM
     try:
         send(pid, chosen)

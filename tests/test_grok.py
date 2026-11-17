@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tomllib
 from collections import deque
@@ -1531,18 +1532,29 @@ def test_a_recorded_turn_replays_through_the_real_adapter(
 def test_the_session_carries_dromons_tools_instructions_and_ask_mode(
     project: tuple[Path, Path, Path],
 ) -> None:
-    workspace, _, _ = project
+    workspace, home, _ = project
     (workspace / "RULES.md").write_text("Be careful.\n")
     server = FakeGrok()
     run(line(server, project, config=LineConfig(instructions=("RULES.md",))))
     session = server.params("session/new")
     assert session["cwd"] == str(workspace)
+    expected = grok_module.GrokLine(
+        grok(),
+        workspace,
+        bridge=["b"],
+        line_token="t",  # noqa: S106, a test token
+        home=home,
+    )
+    log = expected._bridge_log_path()  # pyright: ignore[reportPrivateUsage]
     assert session["mcpServers"] == [
         {
             "name": "dromon",
             "command": "dromon-bridge",
             "args": ["--line", "alpha"],
-            "env": [{"name": "DROMON_LINE_TOKEN", "value": "tok"}],
+            "env": [
+                {"name": "DROMON_LINE_TOKEN", "value": "tok"},
+                {"name": "DROMON_BRIDGE_LOG", "value": str(log)},
+            ],
         }
     ]
     assert session["_meta"]["yoloMode"] is False
@@ -2378,6 +2390,7 @@ def test_the_line_socket_serves_only_the_lines_own_tools(
             "propose_change",
             "list_processes",
             "stop_process",
+            "sample_process",
             "worktree_status",
             "sandbox_probe",
             "list_mail",
@@ -4311,3 +4324,367 @@ def test_hook_confirmation_cannot_be_reused_for_a_later_call(
     with pytest.raises(EngineRefused):
         run(line(server, project))
     assert "session/cancel" in server.methods()
+
+
+# Round 17, item 3. Grok's own record of a server that failed to start.
+
+
+def _write_events(
+    home: Path, cwd: Path, session: str, events: list[dict[str, object]]
+) -> Path:
+    path = grok_module.session_events_path(home, cwd, session)
+    assert path is not None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("kind", ["parent", "ancestor", "hardlink", "fifo"])
+def test_session_events_refuse_aliases_and_nonregular_files(
+    tmp_path: Path, kind: str
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "events.jsonl"
+    target.write_text(
+        json.dumps(
+            {
+                "type": "mcp_server_failed",
+                "server_name": "dromon",
+                "error_message": "outside marker",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    parent = tmp_path / "sessions" / "session"
+    parent.mkdir(parents=True)
+    path = parent / "events.jsonl"
+    if kind == "parent":
+        parent.rmdir()
+        parent.symlink_to(outside, target_is_directory=True)
+    elif kind == "ancestor":
+        parent.rmdir()
+        parent.parent.rmdir()
+        parent.parent.symlink_to(tmp_path, target_is_directory=True)
+        path = parent.parent / "outside" / "events.jsonl"
+    elif kind == "hardlink":
+        path.hardlink_to(target)
+    else:
+        os.mkfifo(path)
+    assert grok_module.read_mcp_failure(path, "dromon") == (False, None)
+
+
+@pytest.mark.parametrize("operation", ["metadata", "read"])
+def test_session_event_deadline_includes_filesystem_waits(
+    project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    import threading
+    import time
+
+    workspace, home, _ = project
+    _write_events(home, workspace, "s1", FAILED_START)
+    target = line(FakeGrok(), project)
+    release = threading.Event()
+
+    def slow(*args: object, **kwargs: object) -> tuple[bool, None]:
+        release.wait(2)
+        return False, None
+
+    monkeypatch.setattr(grok_module, "MCP_EVENTS_WAIT_SECONDS", 0.02)
+    if operation == "read":
+        monkeypatch.setattr(grok_module, "read_mcp_failure", slow)
+    else:
+        original_open = os.open
+
+        def slow_open(*args: Any, **kwargs: Any) -> int:  # noqa: ANN401
+            release.wait(2)
+            return original_open(*args, **kwargs)
+
+        monkeypatch.setattr(os, "open", slow_open)
+
+    async def go() -> None:
+        started = time.monotonic()
+        try:
+            assert await target._server_failure("s1") is None  # pyright: ignore[reportPrivateUsage]
+            assert time.monotonic() - started < 0.3
+        finally:
+            release.set()
+
+    asyncio.run(go())
+
+
+def test_an_unstartable_session_reader_returns_no_diagnostic_and_can_retry(
+    project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    workspace, home, _ = project
+    _write_events(home, workspace, "s1", FAILED_START)
+    target = line(FakeGrok(), project)
+
+    def fail(_thread: threading.Thread) -> None:
+        raise RuntimeError("synthetic thread exhaustion")
+
+    async def go() -> None:
+        with monkeypatch.context() as patch:
+            patch.setattr(threading.Thread, "start", fail)
+            assert await target._server_failure("s1") is None  # pyright: ignore[reportPrivateUsage]
+        assert target._mcp_events_reader is None  # pyright: ignore[reportPrivateUsage]
+        failure = await target._server_failure("s1")  # pyright: ignore[reportPrivateUsage]
+        assert failure is not None and "handshake_failed" in failure
+
+    asyncio.run(go())
+
+
+FAILED_START: Final[list[dict[str, object]]] = [
+    {"type": "mcp_config_resolved", "servers": [{"name": "dromon"}]},
+    {"type": "mcp_server_starting", "server_name": "dromon"},
+    {
+        "type": "mcp_server_failed",
+        "server_name": "dromon",
+        "error_type": "handshake_failed",
+        "error_message": "MCP server 'dromon' handshake failed: connection closed:"
+        " initialize response",
+    },
+    {
+        "type": "mcp_init_completed",
+        "succeeded": 0,
+        "failed": 1,
+        "total_tools": 0,
+        "failed_servers": ["dromon"],
+    },
+]
+
+
+def test_the_events_path_is_grok_s_own_and_refuses_an_identifier_that_names_a_path(
+    tmp_path: Path,
+) -> None:
+    cwd = Path("/work/a tree")
+    path = grok_module.session_events_path(tmp_path, cwd, "abc-d_9")
+    assert path == (
+        tmp_path
+        / ".grok"
+        / "dromon-home"
+        / "sessions"
+        / "%2Fwork%2Fa%20tree"
+        / "abc-d_9"
+        / "events.jsonl"
+    )
+    for bad in ("", "../x", "a/b", "a b", "x" * 129, "sé"):
+        assert grok_module.session_events_path(tmp_path, cwd, bad) is None
+
+
+def test_a_failed_dromon_server_is_read_from_the_record(tmp_path: Path) -> None:
+    path = _write_events(tmp_path, tmp_path, "s1", FAILED_START)
+    completed, failure = grok_module.read_mcp_failure(path, "dromon")
+    assert completed
+    assert failure is not None
+    assert "handshake_failed" in failure and "initialize response" in failure
+    assert grok_module.read_mcp_failure(path, "other") == (True, None)
+
+
+def test_the_record_of_a_server_that_started_names_no_failure(tmp_path: Path) -> None:
+    path = _write_events(
+        tmp_path,
+        tmp_path,
+        "s1",
+        [
+            {"type": "mcp_config_resolved"},
+            {"type": "mcp_init_completed", "succeeded": 1, "failed": 0},
+        ],
+    )
+    assert grok_module.read_mcp_failure(path, "dromon") == (True, None)
+
+
+def test_only_the_last_start_of_a_resumed_session_counts(tmp_path: Path) -> None:
+    path = _write_events(
+        tmp_path,
+        tmp_path,
+        "s1",
+        [
+            *FAILED_START,
+            {"type": "mcp_config_resolved"},
+            {"type": "mcp_init_completed"},
+        ],
+    )
+    assert grok_module.read_mcp_failure(path, "dromon") == (True, None)
+    path = _write_events(
+        tmp_path,
+        tmp_path,
+        "s2",
+        [
+            {"type": "mcp_config_resolved"},
+            {"type": "mcp_init_completed"},
+            *FAILED_START,
+        ],
+    )
+    assert grok_module.read_mcp_failure(path, "dromon")[1] is not None
+
+
+def test_a_list_of_failed_servers_alone_names_the_failure(tmp_path: Path) -> None:
+    path = _write_events(
+        tmp_path,
+        tmp_path,
+        "s1",
+        [{"type": "mcp_init_completed", "failed_servers": ["dromon"]}],
+    )
+    completed, failure = grok_module.read_mcp_failure(path, "dromon")
+    assert completed and failure is not None and "failed servers" in failure
+
+
+@pytest.mark.parametrize("content", ["", "not json\n", "[1, 2]\n", '{"type": 5}\n'])
+def test_a_record_in_another_shape_is_not_a_failure(
+    tmp_path: Path, content: str
+) -> None:
+    path = tmp_path / "events.jsonl"
+    path.write_text(content, encoding="utf-8")
+    assert grok_module.read_mcp_failure(path, "dromon") == (False, None)
+
+
+def test_a_missing_or_linked_or_unreadable_record_is_not_a_failure(
+    tmp_path: Path,
+) -> None:
+    assert grok_module.read_mcp_failure(tmp_path / "none", "dromon") == (False, None)
+    real = _write_events(tmp_path, tmp_path, "s1", FAILED_START)
+    link = tmp_path / "linked.jsonl"
+    link.symlink_to(real)
+    assert grok_module.read_mcp_failure(link, "dromon") == (False, None)
+    assert grok_module.read_mcp_failure(tmp_path, "dromon") == (False, None)
+
+
+def test_a_long_message_is_cut_and_made_printable(tmp_path: Path) -> None:
+    path = _write_events(
+        tmp_path,
+        tmp_path,
+        "s1",
+        [
+            {
+                "type": "mcp_server_failed",
+                "server_name": "dromon",
+                "error_type": "x",
+                "error_message": "\x1b[31m" + "m" * 5000,
+            }
+        ],
+    )
+    _, failure = grok_module.read_mcp_failure(path, "dromon")
+    assert failure is not None and len(failure) < 300 and "\x1b" not in failure
+
+
+def test_a_turn_is_refused_naming_the_failed_dromon_server(
+    project: tuple[Path, Path, Path],
+) -> None:
+    workspace, home, _ = project
+    _write_events(home, workspace, "s1", FAILED_START)
+    server = FakeGrok()
+    with pytest.raises(EngineRefused, match="could not start Dromon's own MCP") as e:
+        run(line(server, project))
+    assert "handshake_failed" in str(e.value)
+    assert "tool the line was not given" not in str(e.value)
+    assert "session/prompt" not in server.methods()
+
+
+def test_a_turn_goes_on_when_the_record_says_the_server_started(
+    project: tuple[Path, Path, Path],
+) -> None:
+    workspace, home, _ = project
+    _write_events(
+        home,
+        workspace,
+        "s1",
+        [{"type": "mcp_config_resolved"}, {"type": "mcp_init_completed", "failed": 0}],
+    )
+    assert run(line(FakeGrok(), project)).text == "done"
+
+
+def test_a_turn_goes_on_without_a_record_after_the_wait(
+    project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace, home, _ = project
+    monkeypatch.setattr(grok_module, "MCP_EVENTS_WAIT_SECONDS", 0.1)
+    # With no record at all there is nothing to wait for, and with one that has not
+    # said the servers finished the wait is bounded.
+    assert run(line(FakeGrok(), project)).text == "done"
+    _write_events(home, workspace, "s1", [{"type": "mcp_config_resolved"}])
+    assert run(line(FakeGrok(), project)).text == "done"
+
+
+def test_a_record_that_arrives_late_is_waited_for(
+    project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace, home, _ = project
+    monkeypatch.setattr(grok_module, "MCP_EVENTS_WAIT_SECONDS", 10.0)
+
+    async def go() -> None:
+        _write_events(home, workspace, "s1", [{"type": "mcp_config_resolved"}])
+        target = line(FakeGrok(), project)
+        task = asyncio.ensure_future(target.run_turn("hello"))
+        await asyncio.sleep(0.3)
+        _write_events(home, workspace, "s1", FAILED_START)
+        with pytest.raises(EngineRefused, match="could not start Dromon's own MCP"):
+            await task
+
+    asyncio.run(go())
+
+
+def test_a_line_without_a_bridge_does_not_look_for_a_record(
+    project: tuple[Path, Path, Path],
+) -> None:
+    workspace, home, _ = project
+    _write_events(home, workspace, "s1", FAILED_START)
+
+    @asynccontextmanager
+    async def connect(
+        arguments: list[str], cwd: Path, env: Mapping[str, str]
+    ) -> AsyncGenerator[Connection]:
+        del arguments, cwd, env
+        yield FakeGrok()
+
+    target = GrokLine(
+        grok(),
+        workspace,
+        protected=(project[2],),
+        environment={},
+        home=home,
+        connection_factory=connect,
+    )
+    assert asyncio.run(target._server_failure("s1")) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_tool_server_is_told_where_to_log_in_groks_own_home(
+    project: tuple[Path, Path, Path],
+) -> None:
+    workspace, home, _ = project
+    server = FakeGrok()
+    assert run(line(server, project)).text == "done"
+    entry = server.params("session/new")["mcpServers"][0]
+    environment = {item["name"]: item["value"] for item in entry["env"]}
+    log = Path(environment["DROMON_BRIDGE_LOG"])
+    assert log.parent == home / ".grok" / "dromon-home" / "bridge-logs"
+    assert log.name.startswith("bridge-") and log.suffix == ".log"
+    assert stat.S_IMODE(log.parent.stat().st_mode) == 0o700
+    other = grok_module.GrokLine(
+        grok(),
+        workspace / "other",
+        bridge=["b"],
+        line_token="t",  # noqa: S106, a test token
+        home=home,
+    )
+    assert other._bridge_log_path() != log  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_home_that_cannot_hold_a_log_directory_leaves_the_server_without_one(
+    project: tuple[Path, Path, Path],
+) -> None:
+    workspace, home, _ = project
+    blocked = home / ".grok" / "dromon-home" / "bridge-logs"
+    blocked.parent.mkdir(parents=True, exist_ok=True)
+    blocked.write_text("a file where the directory goes", encoding="utf-8")
+    target = grok_module.GrokLine(
+        grok(),
+        workspace,
+        bridge=["b"],
+        line_token="t",  # noqa: S106, a test token
+        home=home,
+    )
+    assert target._bridge_log_path() is None  # pyright: ignore[reportPrivateUsage]
