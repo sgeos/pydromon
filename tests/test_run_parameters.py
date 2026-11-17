@@ -6,6 +6,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Generator, Sequence
 from datetime import UTC, datetime
@@ -242,10 +243,20 @@ def spawned_children(
 
 
 def assert_killed(child: subprocess.Popen[bytes]) -> None:
-    """The child was killed and reaped, so it no longer exists."""
+    """The child was killed and reaped, so it no longer exists, and its pipes are
+    closed, so none is left for the collector to report in a later test."""
     assert child.returncode == -9, "the child was not killed"
     with pytest.raises(ProcessLookupError):
         os.kill(child.pid, 0)
+    assert child.stdin is not None and child.stdin.closed
+    assert child.stdout is not None and child.stdout.closed
+
+
+def assert_pipes_closed(child: subprocess.Popen[bytes]) -> None:
+    """Both of the child's pipes are closed, as ``communicate`` leaves them. A pipe
+    left open is a descriptor lost for each cancelled start."""
+    assert child.stdin is not None and child.stdin.closed, "stdin was left open"
+    assert child.stdout is not None and child.stdout.closed, "stdout was left open"
 
 
 def test_the_child_is_killed_at_the_default_deadline(
@@ -270,13 +281,81 @@ def test_the_child_is_killed_at_the_default_deadline(
     assert_killed(child)
 
 
+@pytest.mark.parametrize("window", ["while it starts", "while it matches"])
 def test_the_child_is_killed_when_the_start_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch, window: str
+) -> None:
+    """A start whose call is cancelled, as when the line's turn ends, kills and reaps
+    the child and closes its pipes before the cancellation goes on.
+
+    Fix of 2026-11-05. Core's full gate cancelled in the window after the child
+    started and before the worker handed it back, and the child was left running
+    with both pipes open, which the next test's teardown reported. That window is
+    now held open by the test, so it is reached on every run, and the test waits on
+    events rather than a fixed time. Whatever the outcome, the child is reaped
+    before the test ends, so a failure here does not leak into the next test."""
+    monkeypatch.setattr(runparams, "MATCHER", SLOW_MATCHER)
+    started: list[subprocess.Popen[bytes]] = []
+    began = threading.Event()
+    cancelled = threading.Event()
+    real = cast(Any, spawn.start)
+
+    def holding(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        child = cast(subprocess.Popen[bytes], real(*args, **kwargs))
+        started.append(child)
+        began.set()
+        if window == "while it starts":
+            # The worker holds the child until the call is cancelled.
+            assert cancelled.wait(WAIT_SECONDS), "the call was never cancelled"
+        return child
+
+    monkeypatch.setattr(runparams.spawn, "start", holding)
+    prepared = runparams.prepare(
+        ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
+    )
+
+    async def scenario() -> None:
+        # A deadline past the test's own bound, so only the kill on cancellation,
+        # and never the deadline, can end the child in time.
+        task = asyncio.create_task(runparams.match(prepared, 3 * WAIT_SECONDS))
+        assert await asyncio.to_thread(began.wait, WAIT_SECONDS), "no child started"
+        task.cancel()
+        # Let the cancellation reach the call before the worker goes on.
+        await asyncio.sleep(0)
+        cancelled.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(asyncio.wait_for(scenario(), WAIT_SECONDS))
+        [child] = started
+        assert_killed(child)
+    finally:
+        cancelled.set()
+        for child in started:
+            with child:
+                child.kill()
+
+
+def test_the_child_is_killed_when_the_cancellation_comes_during_the_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A start whose call is cancelled while the child matches, as when the line's
-    turn ends, kills and reaps the child before the cancellation goes on."""
+    """Round 16. The gate on a loaded machine left a child running, because the
+    cancellation arrived after the child existed and before ``spawn.start`` returned,
+    when the call had no handle to kill. The start here is held for a moment after the
+    child is made, so the window is as wide as it ever is, and the cancellation is
+    sent inside it. The child must still be killed and reaped."""
     monkeypatch.setattr(runparams, "MATCHER", SLOW_MATCHER)
-    started = spawned_children(monkeypatch)
+    real = cast(Any, spawn.start)
+    made: list[subprocess.Popen[bytes]] = []
+
+    def held(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        child = cast(subprocess.Popen[bytes], real(*args, **kwargs))
+        made.append(child)
+        time.sleep(0.3)
+        return child
+
+    monkeypatch.setattr(runparams.spawn, "start", held)
     prepared = runparams.prepare(
         ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
     )
@@ -284,16 +363,109 @@ def test_the_child_is_killed_when_the_start_is_cancelled(
     async def scenario() -> None:
         task = asyncio.create_task(runparams.match(prepared))
         for _ in range(1000):
-            if started:
+            if made:
                 break
             await asyncio.sleep(0.01)
+        assert made, "the child was never started"
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
     asyncio.run(asyncio.wait_for(scenario(), 20))
-    [(child, _)] = started
-    assert_killed(child)
+    assert_killed(made[0])
+    assert_pipes_closed(made[0])
+
+
+def test_a_second_cancellation_during_the_start_still_ends_the_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of round 16, finding 2. A second cancellation, as a daemon's shutdown
+    sends after a turn's, ended the wait early and left the child the start made
+    running with its pipes open. Three cancellations are sent inside the window. The
+    task still ends cancelled, the child is killed and reaped, and both pipes are
+    closed, which the earlier test checks for one cancellation only."""
+    monkeypatch.setattr(runparams, "MATCHER", SLOW_MATCHER)
+    real = cast(Any, spawn.start)
+    made: list[subprocess.Popen[bytes]] = []
+
+    def held(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        child = cast(subprocess.Popen[bytes], real(*args, **kwargs))
+        made.append(child)
+        time.sleep(0.5)
+        return child
+
+    monkeypatch.setattr(runparams.spawn, "start", held)
+    prepared = runparams.prepare(
+        ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(runparams.match(prepared))
+        for _ in range(1000):
+            if made:
+                break
+            await asyncio.sleep(0.01)
+        assert made, "the child was never started"
+        for _ in range(3):
+            task.cancel()
+            await asyncio.sleep(0.05)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), 20))
+    assert_killed(made[0])
+    assert_pipes_closed(made[0])
+
+
+def test_a_start_that_fails_oddly_during_a_cancellation_still_cancels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of round 16, finding 2, minor. An exception of a kind other than
+    ``OSError`` or ``TimeoutError`` from the start replaced the cancellation the caller
+    expects. It is read and dropped, and the cancellation goes on."""
+
+    def failing(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        time.sleep(0.2)
+        raise ValueError("odd")
+
+    monkeypatch.setattr(runparams.spawn, "start", failing)
+    prepared = runparams.prepare(
+        ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(runparams.match(prepared))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), 20))
+
+
+def test_a_start_that_fails_during_a_cancellation_leaves_no_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The error path of the same window. A start that fails after the cancellation
+    made no child, so the cancellation goes on and nothing is raised in its place."""
+
+    def failing(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        time.sleep(0.2)
+        raise OSError("no such program")
+
+    monkeypatch.setattr(runparams.spawn, "start", failing)
+    prepared = runparams.prepare(
+        ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(runparams.match(prepared))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), 20))
 
 
 def test_a_child_that_fails_refuses_the_start(monkeypatch: pytest.MonkeyPatch) -> None:

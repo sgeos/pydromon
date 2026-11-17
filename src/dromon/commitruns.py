@@ -38,6 +38,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -158,6 +159,52 @@ def git_environment(base: Mapping[str, str]) -> dict[str, str]:
         "GIT_LFS_SKIP_SMUDGE": "1",
         "GIT_TERMINAL_PROMPT": "0",
     }
+
+
+INTERPRETER_VARIABLE: Final = "UV_PYTHON"
+DOWNLOADS_VARIABLE: Final = "UV_PYTHON_DOWNLOADS"
+"""The two variables of uv's own that a commit run's command is given, the
+interpreter it must use and whether it may download one."""
+
+
+def daemon_interpreter(
+    prefix: str | None = None, version: tuple[int, int] | None = None
+) -> Path:
+    """The base interpreter the daemon runs on, ``bin/pythonMAJOR.MINOR`` under
+    ``sys.base_prefix``, or under ``prefix`` and ``version`` where a test gives them.
+    Raises ``CommitRefused`` when it is not an executable file.
+
+    **Fix of 2026-11-05, commit runs found another Python.** A commit run's fresh
+    ``HOME`` hid uv's managed interpreters, which uv keeps under the home, so the
+    gate's ``uv sync`` took the first Python on the search path instead, one without
+    Tk, and failed collecting the tests. The daemon is started from the project's own
+    virtual environment, which the operator's gate syncs and runs in, so its base
+    interpreter is the one that gate uses. It is named by its path, not found through
+    the operator's home, so nothing else of the home is exposed. **Assumption.** The
+    daemon runs from the project's environment. One started from another interpreter
+    gives commit runs that one, which ``run_status`` does not show. **Porting
+    hazard.** ``sys.base_prefix`` is Python's. A port names the interpreter in its
+    configuration."""
+    major, minor = version if version is not None else sys.version_info[:2]
+    base = Path(prefix if prefix is not None else sys.base_prefix)
+    found = base / "bin" / f"python{major}.{minor}"
+    if not (found.is_file() and os.access(found, os.X_OK)):
+        raise CommitRefused(
+            f"the daemon's interpreter is not at {found}, so a commit run cannot be"
+            " given the interpreter the operator's gate uses"
+        )
+    return found
+
+
+def interpreter_environment(interpreter: Path) -> dict[str, str]:
+    """The variables that make uv in a commit run use ``interpreter`` and download
+    none, so uv is not asked to install anything where the operator keeps
+    interpreters, and its cache stays under the run's fresh ``HOME``. Nothing makes
+    the interpreter read-only, since the command runs outside every sandbox. **Fix
+    of 2026-11-05.** uv has no read-only cache, so sharing the operator's cache would
+    let the commit's code write into it through uv. A run therefore downloads its
+    packages again, as it did before."""
+    return {INTERPRETER_VARIABLE: str(interpreter), DOWNLOADS_VARIABLE: "never"}
 
 
 def _git(

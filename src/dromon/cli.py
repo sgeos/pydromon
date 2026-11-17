@@ -639,9 +639,28 @@ def _warn_secrets(command: str, asked: tuple[str, ...], found: object) -> None:
         )
         return
     verdicts = cast(dict[object, object], found)
+    # Round 17, item 5. A name is printed only when it holds the strict form of an
+    # environment variable's name here, at the print, and not only where the daemon's
+    # list was read, so no caller can pass a name with a control character or an
+    # escape sequence through to the operator's terminal. A name in another form is
+    # counted and left out.
+    printable = [
+        name
+        for name in asked
+        if restart.SECRET_NAME_PATTERN.fullmatch(name) is not None
+    ]
     differing = sorted(
-        name for name in asked if verdicts.get(name) == restart.SecretVerdict.DIFFERS
+        name
+        for name in printable
+        if verdicts.get(name) == restart.SecretVerdict.DIFFERS
     )
+    left_out = len(asked) - len(printable)
+    if left_out:
+        print(
+            f"dromon {command}: left out {left_out}"
+            f" {'secret name' if left_out == 1 else 'secret names'} not in the form of"
+            " an environment variable's name, unshown and not warned of"
+        )
     if differing:
         print(
             f"dromon {command}: warning: the running daemon's environment differs"
@@ -1263,19 +1282,29 @@ def _page_notes(result: dict[str, object], offset: int, shown: int) -> list[str]
     end = offset + shown
     notes: list[str] = []
     if shown == 0 and total > 0:
-        notes.append(f"this page is empty, the {total} matches are all before --offset")
+        notes.append(
+            f"this page is empty, since all {total} matches come before --offset"
+            f" {offset}"
+        )
     elif shown > 0 and (offset > 0 or end < total):
         notes.append(f"showing matches {offset + 1} to {end} of {total}, oldest first")
     after = result.get("unread_after")
     before = result.get("unread_before")
+    # Round 17, item 5. The first wording, "the newest of them among them", read
+    # awkwardly. A page is oldest first, so the newest unread match is after it.
     if type(after) is int and after > 0:
         notes.append(
-            f"{after} unread after this page, the newest of them among them."
+            f"{_unread_count(after)} after this page, including the newest."
             f" --offset {end} shows them"
         )
     if type(before) is int and before > 0:
-        notes.append(f"{before} unread before this page. --offset 0 shows them")
+        notes.append(f"{_unread_count(before)} before this page. --offset 0 shows them")
     return notes
+
+
+def _unread_count(count: int) -> str:
+    """``count`` unread matches in words, singular or plural."""
+    return f"{count} unread {'match' if count == 1 else 'matches'}"
 
 
 def _replies(paths: ProjectPaths, arguments: argparse.Namespace) -> int:

@@ -1770,6 +1770,41 @@ def test_only_a_name_the_client_asked_about_is_warned_of(
     assert "for B," in out and "EVIL" not in out
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "EVIL\x1b[2J",
+        "TAB\tNAME",
+        "new\nline",
+        "1STARTS_WITH_A_DIGIT",
+        "HY-PHEN",
+        "ÉTÉ",
+        "",
+        "A" * 129,
+    ],
+)
+def test_a_name_in_another_form_is_never_printed_even_when_asked(
+    capsys: pytest.CaptureFixture[str], name: str
+) -> None:
+    """**Round 17, item 5.** The strict form is checked where the name is printed,
+    so a caller that passes a daemon-supplied name without reading it through
+    ``_secret_names_of`` still cannot print a control character. The name is counted
+    and left out, and a well-formed name beside it is still warned of."""
+    found = {name: "differs", "GOOD_NAME": "differs"}
+    cli._warn_secrets("restart", (name, "GOOD_NAME"), found)  # pyright: ignore[reportPrivateUsage]
+    out = capsys.readouterr().out
+    assert "for GOOD_NAME," in out
+    assert "left out 1 secret name not in the form" in out
+    if name:
+        assert name not in out
+    assert "\x1b" not in out and "\t" not in out
+
+
+def test_a_name_of_the_strict_form_is_printed() -> None:
+    for name in ("A", "_PRIVATE", "API_TOKEN_2", "a" * 128):
+        assert restart.SECRET_NAME_PATTERN.fullmatch(name) is not None
+
+
 @pytest.mark.parametrize("found", [None, [], "secrets", 3])
 def test_verdicts_in_another_form_compare_nothing(
     capsys: pytest.CaptureFixture[str], found: object

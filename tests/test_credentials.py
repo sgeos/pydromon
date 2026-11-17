@@ -245,6 +245,7 @@ def test_every_event_class_is_classified_as_scrubbed_or_without_free_text() -> N
         "BudgetHandoffRequested": "a provider name and a time",
         "ContextHandedOff": "an enumeration, identifiers and a digest",
         "DisclosureChecked": "a time",
+        "LeaseCapped": "identifiers and a time",
         "LeaseReleased": "a name",
         "LineAwakened": "an identifier",
         "LineConfigured": "sealed by the sealed store",
