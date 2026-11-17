@@ -1758,6 +1758,8 @@ class TurnReport:
     usage_note: str | None = None
     """What the engine's ``usage`` and ``calls`` mean, where an engine's differ from
     Claude Code's, or ``None`` for Claude Code's."""
+    cost_partial: bool = False
+    """Whether the reported cost omits unpriced calls and is a lower bound."""
     sandbox_mode: str | None = None
     """The sandbox the turn ran in, as the adapter knows it, such as ``enabled`` or
     ``none``, or ``None`` where the adapter does not say. Row 8 of the T3 Code

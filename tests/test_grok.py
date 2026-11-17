@@ -4326,6 +4326,49 @@ def test_hook_confirmation_cannot_be_reused_for_a_later_call(
     assert "session/cancel" in server.methods()
 
 
+def test_ungranted_write_permission_is_rejected_and_counts_towards_budget(
+    project: tuple[Path, Path, Path],
+) -> None:
+    budget = grok().settings.tool_budget
+    events: list[dict[str, Any]] = []
+    for index in range(budget + 1):
+        ident = f"denied-{index}"
+        events.extend(
+            [
+                grok_permission(ident=ident, _meta=grok_meta("write")),
+                call_update(ident, status="failed", _meta={"toolNotRun": True}),
+            ]
+        )
+    server = FakeGrok(events)
+    report = run(line(server, project))
+    assert report.interrupted_for == "tool_budget"
+    assert report.tool_uses == ()
+    assert len(server.answers()) == budget + 1
+    assert server.answers()[0]["result"]["outcome"]["optionId"] == "no"
+    assert server.answers()[-1]["result"]["outcome"] == {"outcome": "cancelled"}
+
+
+def test_ungranted_write_notification_has_no_reply_channel(
+    project: tuple[Path, Path, Path],
+) -> None:
+    server = FakeGrok([grok_call("write")])
+    with pytest.raises(EngineRefused, match="not given: write"):
+        run(line(server, project))
+    assert "session/cancel" in server.methods()
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+def test_matching_model_needs_no_pin_on_new_or_resumed_session(
+    project: tuple[Path, Path, Path],
+    resumed: bool,
+) -> None:
+    server = FakeGrok()
+    session_id = "s1:rules-" + stored_digest(LineConfig(), "") if resumed else None
+    report = run(line(server, project, session_id=session_id))
+    assert report.text == "done"
+    assert "session/set_config_option" not in server.methods()
+
+
 # Round 17, item 3. Grok's own record of a server that failed to start.
 
 

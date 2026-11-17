@@ -1,0 +1,1 @@
+Partial cost records retain the known subtotal and count its missing remainder as unknown during replay.

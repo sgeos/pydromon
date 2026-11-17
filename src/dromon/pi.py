@@ -105,6 +105,7 @@ Claude sign-in through Pi is not taken to be a subscription and refuses the turn
 
 PROVIDER_CREDENTIALS: Final[dict[str, tuple[str, ...]]] = {
     "openai": ("OPENAI_API_KEY",),
+    "google": ("GEMINI_API_KEY",),
 }
 """Credential variables available to metered Pi strategies, keyed by the provider
 named in the packaged driver's model. Add a provider only with its verified key
@@ -521,6 +522,7 @@ class _Turn:
         default_factory=list[dict[str, int | bool]]
     )
     cost: float | None = None
+    cost_unknown: bool = False
 
 
 USAGE_KEYS: Final = {
@@ -570,8 +572,15 @@ def _count_usage(usage: Mapping[str, object], turn: _Turn) -> dict[str, int | bo
     turn.calls.append(call)
     cost = usage.get("cost")
     total = cast(dict[str, Any], cost).get("total") if isinstance(cost, dict) else None
-    if isinstance(total, int | float) and not isinstance(total, bool) and total >= 0:
+    if (
+        isinstance(total, int | float)
+        and not isinstance(total, bool)
+        and total >= 0
+        and not (total == 0 and any(call.get(key, 0) for key in USAGE_KEYS.values()))
+    ):
         turn.cost = (turn.cost or 0.0) + float(total)
+    else:
+        turn.cost_unknown = True
     return call
 
 
@@ -649,6 +658,7 @@ class PiLine:
         self._next_id = 0
         self._connection: Connection | None = None
         self._interrupted_cost: float | None = None
+        self._interrupted_cost_partial = False
         """What a cancelled turn had cost when it was cancelled, until taken."""
 
     async def check_start(self) -> None:
@@ -711,6 +721,7 @@ class PiLine:
                     self._connection = None
         except asyncio.CancelledError:
             self._interrupted_cost = turn.cost
+            self._interrupted_cost_partial = turn.cost_unknown
             raise
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
@@ -723,8 +734,15 @@ class PiLine:
     def take_interrupted_cost(self) -> float | None:
         """The cost Pi reported for the calls of a turn that was cancelled, such as
         by an operator's interrupt, once. **Review N8.** ``None`` when none was."""
-        cost, self._interrupted_cost = self._interrupted_cost, None
+        cost, _ = self.take_interrupted_partial_cost()
         return cost
+
+    def take_interrupted_partial_cost(self) -> tuple[float | None, bool]:
+        """Consume the interrupted subtotal and its uncertainty together."""
+        result = self._interrupted_cost, self._interrupted_cost_partial
+        self._interrupted_cost = None
+        self._interrupted_cost_partial = False
+        return result
 
     def _session_to_resume(self) -> str | None:
         """The session file to resume, after checking that it is still a file under
@@ -783,10 +801,19 @@ class PiLine:
             session_id=self.session_id or "",
             capabilities=None,
             cost_estimate_usd=turn.cost,
+            cost_partial=turn.cost_unknown,
             usage=usage,
             calls=tuple(dict(call) for call in turn.calls[-50:]),
             context_tokens=turn.context,
-            usage_note=PI_USAGE_NOTE if turn.calls else None,
+            usage_note=(
+                PI_USAGE_NOTE
+                + " Cost total is partial because Pi reported unpriced usage."
+                " The known part is reported when available."
+                if turn.cost_unknown
+                else PI_USAGE_NOTE
+                if turn.calls
+                else None
+            ),
             # Pi documents that it has no sandbox, as the module says.
             sandbox_mode="none",
         )

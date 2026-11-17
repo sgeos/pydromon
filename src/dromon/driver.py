@@ -58,9 +58,13 @@ ENGINE_OF: Final[dict[str, str]] = {
     "pi:openai/gpt-6-sol": "pi",
     "pi:openai/gpt-6-astra": "pi",
     "cursor-agent:gpt-5.6-luna-medium": "cursor-agent",
+    "cursor-agent:gemini-4-argon-medium": "cursor-agent",
+    "cursor-agent:gemini-4-carbon-medium": "cursor-agent",
+    "cursor-agent:gemini-4-hydrogen-medium": "cursor-agent",
+    "pi:google/gemini-4-argon": "pi",
     "antigravity:gemini-3.8-flash-high": "antigravity",
 }
-"""Each model with a packaged driver for every strategy, and the engine it runs on.
+"""Each model with a packaged driver for a supported strategy, and its engine.
 
 Naming. The first engines each run their own vendor's models, so a model is named by
 the vendor's identifier. Pi, Cursor Agent and Antigravity run other vendors' models,
@@ -128,8 +132,15 @@ class Strategy(StrEnum):
     FLEXIBLE = "flexible"
 
 
+API_ONLY_MODELS: Final = frozenset({"pi:google/gemini-4-argon"})
+"""Models whose documented provider has no subscription strategy."""
+
+
 REPORTED_NAMES: Final[dict[str, str]] = {
     "cursor-agent:gpt-5.6-luna-medium": "GPT-5.6 Luna 1M",
+    "cursor-agent:gemini-4-argon-medium": "Gemini 4 Argon",
+    "cursor-agent:gemini-4-carbon-medium": "Gemini 4 Carbon",
+    "cursor-agent:gemini-4-hydrogen-medium": "Gemini 4 Hydrogen",
 }
 """How an engine names a model in its ``init`` event, where that is not the harness
 identifier. Cursor Agent reports the model's display name, as its listing shows it."""
@@ -252,6 +263,8 @@ class Driver:
         engine has an adapter yet."""
         if model not in ENGINE_OF:
             raise DriverError(f"no driver for model {model!r}")
+        if model in API_ONLY_MODELS and strategy is not Strategy.API:
+            raise DriverError(f"{model} supports only the api strategy")
         resource = resources.files("dromon.drivers").joinpath(
             driver_resource(model, strategy)
         )

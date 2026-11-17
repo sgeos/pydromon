@@ -191,6 +191,8 @@ def test_the_table_says_whether_its_prices_were_verified() -> None:
         (lambda: LineCostRecorded("a", 1, estimated=False), "estimated must be"),
         (lambda: LineCostRecorded("a", 1, between=False), "between must be"),
         (lambda: LineCostRecorded("a", None, estimated=True), "needs a cost"),
+        (lambda: LineCostRecorded("a", 1, partial=False), "partial must be"),
+        (lambda: LineCostRecorded("a", None, partial=True), "needs a cost"),
     ],
 )
 def test_a_malformed_cost_record_is_refused(
@@ -340,3 +342,14 @@ def test_role_status_gives_each_seat_its_whole_cost(world: World) -> None:
     assert by_line == {
         line_id: world.scheduler.whole_cost(line_id) for line_id in ("claude", "codex")
     }
+
+
+def test_partial_cost_roundtrips_and_replays_as_one_uncertain_subtotal() -> None:
+    event = LineCostRecorded("a", 200_000, partial=True)
+    assert decode(encode(event)) == event
+    state = State()
+    state.apply(LineCreated("a", HAIKU, Strategy.SUBSCRIPTION))
+    state.apply(event)
+    found = state.line_costs["a"]
+    assert found.reported_micro_usd == 200_000
+    assert found.turns == 1 and found.unknown == 1
