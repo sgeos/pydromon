@@ -7,75 +7,68 @@ flight, why, what is owed and the next step, within a budget of 8 KB. History li
 git. A rewrite that drops an open item says in its commit message whether the item was
 completed, moved or abandoned.
 
-## State on 2026-11-01
+## State on 2026-11-17
 
-- **Milestone 0.1.0 is complete.** The modules and protocol documents are listed in
-  `docs/architecture/DESIGN.md` and `docs/protocol/README.md`. History is in git.
-- **Round 14, merged as pull requests 123 to 134.** Engine recovery and refusals, Grok
-  tool switches and hooks, process evidence and line temporary directories, mail and
-  role fixes, ViewImage confinement by hook, compaction and reporting, operator
-  tooling with commit runs, `retire`, `renew` and `run status`, credentials sealed out
-  of the event log, two engine hotfixes, and the live checks recorded. Changelog
-  fragments in `changes/` hold the detail until a release.
+- **Milestone 0.1.0 is complete.** Modules and protocol are listed in
+  `docs/architecture/DESIGN.md` and `docs/protocol/README.md`.
+- **Rounds 15 to 17 merged**, pull requests 136 to 161. Round 15's state record, 145,
+  was superseded. Changelog fragments in `changes/` hold the detail until a release.
+- **Round 17.** Gemini 4 drivers for Cursor Agent and Pi, Codex and Claude Code lines
+  denied the project's `secret/`, a disclosure scan in worktrees, conflict-free state
+  versions and floors under `src/dromon/statechanges/` and `docs/protocol/floors/`,
+  queued declared runs, lease expiry and caps, stalled-child samples, a named Grok
+  bridge failure, and a scheduler idle wait that made Linux CI slow.
+- **Launcher, fixed in #162.** On `c4cfe6f` the sweep ended every Claude Code and
+  Grok engine early in a turn, because #157's module command put the launcher marker
+  past the 200 characters `processes.parse_tree` keeps. The daemon runs `3efb5bb`, and
+  a Claude Code turn completed on it on 2026-11-17. Codex lines had escaped only by
+  the reused-pid check on the harness executable.
 - **In flight.** None.
-- **Dependencies.** `claude-agent-sdk==0.2.174`, which bundles Claude Code 2.1.310,
-  `pykeleusma==0.2.2.0`, `cryptography==50.0.2` and `pyopenssl==26.4.0`, from PyPI.
-  Engines observed are Codex 0.166.0 and Grok Build 1.0.70.
+- **Dependencies.** `claude-agent-sdk==0.2.174`, bundling Claude Code 2.1.310,
+  `pykeleusma==0.2.2.0`, `cryptography==50.0.2`. Observed engines Codex 0.169.0,
+  Claude Code 2.1.325 and Grok Build 1.0.70.
 
 ## Next step
 
-pydromon develops itself with Dromon through eight roles, `core`, `engines`,
-`capabilities`, `ops`, `runtime`, `review`, `audit` and `grok-review`, each in its own
-worktree under `tmp/worktrees`. Writing lines start the declared `full-gate` run.
-Upgrades use `dromon restart`. Six of eight lines are satisfied in round 14, and the
-reports are in each worktree's `tmp/reports`.
+Confirm a Grok turn live once its usage balance is restored.
+By the operator's direction of 2026-11-16T23:04Z, OpenAI seats own every role until
+2026-11-17T07:04Z, and Anthropic seats are fallback only through round 18. Each role
+lists its Codex seat first, and the project file names the Codex owners of core,
+engines and review.
 
 ## Open
 
-- **Engine launch checks.** Two round 14 changes passed every test and review and then
-  stopped every line of an engine, a `--deny` argument `grok agent` refuses and a
-  Codex MCP override that broke servers defined by `url`. A gate step that runs each
-  engine's real argument and configuration parsing at no cost is wanted.
-- **Interpreters.** The local gate type-checks one interpreter, and CI found 3.12
-  errors. Run pyright for every interpreter CI tests.
-- **Disclosure budget.** Failing and passing checks both count against ten an hour,
-  and a line spent its hour bisecting its own draft. Count only failing checks.
-  Positions in a refusal stay declined.
-- **Unanswered mail.** Notes asking nothing, wake notes and role notices still count.
-- **Cost across holds.** A release and a restart reset a line's cost and turn counts,
-  so an operator carries the cumulative total by hand. A persistent total is wanted.
-- **Grok.** `todo_write`, scheduler, monitor, `update_goal` and plan mode are still
-  offered, refused per call, and a monitor shell may run before the cancel. The
-  PreToolUse hook fails open on error, per Grok's guide. An ungranted call cancels the
-  whole turn. Grok's home `config.toml` and `requirements.toml` are regenerated only
-  after they are moved aside by hand. The model pin on a resumed session is not
-  distinguished from a session needing none.
-- **Codex.** A listed MCP server absent from the local configuration is not handled.
-  A writer-conflict recovery is not seen live.
-- **Runs.** Receipts lag the output file. `wake_after` does not take a run. Commit
-  runs are built but none is declared. A real directory moved into place of `refs`
-  rests on the sandbox's deny of renames, inferred and not tested live.
-- **Processes.** No attribution by ancestry on macOS. A pid-reuse window remains
-  before a signal. Temporary directories have no byte bound.
-- **Event log.** Start replays the whole log, 0.14 s now. A snapshot is designed in
-  `EVENT_LOG.md` and not built. Events before sealing keep their literals.
-- **Rollback.** `EVENT_LOG.md` states the oldest commit that opens a log after each
-  one-way change.
-- **Unverified live.** Remote open federation between two machines, Grok quota
-  exhaustion and a several-window Claude Code report. The rest of round 14's
-  verify-first items are recorded as observed.
-- **Known limits.** A complete image container may carry arbitrary bytes. A Codex
-  kept session keeps the profile it opened with until the profile digest changes.
-  Claude Code replaces `TMPDIR` with its own directory shared by every Claude Code
-  line of the user.
+- **Grok.** Its usage balance was exhausted on 2026-11-17, and Dromon named the 402
+  refusal and held the line. Its own write, todo, plan, scheduler and monitor tools are still offered,
+  and a call to one fails the turn. The bridge failure of 2026-11-16 did not recur on
+  `c4cfe6f`, and its cause is unknown. `use_tool` has not been seen live.
+- **macOS start stall.** Root cause unproven. A stall now records a sample of the
+  stuck child, and asyncio starts share the descriptor sweep but not a time bound.
+- **Machine status.** The daemon defers full-gate at any level but ok, with no
+  operator override. Memory pressure from applications outside Dromon held lines for
+  hours on 2026-11-16, and the operator ran full gates by hand.
+- **State changes.** Each merge after the first of two state-changing branches needs
+  one new pin file, which the failing test names.
+- **Mail.** `dromon mail` has no time or message bound, and an operator mailbox held
+  over 200 unread notes from earlier rounds.
+- **Roles.** A seat that does not own its role is held on mail, not woken. Changing a
+  line's limit restarts its kept session and stops its background tasks.
+- **Engines unrun live.** Pi, Cursor Agent and Antigravity, and every Gemini 4 driver.
+  Pi's Google provider needs a key and its agent home a sign-in.
+- **Late notices.** Notices already queued share one turn. Separate arrivals are not
+  debounced.
+- **Processes.** A pid-reuse window remains before a signal. Past 32 stuck essential
+  starts a stop by pid is refused.
+- **Unverified live.** Remote open federation, a several-window
+  Claude Code report and Codex writer-conflict recovery.
+- **Known limits.** A complete image container may carry arbitrary bytes. Claude Code
+  replaces `TMPDIR` with a directory shared by its lines, and its lines load the
+  operator's auto-memory index from the project directory.
 - **Budgets, Keleusma.** Deferred by the operator on 2026-10-30.
-- **Parity gaps.** No credential masking, approval reviewer, plugins, language servers
-  or MCP OAuth, and Linux not verified live, per `SANDBOX.md` and `SETTINGS.md`.
-- **Unrun engines.** Pi, Cursor Agent and Antigravity, each with a verify-first list.
-- **Git over SSH.** Works only for a line whose sandbox is disabled. The test
-  repository and its deploy key remain, by the operator's choice.
-- **From other projects.** The blog's second trial and two batches of another
-  project's reports are condensed in untracked notes under `tmp/r13` and `tmp/r14`.
+- **Parity gaps.** No approval reviewer, plugins, language servers or MCP OAuth, and
+  Linux not verified live.
+- **Git over SSH.** Only with a line's sandbox disabled. The test repository and its
+  deploy key remain, by the operator's choice.
 - **Declined.** Line numbers or per-file answers from `check_disclosure`.
 - **In the design.** Hosted teacher traces, the Rust repository name, remote clients.
 
@@ -91,7 +84,7 @@ environment needs `dromon sync-worktrees` after a dependency change.
 ```sh
 git status --short          # clean
 git log --oneline -5        # the newest commit should describe this state
-./scripts/check.sh          # about 5930 tests pass, plus 10 live tests deselected
+./scripts/check.sh          # about 7600 tests pass, plus 10 live tests deselected
 ```
 
 Report any check not run, and any commit after the one that last rewrote this file.

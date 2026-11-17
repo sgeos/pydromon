@@ -4,36 +4,42 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-11-01, round 14, address all known issues
+## 2026-11-17, round 17, address all known issues and drivers for new models
 
-**Done, merged in pull requests 123 to 134.**
+**Done, merged in pull requests 143, 149 and 154 to 162.**
 
-- **Team.** A new `runtime` role on Claude Sonnet 5.5 for processes and the sandbox,
-  and the `full-gate` run declared, which writing lines started 36 times.
-- **Engines.** Codex writer conflicts recover to a new thread. Grok sessions renew
-  when rules or tools change, its model pin sends a bare value, and a PreToolUse hook
-  and documented switches withhold Grok's own tools. A disallowed Codex call is
-  refused alone.
-- **Confinement.** The ViewImage rule now runs as a hook on every Claude Code `Read`,
-  after a live check found in-directory reads bypassed it. Line temporary directories
-  are private, and `worktree_status` reads git from outside the sandbox. A roster
-  oracle on the disclosure list is closed. Credentials are sealed out of the log.
-- **Mail and roles.** Replies close what they answer, `@operator` resolves, a turn
-  ends when its role ownership changes, and leases can be listed.
-- **Operator.** Commit runs for reading lines, `retire`, `renew`, `run status`,
-  `sync-worktrees` without running a line's interpreter, and a restart that reports
-  both commits.
-- **Hotfixes.** Two regressions stopped every Grok line and then every Codex line.
-  Both were found by a live turn and fixed in #128 and #130.
+- **Drivers.** Every coding model Anthropic, OpenAI and xAI released between
+  2026-08-18 and 2026-11-16 already had a driver. Google's `gemini-4-argon`,
+  `gemini-4-carbon` and `gemini-4-hydrogen` now have Cursor Agent drivers at medium
+  effort for every strategy, and Argon a Pi driver on its API key. No Antigravity
+  id is documented, so none was added.
+- **Confinement.** Codex lines deny credentials and the project's `secret/` since round
+  9, and Claude Code lines now deny `secret/` too. A live check on 2026-11-17 from six
+  Codex lines found `secret/`, `~/.ssh` and Codex's sign-in file all denied.
+- **Gates and state.** The disclosure scan runs from worktrees, `check.sh` runs under
+  bash 3.2, and state versions and rollback floors are per-branch files.
+- **Runs.** Declared runs queue on the machine status and a lease, with an age limit.
+- **Mail and leases.** Only mail that asks counts as unanswered, leases record expiry
+  and are capped in place, and the overview reads an index.
+- **Processes.** A stalled start records a sample of the stuck child. A Grok bridge
+  that fails is named as the cause, and its stderr is kept, scrubbed.
+- **CI.** The scheduler's idle wait busy-polled, which made two ownership tests run
+  past five minutes on Linux and turned main red at `aa45ba3`. Fixed in #158.
 
-**Verified live.** ViewImage on Claude Code and Codex before and after the fix,
-`read_only_paths` on both, a line's temporary directory, the Grok tool list before and
-after the switches, five supervised runs through a restart, and the event log's start
-time. Full gates outside the sandbox and continuous integration on every merge.
+**Team.** From 23:04Z on 2026-11-16, by the operator's direction, every role passed to
+an OpenAI seat on Codex, with Anthropic seats as fallback.
 
-**Not verified.** The items under Unverified live in `HANDOFF.md`.
+**Verified.** Full gates outside the sandbox or through the daemon on each branch,
+continuous integration on every merge, reviews with mutation checks on every branch,
+the no-cost engine check on every line, and the live confinement check above.
 
-**Also this round.** The operator merged #128 with one failing check. That was a flake,
-and every later merge tested the counts first. Six of eight lines are satisfied. The
-operator is not, and names a no-cost live check of each engine's launch arguments as
-the change that would most move it.
+**Found broken and fixed.** On `c4cfe6f` the daemon's sweep killed every Claude Code
+and Grok engine early in a turn, because a live launcher read as exited. Runtime
+reproduced it without a model, and #162 fixed it. A Claude Code turn completed on the
+restarted daemon. A Grok turn was refused for an exhausted usage balance, so Grok is
+not yet confirmed live.
+
+**Experience reports.** Seven Codex seats reported, five SATISFIED and two NOT
+SATISFIED, in each worktree's `tmp/reports`. The operator's report is in the main
+checkout's `tmp/reports`. The Anthropic seats and the Grok line wrote none, since
+their turns failed until #162, and Grok's balance then ran out.
