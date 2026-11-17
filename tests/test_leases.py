@@ -14,12 +14,13 @@ from claude_agent_sdk import SdkMcpTool
 from dromon.configview import Overrides
 from dromon.daemon import Daemon
 from dromon.driver import Strategy
-from dromon.eventlog import EventLog
+from dromon.eventlog import EventLog, read_entries
 from dromon.lineconfig import LineConfig
 from dromon.model import (
     EventRejected,
     InvalidField,
     LeaseAcquired,
+    LeaseCapped,
     LeaseEnd,
     LeaseReleased,
     LineAddress,
@@ -262,10 +263,10 @@ def test_a_restart_that_no_longer_declares_a_name_ends_its_lease(
     with EventLog(path) as log:
         after = Scheduler(log, no_engine, hold_wakes=True, wall_clock=clock)
         after.set_leases(["ci"], 600)
-        assert set(log.state.leases) == {"ci"}
+        assert set(log.state.leases) == set()
     # The end is an event, so a later start sees it without applying the file.
     with EventLog(path) as log:
-        assert set(log.state.leases) == {"ci"}
+        assert set(log.state.leases) == set()
 
 
 def test_the_log_refuses_a_second_holder_before_expiry_by_the_events_times() -> None:
@@ -740,3 +741,97 @@ def test_a_duration_survives_a_restart_and_a_change_of_owner(
         AT,
         "2026-10-27T05:04:00Z",
     )
+
+
+def test_expiry_records_one_release(scheduler: Scheduler, clock: Clock) -> None:
+    scheduler.acquire_lease("alpha", "gate")
+    clock.now += timedelta(seconds=600)
+    scheduler.expire_leases()
+    scheduler.expire_leases()
+    log = scheduler._log  # pyright: ignore[reportPrivateUsage]
+    releases = [
+        entry.event
+        for entry in read_entries(log.path)
+        if isinstance(entry.event, LeaseReleased)
+    ]
+    assert len(releases) == 1 and releases[0].cause is LeaseEnd.EXPIRED
+    assert scheduler.leases_of("alpha") == []
+    # Acquisition by a new holder succeeds after the expiry event removed it.
+    assert scheduler.acquire_lease("beta", "gate")
+
+
+@pytest.mark.parametrize("elapsed", [0, 400])
+def test_reload_caps_running_leases(
+    scheduler: Scheduler, clock: Clock, elapsed: int
+) -> None:
+    scheduler.acquire_lease("alpha", "gate")
+    clock.now += timedelta(seconds=elapsed)
+    scheduler.set_leases(["gate", "ci"], 300)
+    held = scheduler.leases_of("alpha")
+    if elapsed < 300:
+        assert held[0]["expires"] == "2026-10-26T09:05:00Z"
+    else:
+        assert held == []
+    pending = scheduler.pending("alpha")
+    assert any("was capped at reload" in message.body for _, message in pending)
+
+
+@pytest.mark.parametrize("stop_after_cap", [False, True])
+def test_reload_replay_never_frees_an_unexpired_capped_lease(
+    tmp_path: Path, clock: Clock, monkeypatch: pytest.MonkeyPatch, stop_after_cap: bool
+) -> None:
+    """Stop at the durable append boundary that formerly separated release and
+    acquire. Before the cap or after it, replay must retain the original holder."""
+    path = tmp_path / "cap.sqlite"
+    with EventLog(path, snapshots=False) as log:
+        scheduler = Scheduler(log, no_engine, hold_wakes=True, wall_clock=clock)
+        for line in ("alpha", "beta"):
+            scheduler.create_line(line, HAIKU, Strategy.SUBSCRIPTION)
+        scheduler.set_leases(["gate"], 600)
+        scheduler.acquire_lease("alpha", "gate", note="still using the resource")
+        append = log.append
+
+        def interrupted(event: object) -> None:
+            if isinstance(event, LeaseCapped):
+                if stop_after_cap:
+                    append(event)
+                raise OSError("simulated stop at cap boundary")
+            raise AssertionError(f"unexpected event before cap {event}")
+
+        monkeypatch.setattr(log, "append", interrupted)
+        with pytest.raises(OSError, match="simulated stop"):
+            scheduler.set_leases(["gate"], 300)
+    with EventLog(path, snapshots=False) as reopened:
+        held = reopened.state.leases["gate"]
+        assert held.line_id == "alpha"
+        assert held.note == "still using the resource"
+        assert held.acquired_at == "2026-10-26T09:00:00Z"
+        assert held.expires == (
+            "2026-10-26T09:05:00Z" if stop_after_cap else "2026-10-26T09:10:00Z"
+        )
+        scheduler = Scheduler(reopened, no_engine, hold_wakes=True, wall_clock=clock)
+        scheduler.set_leases(["gate"], 300)
+        with pytest.raises(LeaseRefused, match="held by line alpha"):
+            scheduler.acquire_lease("beta", "gate")
+        caps = [e.event for e in read_entries(path) if isinstance(e.event, LeaseCapped)]
+        assert len(caps) == 1
+
+
+@pytest.mark.parametrize(
+    ("line", "expires", "message"),
+    [
+        ("beta", "2026-10-26T09:05:00Z", "holds no lease"),
+        ("alpha", "2026-10-26T09:00:00Z", "must shorten"),
+        ("alpha", "2026-10-26T09:10:00Z", "must shorten"),
+        ("alpha", "2026-10-26T09:11:00Z", "must shorten"),
+    ],
+)
+def test_invalid_caps_leave_the_lease_unchanged(
+    scheduler: Scheduler, line: str, expires: str, message: str
+) -> None:
+    scheduler.acquire_lease("alpha", "gate")
+    log = scheduler._log  # pyright: ignore[reportPrivateUsage]
+    before = log.state.leases["gate"]
+    with pytest.raises(EventRejected, match=message):
+        log.append(LeaseCapped("gate", line, expires))
+    assert log.state.leases["gate"] == before

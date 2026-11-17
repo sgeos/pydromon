@@ -775,3 +775,20 @@ def test_each_reason_says_why_the_message_asks(
     assert reason.startswith(expected)
     assert reason.endswith("Reply to it or acknowledge it.")
     assert "body" not in reason
+
+
+def test_status_distinguishes_old_requests_from_informational_notes(
+    world: World,
+) -> None:
+    assert world.scheduler.line_status("alpha")["oldest_unanswered_age"] is None
+    world.deliver(world.scheduler.send(ANA, ALPHA, "for the record", asks_reply=False))
+    assert world.scheduler.line_status("alpha")["oldest_unanswered_age"] is None
+    world.deliver(world.scheduler.send(ANA, ALPHA, "please answer", asks_reply=True))
+    world.clock.advance(86400)
+    status = world.scheduler.line_status("alpha")
+    assert status["unanswered"] == 1
+    assert (
+        status["oldest_unanswered_age"]
+        == cast(list[dict[str, object]], status["unanswered_mail"])[0]["waited"]
+    )
+    assert status["oldest_unanswered_age"] != "0s"

@@ -1,0 +1,1 @@
+Record lease expiry and shorten a held lease in place with lease_capped while preserving its holder, acquisition time and note.

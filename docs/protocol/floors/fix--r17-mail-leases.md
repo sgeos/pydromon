@@ -1,0 +1,7 @@
+Change: `lease_capped` shortens a held lease in place
+Search: case "lease_capped":
+Path: src/dromon/codec.py
+
+Change: `lease_released` accepts expiry and lowered-limit causes
+Search: EXPIRED = "expired"
+Path: src/dromon/model.py

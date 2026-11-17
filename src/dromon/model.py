@@ -2207,9 +2207,9 @@ class BudgetHandoffRequested:
 class LeaseAcquired:
     """A line took a lease the project declares, from ``acquired_at`` until
     ``expires``. **Task of 2026-10-31.** A lease is an event, so a restart keeps its
-    holder and both times, and expiry stays its bound. A lease that has expired needs
-    no event to end. The next acquisition of its name replaces it, so the state holds
-    at most one lease for each name ever declared.
+    holder and both times, and expiry stays its bound. Expiry maintenance records
+    its release. Inventories enforce expiry even before maintenance. The state
+    holds at most one lease for each name ever declared.
 
     A lease also ends without an event of its own, as applying another event ends
     it. ``line_session_cleared`` and ``line_rebound`` end every lease of their line,
@@ -2242,12 +2242,29 @@ class LeaseAcquired:
                 raise InvalidField("note is empty")
 
 
+@dataclass(frozen=True, slots=True)
+class LeaseCapped:
+    """Shorten a held lease in one durable event, preserving its holder and note.
+    A past expiry remains recorded until expiry maintenance removes it."""
+
+    name: str
+    line_id: str
+    expires: str
+
+    def __post_init__(self) -> None:
+        check_id("name", self.name)
+        check_id("line_id", self.line_id)
+        check_instant("expires", self.expires)
+
+
 class LeaseEnd(StrEnum):
-    """Why ``lease_released`` ended a lease. An operator's reload or restart with a
-    project file that no longer declares the name ends it as ``undeclared``."""
+    """Why a lease ended, including observed expiry and a lowered reload limit.
+    A removed declaration ends it as ``undeclared``."""
 
     RELEASED = "released"
     UNDECLARED = "undeclared"
+    EXPIRED = "expired"
+    LIMIT_LOWERED = "limit_lowered"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2666,6 +2683,7 @@ type Event = (
     | BudgetStated
     | BudgetHandoffRequested
     | LeaseAcquired
+    | LeaseCapped
     | LeaseReleased
     | RunStarted
     | RunEnded
@@ -3473,6 +3491,18 @@ class State:
                         f"lease {event.name} is held by line {held.line_id} until"
                         f" {held.expires}"
                     )
+            case LeaseCapped():
+                held = self.leases.get(event.name)
+                if held is None or held.line_id != event.line_id:
+                    raise EventRejected(
+                        f"line {event.line_id} holds no lease {event.name}"
+                    )
+                if not (
+                    parse_due(held.acquired_at)
+                    < parse_due(event.expires)
+                    < parse_due(held.expires)
+                ):
+                    raise EventRejected("a lease cap must shorten its duration")
             case LeaseReleased():
                 held = self.leases.get(event.name)
                 if held is None or held.line_id != event.line_id:
@@ -3924,6 +3954,10 @@ class State:
                 self.budget_handoffs.add((event.provider, event.role_id))
             case LeaseAcquired():
                 self.leases[event.name] = event
+            case LeaseCapped():
+                self.leases[event.name] = replace(
+                    self.leases[event.name], expires=event.expires
+                )
             case LeaseReleased():
                 del self.leases[event.name]
             case RunStarted():
