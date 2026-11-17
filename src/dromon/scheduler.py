@@ -5423,6 +5423,14 @@ class Scheduler:
         line_id, command, argv = start.line_id, start.command, start.argv
         latest_id, run_id, directory = start.latest_id, start.run_id, start.directory
         workdir, environment = start.workdir, start.environment
+        interpreter: dict[str, str] = {}
+        if commit is not None:
+            try:
+                interpreter = commitruns.interpreter_environment(
+                    commitruns.daemon_interpreter()
+                )
+            except commitruns.CommitRefused as error:
+                raise runs.RunRefused(str(error)) from error
         checkout = (
             None
             if commit is None
@@ -5445,8 +5453,10 @@ class Scheduler:
         if checkout is not None:
             # A fresh private home, so the commit's code finds none of the
             # operator's settings, credentials or caches by its home. It is not a
-            # confinement, since the command runs outside every sandbox.
-            environment = {**environment, "HOME": str(checkout.home)}
+            # confinement, since the command runs outside every sandbox. uv is named
+            # the daemon's interpreter, which the fresh home would hide, as
+            # ``commitruns.daemon_interpreter`` explains.
+            environment = {**environment, "HOME": str(checkout.home), **interpreter}
         try:
             launched = await self._process_worker.run(
                 lambda: runs.launch(
@@ -12297,7 +12307,14 @@ class Scheduler:
         """Wait until nothing is in flight and no tick would start a turn. For tests."""
         # Bounded by the turn caps: each pass ends a turn, moves mail, or returns.
         while True:
-            await asyncio.sleep(0)
+            running = tuple(self._running.values())
+            if running:
+                # Waiting does not cancel turns if this test helper is cancelled.
+                await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+            else:
+                # Give queued ticks and external workers time to progress without
+                # continuously copying the state while a turn has yet to start.
+                await asyncio.sleep(0.001)
             if not self._work_waiting():
                 await asyncio.sleep(0)
                 if not self._work_waiting():
