@@ -16,7 +16,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import processes
+from dromon import processes, spawn
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
 from dromon.processes import (
@@ -438,7 +438,10 @@ def test_a_reused_pid_is_neither_listed_nor_stopped_through_the_tools(
     assert error and "no longer the one recorded" in text
     text, error = call(scheduler, "alpha", "list_processes", {})
     assert (text, error) == (
-        processes.unavailable("list_processes", processes.UNIDENTIFIABLE),
+        processes.unavailable(
+            "list_processes",
+            f"{processes.UNIDENTIFIABLE} {processes.NO_LAUNCH_RECORD}",
+        ),
         True,
     )
     assert machine.sent == []
@@ -451,7 +454,7 @@ def test_another_lines_child_is_not_listed_or_stopped(
     listed(scheduler)
     text, error = call(scheduler, "beta", "list_processes", {})
     assert error and text == processes.unavailable(
-        "list_processes", processes.UNIDENTIFIABLE
+        "list_processes", f"{processes.UNIDENTIFIABLE} {processes.NO_LAUNCH_RECORD}"
     )
     text, error = call(scheduler, "beta", "stop_process", {"pid": 2002})
     assert error and text == processes.unavailable(
@@ -629,3 +632,142 @@ def test_a_reused_pid_running_a_name_that_holds_the_recorded_one_is_not_a_root()
     assert not root_is_harness([row(HARNESS, 1, "claude-wrapper --x", FIRST)], record)
     assert not root_is_harness([row(HARNESS, 1, "vim notes.claude", FIRST)], record)
     assert root_is_harness([row(HARNESS, 1, "node /opt/bin/claude --x", FIRST)], record)
+
+
+# Round 17, item 1. A line samples a process of its own by pid.
+
+
+@pytest.fixture
+def sampled(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Stands in for the sampler, which reads a real process, and records the pids it
+    was asked for."""
+    asked: list[int] = []
+
+    def fake(pid: int, **_: object) -> str:
+        asked.append(pid)
+        return "stack Thread_1 > start > __semwait_signal"
+
+    monkeypatch.setattr(spawn, "sample_process", fake)
+    return asked
+
+
+def test_a_line_samples_a_child_the_ledger_holds(
+    blind: tuple[Scheduler, Machine], sampled: list[int]
+) -> None:
+    scheduler, machine = blind
+    listed(scheduler)
+    machine.rows = [row(2002, 1, "sleep 100")]
+    machine.harness = None
+    text, error = call(scheduler, "alpha", "sample_process", {"pid": 2002})
+    assert not error
+    assert text == "process 2002, sleep 100: stack Thread_1 > start > __semwait_signal"
+    assert sampled == [2002]
+    assert machine.sent == [], "a sample signals nothing"
+
+
+def test_the_sample_tool_states_its_full_sampling_wait(
+    blind: tuple[Scheduler, Machine],
+) -> None:
+    scheduler, _ = blind
+    wait = spawn.SAMPLE_WAIT_SECONDS + spawn.SAMPLE_JOIN_SLACK_SECONDS
+    assert f"{wait:g} seconds" in scheduler.sample_process_tool("alpha").description
+
+
+def test_another_lines_child_and_a_stranger_are_not_sampled(
+    blind: tuple[Scheduler, Machine], sampled: list[int]
+) -> None:
+    scheduler, machine = blind
+    listed(scheduler)
+    text, error = call(scheduler, "beta", "sample_process", {"pid": 2002})
+    assert error and text == processes.unavailable(
+        "sample_process", processes.UNIDENTIFIABLE
+    )
+    machine.rows.append(row(4000, 1, "vim"))
+    text, error = call(scheduler, "alpha", "sample_process", {"pid": 4000})
+    assert error and "unavailable" in text
+    assert sampled == []
+
+
+def test_a_reused_pid_is_not_sampled_and_is_forgotten(
+    blind: tuple[Scheduler, Machine], sampled: list[int]
+) -> None:
+    scheduler, machine = blind
+    listed(scheduler)
+    machine.harness = None
+    machine.rows = [row(2002, 1, "vim notes.txt", SECOND)]
+    text, error = call(scheduler, "alpha", "sample_process", {"pid": 2002})
+    assert error and "no longer the one recorded, so it was not sampled" in text
+    assert sampled == []
+
+
+def test_a_child_that_changed_while_it_was_checked_is_not_sampled(
+    blind: tuple[Scheduler, Machine], sampled: list[int]
+) -> None:
+    scheduler, machine = blind
+    listed(scheduler)
+    machine.reuse_at_signal[2002] = SECOND
+    text, error = call(scheduler, "alpha", "sample_process", {"pid": 2002})
+    assert error and "changed while it was checked, so it was not sampled" in text
+    assert sampled == []
+
+
+def test_an_unreadable_table_refuses_a_sample(
+    blind: tuple[Scheduler, Machine], sampled: list[int]
+) -> None:
+    scheduler, machine = blind
+    listed(scheduler)
+    machine.failure = TreeReadFailure("ps did not answer within 10 seconds")
+    text, error = call(scheduler, "alpha", "sample_process", {"pid": 2002})
+    assert error and "could not be read" in text
+    assert sampled == []
+
+
+@pytest.mark.parametrize("pid", [0, 1, -3, os.getpid()])
+def test_a_sample_of_the_daemon_or_a_system_pid_is_refused(
+    blind: tuple[Scheduler, Machine], sampled: list[int], pid: int
+) -> None:
+    scheduler, _ = blind
+    text, error = call(scheduler, "alpha", "sample_process", {"pid": pid})
+    assert error and "is not one of yours" in text
+    assert sampled == []
+
+
+@pytest.mark.parametrize(
+    "args", [{}, {"pid": "2002"}, {"pid": True}, {"pid": 2002, "force": True}]
+)
+def test_a_sample_with_the_wrong_arguments_is_refused(
+    blind: tuple[Scheduler, Machine], sampled: list[int], args: dict[str, object]
+) -> None:
+    scheduler, _ = blind
+    _, error = call(scheduler, "alpha", "sample_process", args)
+    assert error
+    assert sampled == []
+
+
+def test_where_the_mark_can_be_read_a_marked_process_is_sampled_and_a_stranger_is_not(
+    tmp_path: Path, sampled: list[int]
+) -> None:
+    machine = Machine([row(HARNESS, 1, "claude"), row(2001, HARNESS, "sleep 9")])
+    for scheduler in world(tmp_path, machine, identifiable=True):
+        mark = scheduler.line_mark("alpha")
+        machine.marks[2001] = [f"{processes.MARK_VARIABLE}={mark}"]
+        machine.rows.append(row(2005, 1, "vim"))
+        text, error = call(scheduler, "alpha", "sample_process", {"pid": 2001})
+        assert not error and text.startswith("process 2001, sleep 9: ")
+        text, error = call(scheduler, "alpha", "sample_process", {"pid": 2005})
+        assert error and "is not one of yours" in text
+        assert sampled == [2001]
+
+
+def test_an_empty_ledger_says_whether_the_engine_has_a_launch_record(
+    blind: tuple[Scheduler, Machine],
+) -> None:
+    """Round 17, item 4. An engine with a record and no children is not told that it has
+    no root, and one with no record is, so a line can tell the two apart."""
+    scheduler, machine = blind
+    machine.rows = [row(HARNESS, 1, "claude")]
+    with_record, error = call(scheduler, "alpha", "list_processes", {})
+    assert error and processes.NO_LAUNCH_RECORD not in with_record
+    machine.harness = None
+    without, error = call(scheduler, "alpha", "list_processes", {})
+    assert error and processes.NO_LAUNCH_RECORD in without

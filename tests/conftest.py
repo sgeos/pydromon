@@ -674,6 +674,14 @@ def _isolated_spawn_state(
     current = os.environ.get("PYTEST_CURRENT_TEST", "a test").split(" ")[0]
     began = time.monotonic()
     yield
+    # Round 17. A start that stalled samples the children that look stuck on a thread
+    # of its own, which writes the ledger and the log when it ends. It is waited for
+    # here, so that its entry lands in this test's list and not in the next test's.
+    deadline = time.monotonic() + spawn.STALL_SAMPLE_WAIT_SECONDS
+    while time.monotonic() < deadline and any(
+        t.name == "dromon-spawn-sample" for t in threading.enumerate()
+    ):
+        time.sleep(0.01)
     lines = [f"{current}: slow child start, {line}" for line in own]
     # Round 16. A test that took long is named at once, past capture, because a run
     # that is later killed by its timeout lists nothing at its end. On 2026-11-11 a
