@@ -193,7 +193,13 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     ),
     "restart_noted": ("line_id", "message_id", "body"),
     "line_cost_marked": ("line_id", "engine_session", "total_micro_usd"),
-    "line_cost_recorded": ("line_id", "cost_micro_usd", "estimated", "between"),
+    "line_cost_recorded": (
+        "line_id",
+        "cost_micro_usd",
+        "estimated",
+        "between",
+        "partial",
+    ),
     "processes_left": ("line_id", "cause", "pids", "commands", "more"),
     "stop_unverified": ("line_id", "note"),
     "walk_limited": ("note",),
@@ -444,7 +450,7 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "run_ended": ("output_tail",),
     "line_configured": ("sealed",),
     "disclosure_checked": ("checked_bytes",),
-    "line_cost_recorded": ("estimated", "between"),
+    "line_cost_recorded": ("estimated", "between", "partial"),
     "role_declared": ("reviews",),
 }
 """The fields left out of the wire when they are null, which a log written before
@@ -675,6 +681,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "cost_micro_usd": event.cost_micro_usd,
                 "estimated": event.estimated,
                 "between": event.between,
+                "partial": event.partial,
             }
         case ProcessesLeft():
             return "processes_left", {
@@ -1073,6 +1080,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _optional_int(data, "cost_micro_usd"),
                 _optional_bool(data, "estimated"),
                 _optional_bool(data, "between"),
+                _optional_bool(data, "partial"),
             )
         case "processes_left":
             return ProcessesLeft(

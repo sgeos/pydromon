@@ -390,3 +390,11 @@ Run these by hand, in a throwaway directory, before the probe.
     and with only unexpected kinds. Confirm that Dromon answers cancelled, cancels and
     refuses the turn with bounded option evidence, and never substitutes `allow_always`
     for `allow_once`.
+
+## Gemini 4 evidence on 2026-11-16
+
+**Fact.** The operator found no Antigravity installation at Dromon's expected path.
+Google's Antigravity announcement names Argon without documenting a model identifier.
+No Gemini 4 driver is packaged for this engine because a model identifier could not
+be established from the available documentation. A documented identifier and an
+operator verify-first turn remain required before adding a binding.

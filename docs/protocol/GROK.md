@@ -145,6 +145,12 @@ default context of 256,000 tokens and the efforts `low`, `medium`, `high` and `x
 The operator's Grok configuration sets `permission_mode` to `always-approve` and
 declares MCP servers for mail and documents.
 
+**Fact, recorded on 2026-11-16.** The Grok 4.7 Build Fast drivers inherit the
+256,000 token window from Grok 4.7. The catalogue confirms the identifier
+`grok-4.7-build-fast` but does not independently confirm that window.
+**Inference.** Context management may run too late if the actual window is smaller.
+Verify first by checking the effective context limit in an operator turn.
+
 ## The first live probe
 
 **Facts, observed in the operator's probe on 2026-10-27** against Grok Build 1.0.70
@@ -1116,3 +1122,21 @@ Fact. Every Grok session receives a brief rule directing reports through
 The session digest includes a report-rule version so existing sessions renew.
 File-backed arguments retain their existing refusal. No live engine or paid probe
 was run for this change.
+
+## Refused calls and model pins on 2026-11-16
+
+**Fact.** A permission request for an ungranted tool can receive the Agent Client
+Protocol rejection outcome. Dromon rejects that call individually and now counts it
+against the driver's tool budget before responding. The turn continues only after
+Grok confirms that the rejected call did not run. This includes tools outside the
+hook list such as `write`. A notification has no request identifier or tool-result
+response channel. An ungranted call announced through that channel still cancels
+the turn when neither a pending permission request nor a supported hook proves it
+was stopped. Missing rejection options and missing non-execution confirmation
+remain turn refusals. No tool result is fabricated for a notification.
+
+**Fact.** Commit `7193fcd` already made model pinning conditional on the reported
+model differing from the driver's model, for new and resumed sessions. Existing
+tests cover the resumed mismatched model. The current code retains this distinction.
+**Not verified live.** Operator checks of a denied `write` permission request and
+both resumed model cases remain required.
