@@ -174,6 +174,7 @@ from dromon.engine_environment import (
     selected_claude_shell,
 )
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError, LineConfig
+from dromon.mcpstates import servers_of
 from dromon.model import format_due
 from dromon.processes import MARK_VARIABLE
 from dromon.sandbox import blocks_unsandboxed
@@ -1713,6 +1714,10 @@ class Capabilities:
     is unknown, not empty. Row 10 of the T3 Code review."""
     permission_mode: str
     capabilities: tuple[str, ...]
+    mcp_servers: tuple[tuple[str, str], ...] | None = None
+    """**Round 17, item 7.** Each MCP server's name and status as the engine
+    reported them, read by ``mcpstates.servers_of``, or ``None`` where the report
+    held no list."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1779,6 +1784,7 @@ def _capabilities(data: Mapping[str, object]) -> Capabilities:
         tools=_strings(data["tools"]) if isinstance(data.get("tools"), list) else None,
         permission_mode=text("permissionMode"),
         capabilities=_strings(data.get("capabilities")),
+        mcp_servers=servers_of(data),
     )
 
 

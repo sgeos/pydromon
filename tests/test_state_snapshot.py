@@ -236,7 +236,9 @@ def test_a_snapshot_of_another_version_is_ignored(
     path: Path, monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:
     seeded(path)
-    monkeypatch.setattr(statesnapshot, name, getattr(statesnapshot, name) + 1)
+    found = getattr(statesnapshot, name)
+    other = found + 1 if isinstance(found, int) else found[::-1]
+    monkeypatch.setattr(statesnapshot, name, other)
     with EventLog(path) as log:
         before = encoded(log)
     with EventLog(path, snapshots=True) as log:

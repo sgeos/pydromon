@@ -55,7 +55,7 @@ from OpenSSL.SSL import Context as OpenSSLContext
 
 from dromon.scheduler import StartCheckEngine
 from dromon import __version__, exits, fleet, grok, peercred, registry, restart, runs
-from dromon import credentials, evidence, spawn
+from dromon import credentials, evidence, mcpstates, spawn
 from dromon import proposals as proposal_store
 from dromon.federation import (
     MAX_OPEN_REMOTE_PEERS,
@@ -386,6 +386,7 @@ class Daemon:
             wake_every_ticks=scheduler.wake_every_for(line_id),
             own_wake=own_wake,
             rebound=line.rebound,
+            mcp_summary=mcpstates.summary(scheduler.mcp_server_states(line_id)),
         )
 
     # The gateway's view of the daemon.
@@ -3473,14 +3474,21 @@ def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
     sandboxes cannot be made safe in them, before anything starts, rather than at
     each line's first turn. Raises ``ConfigError`` or ``SandboxError``."""
     protected = protected_dirs(paths, config.federation)
-    effective(config.sandbox, paths.root, protected)
+    # Round 17, review of 0db077c, finding 1. The secret directories are checked as
+    # the scheduler protects them, so a document granting one is refused at start.
+    effective(
+        config.sandbox,
+        paths.root,
+        (*protected, *project_secret_paths(paths.root, paths.root)),
+    )
     for line in config.lines.values():
         check_plugins(line.config)
         workdir = resolve_workdir(line.config.workdir, paths.root, protected)
         merged = merge([config.sandbox, line.config.sandbox])
         enabled = merged is not None and merged.enabled
         guarded = git_write_guards(workdir) if enabled else ()
-        effective(merged, workdir, protected, guarded)
+        secrets = project_secret_paths(paths.root, workdir)
+        effective(merged, workdir, (*protected, *secrets), guarded)
     for role_id, role in sorted(config.roles.items()):
         worktree = resolve_workdir(role.workdir, paths.root, protected)
         for line_id in role.seats:
@@ -3518,7 +3526,7 @@ def git_ssh_access(
             document = effective(
                 merge([merged, sandbox_layer(access)]),
                 workdir,
-                protected,
+                (*protected, *project_secret_paths(paths.root, workdir)),
                 git_write_guards(workdir),
             )
             denied = None if document is None else unreadable(access, document)
