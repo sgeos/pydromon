@@ -285,6 +285,7 @@ argument outside a tool's schema is refused.
 | `write_scratch` | Writes a file under the line's scratch in its working directory, `tmp/` or `tmp/lines/LINE`, as below. Its result gives the absolute path written and the bytes written |
 | `check_disclosure` | Checks text, one file, or a list of up to 64 files in the line's working directory against the project's configured disclosure list, answering pass or fail with the sum of matching lines in each file and never a term, a file name or a line location. Files are checked independently, so a match cannot span files. A file is read in parts of at most 1 MiB cut after a newline and the counts are summed, a line may not exceed 1 MiB, and the combined content is at most 16 MiB. A path may be the absolute path `write_scratch` reported. One call, including a list, is one recorded check. In any 3,600 seconds a line has 10 failing checks, which bound the terms it can confirm, 60 passing checks, which bound the candidate texts it can try, and 64 MiB read by its checks in all, which bounds the candidate bytes it can test and the daemon's time spent matching for it, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies since the round 15 review. Once either count is spent every check is refused, content past the bytes left is refused unread, and the answer says what is left of each. The check reads on a worker thread, off the daemon's event loop, and one runs at a time for each line. A file check whose files' bytes all already passed, as a checked text, as a checked file of the same path or as written by `write_scratch`, is answered as a pass from memory and spends nothing of any budget, even once a budget is spent, since it tells the line nothing it did not learn when the bytes passed. A file the daemon wrote without screening, as `scratch_place` writes an operator's CI log, is never remembered as passed. Once a budget is spent, a file is read for that comparison only when its size equals that of a remembered pass, and is never matched. **Round 17, item 5.** A list holds up to 64 files, the number of passes the daemon remembers for a line, so a list that passes is remembered whole and, checked again, costs nothing. It was 8, and a round that changed 71 files took ten checks to cover. The call is still one check, and the bytes are still bounded. Added on 2026-10-28, changed in rounds 15 and 17 |
 | `list_processes`, `stop_process` | List and stop the processes the line started, as below. Where the daemon cannot attribute processes to the line, `list_processes` says it is unavailable and why, and never returns an empty list. Changed in round 14. From round 15 the children the daemon saw below the engine are listed and stopped by pid and start time where the mark cannot be read, as below |
+| `sample_process` | Reads where one of the line's own processes is, by pid, with the operating system's sampler on macOS or the state and wait of the process on Linux, as below. Added in round 17, item 1 |
 | `worktree_status` | Gives the state of the line's own working directory, computed by the daemon outside the line's sandbox, as the processes section below specifies. Added in round 14, item 7 |
 
 **Issues.** **Round 11, item 3, decided by core for review on 2026-10-31.** A line
@@ -926,6 +927,20 @@ tools do the same for a line.
   daemon's user whose environment holds exactly the calling line's mark, with `pid`,
   `elapsed` as `ps` reports it, and `command` cut to 200 characters. The daemon and the
   engines it started directly are left out.
+- **`sample_process`.** Argument `pid`. **Round 17, item 1.** It returns where the process
+  is, bounded to 1,500 characters and about eight seconds, for a child that seems stuck.
+  On macOS it runs `/usr/bin/sample` for one second at 10-millisecond steps and gives the
+  function names of the call graph, in order, and the function on top of each stack, with
+  no address, path or argument. On Linux it gives `State` and `Threads` of the process's
+  `status` and its `wchan`, `syscall` and `stack`, each marked unreadable when the system
+  refuses it. A read that does not return within the bound is named by its file. The pid
+  must be one of the line's own by the same checks as `stop_process`, a ledgered child
+  checked against a fresh reading of its start time and command, or a marked process
+  where the mark can be read. The daemon's own pid, 1 or less, another line's process and
+  a pid given to another process since the ledger saw it are refused with the reason.
+  **Failure modes.** A sampler that cannot run, or ends late, is reported as text and
+  never raises. **Residual.** As for `stop_process` a pid reused between the last check
+  and the sample is not seen. The sample reads and signals nothing.
 - **`stop_process`.** Arguments `pid` and optionally `force`, a boolean. It sends
   `SIGTERM`, or `SIGKILL` with `force`, only to a process of the daemon's user that is
   neither the daemon nor an engine it started and whose environment holds the line's
@@ -1059,7 +1074,7 @@ rests on. A **fact** was observed, an **inference** follows from facts, and a
   of `elapsed`, and answers unavailable, as before, when the ledger is empty, since an
   empty ledger says nothing about the line's processes. Where the mark can be read,
   the ledger adds the children the mark does not show, such as one that cleared its
-  environment with `env -i`. `stop_process` uses the ledger for a pid that it holds.
+  environment with `env -i`. `stop_process` uses the ledger for a pid that it holds. **Round 17, item 4.** The only root of the ledger is the launch record of the line's engine, and an empty ledger answers `list_processes` as unavailable with a second sentence when no such record exists, so that a line can tell no children from no root.
   **Limits, none removed.** A child that detached before any look is not in the ledger,
   so a listing from it is not complete, and no answer says that it is. The engine's own
   helpers are in its tree and are recorded, since the daemon cannot tell them from a
@@ -2495,8 +2510,14 @@ daemon stops it, when the daemon stops or dies, and when the line's engine is st
   three round 13 lines measured, and one 10-second call held a line each time. The hold
   message names the attempts and the measured time of each. A `ps` that cannot run or
   that fails is not retried. The check runs on the process worker, so its worst case
-  delays other process tools for about a minute, and a machine that never answers still
-  holds the line. The stop-time walk keeps its own 0.75-second deadline, since it runs
+  delays other process tools for about a minute. **Round 17, item 5.** A machine whose
+  `ps` only timed out on every attempt no longer holds the line. That reason, a
+  `SilentWalk`, starts the turn with a note that says the table did not answer, so the
+  mail the turn delivers is not lost, which a refused turn would lose, and no operator is
+  asked. The daemon's log says the same. A `ps` that cannot run or fails still refuses
+  the turn and holds the line. **Residual.** The turn runs under `kill_all` without the
+  walk having been shown possible, and the stop at its end reads the table again, ending
+  only what it can reach if it still cannot, which the note tells the line. The stop-time walk keeps its own 0.75-second deadline, since it runs
   while the engine is ending. A typed timeout result of that walk is retried within
   it. Other process-table errors are not retried. If a walk still fails at stop time, the launcher
   ends the harness's group, writes an unverified-stop report and exits unsuccessfully.

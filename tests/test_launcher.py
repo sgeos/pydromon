@@ -988,6 +988,7 @@ def test_a_process_table_that_never_answers_is_refused_within_the_bound() -> Non
     assert world.pauses == [1.0, 2.0]
     assert reason == launcher.walk_timeout_reason([10.0, 20.0, 30.0], world.now)
     assert "3 attempts" in reason
+    assert isinstance(reason, launcher.SilentWalk), "a silent table is not a refusal"
     assert "10.0, 20.0, 30.0 seconds each" in reason
     assert f"{world.now:.1f} seconds in all" in reason
 
@@ -1020,9 +1021,9 @@ def test_a_process_table_failure_that_is_not_a_timeout_is_returned_at_once() -> 
         calls += 1
         return TreeReadFailure("ps cannot be run: denied")
 
-    assert (
-        walk_unavailable(read, world.pause, world.clock) == "ps cannot be run: denied"
-    )
+    reason = walk_unavailable(read, world.pause, world.clock)
+    assert reason == "ps cannot be run: denied"
+    assert not isinstance(reason, launcher.SilentWalk), "a refusal still holds"
     assert calls == 1
     assert world.pauses == []
 

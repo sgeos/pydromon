@@ -669,8 +669,13 @@ def test_the_loop_stays_responsive_while_each_descendant_is_checked(
 ) -> None:
     """Re-review of 6ce43e8. Each check runs ``ps`` for up to a second, and the event
     loop serves every line, so the checks run in a thread. Each stands in here with a
-    sleep of 0.4 seconds, three in all, and a ticker on the loop must never wait
-    anything like that long. The command must still end."""
+    sleep of ``block`` seconds, three in all, and a ticker on the loop must never wait
+    as long as one of them. The command must still end. **Round 17, item 7.** The
+    bound is the block itself, not a constant of 0.3 beside a block of 0.4. A loop that
+    waited for one check would show a gap of at least ``block``, since a sleep never
+    ends early, and a loaded macOS runner showed a gap of 0.30 once, which the old bound
+    called a stall with a margin of 0.1 seconds."""
+    block = 0.4
     rows = [
         TreeRow(50_000 + number, 1, 50_000 + number, "x", "t") for number in range(3)
     ]
@@ -680,7 +685,7 @@ def test_the_loop_stays_responsive_while_each_descendant_is_checked(
         return rows
 
     def slow_signal(row: TreeRow, number: int) -> bool:
-        time.sleep(0.4)
+        time.sleep(block)
         signalled.append(row.pid)
         return False
 
@@ -710,9 +715,9 @@ def test_the_loop_stays_responsive_while_each_descendant_is_checked(
 
     started = time.monotonic()
     asyncio.run(scenario())
-    assert time.monotonic() - started >= 1.2, "the checks did not all run"
+    assert time.monotonic() - started >= len(rows) * block, "the checks did not all run"
     assert sorted(signalled) == sorted(row.pid for row in rows)
-    assert gaps and max(gaps) < 0.3, f"the loop stalled for {max(gaps):.2f} seconds"
+    assert gaps and max(gaps) < block, f"the loop stalled for {max(gaps):.2f} seconds"
 
 
 def test_a_loop_that_cannot_watch_the_pipe_leaves_no_descriptor() -> None:

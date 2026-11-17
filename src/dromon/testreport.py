@@ -11,7 +11,12 @@ which every such test shares, and a test in ``tests/test_testreport.py`` finds a
 does not. **Limit.** A skip with another reason is counted in the grouped list only.
 """
 
+import faulthandler
+import os
+import threading
+import time
 from collections import Counter
+from typing import Final
 
 import pytest
 from _pytest.terminal import TerminalReporter
@@ -28,7 +33,107 @@ _kinds: Counter[str] = Counter()
 _why: dict[str, str] = {}
 
 
+SESSION_REPORT_SECONDS: Final = 1800.0
+"""When the run first says where it is, in seconds after it began. **Round 17, item 7.**
+A macOS job was cancelled at the job's limit and left no log that named the test it
+was in, since the summary comes at the end and the per-test fault bound of five
+minutes does not fire for a run made of many tests that are each only slow. Thirty
+minutes is after the slowest healthy gate seen, 28 minutes on Linux, so a healthy run
+says nothing, and ten minutes before the workflow's step limit of 40."""
+
+SESSION_REPORT_REPEAT_SECONDS: Final = 120.0
+"""How often it says so again."""
+
+SESSION_REPORT_ENV: Final = "DROMON_SESSION_REPORT_SECONDS"
+"""A number of seconds that replaces ``SESSION_REPORT_SECONDS``, for a test of this."""
+
+MAX_SESSION_REPORTS: Final = 20
+"""The most reports a run writes, so a run that hangs for hours cannot fill a log."""
+
+
+def _copy_stderr() -> int | None:
+    """A copy of the real standard error, taken when this module loads, which is before
+    pytest starts capturing, since the module is loaded by ``-p``. The report must reach
+    the log while a test runs, and capture would take it."""
+    try:
+        return os.dup(2)
+    except OSError:
+        return None
+
+
+_STDERR_COPY: Final = _copy_stderr()
+
+
+def session_line(elapsed: float, current: str | None, number: int) -> str:
+    """The report line, naming the running test and the time since the run began. The
+    name of a test is a path and a function name, and carries no value."""
+    where = current if current else "no test, collecting or between tests"
+    return (
+        f"dromond-gate: the run is {elapsed:.0f} seconds old and is at {where[:200]}"
+        f" (report {number})\n"
+    )
+
+
+class SessionWatch(threading.Thread):
+    """Say, from a thread of its own, where the run is, past capture and unbuffered,
+    first after ``first`` seconds and then every ``repeat`` seconds, with the traceback
+    of every thread the first time. Ends when ``stop`` is set. **Round 17, item 7.** A
+    job that the runner cancels at its limit keeps what was written to its log up to
+    then, so a line written while the run is still going is what a cancelled job can
+    show. Never raises into the run."""
+
+    def __init__(
+        self, first: float, repeat: float, descriptor: int | None = _STDERR_COPY
+    ) -> None:
+        super().__init__(name="dromon-session-watch", daemon=True)
+        self.first = first
+        self.repeat = repeat
+        self.descriptor = descriptor
+        self.stop = threading.Event()
+        self.began = time.monotonic()
+        self.written = 0
+
+    def run(self) -> None:
+        wait = self.first
+        while self.written < MAX_SESSION_REPORTS and not self.stop.wait(wait):
+            wait = self.repeat
+            self._report()
+
+    def _report(self) -> None:
+        descriptor = self.descriptor
+        if descriptor is None:
+            return
+        self.written += 1
+        try:
+            line = session_line(
+                time.monotonic() - self.began,
+                os.environ.get("PYTEST_CURRENT_TEST"),
+                self.written,
+            )
+            os.write(descriptor, line.encode(errors="replace"))
+            if self.written == 1:
+                faulthandler.dump_traceback(file=descriptor, all_threads=True)
+        except (OSError, ValueError):
+            return
+
+
+_watch: SessionWatch | None = None
+
+
+def _report_seconds() -> float:
+    try:
+        value = float(os.environ.get(SESSION_REPORT_ENV, ""))
+    except ValueError:
+        return SESSION_REPORT_SECONDS
+    return value if value > 0 else SESSION_REPORT_SECONDS
+
+
 def pytest_sessionstart() -> None:
+    global _watch  # noqa: PLW0603
+    if _watch is not None:
+        _watch.stop.set()
+    _watch = SessionWatch(_report_seconds(), SESSION_REPORT_REPEAT_SECONDS)
+    _watch.start()
     _groups.clear()
     _counts.clear()
     _kinds.clear()
@@ -97,3 +202,8 @@ def pytest_terminal_summary(terminalreporter: TerminalReporter) -> None:
         if remaining:
             terminalreporter.write_line(f"  {remaining} further tests in this group")
     terminalreporter.write_line(omission_line())
+
+
+def pytest_sessionfinish() -> None:
+    if _watch is not None:
+        _watch.stop.set()

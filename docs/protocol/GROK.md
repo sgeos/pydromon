@@ -296,6 +296,16 @@ and workflows live in `$GROK_HOME`.
    `x.ai/mcp/init_progress` whose `total` exceeds Dromon's servers refuses the turn
    too, as does a server list at any later point that names another server. A refusal
    counts the other servers and never names them.
+   **Round 17.** After `session/new` Dromon reads Grok's own record of the session,
+   `events.jsonl` under the sessions directory of its home, and refuses the turn naming
+   the cause when Grok recorded `mcp_server_failed` for Dromon's server or listed it in
+   `failed_servers`. No ACP notice carries that failure, which is why a server that
+   closed at its handshake was seen only as a tool the line was not given. The record is
+   Grok's own and not a documented interface, so one that is missing or reshaped gives
+   no refusal, and the wait for `mcp_init_completed` is bounded at two seconds and only
+   where a record exists. The server is also told, in `DROMON_BRIDGE_LOG`, a file in the
+   `bridge-logs` directory of Grok's home to which it writes its standard error, a start
+   mark and an end mark, so that a failure the engine did not keep can be read.
 6. **Model and mode.** The model identifier comes from `driver.settings.model`, the
    same name Dromon passes to Grok's `--model` option. It must equal the driver's model
    name exactly. Dromon does not derive it from the engine table or accept Grok's
