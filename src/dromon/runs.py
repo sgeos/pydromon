@@ -64,6 +64,7 @@ from pathlib import Path
 from typing import Final, cast
 
 from dromon import spawn
+from dromon.modulecommand import module_command
 from dromon.processes import TreeRow, attached, deepest_first, signal_if_same
 from dromon.model import (
     MAX_EXIT_CODE,
@@ -703,10 +704,7 @@ def launch(
     ready_read, ready_write = os.pipe()
     try:
         child = spawn.start(
-            [
-                sys.executable,
-                "-I",
-                "-m",
+            module_command(
                 "dromon.runs",
                 str(receipt_path(directory, run_id)),
                 run_id,
@@ -714,7 +712,7 @@ def launch(
                 str(ready_write),
                 "--",
                 *argv,
-            ],
+            ),
             pass_fds=(ready_write,),
             stdin=subprocess.PIPE,
             stdout=output,

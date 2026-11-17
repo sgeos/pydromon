@@ -9,7 +9,8 @@ Type: Added
   would write, or when its working directory or the commit checked out there changes.
   The project file may name its gate slot with `runs.slot_lease`, a declared lease that
   holds a run in the queue while another line has it. `run_queued` and `run_dequeued` are
-  new events, `STATE_VERSION` is 7, and a daemon from before them refuses a log that
+  new events, a branch state change file invalidates older snapshots, and a daemon
+  from before them refuses a log that
   holds one. **Review of 883c00f.** An entry is also dropped after waiting longer than
   `runs.queue_max_age_seconds`, by default 7,200, from 60 to 86,400. A start whose
   parameter value looks like a credential is not queued, since the log cannot mask what

@@ -127,6 +127,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final, cast
 
+from dromon.modulecommand import module_command
 from dromon.processes import (
     MARK_VARIABLE,
     TreeReadFailure,
@@ -446,7 +447,7 @@ def wrap(
         if k not in LAUNCH_VARIABLES or k == LAUNCH_MARK_VARIABLE
     }
     launched.update(launch_environment(command[0], policy))
-    arguments = [sys.executable, "-I", "-m", "dromon.launcher", *command[1:]]
+    arguments = module_command("dromon.launcher", *command[1:])
     return arguments, launched, policy
 
 
@@ -1455,7 +1456,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             os.execve(  # noqa: S606
                 sys.executable,
-                [sys.executable, "-I", "-m", "dromon.launcher", *arguments],
+                module_command("dromon.launcher", *arguments),
                 environment,
             )
         except OSError as error:

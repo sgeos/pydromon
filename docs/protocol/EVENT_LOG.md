@@ -141,8 +141,8 @@ Each event has a kind and fields, all required. An optional value is written as 
 | `run_started` | `run_id` and `line_id` identifiers, `role_id` and `previous` identifiers or `null`, `command` identifier, `argv` an array of 1 to 64 texts of at most 1,024 bytes each, the first not empty, `workdir` an absolute path and `output_file` a path relative to it, each of at most 1,024 bytes, `pid` a whole number above 1 and below 2^31, `process_started` and `started_at` times | No run has the identifier and the line is not stopped. `role_id` is the role the line is a seat of, or `null` when it is none, and a seat owns its role. The run's scope is its role, or its line when it has none. No run of the scope is open, the scope's latest run is not `lost` without a `run_cleared`, and `previous` is the scope's latest run, or `null` when it has none. `pid` and `process_started` name the run's supervisor, as [`RUNS.md`](../architecture/RUNS.md) specifies. **Rollback hazard.** As for `lease_acquired`. Added on 2026-10-31. From round 14 a commit run also has `commit`, a full lowercase hexadecimal commit of 40 or 64 characters, and `checkout`, the absolute directory of at most 1,024 bytes its command ran in, each given exactly when the other is, and both left out of the wire when null, so `workdir` then holds only the output. **Rollback hazard.** A daemon that predates them refuses a log that holds a commit run, and reads every other `run_started`. From round 16, item 5, a run in a working directory may also have `tree`, a SHA-256 in lowercase hex of the tree as it started, as [`RUNS.md`](../architecture/RUNS.md) specifies, never with `commit`, and left out of the wire when null. **Rollback hazard.** A daemon that predates it refuses a log once a run records its tree. From round 16, item 3, a run in a worktree also has `workdir_commit`, the full commit `HEAD` named in the worktree when the run started, read by the daemon from the checkout's files, which the line can write, so it is the worktree's own claim and not a commit the daemon checked out, as [`RUNS.md`](../architecture/RUNS.md) records, given only when `commit` is null and left out of the wire when null, as it is when the commit cannot be read. It says nothing of uncommitted changes. **Rollback hazard.** A daemon that predates it refuses a log that holds a run with it |
 | `run_ended` | `run_id` identifier, `status` run status, `exit_code` a 32-bit whole number or `null`, `null` for `lost`, `output_digest` a SHA-256 digest or `null`, `output_bytes` a whole number or `null`, given whenever the digest is, `note` text of at most 1,024 bytes, `ended_at` time, `output_tail` text of at most 2,048 bytes of printable characters and newlines, left out when null | The run exists and has not ended. Ends it with what its receipt or the process table showed. `output_tail` is the last lines of a failed run's output, untrusted, as [`RUNS.md`](../architecture/RUNS.md) specifies, added in the task of 2026-11-05. **Rollback hazard.** As for `lease_acquired`, and a daemon from before `output_tail` refuses a log that gives one. Added on 2026-10-31 |
 | `commit_run_refused` | `line_id` identifier, `role_id` identifier or `null`, `command` identifier, `commit` a full lowercase hexadecimal commit of 40 or 64 characters, `reason` text of at most 1,024 bytes, `refused_at` time | The line is not stopped, and `role_id` is the role the line is a seat of, or `null` when it is none. It replaces the scope's latest refusal, and the scope starts no commit run for 120 seconds after `refused_at`, a cooldown the reader applies, as [`RUNS.md`](../architecture/RUNS.md) specifies. Recorded when a commit run's start fails in its checks or its checkout, which hold the commit worker. **Rollback hazard.** A daemon from before it cannot decode it, and refuses the log. Added in the review of 1449c5c, round 14 |
-| `run_queued` | `queue_id` and `line_id` identifiers, `command` identifier, `previous` identifier or `null`, `commit` a full lowercase hexadecimal commit or `null`, `arguments` an array of at most 64 texts, each `NAME=VALUE` with `NAME` an identifier and `VALUE` at most 1,024 bytes, sorted and without a repeated name, `workdir` text of at most 1,024 bytes, `workdir_commit` a full commit or `null`, `queued_at` time, `reason` text of at most 512 bytes, scrubbed as other reasons are, and `arguments` never holding a credential-shaped value, since the daemon refuses to queue one | The line is not stopped, `queue_id` is in use by no queued run and no run, the line has no queued run, and the queue holds fewer than 8. It adds the entry to the queue, oldest first. Recorded when a line's `start_run` waits only for the machine status or the project's slot lease, as [`RUNS.md`](../architecture/RUNS.md) specifies. It holds what the start needs to begin later and never the command as it will run. **Rollback hazard.** A daemon from before it cannot decode it, since `codec.decode` raises `DecodeError` for an event kind it does not know, so it refuses the whole log and starts nothing, and it reads no snapshot of `STATE_VERSION` 7. The log is usable again only by a daemon at or after the floor, or after every `run_queued` and `run_dequeued` event is removed by an operator who accepts losing what they record. The queue is empty when no entry waits, but the events stay in the log, so emptying the queue does not make the log readable. Added in round 17, and `STATE_VERSION` 7 |
-| `run_dequeued` | `queue_id` identifier, `outcome` of `started` or `dropped`, `run_id` identifier or `null`, given exactly when `outcome` is `started`, `reason` text of at most 512 bytes, `at` time | The queue holds `queue_id`, and `run_id`, when given, is a run. It removes the entry. `started` follows the run's own `run_started`, and `dropped` carries the reason the line is told. **Rollback hazard.** As for `run_queued`. Added in round 17, and `STATE_VERSION` 7 |
+| `run_queued` | `queue_id` and `line_id` identifiers, `command` identifier, `previous` identifier or `null`, `commit` a full lowercase hexadecimal commit or `null`, `arguments` an array of at most 64 texts, each `NAME=VALUE` with `NAME` an identifier and `VALUE` at most 1,024 bytes, sorted and without a repeated name, `workdir` text of at most 1,024 bytes, `workdir_commit` a full commit or `null`, `queued_at` time, `reason` text of at most 512 bytes, scrubbed as other reasons are, and `arguments` never holding a credential-shaped value, since the daemon refuses to queue one | The line is not stopped, `queue_id` is in use by no queued run and no run, the line has no queued run, and the queue holds fewer than 8. It adds the entry to the queue, oldest first. Recorded when a line's `start_run` waits only for the machine status or the project's slot lease, as [`RUNS.md`](../architecture/RUNS.md) specifies. It holds what the start needs to begin later and never the command as it will run. **Rollback hazard.** A daemon from before it cannot decode it, since `codec.decode` raises `DecodeError` for an event kind it does not know, so it refuses the whole log and starts nothing, and its state change file invalidates snapshots from a different set of changes. The log is usable again only by a daemon at or after the floor, or after every `run_queued` and `run_dequeued` event is removed by an operator who accepts losing what they record. The queue is empty when no entry waits, but the events stay in the log, so emptying the queue does not make the log readable. Added in round 17 |
+| `run_dequeued` | `queue_id` identifier, `outcome` of `started` or `dropped`, `run_id` identifier or `null`, given exactly when `outcome` is `started`, `reason` text of at most 512 bytes, `at` time | The queue holds `queue_id`, and `run_id`, when given, is a run. It removes the entry. `started` follows the run's own `run_started`, and `dropped` carries the reason the line is told. **Rollback hazard.** As for `run_queued`. Added in round 17 |
 | `run_cleared` | `run_id` identifier, `cause` run clearance, `operator_id` identifier or `null`, given exactly when `cause` is `operator`, `cleared_at` time | The run exists, has ended as `lost` and is not cleared, and `operator_id`, when given, is a registered operator. A lost run's command may still run, so its scope starts no other run until this is recorded, with `empty` when reconciliation found no process in the supervisor's process group or session, and `operator` when an operator cleared it with `run_clear` after inspection, as [`RUNS.md`](../architecture/RUNS.md) specifies. **Rollback hazard.** As for `lease_acquired`. A daemon older than this review also lets a lost run's scope start another run while its command may still run. Added on 2026-10-31, in the review of that day |
 | `peer_declared` | `peer_id` identifier, `transport` of `unix` or `tls`, `policy` text of at most 65,536 bytes | The peer is new, was removed, or this changes its transport or policy. Recorded at start from the project file's `[peers]` table, as [`FEDERATION.md`](../architecture/FEDERATION.md) specifies. The policy is canonical JSON of every key of the peer's table but `transport`, and never holds a token. A peer declared again after its removal starts with no token. Added on 2026-10-28 |
 | `peer_removed` | `peer_id` | The peer is declared and not removed. Recorded at start when the project file no longer declares it. Clears its token digest. Added on 2026-10-28 |
@@ -196,13 +196,16 @@ from the floor of every change the log holds, so the floor of a log is the newes
 among the changes it holds. Each other document that names a rollback hazard refers
 here. A row names the first commit to write and read the change, or the first of each where it names several changes, and the merge that
 brought it into `main`, which is the oldest commit of `main` that opens it.
-A pending row is on a branch not yet merged, and its floor on `main` will be that
-branch's merge.
+**Round 17, item 3.** A branch no longer adds a pending row here, since every such
+row was appended at the same place and two branches conflicted at every merge. It adds
+a fragment under [`floors/`](floors/README.md), and a release writes its row with the
+commits git names, through `scripts/assemble_floors.py`. The gate refuses a row here
+that still says pending or uncommitted. The state version that a snapshot carries
+changed the same way, to one file per branch under `src/dromon/statechanges/`, as
+`dromon.statesnapshot.STATE_VERSION` records.
 
 | Change | First commit | Floor on `main` | Branch |
 |---|---|---|---|
-| `run_queued`, `run_dequeued`, `STATE_VERSION` 7 | `883c00f` | Pending | `feat/r17-queued-runs` |
-| `line_turn_ended.closing_reason`, `STATE_VERSION` 6 | `b73c57d` | Pending | `fix/r16-grok-continue` |
 | `operator_registered`, operator addresses, `note` and `question` kinds | `4d9b3ff` | `621d6db` | `feat/operator-addresses`, #5 |
 | `line_configured` | `7040c16` | `2d04603` | `feat/ticks-and-line-tools`, #11 |
 | `line_session` | `885540c` | `2e413c8` | `feat/operator-questions`, #12 |
@@ -241,14 +244,15 @@ branch's merge.
 | A commit run, a `run_started` with `commit` and `checkout` | `1449c5c` | `8b2c508` | `feat/operator-r14`, #129 |
 | `commit_run_refused` | `522c146` | `8b2c508` | `feat/operator-r14`, #129 |
 | `line_configured.sealed`, written when a configuration holds a literal value | `025149b` | `8ca4ead` | `feat/eventlog-r14`, #134 |
-| `line_cost_recorded`, written after every turn and every spend between turns | `49236ad` | Pending | `feat/r15-mail-cost-log` |
-| `role_declared.reviews`, written when a role names a role it reviews | `49236ad` | Pending | `feat/r15-mail-cost-log` |
-| `line_turn_ended.failure` and `failure_class`, written with every failed turn | Uncommitted | Pending | `feat/r15-mail-cost-log` |
-| `brief_set.workdir_dirty`, written whenever git can read the worktree as a brief is set | Uncommitted | Pending | `feat/r15-mail-cost-log` |
-| `run_ended.output_tail`, written when a failed run's output has a tail | `172f9b9` | Pending | `feat/r15-runs-disclosure` |
-| `disclosure_checked.checked_bytes`, written with every `check_disclosure` call and screened `write_scratch` | `da29483` | Pending | `feat/r15-runs-disclosure` |
+| `line_cost_recorded`, written after every turn and every spend between turns | `49236ad` | `b41fc7f` | `feat/r15-mail-cost-log`, #138 |
+| `role_declared.reviews`, written when a role names a role it reviews | `49236ad` | `b41fc7f` | `feat/r15-mail-cost-log`, #138 |
+| `line_turn_ended.failure` and `failure_class`, written with every failed turn, and the failure causes | `2cede6e` | `b41fc7f` | `feat/r15-mail-cost-log`, #138 |
+| `brief_set.workdir_dirty`, written whenever git can read the worktree as a brief is set | `2cede6e` | `b41fc7f` | `feat/r15-mail-cost-log`, #138 |
+| `run_ended.output_tail`, written when a failed run's output has a tail | `172f9b9` | `b4d5481` | `feat/r15-runs-disclosure`, #139 |
+| `disclosure_checked.checked_bytes`, written with every `check_disclosure` call and screened `write_scratch` | `da29483` | `b4d5481` | `feat/r15-runs-disclosure`, #139 |
 | `run_started.tree`, written whenever a run in a working directory starts with its tree readable, `STATE_VERSION` 4 | `2902990` | `48146cc` | `fix/r16-fewer-starts`, #147 |
-| `run_started.workdir_commit`, written whenever a run in a worktree starts with its commit readable, `STATE_VERSION` 5 | `16de365` | Pending | `feat/r16-overview-leases`, #148 |
+| `run_started.workdir_commit`, written whenever a run in a worktree starts with its commit readable, `STATE_VERSION` 5 | `16de365` | `cf962a7` | `feat/r16-overview-leases`, #148 |
+| `line_turn_ended.closing_reason`, `STATE_VERSION` 6 | `b73c57d` | `e90ac4d` | `fix/r16-grok-continue`, #152 |
 
 **Fact, from the history.** The table was built from the history of `HEAD` on
 `feat/mail-and-roles` at `5a1603f`. A kind's first commit is the oldest whose
@@ -278,7 +282,15 @@ daemon from this branch runs passes its floor, and from then a rollback to older
 refuses the log until the operator restores it from a copy taken before. The round's
 other changes, the thread rule for unanswered mail and the stale brief lead, add no
 kind, field or value, since each is derived as events apply or composed in the
-prompt.
+prompt. **Updated in round 17 on `fix/r17-operator-tooling`, from `main` at
+`f28ba7a`.** **Fact, from `git log -S` and `git merge-base --is-ancestor` along
+`git rev-list --first-parent`.** Every row that was pending is merged, and each floor
+is the first merge on `main` that contains the row's first commit. The two rows that
+said uncommitted were first written in `2cede6e`, which adds `failure`,
+`failure_class`, `workdir_dirty` and the values of the failure cause together. The
+`closing_reason` row moved to the end, in the order of its merge. Between `8ca4ead`
+and `f28ba7a`, `dromon.codec` gained no field and `dromon.model` no enumeration value
+outside these rows, and #150, #151, #153, #154 and #155 change neither for any event.
 
 **Inference.** The search reads the codec and the model, not every rule of the
 applying code. A rule that a newer daemon applies and an older one refuses, such as a
@@ -798,7 +810,31 @@ resumes.
      replays to. A change to either fails the test until the version is raised and a
      pin appended, and a pin under a version already pinned is refused. Version 2 is
      the round 15 follow-up. Version 3 is the merge of `feat/r15-runs-disclosure`,
-     whose disclosure passes, bytes and run tails failed the pin of version 2. **Fact, observed on 2026-11-05.** The shape digest of item
+     whose disclosure passes, bytes and run tails failed the pin of version 2.
+     **Round 17, item 3.** The whole number became the SHA-256 of the names of the
+     files in `src/dromon/statechanges/`, one per branch that changed the state, and
+     each pin became one file in `tests/state_pins/` named for the version it pins, so
+     two such branches add different files and never conflict. Their merge holds both
+     names, so its version is neither branch's and a snapshot either wrote is ignored.
+     The merge needs one new pin, which the failing test names with its content.
+     **Residual.** The test cannot tell a merge from a merge with a further change
+     slipped in, so the pin of a merge is written only after reading what it merged.
+     A snapshot written by a daemon from before this change carries a whole number,
+     which is never this code's version, so it is ignored once and replay is whole.
+     **Review of `0db077c`, finding 4.** An entry of `statechanges/` not named
+     `NAME.txt`, such as a merge tool's leftover, is left out with a warning from the
+     gate rather than stopping the package from importing. A set that is empty, too
+     large or unreadable makes the version `unusable`, and every snapshot is then
+     refused and the log replayed. Discovery reads at most 4097 directory entries
+     before sorting at most 4096 and retains at most 128 ignored names. Either
+     overflow makes the set unusable rather than trusting an arbitrary prefix.
+     These limits bound counts rather than name bytes or filesystem latency.
+     **Item 6 of that review.** The pinned history adds
+     enough disclosure checks to pass each of their three caps, since a changed cap
+     changes which checks a replay keeps and was not caught. **Residual, inference.**
+     The other caps of `State.apply`, of task records, correlations, request keys and
+     the saturated cost totals, are still not reached by the pinned history.
+     **Fact, observed on 2026-11-05.** The shape digest of item
      2 differs between Python 3.12 and 3.15, since it uses Python's own text of a type,
      which is why the pin uses another digest.
 7. **What it does not bound.** Memory. A snapshot bounds the start time by the events
@@ -897,3 +933,10 @@ separate engine evidence files are unchanged.
 Rollback hazard. Older daemons refuse events carrying `closing_reason`. The floor
 table above records the first compatible commit and its pending main floor. Ports
 must preserve the character bound and screening order.
+
+State change discovery slices `os.scandir` directly and closes the scanner after
+reading, including on overflow or a read error. It does not use `Path.iterdir`, which
+can allocate the full directory before yielding on supported Python versions.
+Non-filesystem package resources make snapshots unusable because their enumeration
+bounds are unknown. The entry limits are unchanged. The event log remains usable
+through full replay in that case.

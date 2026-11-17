@@ -263,6 +263,10 @@ class LineFacts:
     own_wake: bool
     rebound: bool = False
     """Whether a rebind set the line's current binding."""
+    mcp_summary: str | None = None
+    """**Round 17, item 7.** Each MCP server as configured, connected and callable,
+    as ``mcpstates.summary`` writes it, or ``None`` where no scheduler was asked, and
+    the names alone are shown."""
 
 
 def _driver_effort(model: str, strategy: str) -> str:
@@ -410,8 +414,11 @@ def line_entries(facts: LineFacts, project: Sequence[Layer]) -> list[dict[str, o
         [
             info(
                 "mcp_servers",
-                "MCP servers, by name",
-                ", ".join(sorted(config.server_names())) or "none",
+                "MCP servers, by name, and whether each is configured, connected"
+                " and callable, as the line's latest turn reported",
+                facts.mcp_summary
+                if facts.mcp_summary is not None
+                else ", ".join(sorted(config.server_names())) or "none",
             ),
             info("sandbox", "the line's own sandbox", _present(config.sandbox)),
             info(

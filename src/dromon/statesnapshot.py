@@ -25,10 +25,10 @@ run on the snapshot as on an event.
 **The shape digest.** The SHA-256 of the type tree the encoder walks, each record's
 name and each field's name and type. A change to the state's shape changes it, so a
 snapshot from code of another shape is ignored without anyone raising a version.
-``STATE_VERSION`` must still be raised by hand when the meaning of applying an event
-changes and the shape does not. A test pins it with the codec's types and a replay, as
-``codec_digest`` describes, and ``dromond --check`` and the check after every start
-from a snapshot find a difference the pin did not.
+``STATE_VERSION`` must still change by hand, through a state change file, when the
+meaning of applying an event changes and the shape does not. A test pins it with the
+codec's types and a replay, as ``codec_digest`` describes, and ``dromond --check``
+and the check after every start from a snapshot find a difference the pin did not.
 
 **Porting hazard.** The reflection is Python's. A port writes the same encoding with
 explicit code for each record, or ignores the file and replays the log, which is
@@ -38,14 +38,18 @@ always correct.
 import enum
 import functools
 import hashlib
+import importlib.resources
 import json
 import os
+import re
 import stat
 import types
 import typing
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime
+from importlib.resources.abc import Traversable
+from itertools import islice
 from pathlib import Path
 from typing import Final, cast
 
@@ -54,20 +58,147 @@ from dromon.model import Event, State
 FORMAT_VERSION: Final = 1
 """The version of the file's own layout."""
 
-STATE_VERSION: Final = 7
-"""Raised by hand whenever applying an event comes to mean something else for a state
-of the same shape, since the shape digest cannot see that. **Review of 49236ad, item
-3.** ``tests/test_state_version.py`` fails when the types ``codec_digest`` covers, or
-the state a fixed history replays to, change while this stays the same, so a raise
-cannot be forgotten. Version 2 is the round 15 follow-up, whose events
-``line_turn_ended`` and ``brief_set`` gained fields. Version 3 is the merge of
-``feat/r15-runs-disclosure``, where ``disclosure_checked`` gained ``checked_bytes`` and
-a pass is kept apart from a failure, and ``run_ended`` gained ``output_tail``.
-Version 4 is round 16, item 5, where ``run_started`` gained ``tree``. Version 5 is
-round 16, item 3, merged after it, where ``run_started`` gained ``workdir_commit``.
-Version 6 adds round 16 closing diagnostics and their latest failure state,
-including a nonempty replay reason. Version 7 is round 17, item 1, where the events
-``run_queued`` and ``run_dequeued`` and the state's ``queued_runs`` were added."""
+STATE_CHANGES_PACKAGE: Final = "statechanges"
+"""The directory in this package holding one file per change to what applying an
+event means, ``NAME.txt``, where NAME is the branch that made the change with each
+``/`` written ``--``, as ``changes/`` names a changelog fragment."""
+
+STATE_CHANGE_NAME: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
+"""The form of a state change's name, the file name without ``.txt``."""
+
+MAX_STATE_CHANGES: Final = 1024
+"""The most state changes read, so the read is bounded."""
+
+
+MAX_STATE_CHANGE_ENTRIES: Final = 4096
+"""The most directory entries sorted, including hidden and ignored entries."""
+
+MAX_IGNORED_STATE_CHANGES: Final = 128
+"""The most warning names retained before the set is declared unusable."""
+
+
+@dataclass(frozen=True)
+class StateChanges:
+    """What ``read_state_changes`` found. ``problem`` is why the set cannot be
+    trusted, or ``None`` when it can."""
+
+    names: tuple[str, ...]
+    ignored: tuple[str, ...]
+    problem: str | None
+
+
+def read_state_changes(directory: Traversable) -> StateChanges:
+    """The names of the state changes in ``directory``, sorted, and the entries left
+    out. It never raises, since it runs when this module is imported.
+
+    **Review of 0db077c, finding 4.** It raised ``ValueError`` for any entry not
+    named ``NAME.txt``, so one leftover file, such as a merge tool's ``base.txt.orig``,
+    stopped every command that imports the package. Such an entry is now left out
+    and named in ``ignored``, which the gate prints as a warning. Hidden entries,
+    such as a file browser's ``.DS_Store``, and the package's own files are left out
+    without being named. A set that is empty, larger than ``MAX_STATE_CHANGES``, or
+    unreadable gives a ``problem``, and then ``read`` refuses every snapshot, so the
+    log is replayed, which is always correct, rather than a snapshot of other code
+    passing as this code's. Residual. A state change file misnamed by its author, as
+    ``Feat--x.txt``, is left out with the warning, and the pin test fails, since the
+    set it names no longer matches."""
+    # Directory overflow refuses the set rather than hashing an arbitrary prefix.
+    # Warning overflow also refuses it, retaining only a bounded sorted prefix.
+    # Entry counts do not bound name bytes or the latency of filesystem calls.
+    # Other resource loaders may eagerly enumerate or extract a whole archive.
+    # Refuse snapshots for them rather than claim a bound we cannot enforce.
+    if not isinstance(directory, Path):
+        return StateChanges((), (), "state changes require a filesystem directory")
+    names: list[str] = []
+    ignored: list[str] = []
+    try:
+        # Bound consumption before sorting, including entries later ignored. The extra
+        # entry detects overflow without exhausting an arbitrarily large iterator.
+        # Path.iterdir eagerly lists scandir on some supported Python versions.
+        # Slice the scanner itself and close it on success, overflow and failure.
+        with os.scandir(directory) as scanner:
+            entries = list(islice(scanner, MAX_STATE_CHANGE_ENTRIES + 1))
+        if len(entries) > MAX_STATE_CHANGE_ENTRIES:
+            return StateChanges(
+                (),
+                (),
+                f"more than {MAX_STATE_CHANGE_ENTRIES} state change directory entries",
+            )
+        entries.sort(key=lambda entry: entry.name)
+        for entry in entries:
+            if entry.name in ("__init__.py", "__pycache__", "README.md"):
+                continue
+            if entry.name.startswith("."):
+                continue
+            name = entry.name.removesuffix(".txt")
+            if (
+                not entry.is_file()
+                or not entry.name.endswith(".txt")
+                or STATE_CHANGE_NAME.fullmatch(name) is None
+            ):
+                if len(ignored) == MAX_IGNORED_STATE_CHANGES:
+                    return StateChanges(
+                        (),
+                        tuple(ignored),
+                        f"more than {MAX_IGNORED_STATE_CHANGES} ignored state change"
+                        " entries",
+                    )
+                ignored.append(entry.name)
+                continue
+            names.append(name)
+            if len(names) > MAX_STATE_CHANGES:
+                return StateChanges(
+                    (), tuple(ignored), f"more than {MAX_STATE_CHANGES} state changes"
+                )
+    except OSError as error:
+        return StateChanges((), (), f"the state changes could not be read: {error}")
+    if not names:
+        return StateChanges(
+            (), tuple(ignored), "no state change is recorded, not even the base"
+        )
+    return StateChanges(tuple(sorted(names)), tuple(ignored), None)
+
+
+def state_version_of(changes: tuple[str, ...]) -> str:
+    """The state version a set of state changes gives, the SHA-256 of their sorted
+    names, one per line."""
+    return hashlib.sha256("".join(f"{name}\n" for name in changes).encode()).hexdigest()
+
+
+FOUND_STATE_CHANGES: Final = read_state_changes(
+    importlib.resources.files("dromon").joinpath(STATE_CHANGES_PACKAGE)
+)
+"""What was read of this code's state changes, with any entries left out."""
+
+STATE_CHANGES: Final = FOUND_STATE_CHANGES.names
+"""Every change to what applying an event means that this code holds."""
+
+UNUSABLE_STATE_VERSION: Final = "unusable"
+"""The version written when the set cannot be trusted. It is no digest, so no code
+with a usable set accepts a snapshot that carries it, and ``read`` refuses every
+snapshot while the set is unusable."""
+
+STATE_VERSION: Final = (
+    state_version_of(STATE_CHANGES)
+    if FOUND_STATE_CHANGES.problem is None
+    else UNUSABLE_STATE_VERSION
+)
+"""Changes whenever applying an event comes to mean something else for a state of the
+same shape, since the shape digest cannot see that. **Review of 49236ad, item 3.**
+``tests/test_state_version.py`` fails when the types ``codec_digest`` covers, or the
+state a fixed history replays to, change while this stays the same, so a change
+cannot be forgotten.
+
+**Round 17, item 3. A set, not a counter.** It was a whole number that each branch
+raised, so two branches that both changed the state conflicted at every merge, in this
+line, in its history, in the pins and in the rollback floor table, and the second to
+merge renumbered. Now a branch that changes what applying an event means adds one file,
+``statechanges/BRANCH.txt``, saying what changed, and the version is the digest of the
+set of names. Two branches add two files, which never conflict, and their merge holds
+both, so its version differs from either branch's and a snapshot written by either is
+ignored, as it must be. ``statechanges/base.txt`` holds the history of the whole
+numbers 1 to 6 this replaced. **Porting note.** A port embeds the names at build time
+and computes the same digest. Reading a directory at import is Python's convenience."""
 
 SUFFIX: Final = ".snapshot"
 """The snapshot of ``events.sqlite`` is ``events.sqlite.snapshot``."""
@@ -666,6 +797,11 @@ def read(
     owner's alone within the bound, its digest verifies, its versions and shape are
     this code's, its ``seq`` lies within the log, and the log's rows 1 and ``seq``
     have the digests it names."""
+    if FOUND_STATE_CHANGES.problem is not None:
+        raise SnapshotRefused(
+            f"this code's state version is unusable, because"
+            f" {FOUND_STATE_CHANGES.problem}, so the log is replayed"
+        )
     raw = _read_file(path)
     try:
         body = json.loads(raw.decode("utf-8"))

@@ -90,6 +90,31 @@ read-only seats, findings 1 and 2. Dromon's `write_scratch` tool remains
 available for scratch files, under the line's own `tmp/lines/LINE`, as
 [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies.
 
+**Links in the path lists, round 16, item 5.** **Fact, reported by another project on a
+daemon about two weeks old.** A line's sandbox could not write its worktree when that
+directory was a link to another volume, because the sandbox follows the link to the real
+path before it matches a rule. **Change.** Where the sandbox is enabled, Dromon keeps
+each absolute or home-relative entry of the four lists as written, and for the two deny
+lists only adds its real path when that differs. It adds the real path of each protected
+directory and of each guarded path to the deny lists, and grants write access to the real
+path of the line's working directory when that is a link. **Review of round 16, finding
+1.** An allow entry is never given a real form, because a line that can write a link
+where an allow entry lives, such as its reports directory, could then point the link at a
+directory it may not write and have the grant follow at its next engine build. A real
+form in a deny list only denies more. The working directory is the one allow entry
+granted by its real path, since the operator chose it and a line does not write the link
+that names it. **Residual.** A line with write access to the directory that holds another
+line's working directory can still replace that working directory by a link, and the grant
+follows it. Placing worktrees where no line can write their parent is the operator's
+protection. A
+`denyWrite` entry for the working directory still wins over the grant, so a read line
+stays read only. **Failure modes.** The real path is read once, when the line's sandbox
+is built, so a link changed afterwards, or created below an entry, is not followed. A
+path that does not exist resolves as far as it can. A link to a directory the line must
+not write is a decision of the operator, since the grant follows where the link leads
+and the working directory's own path is what configures it. The check that refuses an
+entry inside a protected directory compares real paths and is unchanged.
+
 **A temporary directory and package cache, round 14, item 6.** Where a line's sandbox is
 enabled, Dromon also grants write access to two directories of the line's own outside
 its working directory, and sets `TMPDIR` and `UV_CACHE_DIR` to them. They are outside
@@ -180,6 +205,21 @@ project settings.
    refused, after `~` expansion and symbolic link resolution. `dromond` checks the
    project file's documents before it starts, and a line whose document fails the check
    at its first turn has that turn end before any command runs.
+   **Round 17, review of 0db077c, finding 1, decided by the operator.** The project's
+   `secret` directories, at the project root and in the line's working directory, are
+   protected in the same way for every Claude Code line, by real path, where they
+   exist when the line's engine is built. Codex and Grok lines have had them since
+   round 9. So the disclosure list under `secret/` is closed to every line, and the
+   gate a line runs in its own sandbox skips the disclosure scan with its reason,
+   while `full-gate`, which runs outside every sandbox, scans. **Where a line's own
+   documents could remove it.** A sandbox document's `allowRead` or `allowWrite`
+   entry inside one of them is refused as above, at `dromond`'s start for the project
+   file and at the line's build for an override. A settings `allow` rule does not
+   reopen it, since Claude Code applies a `deny` rule first. A document that leaves the
+   sandbox disabled removes the shell's denial, as for every protected directory,
+   while the file tools stay denied by the settings. **Residuals.** A directory made
+   after the build is denied from the line's next build. A line whose sandbox is
+   disabled can read them with its shell.
 4. **Git hooks and configuration.** When the line's working directory lies in a git
    checkout, an enabled sandbox also denies writes to the hooks and configuration git
    would act on there, whether or not any layer grants the git directory. A command
@@ -282,3 +322,17 @@ succeeded and the one that wrote in the home directory was refused.
   [`CODEX.md`](CODEX.md) and [`GROK.md`](GROK.md) specify.
 - Linux and WSL2 behaviour is specified by Claude Code and has not been verified live
   by this line. Continuous integration runs the unit tests on Linux.
+
+The repository gate clears `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE` before
+its first Git call and before selecting its working directory. Clearing them only
+at disclosure lookup allows the initial directory selection to follow a decoy.
+This protects checkout selection from those environment variables. It assumes the
+Git executable and the checkout metadata are trusted, subject to the worktree
+back-pointer checks in the gate.
+
+The repository gate supports the platform Bash, including version 3.2 on macOS.
+With unset-variable checking enabled, Bash 3.2 treats an empty array expansion as
+an unset variable. Array arguments therefore use guarded expansion so an empty
+list supplies zero arguments. Gate tests select `/bin/bash` when it exists and
+otherwise use Bash from the executable search path. An alternate shell selected
+by the environment is not evidence that the platform shell works.

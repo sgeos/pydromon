@@ -23,6 +23,7 @@ from dromon.driver import Driver, Strategy
 from dromon.engine import (
     CLAUDE_CODE_PROMPT_MARK,
     INTERRUPTED_KIND,
+    Capabilities,
     ClaudeCodeLine,
     TurnReport,
 )
@@ -104,12 +105,21 @@ class Recorder:
         self.session_id = spec.session_id
         self.prompts: list[str] = []
         self.cost = 0.25
+        self.capabilities: Capabilities | None = None
 
     async def run_turn(self, prompt: str) -> TurnReport:
         self.prompts.append(prompt)
         self.session_id = self.session_id or "session-1"
         return TurnReport(
-            "success", 1, "ok", (), None, None, self.session_id, None, self.cost
+            "success",
+            1,
+            "ok",
+            (),
+            None,
+            None,
+            self.session_id,
+            self.capabilities,
+            self.cost,
         )
 
 
@@ -2837,6 +2847,49 @@ def test_line_status_gives_a_stated_budget_with_its_time_and_age(
     assert len(text.encode("utf-8")) <= MAX_LINE_STATUS_DEFAULT_BYTES
 
 
+@pytest.mark.parametrize(
+    ("back", "ahead"),
+    [
+        (timedelta(hours=1, minutes=5), "1 hour 5 minutes"),
+        (timedelta(seconds=30), "less than a minute"),
+        (timedelta(days=2, minutes=1), "2 days 1 minute"),
+    ],
+)
+def test_a_budget_observed_after_the_daemon_s_time_has_no_negative_age(
+    world: World, back: timedelta, ahead: str
+) -> None:
+    """**Round 17, item 4.** A clock set back after a statement gave a negative
+    ``age_seconds`` beside words saying the age was unknown. The number now says
+    unknown too, and the words say how far ahead the statement is."""
+    stated = world.scheduler.state_budget("claude-code", 40, None, "by hand")
+    world.clock.now -= back
+    budget = json.loads(world.call("line_status")[0])["provider_budget"]
+    assert budget["observed_at"] == stated["stated_at"]
+    assert budget["age_seconds"] == "unknown"
+    assert budget["age"] == (
+        f"observed {ahead} after the daemon's current time, as when its clock was"
+        " set back, so its age is unknown"
+    )
+    assert not any(isinstance(value, int) and value < 0 for value in budget.values())
+
+
+@pytest.mark.parametrize(
+    ("forward", "age_seconds", "age"),
+    [
+        (timedelta(0), 0, "observed less than a minute ago"),
+        (timedelta(seconds=59), 59, "observed less than a minute ago"),
+        (timedelta(minutes=1), 60, "observed 1 minute ago"),
+    ],
+)
+def test_a_budget_observed_now_or_just_before_has_its_age(
+    world: World, forward: timedelta, age_seconds: int, age: str
+) -> None:
+    world.scheduler.state_budget("claude-code", 40, None, "by hand")
+    world.clock.now += forward
+    budget = json.loads(world.call("line_status")[0])["provider_budget"]
+    assert (budget["age_seconds"], budget["age"]) == (age_seconds, age)
+
+
 def test_line_status_shows_how_unknown_cost_counts(world: World) -> None:
     scheduler = world.scheduler
     scheduler.spent_between("alpha", INTERRUPTED_KIND, None, None)
@@ -3369,3 +3422,97 @@ def test_a_restart_note_starts_its_turn_even_when_answered(world: World) -> None
     assert scheduler._nothing_new("alpha", [(message_id, answered)]) is False  # pyright: ignore[reportPrivateUsage]
     ordinary = dataclasses.replace(answered, restart_note=False)
     assert scheduler._nothing_new("alpha", [(message_id, ordinary)]) is True  # pyright: ignore[reportPrivateUsage]
+
+
+# Round 17, item 7. Each MCP server of a line as configured, connected and callable.
+
+
+def reporting(
+    servers: tuple[tuple[str, str], ...] | None, tools: tuple[str, ...]
+) -> Capabilities:
+    return Capabilities(
+        "1", "2", HAIKU, "none", tools, "default", (), mcp_servers=servers
+    )
+
+
+def test_the_scheduler_tells_configured_connected_and_callable_apart(
+    world: World,
+) -> None:
+    """Before a turn only the configuration is known. After one, the engine's own
+    report says which server connected and which offers a tool, with no call made.
+    The line's own ``line_status`` still names none of its servers."""
+    config = LineConfig(
+        mcp_servers=(
+            ("jotter", McpServer("stdio", command="jotter")),
+            ("broken", McpServer("stdio", command="broken")),
+            ("quiet", McpServer("stdio", command="quiet")),
+        ),
+    )
+    world.scheduler.configure_line("alpha", config)
+    assert [
+        (s["name"], s["configured"], s["connected"], s["callable"])
+        for s in world.scheduler.mcp_server_states("alpha")
+    ] == [
+        ("broken", "yes", "unknown", "unknown"),
+        ("jotter", "yes", "unknown", "unknown"),
+        ("quiet", "yes", "unknown", "unknown"),
+    ]
+    world.turn("first")
+    world.engines["alpha"].capabilities = reporting(
+        (
+            ("jotter", "connected"),
+            ("broken", "failed"),
+            ("quiet", "connected"),
+            ("dromon", "connected"),
+        ),
+        ("Read", "mcp__jotter__note", "mcp__dromon__send_message"),
+    )
+    world.turn("second")
+    states = {s["name"]: s for s in world.scheduler.mcp_server_states("alpha")}
+    assert (states["jotter"]["connected"], states["jotter"]["callable"]) == (
+        "yes",
+        "yes",
+    )
+    assert (states["broken"]["connected"], states["broken"]["engine_status"]) == (
+        "no",
+        "failed",
+    )
+    assert states["broken"]["callable"] == "no"
+    assert (states["quiet"]["connected"], states["quiet"]["callable"]) == ("yes", "no")
+    assert states["dromon"]["configured"] == "dromon"
+    detail = world.call("line_status", {"detail": True, "lists": True})[0]
+    assert "jotter" not in detail and "broken" not in detail
+
+
+def test_the_settings_view_shows_the_server_states(world: World) -> None:
+    from dromon import mcpstates
+    from dromon.configview import LineFacts, Overrides, line_entries, project_layers
+    from dromon.limits import DEFAULT_LIMITS
+    from dromon.projectconfig import ProjectConfig
+
+    config = LineConfig(mcp_servers=(("jotter", McpServer("stdio", command="j")),))
+    states = mcpstates.server_states(
+        config.server_names(),
+        mcpstates.EngineReport((("jotter", "failed"),), ("Read",)),
+    )
+    facts = LineFacts(
+        "a",
+        HAIKU,
+        HAIKU,
+        (HAIKU,),
+        "subscription",
+        None,
+        config,
+        {},
+        DEFAULT_LIMITS,
+        False,
+        1,
+        False,
+        mcp_summary=mcpstates.summary(states),
+    )
+    layers = project_layers(ProjectConfig(), Overrides(), {}, False)
+    entry = next(e for e in line_entries(facts, layers) if e["key"] == "mcp_servers")
+    assert entry["value"] == "jotter configured, not connected, failed, no tool offered"
+    plain = dataclasses.replace(facts, mcp_summary=None)
+    entry = next(e for e in line_entries(plain, layers) if e["key"] == "mcp_servers")
+    assert entry["value"] == "jotter"
