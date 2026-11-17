@@ -40,7 +40,7 @@ held to the project's sandbox requirement, as [`PROJECT_CONFIG.md`](PROJECT_CONF
 `wake_after`, `acquire_lease` or `release_lease`, which only lines have, and no
 `rebind_line`, `hibernate`, `awaken` or `restart`, which only an operator has through a
 client. Nor has it `line_status`,
-`read_instructions`, `write_scratch`, `check_disclosure`, `list_processes` or `stop_process`, which
+`read_instructions`, `write_scratch`, `check_disclosure`, `list_processes`, `stop_process` or `sample_process`, which
 describe, write or act for a line. An agent below
 `operator` access is refused when its `create_line` or `configure_line` sets
 `plugins`, since plugins load code into a line. An anonymous agent whose chosen name contains a

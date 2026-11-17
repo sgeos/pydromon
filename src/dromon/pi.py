@@ -46,7 +46,7 @@ from typing import Any, Final, cast
 
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import capabilities
+from dromon import capabilities, spawn
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import (
     MESSAGE_END,
@@ -402,7 +402,7 @@ async def pi_auth_check(
     found = shutil.which(COMMAND, path=environment.get("PATH"))
     if found is None:
         raise EngineRefused("the pi command is not installed or not on PATH")
-    process = await asyncio.create_subprocess_exec(
+    process = await spawn.subprocess_exec(
         found,
         "auth",
         "check",

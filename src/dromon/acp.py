@@ -24,6 +24,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
+from dromon import BRIDGE_LOG_VARIABLE
 from dromon.engine import EngineClosed
 
 PROTOCOL_VERSION: Final = 1
@@ -324,19 +325,25 @@ def own_tool_names(mcp_tools: Sequence[str]) -> frozenset[str]:
 
 
 def mcp_servers(
-    bridge: Sequence[str], line_token: str | None
+    bridge: Sequence[str], line_token: str | None, log_path: Path | None = None
 ) -> list[dict[str, object]]:
     """The ``mcpServers`` of a session, Dromon's own tools served by ``bridge`` with the
     line's token in its environment, or none without a bridge or a token. The token is
-    passed in the request, never written to disk."""
+    passed in the request, never written to disk. **Round 17.** ``log_path``, where the
+    engine's sandbox allows a write, is named to the server in ``DROMON_BRIDGE_LOG`` so
+    that its standard error and its end are kept, as ``dromon.BRIDGE_LOG_VARIABLE``
+    says."""
     if not bridge or line_token is None:
         return []
+    environment: list[dict[str, str]] = [{"name": TOKEN_VARIABLE, "value": line_token}]
+    if log_path is not None:
+        environment.append({"name": BRIDGE_LOG_VARIABLE, "value": str(log_path)})
     return [
         {
             "name": MCP_SERVER_NAME,
             "command": bridge[0],
             "args": list(bridge[1:]),
-            "env": [{"name": TOKEN_VARIABLE, "value": line_token}],
+            "env": environment,
         }
     ]
 

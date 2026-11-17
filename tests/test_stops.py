@@ -741,6 +741,60 @@ def test_a_kill_all_turn_is_refused_where_the_table_cannot_be_walked(
     assert reason.endswith("ps cannot be run: denied")
 
 
+def test_a_silent_process_table_starts_the_turn_with_a_note_and_holds_nothing(
+    worlds: Callable[..., World], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round 17, item 5. A ``ps`` that only timed out does not hold the line and does
+    not lose the mail of the turn, which a refused turn would. The turn is told."""
+    engine = Engine()
+    silent = launcher.SilentWalk("ps did not answer in 3 attempts, 65.0 seconds in all")
+    world = worlds(engine, walk_check=lambda: silent)
+
+    async def act() -> None:
+        world.scheduler.send(ANA, LineAddress("alpha"), "x")
+
+    run(world, act)
+    assert world.log.state.lines["alpha"].held_by is None
+    assert len(engine.prompts) == 1
+    prompt = engine.prompts[0]
+    assert prompt.startswith(scheduler_module.WALK_SILENT_NOTE)
+    assert "ps did not answer in 3 attempts" in prompt.splitlines()[0]
+    assert "starts a turn without a process walk" in capsys.readouterr().err
+
+
+def test_a_refused_process_table_still_refuses_the_turn_and_holds_the_line(
+    worlds: Callable[..., World],
+) -> None:
+    engine = Engine()
+    world = worlds(engine, walk_check=lambda: "ps cannot be run: denied")
+
+    async def act() -> None:
+        world.scheduler.send(ANA, LineAddress("alpha"), "x")
+
+    run(world, act)
+    assert engine.prompts == []
+    assert world.log.state.lines["alpha"].held_by is not None
+
+
+def test_a_silent_table_is_not_mentioned_to_a_line_that_needs_no_walk(
+    worlds: Callable[..., World],
+) -> None:
+    engine = Engine()
+    world = worlds(
+        engine,
+        walk_check=lambda: launcher.SilentWalk("ps did not answer in 3 attempts"),
+    )
+    world.scheduler.configure_line(
+        "alpha", LineConfig(stop_policy=StopPolicy.LEAVE_BACKGROUND)
+    )
+
+    async def act() -> None:
+        world.scheduler.send(ANA, LineAddress("alpha"), "x")
+
+    run(world, act)
+    assert scheduler_module.WALK_SILENT_NOTE not in engine.prompts[0]
+
+
 def test_a_leave_background_turn_needs_no_walk(
     worlds: Callable[..., World],
 ) -> None:

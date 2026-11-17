@@ -233,6 +233,7 @@ from dromon.processes import (
     ProcessTable,
     ProcessWorker,
     TreeReadFailure,
+    NO_LAUNCH_RECORD,
     UNIDENTIFIABLE,
     unavailable,
     SystemProcesses,
@@ -248,6 +249,7 @@ from dromon.processes import (
     pid_task_id,
     root_is_harness,
     stop_ledgered,
+    verified_child,
     stop_line_process,
     tree_or_reason,
 )
@@ -1343,6 +1345,7 @@ SANDBOX_PROBE_TOOL_NAME: Final = "sandbox_probe"
 
 LIST_PROCESSES_TOOL_NAME: Final = "list_processes"
 STOP_PROCESS_TOOL_NAME: Final = "stop_process"
+SAMPLE_PROCESS_TOOL_NAME: Final = "sample_process"
 
 LIST_BACKGROUND_TOOL_NAME: Final = "list_background"
 COMPACT_SESSION_TOOL_NAME: Final = "compact_session"
@@ -1479,6 +1482,15 @@ STOP_BACKGROUND_SCHEMA: Final[dict[str, object]] = {
     "additionalProperties": False,
 }
 
+SAMPLE_PROCESS_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "pid": {"type": "integer", "description": "One of your processes"},
+    },
+    "required": ["pid"],
+    "additionalProperties": False,
+}
+
 STOP_PROCESS_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
     "properties": {
@@ -1505,6 +1517,19 @@ def _scratch_refused(rule: str, detail: str) -> LineToolRefused:
 
 class TurnRefused(RuntimeError):
     """The scheduler refused to start a line's turn, for the reason it gives."""
+
+
+WALK_SILENT_NOTE: Final = (
+    "Daemon note, round 17. The line's stop policy is kill_all, which needs the process"
+    " table, and the table did not answer in time, so this turn started without the"
+    " check that it can be walked and the line was not held. The stop at the end of the"
+    " turn reads the table again. If it still cannot, it ends only what it can reach,"
+    " so stop what you started before your turn ends. The table said: "
+)
+"""What a turn is told when the process table was silent. **Round 17, item 5.** A
+``ps`` that only timed out, after the check's whole bound, is not a table that cannot
+be walked, and refusing the turn held the line for an operator each time. The turn
+starts with this note instead. The reason is added after it."""
 
 
 class GitSshChanged(TurnRefused):
@@ -2797,6 +2822,8 @@ class Scheduler:
         self._checkout_dir = checkout_dir
         """Where commit runs' checkouts are made, or ``None``, which refuses them."""
         self._checkouts_starting: set[str] = set()
+        # Review of round 17. Supervisors being ended after a cancellation.
+        self._abandoning: set[asyncio.Future[None]] = set()
         """Runs whose checkout is made but whose start is not yet recorded, which a
         tidy keeps."""
         self._ref_anchor: commitruns.RefAnchor | str = "no project root was given"
@@ -5465,6 +5492,8 @@ class Scheduler:
             # ``commitruns.daemon_interpreter`` explains.
             environment = {**environment, "HOME": str(checkout.home), **interpreter}
         try:
+            # Round 17, item 3. A cancellation while the supervisor starts must not
+            # leave it running with its input open, so the worker ends it unseen.
             launched = await self._process_worker.run(
                 lambda: runs.launch(
                     directory,
@@ -5474,29 +5503,33 @@ class Scheduler:
                     environment,
                     self._run_start_of,
                     command_dir=command_dir,
-                )
-            )
-            started = RunStarted(
-                run_id,
-                line_id,
-                self._run_role(line_id),
-                latest_id,
-                command,
-                argv,
-                str(workdir),
-                launched.output_file,
-                launched.child.pid,
-                launched.process_started,
-                format_due(self._wall_clock()),
-                commit,
-                None if command_dir is None else str(command_dir),
-                tree,
-                head,
+                ),
+                lambda late: runs.abandon(late.child),
             )
             try:
+                # Review of round 17, finding 1. Built inside the guard, so a
+                # validation error here ends the supervisor and does not leave it to
+                # the collector.
+                started = RunStarted(
+                    run_id,
+                    line_id,
+                    self._run_role(line_id),
+                    latest_id,
+                    command,
+                    argv,
+                    str(workdir),
+                    launched.output_file,
+                    launched.child.pid,
+                    launched.process_started,
+                    format_due(self._wall_clock()),
+                    commit,
+                    None if command_dir is None else str(command_dir),
+                    tree,
+                    head,
+                )
                 self._log.append(started)
             except BaseException:
-                await self._process_worker.run(lambda: runs.abandon(launched.child))
+                await self._end_run_child(launched.child)
                 raise
         except BaseException:
             if checkout is not None:
@@ -5506,7 +5539,7 @@ class Scheduler:
             self._checkouts_starting.discard(run_id)
         self._run_children[run_id] = launched.child
         if not runs.release(launched):
-            await self._process_worker.run(lambda: runs.abandon(launched.child))
+            await self._end_run_child(launched.child)
             self._record_run_end(
                 runs.Finding(
                     run_id,
@@ -5525,6 +5558,29 @@ class Scheduler:
             )
         self._watch_run(run_id, launched.child)
         return started
+
+    async def _end_run_child(self, child: subprocess.Popen[Any]) -> None:
+        """End a supervisor that was launched and will not be used, and finish doing
+        so even if this task is cancelled again. **Review of round 17, finding 1.** The
+        abandon is queued on the process worker, which skips a call whose caller was
+        cancelled before it ran, so a second cancellation while it waited would leave
+        the supervisor running with its input open. The call is a task of its own that
+        a cancellation of this one does not reach. The reference held in
+        ``_abandoning`` keeps it from being collected before it runs."""
+        task = asyncio.ensure_future(
+            self._process_worker.run(lambda: runs.abandon(child))
+        )
+        self._abandoning.add(task)
+
+        def done(finished: asyncio.Future[None]) -> None:
+            self._abandoning.discard(finished)
+            if not finished.cancelled():
+                # Read, so that a refusal is not reported as never retrieved. The
+                # abandon of a refused call is the collector's, as it was before.
+                finished.exception()
+
+        task.add_done_callback(done)
+        await asyncio.shield(task)
 
     async def _make_checkout(
         self, line_id: str, command: str, run_id: str, commit: str
@@ -8625,9 +8681,18 @@ class Scheduler:
                     # A table that could not be read is not an empty ledger.
                     return _tool_error(unavailable(LIST_PROCESSES_TOOL_NAME, ledgered))
                 if not ledgered:
-                    return _tool_error(
-                        unavailable(LIST_PROCESSES_TOOL_NAME, UNIDENTIFIABLE)
+                    # Round 17, item 4. Say whether the ledger is empty because the
+                    # engine has no launch record to root it, which a line cannot
+                    # otherwise tell from an engine with no children.
+                    record = await self._process_worker.run(
+                        lambda: self._harness_read(line_id)
                     )
+                    reason = (
+                        UNIDENTIFIABLE
+                        if record is not None
+                        else f"{UNIDENTIFIABLE} {NO_LAUNCH_RECORD}"
+                    )
+                    return _tool_error(unavailable(LIST_PROCESSES_TOOL_NAME, reason))
                 return _tool_text(json.dumps(ledgered, indent=2))
             mark = self.line_mark(line_id)
             try:
@@ -8724,6 +8789,81 @@ class Scheduler:
                 " force is true. Any other process is refused."
             ),
             input_schema=STOP_PROCESS_SCHEMA,
+            handler=handler,
+        )
+
+    async def _owned_process(self, line_id: str, pid: int) -> str | None:
+        """What ``pid`` is, as a command, if it is one of the line's own processes by
+        the ledger, checked against a fresh reading, or by the mark where the mark can
+        be read, and ``None`` if it is not. Raises ``ProcessRefused`` with the reason
+        for a ledgered pid that is no longer the recorded process. **Round 17.**"""
+        me = os.getpid()
+        if self._children.find(line_id, pid) is not None:
+            entry = await self._process_worker.run(
+                lambda: verified_child(
+                    self._children,
+                    line_id,
+                    pid,
+                    self._tree_read,
+                    self._identity_read,
+                    lambda candidate: candidate == me,
+                    "sampled",
+                )
+            )
+            return entry.command
+        if not self._processes_identifiable:
+            return None
+        mark = self.line_mark(line_id)
+        found = await self._process_worker.run(
+            lambda: line_processes(self._processes, mark, me)
+        )
+        return next(
+            (str(row["command"]) for row in found if row["pid"] == pid and pid != me),
+            None,
+        )
+
+    def sample_process_tool(self, line_id: str) -> SdkMcpTool[Any]:
+        """The ``sample_process`` tool for ``line_id``, which reads the stack of only
+        its own processes. **Round 17, item 1.** The stall of a child start leaves a
+        process that is forked and never runs, and nothing in a line's own tools showed
+        where it waited. The sample is of one process the line owns, by the same checks
+        that precede a stop, and is bounded in time and in length."""
+
+        async def handler(args: dict[str, Any]) -> dict[str, Any]:
+            unexpected = _unexpected(args, SAMPLE_PROCESS_SCHEMA)
+            if unexpected:
+                return _tool_error(unexpected)
+            pid: object = args.get("pid")
+            if type(pid) is not int:
+                return _tool_error("pid must be a whole number")
+            if pid <= 1 or pid == os.getpid():
+                return _tool_error(f"process {pid} is not one of yours")
+            ledgered = self._children.find(line_id, pid) is not None
+            if not self._processes_identifiable and not ledgered:
+                return _tool_error(
+                    unavailable(SAMPLE_PROCESS_TOOL_NAME, UNIDENTIFIABLE)
+                )
+            try:
+                command = await self._owned_process(line_id, pid)
+            except ProcessRefused as error:
+                return _tool_error(str(error))
+            if command is None:
+                return _tool_error(f"process {pid} is not one of yours")
+            where = await asyncio.to_thread(spawn.sample_process, pid)
+            return _tool_text(
+                f"process {pid}, {command[:MAX_COMMAND_CHARACTERS]}: {where}"
+            )
+
+        return SdkMcpTool(
+            name=SAMPLE_PROCESS_TOOL_NAME,
+            description=(
+                "Read where one of your own processes is, by pid, with the operating"
+                " system's sampler on macOS or the process's state and wait on"
+                " Linux. Sampling waits at most 32 seconds, plus ownership checks and"
+                " scheduling. It reads only. Use it on a child"
+                " that seems stuck. Any process that is not yours is refused."
+            ),
+            input_schema=SAMPLE_PROCESS_SCHEMA,
             handler=handler,
         )
 
@@ -11279,6 +11419,7 @@ class Scheduler:
             self.propose_change_tool(line_id),
             self.list_processes_tool(line_id),
             self.stop_process_tool(line_id),
+            self.sample_process_tool(line_id),
             self.worktree_status_tool(line_id),
             self.sandbox_probe_tool(line_id),
             self.list_mail_tool(line_id),
@@ -12565,7 +12706,7 @@ class Scheduler:
         try:
             if refused is not None:
                 raise refused
-            await self._check_walk(line_id)
+            walk_note = await self._check_walk(line_id)
             self._check_git_ssh(line_id)
             engine = self.engine_for(line_id)
             trimmed = await self._trim_line_temp(engine)
@@ -12579,6 +12720,8 @@ class Scheduler:
             stale = await self._stale_brief_notice(line_id, led_brief)
             if stale is not None:
                 prompt = f"{stale}\n\n{prompt}"
+            if walk_note is not None:
+                prompt = f"{walk_note}\n\n{prompt}"
             self._start_token(line_id, engine)
             if compaction is not None:
                 if isinstance(engine, CompactingEngine):
@@ -13434,27 +13577,40 @@ class Scheduler:
         )
         self.hold(line_id, f"{what}. {cut}", cause=HoldCause.TURN_FAILED)
 
-    async def _check_walk(self, line_id: str) -> None:
+    async def _check_walk(self, line_id: str) -> str | None:
         """Refuse the turn when the line's stop policy is ``kill_all`` and the
         process table cannot be walked, since the stop could then reach only the
-        engine's own group and could not say what it missed. **Review F2.**"""
+        engine's own group and could not say what it missed. **Review F2.** Returns a
+        note for the turn when the table was only silent, which is not a refusal, and
+        ``None`` otherwise. **Round 17, item 5.**"""
         if self._walk_check is None:
-            return
+            return None
         if (
             self.effective_config(line_id).stop_policy
             is not launcher.StopPolicy.KILL_ALL
         ):
-            return
+            return None
         try:
             reason = await self._walk_worker.run(self._walk_check)
         except ProcessRefused as error:
             reason = str(error)
+        if reason is not None and isinstance(reason, launcher.SilentWalk):
+            # Round 17, item 5. The mail of the turn is already delivered, so a turn
+            # that is not started loses it, and a refusal holds the line. The turn
+            # starts, told why, and the daemon's log says the same.
+            print(
+                f"dromond: line {line_id} starts a turn without a process walk:"
+                f" {reason}",
+                file=sys.stderr,
+            )
+            return f"{WALK_SILENT_NOTE}{reason}"
         if reason is not None:
             raise TurnRefused(
                 "the line's stop policy is kill_all, which must find everything its"
                 " engine starts, and the process table cannot be read here, so the"
                 f" turn was not started: {reason}"
             )
+        return None
 
     def _count_interrupted(self, line_id: str, engine: LineEngine | None) -> None:
         """Count the cost a cancelled turn's engine measured before it ended toward

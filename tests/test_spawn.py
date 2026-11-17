@@ -18,7 +18,7 @@ import threading
 import tomllib
 from collections.abc import Callable, Generator, Iterator, Mapping
 from pathlib import Path
-from typing import IO, TYPE_CHECKING
+from typing import IO, TYPE_CHECKING, Any
 
 import pytest
 
@@ -334,10 +334,11 @@ def test_the_land_runner_reports_a_stall_as_its_own_status(
 CALLS = {"run", "Popen", "check_output", "check_call", "call", "getoutput"}
 ASYNC_CALLS = {"create_subprocess_exec", "create_subprocess_shell"}
 ASYNC_KNOWN = {"relay.py", "pi.py", "codex.py", "jsonlines.py", "grok.py"}
-"""The modules that start a child with asyncio, which runs ``Popen`` on the event
-loop's own thread and cannot be moved to another. They are the known residual that
-``dromon.spawn`` names. A new one fails the test below, so the residual cannot grow
-unseen."""
+"""The modules that start a child on the event loop, which runs ``Popen`` on the loop's
+own thread and cannot be moved to another. They are the known residual that
+``dromon.spawn`` names, and since round 17 they start through ``spawn.subprocess_exec``,
+which gives them the descriptor handling of ``start`` and not its bound. A new one fails
+the tests below, so the residual cannot grow unseen."""
 
 
 def called(path: Path, names: set[str], owner: str) -> list[int]:
@@ -371,9 +372,13 @@ def test_no_module_starts_a_child_without_spawn_but_those_it_names() -> None:
     assert all(reason for reason in spawn.EXEMPT.values())
 
 
-def test_the_asyncio_starts_are_the_known_residual() -> None:
-    found = {path.name for path in modules() if called(path, ASYNC_CALLS, "asyncio")}
-    assert found == ASYNC_KNOWN
+def test_the_asyncio_starts_are_the_known_residual_and_go_through_spawn() -> None:
+    direct = {path.name for path in modules() if called(path, ASYNC_CALLS, "asyncio")}
+    assert direct == {"spawn.py"}, "a module starts a child on the loop by itself"
+    through = {
+        path.name for path in modules() if called(path, {"subprocess_exec"}, "spawn")
+    }
+    assert through == ASYNC_KNOWN
 
 
 def test_the_start_bound_is_named_once() -> None:
@@ -2496,3 +2501,511 @@ def test_a_start_with_a_bound_within_the_snapshot_time_takes_no_snapshot(
         while spawn.stranded_count() and time.monotonic() < ended:
             time.sleep(0.01)
     assert calls == []
+
+
+# Round 17. A sample of a stuck child, kept in the ledger when a start stalls.
+
+REPORT = """Sampling process 1 for 1 second with 10 milliseconds of run time
+Sampling completed, processing symbols...
+
+Analysis of sampling python (pid 1) every 10 milliseconds
+Process:         python [1]
+----
+
+Call graph:
+    93 Thread_1   DispatchQueue_1: com.apple.main-thread  (serial)
+      93 start  (in dyld) + 6652  [0x198654d7c]
+        93 Py_BytesMain  (in libpython3.12.dylib) + 36  [0x1037ba880]
+          93 nanosleep  (in libsystem_c.dylib) + 220  [0x19874f054]
+            93 __semwait_signal  (in libsystem_kernel.dylib) + 8  [0x1986e7308]
+
+Total number in stack (recursive counted multiple, when >=5):
+
+Sort by top of stack, same collapsed (when >= 5):
+        __semwait_signal  (in libsystem_kernel.dylib)        93
+"""
+"""The shape of a macOS sampler report, as printed by ``sample`` on 2026-11-16."""
+
+
+def test_a_sample_report_is_condensed_to_function_names_and_the_top_of_stack() -> None:
+    text = spawn.condense_sample(REPORT)
+    assert text == (
+        "stack Thread_1 > start > Py_BytesMain > nanosleep > __semwait_signal;"
+        " on top, __semwait_signal 93"
+    )
+    assert "0x" not in text and "libsystem" not in text
+
+
+def test_a_sample_report_is_bounded_in_frames_and_characters() -> None:
+    deep = "\n".join(f"{' ' * (n + 4)}9 frame_{n}  (in lib) + 1" for n in range(500))
+    text = spawn.condense_sample(f"Call graph:\n{deep}\n\nTotal number in stack")
+    assert text.count(" > ") == spawn.MAX_SAMPLE_FRAMES - 1
+    assert len(text) <= spawn.MAX_SAMPLE_CHARS
+
+
+@pytest.mark.parametrize(
+    ("report", "expected"),
+    [
+        ("", "the sampler printed nothing"),
+        (
+            "sample cannot examine process 5 because you do not have privileges\n\n"
+            "more\nlines\n",
+            "sample cannot examine process 5 because you do not have privileges; more",
+        ),
+    ],
+)
+def test_a_sample_report_without_a_call_graph_gives_the_reason(
+    report: str, expected: str
+) -> None:
+    assert spawn.condense_sample(report) == expected
+
+
+@pytest.mark.parametrize("pid", [0, 1, -5, True, "7", None])
+def test_a_sample_of_something_that_is_not_another_process_is_refused(
+    pid: object,
+) -> None:
+    assert spawn.sample_process(pid).startswith("refused")  # type: ignore[arg-type]
+
+
+def test_a_sample_of_this_process_is_refused() -> None:
+    assert spawn.sample_process(os.getpid()).startswith("refused")
+
+
+def test_a_proc_sample_reads_state_and_wait_and_says_what_is_refused(
+    tmp_path: Path,
+) -> None:
+    entry = tmp_path / "123"
+    entry.mkdir()
+    (entry / "status").write_text("Name:\tgit\nState:\tD (disk sleep)\nThreads:\t1\n")
+    (entry / "wchan").write_text("wait_for_completion\n")
+    (tmp_path / "self").mkdir()
+    (tmp_path / "self" / "stat").write_text("1 (x) S 0\n")
+    text = spawn.sample_process(123, proc=tmp_path)
+    assert "State: D (disk sleep)" in text and "Threads: 1" in text
+    assert "wchan wait_for_completion" in text
+    assert "syscall unreadable" in text and "stack unreadable" in text
+    assert "Name" not in text
+
+
+def test_a_proc_sample_of_a_process_that_ended_says_so(tmp_path: Path) -> None:
+    (tmp_path / "self").mkdir()
+    (tmp_path / "self" / "stat").write_text("1 (x) S 0\n")
+    assert "status unreadable" in spawn.sample_process(999, proc=tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs named pipes")
+def test_a_proc_sample_does_not_wait_for_ever_on_a_read_that_blocks(
+    tmp_path: Path,
+) -> None:
+    """``/proc/PID/syscall`` of a child in the middle of ``exec`` can block, as the
+    other reads of ``/proc`` did. A named pipe stands in, since it blocks a read."""
+    entry = tmp_path / "123"
+    entry.mkdir()
+    (entry / "status").write_text("State:\tR\n")
+    (entry / "wchan").write_text("0\n")
+    os.mkfifo(entry / "syscall")
+    (tmp_path / "self").mkdir()
+    (tmp_path / "self" / "stat").write_text("1 (x) S 0\n")
+    began = time.monotonic()
+    text = spawn.sample_process(123, proc=tmp_path, wait=0.3)
+    assert time.monotonic() - began < 5
+    assert "123/syscall did not return within 0.3s" in text
+    assert "wchan 0" in text
+    # Let the abandoned reader end, so that no thread outlives the test.
+    with open(entry / "syscall", "w"):
+        pass
+
+
+def test_a_sampler_that_cannot_run_is_reported_not_raised(tmp_path: Path) -> None:
+    text = spawn._run_sampler(  # pyright: ignore[reportPrivateUsage]
+        7, str(tmp_path / "missing"), 5.0
+    )
+    assert text == "the sampler could not run, FileNotFoundError"
+
+
+def test_a_sampler_that_does_not_end_is_killed_and_reported(tmp_path: Path) -> None:
+    program = tmp_path / "slow-sampler"
+    marker = tmp_path / "started"
+    program.write_text(f"#!/bin/sh\necho $$ > {marker}\nexec sleep 60\n")
+    program.chmod(0o755)
+    started = time.monotonic()
+    text = spawn._run_sampler(7, str(program), 0.5)  # pyright: ignore[reportPrivateUsage]
+    elapsed = time.monotonic() - started
+    assert text == "the sampler did not end in time"
+    assert elapsed < 0.5 + spawn.SAMPLE_JOIN_SLACK_SECONDS + 2.0
+    pid = int(marker.read_text())
+    deadline = time.monotonic() + 10
+    while alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not alive(pid)
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or not os.access(spawn.SAMPLE_PROGRAM, os.X_OK),
+    reason="needs the macOS sampler",
+)
+def test_the_macos_sampler_gives_the_stack_of_a_real_child() -> None:
+    child = subprocess.Popen(  # noqa: S603  # direct on purpose
+        [sys.executable, "-I", "-c", "import time; time.sleep(60)"]
+    )
+    try:
+        text = spawn.sample_process(child.pid)
+    finally:
+        child.kill()
+        child.wait()
+    if not text.startswith("stack "):
+        refused = ("not permitted", "cannot examine", "could not run", "denied")
+        if any(word in text.lower() for word in refused):
+            # Review of round 17. Said in the reason, which the run lists, so a runner
+            # whose sampler is refused is told that this test did not test it.
+            pytest.skip(
+                "the macOS sampler was REFUSED here, so the sampler was not tested,"
+                f" and it said: {text}"
+            )
+        pytest.fail(f"the sampler ran and gave no stack, it said: {text}")
+    assert "time_sleep" in text or "nanosleep" in text or "__semwait" in text
+    assert len(text) <= spawn.MAX_SAMPLE_CHARS
+
+
+def _children_reader(
+    table: "list[spawn._Child] | str",  # pyright: ignore[reportPrivateUsage]
+) -> Callable[..., "list[spawn._Child] | str"]:  # pyright: ignore[reportPrivateUsage]
+    def read(*args: object) -> "list[spawn._Child] | str":  # pyright: ignore[reportPrivateUsage]
+        del args
+        return table if isinstance(table, str) else list(table)
+
+    return read
+
+
+def test_only_a_child_forked_and_not_executed_is_taken_as_stuck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child = spawn._Child  # pyright: ignore[reportPrivateUsage]
+    rows = [
+        child(10, "S", "git", False, None),
+        child(11, "S", "git", True, None),
+        child(12, "I", "git", None, None),
+        child(13, "S", "git", None, None),
+        child(14, "D", "git", None, None),
+    ]
+    read = _children_reader(rows)
+    monkeypatch.setattr(spawn, "_libproc_children", read)
+    monkeypatch.setattr(spawn, "_proc_children_bounded", read)
+    chosen = spawn._stall_candidates()  # pyright: ignore[reportPrivateUsage]
+    assert [c.pid for c in chosen] == [10, 12]
+    assert len(chosen) <= spawn.MAX_SAMPLED
+
+
+def test_a_table_that_cannot_be_read_gives_no_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read = _children_reader("unavailable, x")
+    monkeypatch.setattr(spawn, "_libproc_children", read)
+    monkeypatch.setattr(spawn, "_proc_children_bounded", read)
+    assert spawn._stall_candidates() == []  # pyright: ignore[reportPrivateUsage]
+
+
+def _wait_for_stall_sample(count: int = 1) -> list[str]:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        found = [n for n in spawn.slow_starts() if n.startswith("stall sample, ")]
+        if len(found) >= count:
+            return found
+        time.sleep(0.01)
+    return []
+
+
+def test_a_start_that_stalls_leaves_a_sample_of_the_stuck_child_in_the_ledger(
+    stalled: "StalledStart",
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The evidence the macOS stall has lacked. A real child that waits stands in for
+    the stuck one, and the sample is taken while the start is still stalled."""
+    stuck = spawn._REAL_POPEN(  # pyright: ignore[reportPrivateUsage]
+        [sys.executable, "-I", "-c", "import time; time.sleep(60)"]
+    )
+    try:
+        child = spawn._Child(stuck.pid, "S", "python", False, None)  # pyright: ignore[reportPrivateUsage]
+
+        def candidates() -> list[spawn._Child]:  # pyright: ignore[reportPrivateUsage]
+            return [child]
+
+        monkeypatch.setattr(spawn, "_stall_candidates", candidates)
+        with pytest.raises(spawn.StartStalled):
+            spawn.start(SLEEP)
+        assert stalled.stall, "the start was still stalled when it was sampled"
+        found = _wait_for_stall_sample()
+        assert found, "no stall sample was recorded"
+        assert f"child {stuck.pid} state S program python" in found[0]
+        assert "not started within" in found[0] and "sleep" in found[0]
+        written = stderr_with(capsys, f"child {stuck.pid}")
+        assert "dromond: stall sample, " in written
+        stalled.stall = False
+        stalled.gate.set()
+        stalled.until_reaped()
+    finally:
+        stuck.kill()
+        stuck.wait()
+
+
+def test_a_stall_with_no_stuck_child_says_so_in_the_ledger(
+    stalled: "StalledStart", monkeypatch: pytest.MonkeyPatch
+) -> None:
+
+    def none() -> list[spawn._Child]:  # pyright: ignore[reportPrivateUsage]
+        return []
+
+    monkeypatch.setattr(spawn, "_stall_candidates", none)
+    with pytest.raises(spawn.StartStalled):
+        spawn.start(SLEEP)
+    found = _wait_for_stall_sample()
+    assert (
+        found and "no child of the daemon that was forked and not executed" in found[0]
+    )
+    stalled.stall = False
+    stalled.gate.set()
+    stalled.until_reaped()
+
+
+def test_a_stall_sample_that_raises_does_not_disturb_the_stall_error(
+    stalled: "StalledStart", monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken() -> list[object]:
+        raise RuntimeError("stand-in")
+
+    monkeypatch.setattr(spawn, "_stall_candidates", broken)
+    with pytest.raises(spawn.StartStalled, match="did not start within"):
+        spawn.start(SLEEP)
+    stalled.stall = False
+    stalled.gate.set()
+    stalled.until_reaped()
+
+
+def test_the_ledger_keeps_room_for_stall_samples_when_slow_starts_fill_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(spawn, "MAX_SLOW_STARTS_KEPT", 2)
+    monkeypatch.setattr(spawn, "MAX_STALL_SAMPLES_KEPT", 1)
+    keep = spawn._keep_slow  # pyright: ignore[reportPrivateUsage]
+    assert keep("one") and keep("two")
+    assert not keep("three")
+    assert keep("sample", reserved=True)
+    assert not keep("another sample", reserved=True)
+    assert spawn.slow_starts() == ["one", "two", "sample"]
+
+
+# Round 17, item 2. Starts on the event loop share the descriptor handling.
+
+
+def _listing_program(passed: int | None = None) -> list[str]:
+    program = LISTER
+    if passed is not None:
+        program = "import os, sys\nos.write(int(sys.argv[1]), b'hello')\n" + LISTER
+    return [sys.executable, "-I", "-c", program] + (
+        [] if passed is None else [str(passed)]
+    )
+
+
+async def _async_listing(**options: Any) -> list[int]:  # noqa: ANN401
+    process = await spawn.subprocess_exec(
+        *_listing_program(options.get("pass_fds", (None,))[0]),
+        stdout=asyncio.subprocess.PIPE,
+        **options,
+    )
+    out, _ = await asyncio.wait_for(process.communicate(), 30)
+    assert process.returncode == 0
+    return list(ast.literal_eval(out.decode().strip()))
+
+
+def test_a_child_started_on_the_loop_does_not_inherit_a_stray_descriptor(
+    hygiene: None,
+) -> None:
+    leaked_read, leaked_write = os.pipe()
+    try:
+        os.set_inheritable(leaked_read, True)
+        before = spawn.cleared_descriptors()
+        seen = asyncio.run(_async_listing())
+        assert leaked_read not in seen
+        assert [n for n in seen if n > 2] == []
+        assert spawn.cleared_descriptors() >= before + 1
+        assert not os.get_inheritable(leaked_read)
+    finally:
+        os.close(leaked_read)
+        os.close(leaked_write)
+
+
+def test_a_child_started_on_the_loop_gets_the_descriptor_it_is_passed_and_no_other(
+    hygiene: None,
+) -> None:
+    read, write = os.pipe()
+    other_read, other_write = os.pipe()
+    try:
+        os.set_inheritable(other_read, True)
+        seen = asyncio.run(_async_listing(pass_fds=(write,)))
+        assert write in seen and other_read not in seen
+        assert os.read(read, 5) == b"hello"
+        assert not os.get_inheritable(write), "the marking ended with the start"
+    finally:
+        for descriptor in (read, write, other_read, other_write):
+            os.close(descriptor)
+
+
+def test_a_start_on_the_loop_leaves_the_closing_to_the_child_where_that_is_the_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(spawn.CHILD_CLOSES_ENV, "1")
+    seen: list[dict[str, Any]] = []
+    real = asyncio.create_subprocess_exec
+
+    async def record(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:  # noqa: ANN401
+        seen.append(dict(kwargs))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", record)
+
+    async def go() -> None:
+        process = await spawn.subprocess_exec(*TRUE)
+        assert await process.wait() == 0
+
+    asyncio.run(go())
+    assert "close_fds" not in seen[0]
+
+
+def test_a_start_on_the_loop_without_the_fork_lock_is_left_to_the_child(
+    hygiene: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(spawn, "_FORK_INSTALLED", [False])
+    seen: list[dict[str, Any]] = []
+    real = asyncio.create_subprocess_exec
+
+    async def record(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:  # noqa: ANN401
+        seen.append(dict(kwargs))
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", record)
+
+    async def go() -> None:
+        process = await spawn.subprocess_exec(*TRUE)
+        assert await process.wait() == 0
+
+    asyncio.run(go())
+    assert "close_fds" not in seen[0]
+
+
+def test_a_start_on_the_loop_whose_sweep_did_not_run_is_killed_and_fails(
+    hygiene: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def skip(sweep: object) -> None:
+        del sweep
+
+    monkeypatch.setattr(spawn, "_sweep_inheritable", skip)
+    made: list[asyncio.subprocess.Process] = []
+    real = asyncio.create_subprocess_exec
+
+    async def record(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:  # noqa: ANN401
+        process = await real(*args, **kwargs)
+        made.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", record)
+
+    async def go() -> None:
+        with pytest.raises(OSError, match="sweep did not run"):
+            await spawn.subprocess_exec(
+                sys.executable, "-I", "-c", "import time; time.sleep(60)"
+            )
+
+    asyncio.run(go())
+    assert len(made) == 1 and made[0].returncode is not None
+
+
+def test_a_sweep_that_cannot_list_fails_a_start_on_the_loop_and_makes_no_child(
+    hygiene: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = {"count": 0}
+
+    def listing() -> list[int] | None:
+        calls["count"] += 1
+        return [0, 1, 2] if calls["count"] == 1 else None
+
+    monkeypatch.setattr(spawn, "_open_descriptors", listing)
+
+    async def go() -> None:
+        with pytest.raises(OSError, match="cannot be listed"):
+            await spawn.subprocess_exec(*TRUE)
+
+    asyncio.run(go())
+    assert spawn._fork_slot.__dict__.get("sweep") is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_fork_hook_takes_the_sweep_out_of_the_slot_as_it_uses_it(
+    hygiene: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of round 17, finding 2. Failing before the hook consumed the sweep, when
+    the second fork on the thread ran it again."""
+    ran: list[object] = []
+    monkeypatch.setattr(spawn, "_sweep_inheritable", ran.append)
+
+    def unmark(sweep: object) -> None:
+        del sweep
+
+    monkeypatch.setattr(spawn, "_unmark_inheritable", unmark)
+    sweep = spawn._Sweep(())  # pyright: ignore[reportPrivateUsage]
+    spawn._fork_slot.sweep = sweep  # pyright: ignore[reportPrivateUsage]
+    try:
+        with spawn.forking():
+            assert spawn._fork_slot.sweep is None  # pyright: ignore[reportPrivateUsage]
+        with spawn.forking():
+            pass
+    finally:
+        spawn._fork_slot.sweep = None  # pyright: ignore[reportPrivateUsage]
+    assert ran == [sweep], "the sweep ran for one fork and not for the next"
+
+
+def test_a_plain_start_beside_a_start_on_the_loop_does_not_run_its_sweep(
+    hygiene: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case the review observed, two starts on one loop thread, the first of which
+    passes a descriptor. The sweep is for the first start's fork alone."""
+    read, write = os.pipe()
+    ran: list[object] = []
+    real = spawn._sweep_inheritable  # pyright: ignore[reportPrivateUsage]
+
+    def count(sweep: spawn._Sweep) -> None:  # pyright: ignore[reportPrivateUsage]
+        ran.append(sweep)
+        real(sweep)
+
+    monkeypatch.setattr(spawn, "_sweep_inheritable", count)
+
+    async def go() -> None:
+        first = asyncio.ensure_future(spawn.subprocess_exec(*TRUE, pass_fds=(write,)))
+        second = asyncio.ensure_future(asyncio.create_subprocess_exec(*TRUE))
+        for process in await asyncio.gather(first, second):
+            assert await process.wait() == 0
+
+    try:
+        asyncio.run(go())
+    finally:
+        os.close(read)
+        os.close(write)
+    assert len(ran) == 1, "only the start that asked for a sweep ran one"
+
+
+def test_the_wait_for_the_stall_sample_thread_covers_the_worst_case_with_a_margin() -> (
+    None
+):
+    """Review of round 17. The fixture waits for the thread that samples a stalled
+    start, so its wait is derived from the thread's own bounds. Two children, each
+    taking the sampler's wait, the join slack and a log wait, and a last log wait."""
+    worst = (
+        spawn.MAX_SAMPLED
+        * (
+            spawn.SAMPLE_WAIT_SECONDS
+            + spawn.SAMPLE_JOIN_SLACK_SECONDS
+            + spawn.SAMPLE_LOG_WAIT_SECONDS
+        )
+        + spawn.SAMPLE_LOG_WAIT_SECONDS
+    )
+    assert worst + spawn.STALL_SAMPLE_SLACK_SECONDS <= spawn.STALL_SAMPLE_WAIT_SECONDS
+    assert spawn.STALL_SAMPLE_SLACK_SECONDS >= 5.0
