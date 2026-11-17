@@ -550,6 +550,65 @@ def test_a_clean_join_keeps_the_summary(project: Path) -> None:
         assert "alpha" not in log.state.disclosure_checks
 
 
+@pytest.mark.parametrize("reason", ["tail", "summary", "both", "spent"])
+def test_a_term_spanning_the_join_of_the_note_and_a_withheld_notice_is_withheld(
+    project: Path, reason: str
+) -> None:
+    """Round 17, item 3, which round 16 left as a residual. The notice of what was
+    withheld is joined to the note, and a listed term can span that join while neither
+    part holds it. The joined text is screened last, and the note is then dropped for
+    a notice that names no run, so the record holds no term. The term is derived from
+    the notice the code in question builds, so the test fails if the join changes."""
+    notices = {
+        "tail": runs.TAIL_WITHHELD,
+        "summary": runs.SUMMARY_WITHHELD,
+        "both": runs.OUTPUT_WITHHELD,
+        "spent": runs.OUTPUT_WITHHELD_SPENT,
+    }
+    note = "exited with code 1"
+    joined = runs.note_withheld(note, notices[reason])
+    # A term across the join, starting in the note and ending in the notice.
+    term = joined[len(note) - 6 : len(note) + 12].casefold()
+    assert term.count(". ") == 1
+    finding = runs.Finding(
+        "r-1",
+        RunStatus.EXITED,
+        1,
+        note,
+        None,
+        None,
+        "codename" if reason in {"summary", "both"} else "1 failed",
+        "codename" if reason in {"tail", "both"} else None,
+    )
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        (project / "terms").write_text(f"{term}\ncodename\n")
+        scheduler.set_disclosure_terms(load_terms(project / "terms"))
+        if reason == "spent":
+            for _ in range(MAX_DISCLOSURE_CHECKS):
+                assert scheduler.check_disclosure("alpha", "codename", None).matched
+        # Premise, derived and not assumed: neither part holds the term alone.
+        assert scheduler.discloses(joined)
+        assert not scheduler.discloses(note)
+        assert not scheduler.discloses(notices[reason])
+        text, tail = screened(scheduler, finding)
+        assert not scheduler.discloses(text)
+        assert tail is None or not scheduler.discloses(tail)
+        assert runs.NOTE_WITHHELD in text
+        assert note not in text
+
+
+def test_a_note_that_holds_no_term_is_recorded_as_it_was(project: Path) -> None:
+    finding = runs.Finding(
+        "r-1", RunStatus.EXITED, 1, "exited with code 1", None, None, None, "boom"
+    )
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        listed(scheduler, project)
+        text, tail = screened(scheduler, finding)
+        assert (text, tail) == ("exited with code 1", "boom")
+
+
 # Round 16, item 3. One authoritative receipt, sent once, naming what ran.
 
 

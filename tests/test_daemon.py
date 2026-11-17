@@ -224,6 +224,30 @@ def test_daemon_run_finally_joins_a_process_worker_with_a_running_call(
     assert "dromond: stopped" in capsys.readouterr().err
 
 
+def test_a_start_prints_the_warnings_of_the_project_file(
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Round 17, items 6 and 7. A file that loads but whose line every turn would
+    refuse is said so at the start, not only by ``dromon config``."""
+
+    async def fake_serve(daemon: Daemon) -> None:
+        del daemon
+
+    paths.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (paths.state_dir / "dromon.toml").write_text(
+        "version = 1\n[lines.beta]\nmodel = 'claude-haiku-5-5'\n"
+        "workdir_access = 'read'\nbuiltin_tools = ['Read']\n"
+        "[lines.beta.mcp_servers.game]\ntype = 'stdio'\ncommand = '/bin/true'\n"
+    )
+    monkeypatch.setattr(daemon_module, "serve", fake_serve)
+    monkeypatch.setattr(daemon_module, "environment_reading_works", lambda: False)
+    assert daemon_module.run(paths) == exits.OK
+    err = capsys.readouterr().err
+    assert "dromond: warning: line beta has workdir_access read" in err
+
+
 def test_a_start_makes_every_private_directory_and_refuses_naming_each_wide_one(
     paths: ProjectPaths, capsys: pytest.CaptureFixture[str]
 ) -> None:

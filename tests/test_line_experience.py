@@ -1221,6 +1221,26 @@ def test_passes_count_against_their_own_larger_limit(
     assert f"{MAX_DISCLOSURE_PASSES} of {MAX_DISCLOSURE_PASSES} passing" in text
 
 
+def test_a_full_list_of_files_is_one_check_and_is_remembered_whole(
+    world: World, tmp_path: Path
+) -> None:
+    """Round 17, item 5. The longest list is one check, every file of it is
+    remembered as passed, and the same list again is answered from memory, so
+    a round that changes many files costs one check and not one for each eight."""
+    listed(world, tmp_path)
+    names = [f"file-{n}.md" for n in range(scheduler_module.MAX_CHECKED_PATHS)]
+    for name in names:
+        (world.root / name).write_text(f"clean {name}\n")
+    text, error = world.call("check_disclosure", {"paths": names})
+    assert not error and text.startswith("pass"), text
+    assert len(checks(world)) == 1
+    again, error = world.call("check_disclosure", {"paths": names})
+    assert not error and again.startswith("pass")
+    assert len(checks(world)) == 1
+    remembered = world.scheduler._clean_memory("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert {path for path, _ in remembered} >= set(names)
+
+
 def test_the_bytes_checked_an_hour_are_bounded(
     world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1495,6 +1515,7 @@ def test_check_disclosure_refuses_without_a_list_or_one_input(
     text, error = world.call("check_disclosure", {"paths": too_many})
     assert error and f"between 1 and {scheduler_module.MAX_CHECKED_PATHS}" in text
     assert len(checks(world)) == 1
+    assert scheduler_module.MAX_CHECKED_PATHS == scheduler_module.MAX_CLEAN_CHECKED
     text, error = world.call("check_disclosure", {"paths": []})
     assert error and "between 1 and" in text
     text, error = world.call("check_disclosure", {"paths": "one.md"})

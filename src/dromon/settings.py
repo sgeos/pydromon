@@ -40,6 +40,7 @@ unchanged. Hook order is significant to a reader and is kept, while rule arrays 
 sorted, as in ``dromon.sandbox``.
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -379,8 +380,50 @@ FILE_TOOLS: Final = frozenset(
 FILE_RULE: Final = re.compile(r"([A-Za-z]+)\((.*)\)", re.DOTALL)
 
 
+GLOB_CHARACTERS: Final = frozenset("*?[")
+"""The characters that make a path segment a pattern, as Claude Code reads one."""
+
+
+def _directories(base: str) -> list[str]:
+    """The names of the directories directly under ``base``, sorted, or none when it
+    cannot be listed. One level only, so the cost is bounded by that directory."""
+    try:
+        with os.scandir(base) as entries:
+            return sorted(entry.name for entry in entries if entry.is_dir())
+    except OSError:
+        return []
+
+
+def _names_matching(base: str, first: str) -> list[str]:
+    """The directories of ``base`` that the first segment ``first`` of a rule names,
+    which is itself when it is a plain name and the ones it matches when it is a
+    pattern. A segment with ``**`` names none, since it is how a project writes a
+    rule over everything it holds."""
+    if "**" in first:
+        return []
+    if not GLOB_CHARACTERS & set(first):
+        return [first] if os.path.isdir(os.path.join(base, first)) else []
+    return [name for name in _directories(base) if fnmatch.fnmatchcase(name, first)]
+
+
+def _project_holds(project: str, first: str, rest: str) -> bool:
+    """Whether the rule, read as relative to ``project``, can name something there.
+    A plain first segment needs the directory. A pattern needs a directory it
+    matches, and when what follows is also a plain path, that path under one of them,
+    so that ``/*/notes.md`` is not taken for a project rule unless some directory has
+    the file."""
+    names = _names_matching(project, first)
+    if not names:
+        return False
+    if not rest or GLOB_CHARACTERS & set(rest) or not GLOB_CHARACTERS & set(first):
+        return True
+    return any(os.path.exists(os.path.join(project, name, rest)) for name in names)
+
+
 def single_slash_rules(
-    document: Mapping[str, object], root: str = "/"
+    document: Mapping[str, object],
+    root: str = "/",
+    projects: Sequence[str] = (),
 ) -> list[tuple[str, str, str]]:
     """The rules of ``document`` that name a path as if it were absolute but begin
     with one slash, as ``(list, rule, corrected)`` in the order of the document.
@@ -391,13 +434,27 @@ def single_slash_rules(
     nothing says so, which for a ``deny`` rule leaves the file unprotected.
 
     **Which rules.** Only the tools that name files, and only a path whose first
-    segment is a directory of ``root``, the filesystem's own, which is the sign of an
-    absolute path written with one slash. A path such as ``/src/**`` that is relative
-    to the project on purpose names no directory of ``root`` and is not reported.
-    **Residual.** A project that has a directory by the name of one at the filesystem
-    root, such as ``/tmp``, and means its own, is reported wrongly, which the warning's
-    wording allows for. A rule on a machine whose root differs from the one the
-    settings will run on is judged by this machine's. The check never refuses."""
+    segment names a directory of ``root``, the filesystem's own, which is the sign of
+    an absolute path written with one slash. A path such as ``/src/**`` that is
+    relative to the project on purpose names no directory of ``root`` and is not
+    reported.
+
+    **Round 17, item 6, both confirmed by a test before the change.** A first segment
+    that is a pattern, as in ``Read(/*/secret)``, named no directory and was missed.
+    It now names the directories of ``root`` it matches, and is reported when it
+    matches one. A first segment with ``**`` is never reported, since it is how a
+    project writes a rule over everything it holds. And a project that has a directory
+    by the name of one at the root, which ``/tmp/**`` then plausibly means, was warned
+    wrongly. ``projects`` are the directories the rule may be relative to, the
+    project's and a line's working directory, and a rule that one of them can satisfy,
+    as ``_project_holds`` says, is not reported.
+
+    **Residual.** The two readings cannot be told apart where the project and the
+    root both hold the name, so such a rule is left unreported, and a deny rule of
+    that kind protects nothing of the root. A rule on a machine whose root differs
+    from the one the settings run on is judged by this machine's. A rule with a
+    pattern in its first segment that a project directory also matches, with the file
+    after it present there, is taken for the project's. The check never refuses."""
     found: list[tuple[str, str, str]] = []
     permissions = document.get("permissions", {})
     if not isinstance(permissions, dict):
@@ -416,9 +473,12 @@ def single_slash_rules(
             specifier = match.group(2)
             if not specifier.startswith("/") or specifier.startswith("//"):
                 continue
-            first = specifier[1:].split("/", 1)[0]
-            if first and os.path.isdir(os.path.join(root, first)):
-                found.append((name, rule, f"{match.group(1)}(/{specifier})"))
+            first, _, rest = specifier[1:].partition("/")
+            if not first or not _names_matching(root, first):
+                continue
+            if any(_project_holds(project, first, rest) for project in projects):
+                continue
+            found.append((name, rule, f"{match.group(1)}(/{specifier})"))
     return found
 
 

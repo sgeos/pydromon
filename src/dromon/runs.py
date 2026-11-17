@@ -389,6 +389,18 @@ R1.** Whether a tail was withheld says whether the output held a term, which is 
 answer the check limits, so a line that has spent them learns nothing from it."""
 
 
+NOTE_WITHHELD: Final = (
+    "The note of this run's end is withheld from this record, since its text held a"
+    " term from the project's disclosure list. The output file is unchanged"
+)
+"""What a run's end says in place of its note when the note, joined to the notice of
+what was withheld or to the clean summary, holds a listed term that neither held
+alone. **Round 17, item 3.** Round 16 screened the join with the summary and left the
+join with a notice as a residual. The note is the daemon's own words and an exit
+code, so the term cannot be chosen by the run's output, and the replacement counts
+as no failing check."""
+
+
 def note_withheld(note: str, reason: str) -> str:
     """The run's note with the reason its summary and tail are withheld after it."""
     lead = f"{note}. " if note else ""

@@ -230,6 +230,8 @@ COVERED: Final[dict[type, tuple[str, ...]]] = {
     model.RunEnded: ("note", "output_tail"),
     model.CommitRunRefused: ("reason",),
     model.RunStarted: ("argv",),
+    model.RunQueued: ("reason",),
+    model.RunDequeued: ("reason",),
 }
 """The events with free text, and the fields of each that are scrubbed. **Round 15,
 review of 3344ca6.** ``RunStarted.argv`` is added. It is the project file's argument
@@ -248,6 +250,16 @@ Fields with text that are deliberately **not** scrubbed.
   written, as ``dromon.sealed`` says. A credential written into another place, such as
   the instructions, is recorded as written, and the operator is told so.
 - ``PeerDeclared.policy`` is written by the federation module and never holds a token.
+- ``RunQueued.arguments`` are the values a line gave for a declared command's
+  parameters, each checked against that parameter's declared pattern, and read again
+  from the event to start the run, so a mask would change what runs, as it would in a
+  configuration. **Review of 883c00f, finding 2.** Instead of masking, the scheduler
+  refuses to queue a start whose value ``scrub_text`` would change, and says why, so a
+  credential-shaped value, or a literal secret value of the project, never reaches the
+  log through a queued run. The run's own ``argv`` is scrubbed when it starts.
+  ``RunQueued.reason`` and ``RunDequeued.reason`` are scrubbed as the other reasons are.
+  **Residual.** A credential that neither the patterns nor the literal values know is
+  recorded, as it is in any text the daemon cannot recognise.
 - ``RunStarted.command``, ``CommitRunRefused.command`` and ``LeaseReleased.name`` are
   names the project file declares, checked as identifiers, not free text.
 """
