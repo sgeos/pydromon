@@ -12284,7 +12284,14 @@ class Scheduler:
         """Wait until nothing is in flight and no tick would start a turn. For tests."""
         # Bounded by the turn caps: each pass ends a turn, moves mail, or returns.
         while True:
-            await asyncio.sleep(0)
+            running = tuple(self._running.values())
+            if running:
+                # Waiting does not cancel turns if this test helper is cancelled.
+                await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+            else:
+                # Give queued ticks and external workers time to progress without
+                # continuously copying the state while a turn has yet to start.
+                await asyncio.sleep(0.001)
             if not self._work_waiting():
                 await asyncio.sleep(0)
                 if not self._work_waiting():
