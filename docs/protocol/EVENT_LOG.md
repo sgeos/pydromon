@@ -931,3 +931,10 @@ separate engine evidence files are unchanged.
 Rollback hazard. Older daemons refuse events carrying `closing_reason`. The floor
 table above records the first compatible commit and its pending main floor. Ports
 must preserve the character bound and screening order.
+
+State change discovery slices `os.scandir` directly and closes the scanner after
+reading, including on overflow or a read error. It does not use `Path.iterdir`, which
+can allocate the full directory before yielding on supported Python versions.
+Non-filesystem package resources make snapshots unusable because their enumeration
+bounds are unknown. The entry limits are unchanged. The event log remains usable
+through full replay in that case.

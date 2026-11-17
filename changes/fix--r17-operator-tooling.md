@@ -42,3 +42,10 @@ Type: Fixed
   checkout, so `GIT_WORK_TREE` cannot redirect the scan to a decoy. State change
   discovery bounds directory consumption before sorting and bounds ignored warning
   names, refusing snapshots if either limit is exceeded.
+- Round 17 follow-up. State change discovery bounds the filesystem scanner itself
+  and closes it after reading. Python versions whose `Path.iterdir` first lists the
+  whole directory no longer allocate that list. Non-filesystem package resources
+  refuse snapshots and retain full event log replay.
+- Round 17 macOS follow-up. The gate guards possibly empty array arguments under
+  unset-variable checking for Bash 3.2. Its script tests select `/bin/bash` when
+  available, so the platform shell exercises disclosure acceptance cases locally.

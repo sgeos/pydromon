@@ -329,3 +329,10 @@ at disclosure lookup allows the initial directory selection to follow a decoy.
 This protects checkout selection from those environment variables. It assumes the
 Git executable and the checkout metadata are trusted, subject to the worktree
 back-pointer checks in the gate.
+
+The repository gate supports the platform Bash, including version 3.2 on macOS.
+With unset-variable checking enabled, Bash 3.2 treats an empty array expansion as
+an unset variable. Array arguments therefore use guarded expansion so an empty
+list supplies zero arguments. Gate tests select `/bin/bash` when it exists and
+otherwise use Bash from the executable search path. An alternate shell selected
+by the environment is not evidence that the platform shell works.

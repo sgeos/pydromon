@@ -26,6 +26,9 @@ set -euo pipefail
 # GIT_WORK_TREE can redirect cd before the disclosure lookup clears its environment.
 unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE
 
+# Bash 3.2 treats an empty array as unset under -u. Guard array argument
+# expansions so an empty array supplies zero arguments on every supported shell.
+
 hygiene_only=false
 if [[ "${1:-}" == "--hygiene-only" ]]; then
     [[ $# -eq 1 ]] || { printf 'usage: %s --hygiene-only, alone\n' "$0" >&2; exit 2; }
@@ -223,7 +226,7 @@ done < <(printf '%s\n' "$shell_list")
 if ((${#shell_files[@]} > 0)); then
     command -v shellcheck >/dev/null ||
         fail "shellcheck is not installed, so ${#shell_files[@]} shell files went unchecked"
-    shellcheck -- "${shell_files[@]}" || fail "shellcheck reported problems, listed above"
+    shellcheck -- ${shell_files[@]+"${shell_files[@]}"} || fail "shellcheck reported problems, listed above"
 fi
 pass "shellcheck is clean on ${#shell_files[@]} shell files"
 
@@ -349,7 +352,7 @@ elif [[ "$terms_state" == ok ]]; then
         patterns+=(-e "$term")
     done < "$terms_file"
     if ((${#patterns[@]} > 0)); then
-        hits="$(git grep -n -I -i -F "${patterns[@]}" -- . || true)"
+        hits="$(git grep -n -I -i -F ${patterns[@]+"${patterns[@]}"} -- . || true)"
         # Operator hashes exempt only the configured file and exact line.
         hits="$(printf '%s\n' "$hits" | DISCLOSURE_CONFIG="$config_file" python3 -I -c '
 import hashlib
@@ -412,7 +415,7 @@ for hit in sys.stdin:
                 hit_text="${hit_rest#*:}"
                 hit_key="$hit_path:$hit_number:$hit_text"
                 is_accepted=false
-                for accepted_pair in "${accepted_pairs[@]}"; do
+                for accepted_pair in ${accepted_pairs[@]+"${accepted_pairs[@]}"}; do
                     if [[ "$hit_key" == "$accepted_pair" ]]; then
                         is_accepted=true
                         ((accepted_hits += 1))
@@ -423,7 +426,7 @@ for hit in sys.stdin:
                     remaining_hits+=("$hit_path:$hit_number")
             done <<< "$hits"
             if ((${#remaining_hits[@]} > 0)); then
-                printf '%s\n' "${remaining_hits[@]}" >&2
+                printf '%s\n' ${remaining_hits[@]+"${remaining_hits[@]}"} >&2
                 fail "tracked files contain terms from $terms_file, at the lines listed above"
             fi
             pass "disclosure scan skipped $accepted_hits accepted path and line match(es) from $accepted_file"

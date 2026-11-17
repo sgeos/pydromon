@@ -29,11 +29,13 @@ reached by the history either, so a change to one is not caught here."""
 
 import enum
 import hashlib
+import os
 import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -266,8 +268,27 @@ class Directory:
         return self.entries
 
 
+def read_directory(directory: Directory) -> statesnapshot.StateChanges:
+    closed = False
+
+    @contextmanager
+    def scanner(path: Path) -> Generator[Iterator[Entry]]:
+        nonlocal closed
+        del path
+        try:
+            yield iter(directory.iterdir())
+        finally:
+            closed = True
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(statesnapshot.os, "scandir", scanner)
+        found = statesnapshot.read_state_changes(Path("fixture"))
+    assert closed
+    return found
+
+
 def read(*entries: Entry) -> statesnapshot.StateChanges:
-    return statesnapshot.read_state_changes(Directory(*entries))  # pyright: ignore[reportArgumentType]
+    return read_directory(Directory(*entries))
 
 
 def test_the_state_changes_are_read_sorted_without_the_readme() -> None:
@@ -319,7 +340,7 @@ class Unreadable:
 
 
 def test_a_directory_that_cannot_be_read_is_a_problem() -> None:
-    found = statesnapshot.read_state_changes(Unreadable())  # pyright: ignore[reportArgumentType]
+    found = read_directory(Unreadable())  # pyright: ignore[reportArgumentType]
     assert found.problem is not None and "Permission denied" in found.problem
 
 
@@ -477,7 +498,7 @@ def test_directory_consumption_is_bounded_before_sorting(name: str) -> None:
                 yield Entry(name)
 
     directory = LargeDirectory()
-    found = statesnapshot.read_state_changes(directory)  # pyright: ignore[reportArgumentType]
+    found = read_directory(directory)  # pyright: ignore[reportArgumentType]
     assert directory.consumed == statesnapshot.MAX_STATE_CHANGE_ENTRIES + 1
     assert found.names == () and found.ignored == ()
     assert found.problem == (
@@ -513,6 +534,53 @@ def test_an_iterator_read_error_refuses_a_partial_set() -> None:
             yield Entry("base.txt")
             raise PermissionError("directory iteration refused")
 
-    found = statesnapshot.read_state_changes(InterruptedDirectory())  # pyright: ignore[reportArgumentType]
+    found = read_directory(InterruptedDirectory())  # pyright: ignore[reportArgumentType]
     assert found.names == () and found.ignored == ()
     assert found.problem is not None and "directory iteration refused" in found.problem
+
+
+@pytest.mark.parametrize("count", [4096, 4097, 10000])
+def test_real_directory_scan_consumption_and_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
+    # Hidden files count toward the directory bound without exhausting warning or
+    # valid-name limits first. A base file makes the inclusive boundary usable.
+    (tmp_path / "base.txt").touch()
+    for number in range(count - 1):
+        (tmp_path / f".hidden-{number}").touch()
+    original = os.scandir
+    consumed = 0
+    closed = False
+
+    @contextmanager
+    def counted(path: Path) -> Generator[Iterator[os.DirEntry[str]]]:
+        nonlocal closed
+        with original(path) as scanner:
+
+            def entries() -> Iterator[os.DirEntry[str]]:
+                nonlocal consumed
+                for entry in scanner:
+                    consumed += 1
+                    yield entry
+
+            try:
+                yield entries()
+            finally:
+                closed = True
+
+    monkeypatch.setattr(statesnapshot.os, "scandir", counted)
+    found = statesnapshot.read_state_changes(tmp_path)
+    assert closed
+    assert consumed == min(count, statesnapshot.MAX_STATE_CHANGE_ENTRIES + 1)
+    if count <= statesnapshot.MAX_STATE_CHANGE_ENTRIES:
+        assert found == statesnapshot.StateChanges(("base",), (), None)
+    else:
+        assert found.names == () and found.ignored == ()
+        assert found.problem is not None and "directory entries" in found.problem
+
+
+def test_non_filesystem_resources_refuse_snapshots() -> None:
+    found = statesnapshot.read_state_changes(Directory())  # pyright: ignore[reportArgumentType]
+    assert found == statesnapshot.StateChanges(
+        (), (), "state changes require a filesystem directory"
+    )

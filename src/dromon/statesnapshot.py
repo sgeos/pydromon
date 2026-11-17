@@ -105,12 +105,19 @@ def read_state_changes(directory: Traversable) -> StateChanges:
     # Directory overflow refuses the set rather than hashing an arbitrary prefix.
     # Warning overflow also refuses it, retaining only a bounded sorted prefix.
     # Entry counts do not bound name bytes or the latency of filesystem calls.
+    # Other resource loaders may eagerly enumerate or extract a whole archive.
+    # Refuse snapshots for them rather than claim a bound we cannot enforce.
+    if not isinstance(directory, Path):
+        return StateChanges((), (), "state changes require a filesystem directory")
     names: list[str] = []
     ignored: list[str] = []
     try:
         # Bound consumption before sorting, including entries later ignored. The extra
         # entry detects overflow without exhausting an arbitrarily large iterator.
-        entries = list(islice(directory.iterdir(), MAX_STATE_CHANGE_ENTRIES + 1))
+        # Path.iterdir eagerly lists scandir on some supported Python versions.
+        # Slice the scanner itself and close it on success, overflow and failure.
+        with os.scandir(directory) as scanner:
+            entries = list(islice(scanner, MAX_STATE_CHANGE_ENTRIES + 1))
         if len(entries) > MAX_STATE_CHANGE_ENTRIES:
             return StateChanges(
                 (),

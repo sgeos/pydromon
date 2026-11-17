@@ -17,9 +17,15 @@ def executable(name: str) -> str:
     return found
 
 
+def bash() -> str:
+    """Exercise the platform shell, including Bash 3.2 on macOS."""
+    system_bash = Path("/bin/bash")
+    return str(system_bash) if system_bash.is_file() else executable("bash")
+
+
 def check_project(root: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(  # noqa: S603
-        [executable("bash"), "scripts/check.sh", "--hygiene-only"],
+        [bash(), "scripts/check.sh", "--hygiene-only"],
         cwd=root,
         capture_output=True,
         text=True,
@@ -182,7 +188,7 @@ def check_with(
     root: Path, environment: dict[str, str]
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(  # noqa: S603
-        [executable("bash"), "scripts/check.sh", "--hygiene-only"],
+        [bash(), "scripts/check.sh", "--hygiene-only"],
         cwd=root,
         capture_output=True,
         text=True,
