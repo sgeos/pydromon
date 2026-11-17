@@ -154,7 +154,7 @@ from dromon.overrides import decode as decode_override
 from dromon.overrides import encode as encode_override_document
 from dromon.overrides import encode as encode_override
 from dromon.driver import ENGINE_OF, MODELS, Driver, DriverError, Strategy
-from dromon import priority, readiness, restart
+from dromon import mcpstates, priority, readiness, restart
 from dromon.priority import PriorityLimiter, PriorityRefused, peer_key
 from dromon.federation import NO_FEDERATION, SCOPE_LOCAL, FederationConfig
 from dromon.forwarder import PeerReport, check_outbound, outage_text
@@ -2295,7 +2295,11 @@ def engine_factory(
                         ),
                     ]
                 )
-        sandbox = effective(merged, workdir, protected_now, guarded)
+        # Round 17, review of 0db077c, finding 1. The project's secret directories are
+        # denied to Claude Code lines as they have been to Codex and Grok lines since
+        # round 9, in the sandbox for the shell and in the settings for the file tools.
+        # A layer that grants one of them back is refused, as for any protected path.
+        sandbox = effective(merged, workdir, engine_protected, guarded)
         if enabled and git_ssh is not None and sandbox is not None:
             denied = unreadable(git_ssh, sandbox)
             if denied is not None:
@@ -2332,7 +2336,7 @@ def engine_factory(
             session_id=spec.session_id,
             sandbox=sandbox,
             settings=engine_settings.effective(
-                settings, protected_now, write_protected
+                settings, engine_protected, write_protected
             ),
             observe=spec.observe,
             mark=spec.mark,
@@ -2666,6 +2670,9 @@ class Scheduler:
         operator releases the line. Held in memory, since a held line starts no turn
         and a restart ends the turn that spent it."""
         self._turn_costs: dict[str, deque[dict[str, object]]] = {}
+        self._engine_reports: dict[str, mcpstates.EngineReport] = {}
+        """Each line's latest engine report of its MCP servers and tools. **Round 17,
+        item 7.** In memory, so ``unknown`` after a restart until the line runs."""
         self._counting: dict[str, bool] = {}
         """Whether each line's turn in flight counts as autonomous."""
         """The estimated cost of each line's last ``RECENT_TURN_COSTS`` turns."""
@@ -7375,6 +7382,18 @@ class Scheduler:
             ),
         }
 
+    def mcp_server_states(self, line_id: str) -> list[dict[str, str]]:
+        """Each MCP server of the line as configured, connected and callable, as
+        ``mcpstates.server_states`` gives them from the configuration and the line's
+        latest engine report. **Round 17, item 7.** Reads nothing new and calls
+        nothing. It is given where the servers were already reported, the operator's
+        settings view, and not in the line's own ``line_status``, which never names a
+        line's servers, as a test there holds."""
+        return mcpstates.server_states(
+            self.effective_config(line_id).server_names(),
+            self._engine_reports.get(line_id),
+        )
+
     def _turn_posture(self, line_id: str, report: TurnReport) -> dict[str, object]:
         """What a turn ran with, for its ``recent_turns`` entry. Row 8."""
         engine = ENGINE_OF[self.model_of(line_id)]
@@ -12083,6 +12102,10 @@ class Scheduler:
             case TurnCause.AUTONOMOUS:
                 turns = used + int(count_autonomous)
         self._autonomous[line_id] = turns
+        if report is not None and report.capabilities is not None:
+            self._engine_reports[line_id] = mcpstates.EngineReport(
+                report.capabilities.mcp_servers, report.capabilities.tools
+            )
         if report is not None:
             costs = self._turn_costs.setdefault(
                 line_id, deque(maxlen=RECENT_TURN_COSTS)
@@ -15387,29 +15410,41 @@ def _age_of(observed_at: str, now: datetime) -> tuple[int | str, str]:
     """How long before ``now`` the instant ``observed_at`` was, in whole seconds
     and in words, or ``unknown`` for both when it cannot be read. **Round 16, item
     6.** An instant after ``now``, as when the daemon's clock was set back, is not
-    given as an age of zero, which would read as fresh, and says so instead."""
+    given as an age of zero, which would read as fresh, and says so instead.
+
+    **Round 17, item 4.** That instant gave its negative difference as
+    ``age_seconds`` beside words saying the age was unknown, so the number and the
+    words disagreed, and a reader that compared the number with a bound read a figure
+    from the future as the freshest of all. ``age_seconds`` is now ``unknown`` there,
+    as the words say, and the words give how far ahead the instant is."""
     try:
         observed = parse_due(observed_at)
     except InvalidField:
         return UNKNOWN, UNKNOWN
     seconds = int((now - observed).total_seconds())
     if seconds < 0:
-        return (
-            seconds,
-            "observed after the daemon's current time, so its age is unknown",
+        ahead = _span_words(-seconds)
+        return UNKNOWN, (
+            f"observed {ahead if ahead else 'less than a minute'} after the"
+            " daemon's current time, as when its clock was set back, so its age is"
+            " unknown"
         )
+    span = _span_words(seconds)
+    return seconds, (
+        "observed less than a minute ago" if not span else f"observed {span} ago"
+    )
+
+
+def _span_words(seconds: int) -> str:
+    """``seconds``, at least 0, in days, hours and minutes, such as ``2 hours 5
+    minutes``, or empty below a minute."""
     days, rest = divmod(seconds, 86400)
     hours, rest = divmod(rest, 3600)
     minutes = rest // 60
-    parts = [
+    return " ".join(
         f"{count} {unit}{'' if count == 1 else 's'}"
         for count, unit in ((days, "day"), (hours, "hour"), (minutes, "minute"))
         if count
-    ]
-    return seconds, (
-        "observed less than a minute ago"
-        if not parts
-        else f"observed {' '.join(parts)} ago"
     )
 
 

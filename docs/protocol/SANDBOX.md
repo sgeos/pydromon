@@ -205,6 +205,21 @@ project settings.
    refused, after `~` expansion and symbolic link resolution. `dromond` checks the
    project file's documents before it starts, and a line whose document fails the check
    at its first turn has that turn end before any command runs.
+   **Round 17, review of 0db077c, finding 1, decided by the operator.** The project's
+   `secret` directories, at the project root and in the line's working directory, are
+   protected in the same way for every Claude Code line, by real path, where they
+   exist when the line's engine is built. Codex and Grok lines have had them since
+   round 9. So the disclosure list under `secret/` is closed to every line, and the
+   gate a line runs in its own sandbox skips the disclosure scan with its reason,
+   while `full-gate`, which runs outside every sandbox, scans. **Where a line's own
+   documents could remove it.** A sandbox document's `allowRead` or `allowWrite`
+   entry inside one of them is refused as above, at `dromond`'s start for the project
+   file and at the line's build for an override. A settings `allow` rule does not
+   reopen it, since Claude Code applies a `deny` rule first. A document that leaves the
+   sandbox disabled removes the shell's denial, as for every protected directory,
+   while the file tools stay denied by the settings. **Residuals.** A directory made
+   after the build is denied from the line's next build. A line whose sandbox is
+   disabled can read them with its shell.
 4. **Git hooks and configuration.** When the line's working directory lies in a git
    checkout, an enabled sandbox also denies writes to the hooks and configuration git
    would act on there, whether or not any layer grants the git directory. A command
@@ -307,3 +322,17 @@ succeeded and the one that wrote in the home directory was refused.
   [`CODEX.md`](CODEX.md) and [`GROK.md`](GROK.md) specify.
 - Linux and WSL2 behaviour is specified by Claude Code and has not been verified live
   by this line. Continuous integration runs the unit tests on Linux.
+
+The repository gate clears `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE` before
+its first Git call and before selecting its working directory. Clearing them only
+at disclosure lookup allows the initial directory selection to follow a decoy.
+This protects checkout selection from those environment variables. It assumes the
+Git executable and the checkout metadata are trusted, subject to the worktree
+back-pointer checks in the gate.
+
+The repository gate supports the platform Bash, including version 3.2 on macOS.
+With unset-variable checking enabled, Bash 3.2 treats an empty array expansion as
+an unset variable. Array arguments therefore use guarded expansion so an empty
+list supplies zero arguments. Gate tests select `/bin/bash` when it exists and
+otherwise use Bash from the executable search path. An alternate shell selected
+by the environment is not evidence that the platform shell works.
