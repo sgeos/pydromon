@@ -2628,8 +2628,11 @@ def test_a_sampler_that_does_not_end_is_killed_and_reported(tmp_path: Path) -> N
     marker = tmp_path / "started"
     program.write_text(f"#!/bin/sh\necho $$ > {marker}\nexec sleep 60\n")
     program.chmod(0o755)
+    started = time.monotonic()
     text = spawn._run_sampler(7, str(program), 0.5)  # pyright: ignore[reportPrivateUsage]
+    elapsed = time.monotonic() - started
     assert text == "the sampler did not end in time"
+    assert elapsed < 0.5 + spawn.SAMPLE_JOIN_SLACK_SECONDS + 2.0
     pid = int(marker.read_text())
     deadline = time.monotonic() + 10
     while alive(pid) and time.monotonic() < deadline:

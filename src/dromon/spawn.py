@@ -306,11 +306,16 @@ child that was forked and never ran its program, which is the stuck child of the
 this module records. It was run against a plain child inside an agent's sandbox and
 printed a call graph there."""
 SAMPLE_SECONDS: Final = 1
-"""How long the sampler watches, in seconds, at ``SAMPLE_INTERVAL_MS`` steps."""
+"""How long the sampler watches, in seconds, at ``SAMPLE_INTERVAL_MS`` steps.
+Already shorter than sample's ten-second default. Keep a whole second because its
+manual does not promise fractional durations."""
 SAMPLE_INTERVAL_MS: Final = 10
-SAMPLE_WAIT_SECONDS: Final = 6.0
+SAMPLE_WAIT_SECONDS: Final = 30.0
 """The most a sample waits for the sampler, or for a read of ``/proc``, before it is
-left behind. The wait is on a thread of its own, so the caller never waits past it."""
+left behind. Symbol loading and report generation need time beyond the recording
+interval, particularly on continuous integration runners. A sample may take another
+``SAMPLE_JOIN_SLACK_SECONDS`` to end its worker. Stall sampling runs separately after
+the start has raised ``StartStalled`` and does not extend the start's bound."""
 SAMPLE_JOIN_SLACK_SECONDS: Final = 2.0
 """How long past ``wait`` a sample waits for the thread that runs the sampler, which
 itself kills the sampler at ``wait`` and allows it a second to end."""

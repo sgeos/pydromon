@@ -121,7 +121,7 @@ def private_project() -> Generator[Path]:
     Grok line's profile makes them. A mode of 000 is the closest a test has to a
     sandbox rule, since a test cannot apply one inside the sandbox that runs it."""
     # A short path, since the socket path inside it has a limit of 103 bytes.
-    root = Path(tempfile.mkdtemp(prefix="pj"))
+    root = Path(tempfile.mkdtemp(prefix="pj", dir="/tmp"))
     (root / ".dromon" / "run").mkdir(parents=True)
     (root / "secret").mkdir()
     (root / "secret" / "key").write_text("not for lines", encoding="utf-8")
