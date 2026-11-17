@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from dromon import BRIDGE_LOG_VARIABLE, acp
+from dromon.privatefiles import open_log
 
 INITIALIZE = json.dumps(
     {
@@ -53,7 +54,7 @@ def test_a_server_that_ends_normally_leaves_a_start_and_an_end(tmp_path: Path) -
     result = _python("import dromon", log)
     assert result.returncode == 0, result.stderr
     lines = log.read_text(encoding="utf-8").splitlines()
-    assert lines[0].startswith("dromon bridge started, argv")
+    assert lines[0].startswith("dromon bridge started, pid")
     assert lines[-1].startswith("dromon bridge ended normally, pid")
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
     assert result.stderr == "", "standard error went to the log, not to the engine"
@@ -113,6 +114,95 @@ def test_the_servers_environment_names_the_log_only_where_one_is_given(
         {"name": "DROMON_LINE_TOKEN", "value": "tok"},
         {"name": BRIDGE_LOG_VARIABLE, "value": str(tmp_path / "x.log")},
     ]
+
+
+@pytest.mark.parametrize("alias", ["parent", "hardlink", "fifo"])
+def test_an_aliased_or_nonregular_log_is_refused(tmp_path: Path, alias: str) -> None:
+    directory = tmp_path / "logs"
+    directory.mkdir(mode=0o700)
+    target = tmp_path / "keep"
+    target.write_text("keep", encoding="utf-8")
+    log = directory / "bridge.log"
+    if alias == "parent":
+        directory.rmdir()
+        directory.symlink_to(tmp_path, target_is_directory=True)
+        log = directory / "keep"
+    elif alias == "hardlink":
+        log.hardlink_to(target)
+    else:
+        os.mkfifo(log)
+    result = _python("import dromon; print('served')", log, timeout=5)
+    assert result.returncode == 0 and result.stdout.strip() == "served"
+    assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_existing_log_permissions_are_private_and_missing_directory_is_created(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "logs" / "bridge.log"
+    assert _python("import dromon", log).returncode == 0
+    assert stat.S_IMODE(log.parent.stat().st_mode) == 0o700
+    log.chmod(0o644)
+    assert _python("import dromon", log).returncode == 0
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600
+
+
+def test_bridge_diagnostics_scrub_credentials_and_omit_arguments(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "bridge.log"
+    secret = "bridge-private-test-value"  # noqa: S105, synthetic credential
+    result = _python(
+        "import sys, os\n"
+        f"sys.argv = ['bridge', '{secret}']\n"
+        "import dromon\n"
+        f"os.write(2, b'PASSWORD={secret}\\n')\n"
+        f"print('Bearer {secret}', file=sys.stderr)\n"
+        f"raise RuntimeError('API_KEY={secret}')",
+        log,
+    )
+    assert result.returncode != 0
+    text = log.read_text(encoding="utf-8")
+    assert secret not in text and "argv" not in text
+    assert "RuntimeError" in text and "bridge started" in text
+
+
+def test_a_log_directory_owned_by_another_user_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: owner + 1)
+    with pytest.raises(OSError, match="not owned"):
+        open_log(tmp_path / "bridge.log")
+
+
+def test_credentials_split_between_native_writes_are_scrubbed(tmp_path: Path) -> None:
+    log = tmp_path / "bridge.log"
+    result = _python(
+        "import dromon, os\n"
+        "os.write(2, b'PASSWORD=split-')\n"
+        "os.write(2, b'credential-value\\n')\n"
+        "os.write(2, b'-----BEGIN PRIVATE KEY-----\\n')\n"
+        "os.write(2, b'private-body\\n-----END PRIVATE KEY-----\\n')",
+        log,
+    )
+    assert result.returncode == 0
+    text = log.read_text(encoding="utf-8")
+    assert "split-credential-value" not in text
+    assert "private-body" not in text
+
+
+def test_a_log_worker_that_cannot_start_preserves_stderr(tmp_path: Path) -> None:
+    result = _python(
+        "import dromon, sys, threading\n"
+        "def fail(self):\n    raise RuntimeError('no thread')\n"
+        "threading.Thread.start = fail\n"
+        f"assert not dromon._capture_bridge_log({str(tmp_path / 'log')!r})\n"
+        "print('still served', file=sys.stderr)",
+        None,
+    )
+    assert result.returncode == 0
+    assert result.stderr.strip() == "still served"
 
 
 @pytest.fixture

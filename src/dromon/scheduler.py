@@ -8805,7 +8805,8 @@ class Scheduler:
             description=(
                 "Read where one of your own processes is, by pid, with the operating"
                 " system's sampler on macOS or the process's state and wait on"
-                " Linux. It reads only and takes about a second. Use it on a child"
+                " Linux. Sampling waits at most 32 seconds, plus ownership checks and"
+                " scheduling. It reads only. Use it on a child"
                 " that seems stuck. Any process that is not yours is refused."
             ),
             input_schema=SAMPLE_PROCESS_SCHEMA,

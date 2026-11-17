@@ -61,6 +61,8 @@ import json
 import os
 import shutil
 import stat
+import threading
+import time
 import tomllib
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -72,6 +74,7 @@ from urllib.parse import quote
 
 from claude_agent_sdk import SdkMcpTool
 
+from dromon.privatefiles import open_directory, open_regular
 from dromon import acp, evidence, spawn
 from dromon.model import MAX_SESSION_BYTES
 from dromon.acp import bridge_command as bridge_command
@@ -1566,7 +1569,7 @@ def read_mcp_failure(events: Path, name: str) -> tuple[bool, str | None]:
     ``mcp_config_resolved`` as the start of the record, and never raises. A file that
     is missing, unreadable, or not in the shape described gives ``(False, None)``."""
     try:
-        descriptor = os.open(events, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        descriptor = open_regular(events)
     except OSError:
         return False, None
     try:
@@ -1649,6 +1652,7 @@ class GrokLine:
         self.line_token = line_token
         self._environment = os.environ if environment is None else environment
         self._home = Path.home() if home is None else home
+        self._mcp_events_reader: threading.Thread | None = None
         self._connect = connection_factory
         self._observe = observe
         self.mark = mark
@@ -2627,15 +2631,21 @@ class GrokLine:
     def _bridge_log_path(self) -> Path | None:
         """Where Dromon's tool server for this line writes its standard error and its
         end, in a directory of Grok's home that the line's profile allows it to write.
-        **Round 17, item 1.** One file for each working directory, so that two Grok
-        lines do not truncate each other's. ``None`` where the directory cannot be
-        made, which leaves the server to run without a log."""
+        **Round 17, item 1.** One file for each working directory. Concurrent servers
+        for that directory share this diagnostic file. ``None`` where the directory
+        cannot be made, which leaves the server to run without a log."""
         if not self.bridge or self.line_token is None:
             return None
         directory = self._home / HOME_DIR / BRIDGE_LOG_DIR
         digest = hashlib.sha256(str(self.cwd).encode()).hexdigest()[:16]
         try:
-            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            descriptor = open_directory(directory, create=True)
+            try:
+                if os.fstat(descriptor).st_uid != os.getuid():
+                    return None
+                os.fchmod(descriptor, 0o700)
+            finally:
+                os.close(descriptor)
         except OSError:
             return None
         return directory / f"bridge-{digest}.log"
@@ -2653,21 +2663,39 @@ class GrokLine:
         path = session_events_path(self._home, self.cwd, session_id)
         if path is None:
             return None
-        if not await asyncio.to_thread(path.is_file):
-            # Grok keeps no record of this session, which is the case in every test of
-            # the adapter, so there is nothing to wait for.
+        # One daemon worker per line bounds both metadata and data waits without
+        # leaving an unbounded queue of executor reads. A stuck read cannot be
+        # cancelled in Python and blocks further diagnostic reads for this line.
+        if self._mcp_events_reader is not None and self._mcp_events_reader.is_alive():
             return None
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + MCP_EVENTS_WAIT_SECONDS
-        while True:
-            completed, failure = await asyncio.to_thread(
-                read_mcp_failure, path, acp.MCP_SERVER_NAME
-            )
-            if failure is not None:
-                return failure
-            if completed or loop.time() >= deadline:
+        result: list[str | None] = []
+        finished = threading.Event()
+        deadline = time.monotonic() + MCP_EVENTS_WAIT_SECONDS
+
+        def read() -> None:
+            try:
+                descriptor = open_regular(path)
+                os.close(descriptor)
+                while time.monotonic() < deadline:
+                    completed, failure = read_mcp_failure(path, acp.MCP_SERVER_NAME)
+                    if failure is not None or completed:
+                        result.append(failure)
+                        return
+                    time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            except OSError:
+                pass
+            finally:
+                finished.set()
+
+        reader = threading.Thread(target=read, name="dromon-grok-events", daemon=True)
+        self._mcp_events_reader = reader
+        reader.start()
+        while not finished.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return None
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(min(0.01, remaining))
+        return result[0] if result else None
 
     async def _prompt(self, session_id: str, prompt: str, turn: _Turn) -> str:
         if self._model_replaced:

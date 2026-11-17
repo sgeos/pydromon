@@ -665,6 +665,14 @@ def test_a_line_samples_a_child_the_ledger_holds(
     assert machine.sent == [], "a sample signals nothing"
 
 
+def test_the_sample_tool_states_its_full_sampling_wait(
+    blind: tuple[Scheduler, Machine],
+) -> None:
+    scheduler, _ = blind
+    wait = spawn.SAMPLE_WAIT_SECONDS + spawn.SAMPLE_JOIN_SLACK_SECONDS
+    assert f"{wait:g} seconds" in scheduler.sample_process_tool("alpha").description
+
+
 def test_another_lines_child_and_a_stranger_are_not_sampled(
     blind: tuple[Scheduler, Machine], sampled: list[int]
 ) -> None:

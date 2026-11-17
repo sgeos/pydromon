@@ -4339,6 +4339,81 @@ def _write_events(
     return path
 
 
+@pytest.mark.parametrize("kind", ["parent", "ancestor", "hardlink", "fifo"])
+def test_session_events_refuse_aliases_and_nonregular_files(
+    tmp_path: Path, kind: str
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "events.jsonl"
+    target.write_text(
+        json.dumps(
+            {
+                "type": "mcp_server_failed",
+                "server_name": "dromon",
+                "error_message": "outside marker",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    parent = tmp_path / "sessions" / "session"
+    parent.mkdir(parents=True)
+    path = parent / "events.jsonl"
+    if kind == "parent":
+        parent.rmdir()
+        parent.symlink_to(outside, target_is_directory=True)
+    elif kind == "ancestor":
+        parent.rmdir()
+        parent.parent.rmdir()
+        parent.parent.symlink_to(tmp_path, target_is_directory=True)
+        path = parent.parent / "outside" / "events.jsonl"
+    elif kind == "hardlink":
+        path.hardlink_to(target)
+    else:
+        os.mkfifo(path)
+    assert grok_module.read_mcp_failure(path, "dromon") == (False, None)
+
+
+@pytest.mark.parametrize("operation", ["metadata", "read"])
+def test_session_event_deadline_includes_filesystem_waits(
+    project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    import threading
+    import time
+
+    workspace, home, _ = project
+    _write_events(home, workspace, "s1", FAILED_START)
+    target = line(FakeGrok(), project)
+    release = threading.Event()
+
+    def slow(*args: object, **kwargs: object) -> tuple[bool, None]:
+        release.wait(2)
+        return False, None
+
+    monkeypatch.setattr(grok_module, "MCP_EVENTS_WAIT_SECONDS", 0.02)
+    if operation == "read":
+        monkeypatch.setattr(grok_module, "read_mcp_failure", slow)
+    else:
+        original_open = os.open
+
+        def slow_open(*args: Any, **kwargs: Any) -> int:  # noqa: ANN401
+            release.wait(2)
+            return original_open(*args, **kwargs)
+
+        monkeypatch.setattr(os, "open", slow_open)
+
+    async def go() -> None:
+        started = time.monotonic()
+        try:
+            assert await target._server_failure("s1") is None  # pyright: ignore[reportPrivateUsage]
+            assert time.monotonic() - started < 0.3
+        finally:
+            release.set()
+
+    asyncio.run(go())
+
+
 FAILED_START: Final[list[dict[str, object]]] = [
     {"type": "mcp_config_resolved", "servers": [{"name": "dromon"}]},
     {"type": "mcp_server_starting", "server_name": "dromon"},
