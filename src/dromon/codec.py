@@ -90,8 +90,11 @@ from dromon.model import (
     LeaseCapped,
     LeaseEnd,
     LeaseReleased,
+    QueueEnd,
     RunCleared,
     RunClearance,
+    RunDequeued,
+    RunQueued,
     RunEnded,
     RunStarted,
     RunStatus,
@@ -191,7 +194,13 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
     ),
     "restart_noted": ("line_id", "message_id", "body"),
     "line_cost_marked": ("line_id", "engine_session", "total_micro_usd"),
-    "line_cost_recorded": ("line_id", "cost_micro_usd", "estimated", "between"),
+    "line_cost_recorded": (
+        "line_id",
+        "cost_micro_usd",
+        "estimated",
+        "between",
+        "partial",
+    ),
     "processes_left": ("line_id", "cause", "pids", "commands", "more"),
     "stop_unverified": ("line_id", "note"),
     "walk_limited": ("note",),
@@ -305,6 +314,19 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "reason",
         "refused_at",
     ),
+    "run_queued": (
+        "queue_id",
+        "line_id",
+        "command",
+        "previous",
+        "commit",
+        "arguments",
+        "workdir",
+        "workdir_commit",
+        "queued_at",
+        "reason",
+    ),
+    "run_dequeued": ("queue_id", "outcome", "run_id", "reason", "at"),
     "peer_declared": ("peer_id", "transport", "policy"),
     "peer_removed": ("peer_id",),
     "peer_keyed": ("peer_id", "token_sha256"),
@@ -430,7 +452,7 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "run_ended": ("output_tail",),
     "line_configured": ("sealed",),
     "disclosure_checked": ("checked_bytes",),
-    "line_cost_recorded": ("estimated", "between"),
+    "line_cost_recorded": ("estimated", "between", "partial"),
     "role_declared": ("reviews",),
 }
 """The fields left out of the wire when they are null, which a log written before
@@ -661,6 +683,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "cost_micro_usd": event.cost_micro_usd,
                 "estimated": event.estimated,
                 "between": event.between,
+                "partial": event.partial,
             }
         case ProcessesLeft():
             return "processes_left", {
@@ -860,6 +883,27 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "reason": event.reason,
                 "refused_at": event.refused_at,
             }
+        case RunQueued():
+            return "run_queued", {
+                "queue_id": event.queue_id,
+                "line_id": event.line_id,
+                "command": event.command,
+                "previous": event.previous,
+                "commit": event.commit,
+                "arguments": [f"{name}={value}" for name, value in event.arguments],
+                "workdir": event.workdir,
+                "workdir_commit": event.workdir_commit,
+                "queued_at": event.queued_at,
+                "reason": event.reason,
+            }
+        case RunDequeued():
+            return "run_dequeued", {
+                "queue_id": event.queue_id,
+                "outcome": event.outcome.value,
+                "run_id": event.run_id,
+                "reason": event.reason,
+                "at": event.at,
+            }
         case PeerDeclared():
             return "peer_declared", {
                 "peer_id": event.peer_id,
@@ -1044,6 +1088,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _optional_int(data, "cost_micro_usd"),
                 _optional_bool(data, "estimated"),
                 _optional_bool(data, "between"),
+                _optional_bool(data, "partial"),
             )
         case "processes_left":
             return ProcessesLeft(
@@ -1236,6 +1281,27 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "reason"),
                 _str(data, "refused_at"),
             )
+        case "run_queued":
+            return RunQueued(
+                _str(data, "queue_id"),
+                _str(data, "line_id"),
+                _str(data, "command"),
+                _optional_str(data, "previous"),
+                _optional_str(data, "commit"),
+                _arguments(data),
+                _str(data, "workdir"),
+                _optional_str(data, "workdir_commit"),
+                _str(data, "queued_at"),
+                _str(data, "reason"),
+            )
+        case "run_dequeued":
+            return RunDequeued(
+                _str(data, "queue_id"),
+                _member(data, "outcome", QueueEnd),
+                _optional_str(data, "run_id"),
+                _str(data, "reason"),
+                _str(data, "at"),
+            )
         case "peer_declared":
             return PeerDeclared(
                 _str(data, "peer_id"), _str(data, "transport"), _str(data, "policy")
@@ -1312,6 +1378,18 @@ def _optional_str(data: dict[str, object], name: str) -> str | None:
     if not isinstance(value, str):
         raise DecodeError(f"{name} is not a string or null")
     return value
+
+
+def _arguments(data: dict[str, object]) -> tuple[tuple[str, str], ...]:
+    """The parameter values of a ``run_queued``, each written ``name=value``, split at
+    the first ``=``. A name holds none, so the split is exact."""
+    pairs: list[tuple[str, str]] = []
+    for item in _list(data, "arguments", str):
+        name, separator, value = item.partition("=")
+        if not separator:
+            raise DecodeError("an argument has no =")
+        pairs.append((name, value))
+    return tuple(pairs)
 
 
 def _reviews(data: dict[str, object]) -> tuple[str, ...]:
@@ -1401,6 +1479,7 @@ def _member[
         RunStatus,
         RunClearance,
         FailureCause,
+        QueueEnd,
     )
 ](data: dict[str, object], name: str, kind: type[T]) -> T:
     value = _str(data, name)

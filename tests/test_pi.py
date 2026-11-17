@@ -33,6 +33,9 @@ from dromon.driver import (
     driver_resource,
 )
 from dromon.engine import EngineRefused, TurnReport
+from dromon.eventlog import EventLog
+from dromon.peering import TurnCause
+from dromon.scheduler import Scheduler
 from dromon.priority import SteeredDriver
 from dromon.grok import bridge_command
 from dromon.jsonlines import Connection, json_lines_factory
@@ -1073,3 +1076,128 @@ def test_start_check_reads_state_without_a_model_prompt(home: Path) -> None:
     methods = [message.get("type") for message in server.sent]
     assert "get_state" in methods
     assert "prompt" not in methods
+
+
+def test_google_credentials_are_metered_and_allowlisted() -> None:
+    environment = {"GEMINI_API_KEY": "example", "GOOGLE_API_KEY": "excluded"}
+    assert (
+        engine_environment(environment, Strategy.API, "google").get("GEMINI_API_KEY")
+        == "example"
+    )
+    assert "GOOGLE_API_KEY" not in engine_environment(
+        environment, Strategy.API, "google"
+    )
+    assert "GEMINI_API_KEY" not in engine_environment(
+        environment, Strategy.SUBSCRIPTION, "google"
+    )
+    assert (
+        credential_of(
+            "google", {"provider": "google", "status": "ready", "authType": "api_key"}
+        )
+        is Credential.API
+    )
+    with pytest.raises(EngineRefused):
+        credential_of(
+            "google", {"provider": "google", "status": "ready", "authType": "oauth"}
+        )
+
+
+@pytest.mark.parametrize("reported_cost", [0, None])
+def test_unpriced_pi_usage_is_unknown_instead_of_free(
+    home: Path, reported_cost: int | None
+) -> None:
+    spent = usage(100, 10, cost=0)
+    if reported_cost is None:
+        del spent["cost"]
+    server = FakePi([TURN_START, assistant("done", spent=spent)])
+    report = run(line(server, home))
+    assert report.cost_estimate_usd is None
+    assert report.cost_partial
+    assert (
+        report.usage_note is not None and "Cost total is partial" in report.usage_note
+    )
+
+
+@pytest.mark.parametrize("unpriced_first", [False, True])
+def test_mixed_pi_cost_keeps_the_known_part(home: Path, unpriced_first: bool) -> None:
+    priced = assistant("priced", spent=usage(100, 20, cost=0.2))
+    unpriced = assistant("unpriced", spent=usage(100, 20, cost=0))
+    calls = [unpriced, priced] if unpriced_first else [priced, unpriced]
+    report = run(line(FakePi([TURN_START, *calls]), home))
+    assert report.cost_estimate_usd == pytest.approx(0.2)
+    assert report.usage_note is not None and "partial" in report.usage_note
+    assert report.cost_partial
+    with EventLog(home / "cost.sqlite") as log:
+        scheduler = Scheduler(log, engine_factory(str(home)), tick_seconds=0)
+        scheduler.create_line("pi", "pi:openai/gpt-6-sol", Strategy.SUBSCRIPTION)
+        scheduler._apply_limits(  # pyright: ignore[reportPrivateUsage]
+            "pi", TurnCause.OPERATOR, False, report
+        )
+        status = scheduler.cost_status("pi")
+        assert status["estimate"] == "0.2000"
+        assert status["basis"] == "lower_bound"
+        assert status["unknown_turns"] == 1
+        assert scheduler.whole_cost("pi")["unknown_cost"] == 1
+        assert scheduler.whole_cost("pi")["turns"] == 1
+    with EventLog(home / "cost.sqlite") as log:
+        assert log.state.line_costs["pi"].unknown == 1
+        assert log.state.line_costs["pi"].reported_micro_usd == 200_000
+
+
+@pytest.mark.parametrize("known", [False, True])
+def test_interrupted_unpriced_pi_keeps_known_cost(home: Path, known: bool) -> None:
+    calls = [assistant("unpriced", spent=usage(100, 20, cost=0))]
+    if known:
+        calls.insert(0, assistant("priced", spent=usage(100, 20, cost=0.2)))
+    server = FakePi([TURN_START, *calls], hang=True)
+    target = line(server, home)
+
+    async def go() -> None:
+        task = asyncio.ensure_future(target.run_turn("long work"))
+        for _ in range(1000):
+            if server.started and not server.queue and "prompt" in server.commands():
+                break
+            await asyncio.sleep(0.001)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(go())
+    with EventLog(home / "interrupted.sqlite") as log:
+        scheduler = Scheduler(log, engine_factory(str(home)), tick_seconds=0)
+        scheduler.create_line("pi", "pi:openai/gpt-6-sol", Strategy.SUBSCRIPTION)
+        scheduler._count_interrupted("pi", target)  # pyright: ignore[reportPrivateUsage]
+        status = scheduler.cost_status("pi")
+        assert status["estimate"] == ("0.2000" if known else "unknown")
+        assert status["basis"] == ("lower_bound" if known else "unknown")
+        assert status["unknown_turns"] == 1
+        assert scheduler.whole_cost("pi")["unknown_cost"] == 1
+        assert scheduler.whole_cost("pi")["between_turns"] == 1
+        scheduler._count_interrupted("pi", target)  # pyright: ignore[reportPrivateUsage]
+        assert scheduler.whole_cost("pi")["between_turns"] == 1
+    assert target.take_interrupted_partial_cost() == (None, False)
+    assert target.take_interrupted_cost() is None
+
+
+def test_priced_google_argon_turn_reports_catalogue_cost(home: Path) -> None:
+    # Pi 1.5.2's bundled Google table prices Argon at 2 input, 10 output and
+    # 0.1 cache-read dollars per million tokens. Cache writes are zero.
+    spent = usage(100, 20)
+    expected = (100 * 2 + 20 * 10 + 100 * 0.1) / 1_000_000
+    spent["cost"]["total"] = expected
+    server = FakePi(
+        [TURN_START, assistant("done", spent=spent)],
+        model={"provider": "google", "id": "gemini-4-argon"},
+    )
+    target = line(
+        server,
+        home,
+        strategy=Strategy.API,
+        answer={"provider": "google", "status": "ready", "authType": "api_key"},
+    )
+    target.driver = Driver.for_model("pi:google/gemini-4-argon", Strategy.API)
+    report = run(target)
+    assert report.credential is Credential.API
+    assert not report.cost_partial
+    assert report.cost_estimate_usd == pytest.approx(expected)
+    assert report.usage_note == pi.PI_USAGE_NOTE

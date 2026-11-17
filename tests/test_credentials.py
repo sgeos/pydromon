@@ -317,6 +317,34 @@ def test_a_run_started_event_has_its_arguments_masked_and_its_names_kept() -> No
     assert found.command == "full-gate" and found.pid == 4242
 
 
+def test_the_reasons_of_a_queued_run_are_scrubbed() -> None:
+    """Round 17, item 1. A reason the daemon words can name a value a line gave, so
+    it is masked as the other reasons are, while the arguments are not, since the
+    run is started from them."""
+    token = FAKES["github"]
+    queued = model.RunQueued(
+        "q-1",
+        "alpha",
+        "full-gate",
+        None,
+        None,
+        (("branch", "main"),),
+        "/w",
+        None,
+        AT,
+        f"waits for {token}",
+    )
+    found = scrub_event(queued)
+    assert isinstance(found, model.RunQueued)
+    assert token not in found.reason and found.arguments == queued.arguments
+    ended = model.RunDequeued(
+        "q-1", model.QueueEnd.DROPPED, None, f"dropped {token}", AT
+    )
+    found_end = scrub_event(ended)
+    assert isinstance(found_end, model.RunDequeued)
+    assert token not in found_end.reason
+
+
 def test_the_events_left_unscrubbed_on_purpose_are_named_with_a_reason() -> None:
     # The classification test above lists them. The configuration events pass through
     # whole, since the daemon decodes them again to build an engine.

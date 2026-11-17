@@ -51,11 +51,12 @@ from dromon import antigravity, capabilities, codex, cursor, evidence, grok, pi
 from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
 from dromon.engine import EngineRefused
 from dromon.agents import LINE_TOKEN_ENV, TOKEN_ENV
-from dromon.lineconfig import EFFORTS, WorkdirAccess, can_write_workdir
+from dromon.configwarnings import config_warnings
+from dromon.lineconfig import EFFORTS, can_write_workdir
 from dromon.projectconfig import ProjectConfig
 from dromon.model import AgentAccess
 from dromon.protocol import Operation, ProtocolError
-from dromon.scheduler import LineSpec, claude_read_only_refusal, engine_factory
+from dromon.scheduler import LineSpec, engine_factory
 from dromon import settings as engine_settings
 from dromon.sandbox import (
     SandboxConfig,
@@ -1649,28 +1650,8 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         print(f"role {name}: {role}")
     for name, peer in sorted(config.federation.peers.items()):
         print(f"peer {name}: {peer}")
-    for place, layer in (
-        ("the project's settings", config.settings),
-        *(
-            (f"line {line_id}'s settings", line.config.settings)
-            for line_id, line in sorted(config.lines.items())
-        ),
-    ):
-        if layer is None:
-            continue
-        for kind, rule, corrected in engine_settings.single_slash_rules(
-            layer.document()
-        ):
-            print(
-                f"warning: {place} {kind} rule {rule} has an absolute path with one"
-                " leading slash, which Claude Code reads as relative to the project,"
-                f" so it matches nothing there. For an absolute path write {corrected}"
-                + (
-                    ". A deny rule that matches nothing protects nothing"
-                    if kind == "deny"
-                    else ""
-                )
-            )
+    for warning in config_warnings(config, paths.root):
+        print(f"warning: {warning}")
     for line_id, line in sorted(config.lines.items()):
         line_settings = engine_settings.merge([config.settings, line.config.settings])
         line_sandbox = merge([config.sandbox, line.config.sandbox])
@@ -1714,18 +1695,6 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             + (", git ssh" if line.git_ssh else "")
         )
         print(f"  effective sandbox allowWrite: {writes}")
-        refusal = (
-            claude_read_only_refusal(line.config, config.settings, config.sandbox)
-            if line.config.workdir_access is WorkdirAccess.READ
-            and ENGINE_OF.get(line.model) == CLAUDE_CODE_ENGINE
-            else None
-        )
-        if refusal is not None:
-            print(
-                f"warning: line {line_id} has workdir_access read, and every turn of"
-                f" it will be refused, since {refusal}. Remove what that names, or"
-                " change the line's workdir_access"
-            )
     shared_workdirs: dict[str, list[str]] = {}
     for line_id, line in sorted(config.lines.items()):
         if not can_write_workdir(line.config, ENGINE_OF.get(line.model)):
@@ -2164,17 +2133,22 @@ def _set(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
 
 def _reload(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     """Reload the project file, and print each role the file left as it was, one
-    notice to a line, since a run-time change of a role is not undone silently."""
+    notice to a line, since a run-time change of a role is not undone silently, and
+    each warning about the file, as ``dromon config`` gives them. **Round 17, items 6
+    and 7.**"""
     del arguments
     result = _call(paths, "reload", Operation.RELOAD_PROJECT, {})
     if isinstance(result, int):
         return result
     notices = cast(list[object], result.get("role_notices", []))
+    warnings = cast(list[object], result.get("warnings", []))
     for key, value in sorted(result.items()):
-        if key != "role_notices":
+        if key not in {"role_notices", "warnings"}:
             print(f"{key} {value}")
     for notice in notices:
         print(f"notice: {notice}")
+    for warning in warnings:
+        print(f"warning: {warning}")
     return exits.OK
 
 

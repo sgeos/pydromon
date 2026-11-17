@@ -46,10 +46,19 @@ gives two more warnings, neither of which refuses the file.
   every turn, because Claude Code cannot confine those to a read-only directory. The
   refusal appeared only when a turn was tried. The warning gives the same reason, from
   `scheduler.claude_read_only_refusal`, the one function the engine builder uses, so
-  the warning cannot differ from the refusal. **Inference.** Other engines refuse a read
-  line for reasons of their own, in their own builders, and are not covered, which is
-  recorded as a residual. A seat of a role that does not own it is built read-only by
-  the scheduler without any `workdir_access` in the file, and is not warned of either.
+  the warning cannot differ from the refusal.
+- **Round 17, item 7, every engine and the seats of a role.** The same warning now
+  covers a line on any engine whose adapter refuses the configuration with read
+  access, through `scheduler.read_only_refusal`, which asks the adapter's own
+  `unsupported`. Pi, Cursor and Antigravity cannot confine a reader and refuse the
+  access, and Codex gives the reasons of its configuration, such as a built-in tool it
+  does not support. A seat of a role is built with read access whenever another seat
+  owns the role, so each seat is judged as a reader, and a warning names the role and
+  says the turns it takes while it does not own the role will be refused. A seat on an
+  engine that cannot confine it, one outside the capability table's read-only set, is
+  not refused and its mail waits while another seat owns the role, which the warning
+  says. **Residual.** Ownership moves at run time, so a seat is judged as one that may
+  not own the role. An engine the table does not name is not judged.
 - **A one-slash absolute path in a permission rule.** In a Claude Code rule a path that
   begins with one slash is relative to the project, and an absolute one begins with two,
   as in `Read(//abs/path)`. A rule with one matches nothing, silently, and a `deny` rule
@@ -57,10 +66,25 @@ gives two more warnings, neither of which refuses the file.
   project's `settings` and of each line's, for a tool that names files, `Read`, `Edit`,
   `Write`, `NotebookEdit`, `MultiEdit`, `Glob` or `Grep`, whose path starts with one
   slash and whose first segment is a directory of the filesystem root. It names the rule
-  and the corrected one. **Residual.** A project that has a directory by the name of one
-  at the root, such as `/tmp`, and means its own, is warned of wrongly, which the wording
-  allows for. `/src/**`, which names no directory of the root, is taken as project
-  relative and not reported. Only `dromon config` checks, the daemon does not.
+  and the corrected one. `/src/**`, which names no directory of the root, is taken as
+  project relative and not reported.
+- **Round 17, item 6.** Two defects were confirmed against the check, and a third gap
+  closed. A first segment that is a pattern, as in `Read(/*/secret)`, named no
+  directory and was missed. It now names the root's directories it matches, with `*`,
+  `?` and `[` read as `fnmatch` reads them, and is reported when it matches one. A
+  segment with `**` is never reported, since a project writes a rule over everything
+  it holds that way. A project, or a line's working directory, that has a directory by
+  the name of one at the root, such as `/tmp`, and means its own, was warned of
+  wrongly. A rule that the project or the line's working directory can satisfy is now
+  left alone. For a pattern in the first segment that means a directory it matches, and
+  when a plain path follows, that path under one of them, so that `Read(/*/todo.md)` is
+  taken for the project's only if some directory holds the file. **Residual.** Where
+  both the project and the root hold the name the two readings cannot be told apart, so
+  the rule is left unreported, and a deny rule of that kind protects nothing of the
+  root. The daemon now says the same as `dromon config`, since `configwarnings` is one
+  module that both call. It prints each warning to its standard error at a start, and
+  gives them as `warnings` in the answer to `reload_project`, which `dromon reload`
+  prints. A warning never refuses the file.
 
 The warning of two writing lines that share a workdir, above, already leaves out a line
 that cannot write, as the operator's item of the same round asked. It did so from round
@@ -148,13 +172,15 @@ relay = "tail"          # the route of operator ana's mail
 | `runs.commands` | table of names to arrays of text | none | The commands lines may start as supervised runs, at most 64, each name an identifier and each command its program and at most 63 arguments, never a shell string, as [`RUNS.md`](../architecture/RUNS.md) specifies. A declared command runs with the daemon's authority, outside any line's sandbox. Added on 2026-10-31 |
 | `runs.commit_commands` | table of names to arrays of text | none | Commands a line, a line that only reads its working directory included, may start on a commit it names, in a checkout the daemon makes in its state directory, as the commit run section of [`RUNS.md`](../architecture/RUNS.md) specifies. Each as in `runs.commands`, and no name may be in both tables. Declaring one requires `runs.commit_refs.patterns`. Added in round 14 |
 | `runs.parameters.COMMAND.NAME` | table with `pattern` text and an optional `description` | none | A parameter of the declared command COMMAND, whose argument `{NAME}` a line's `start_run` replaces with a value it gives in `arguments`. `pattern` is a regular expression of at most 256 bytes without `(?`, backreferences or possessive quantifiers, which the whole value must match, and `description` printable text of at most 256 bytes. Every placeholder of a command must be declared and every declaration used, at most eight a command. A value is also 1 to 256 printable bytes and never begins with `-`, as the parameter section of [`RUNS.md`](../architecture/RUNS.md) specifies with its trust argument. Added in the task of 2026-11-05 |
+| `runs.queue_max_age_seconds` | whole number, 60 to 86,400 | 7200 | The longest a queued run waits before it is dropped, with an event and a note to its line. Two hours is eight runs of a quarter of an hour, the queue's size at the length of the full gate. Added in round 17, review of 883c00f |
+| `runs.slot_lease` | identifier of a declared lease | none | The project's gate slot. A run a line starts waits in the queue while another line holds this lease, and begins when it is free, as the queued runs section of [`RUNS.md`](../architecture/RUNS.md) specifies. It must be in `leases.names`. Added in round 17 |
 | `runs.commit_refs.patterns` | array of text | none | The ref patterns, 1 to 16, each beginning `refs/remotes/REMOTE/` with a remote named without wildcards, without spaces or `..`, as `git for-each-ref` reads them. A commit run's commit must be the tip of a ref matching one. A pattern under `refs/heads`, `refs/tags` or anywhere else outside `refs/remotes` is refused, since a line's sandbox may write those refs. Added in round 14, and narrowed to remote-tracking tips in its review of 1449c5c |
 | `limits.*` | as in `CLIENT.md` | 12, 2, 0 | The conversation limits of every line |
 | `wake.every_ticks` | integer in [1, 3600] | 1 | The wake policy of every line |
 | `profiles.NAME` | table | none | A reusable line template with every line key but `profile` and `session` |
 | `lines.ID` | table | none | A line, named by a line identifier |
 | `lines.ID.profile` | profile name | none | The profile the line starts from |
-| `lines.ID.model` | model | required | `claude-opus-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`, `claude-fable-5-2`, `claude-sonnet-5-5`, `gpt-6-luna`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol` and `gpt-6.1-terra` on Codex as [`CODEX.md`](CODEX.md) specifies, `grok-4.7` and `grok-4.7-build-fast` on Grok Build as [`GROK.md`](GROK.md) specifies, `pi:openai/gpt-6-luna`, `pi:openai/gpt-6-astra`, `pi:openai/gpt-6-sol`, `pi:openai/gpt-6.1-sol` and `pi:openai/gpt-6.1-terra` on Pi as [`PI.md`](PI.md) specifies, `cursor-agent:gpt-5.6-luna-medium` on Cursor Agent as [`CURSOR.md`](CURSOR.md) specifies, or `antigravity:gemini-3.8-flash-high` on Antigravity as [`ANTIGRAVITY.md`](ANTIGRAVITY.md) specifies. A daemon refuses Cursor and Antigravity lines |
+| `lines.ID.model` | model | required | `claude-opus-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`, `claude-fable-5-2`, `claude-sonnet-5-5`, `gpt-6-luna`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol` and `gpt-6.1-terra` on Codex as [`CODEX.md`](CODEX.md) specifies, `grok-4.7` and `grok-4.7-build-fast` on Grok Build as [`GROK.md`](GROK.md) specifies, `pi:openai/gpt-6-luna`, `pi:openai/gpt-6-astra`, `pi:openai/gpt-6-sol`, `pi:openai/gpt-6.1-sol` and `pi:openai/gpt-6.1-terra` and `pi:google/gemini-4-argon` on Pi as [`PI.md`](PI.md) specifies, `cursor-agent:gpt-5.6-luna-medium`, `cursor-agent:gemini-4-argon-medium`, `cursor-agent:gemini-4-carbon-medium` and `cursor-agent:gemini-4-hydrogen-medium` on Cursor Agent as [`CURSOR.md`](CURSOR.md) specifies, or `antigravity:gemini-3.8-flash-high` on Antigravity as [`ANTIGRAVITY.md`](ANTIGRAVITY.md) specifies. A daemon refuses Cursor and Antigravity lines |
 | `lines.ID.strategy` | strategy | `subscription` | `subscription`, `api` or `flexible` |
 | `lines.ID.limits` | table | the file's | Limits for this line, each key defaulting to the file's |
 | `lines.ID.wake` | table | the file's | The wake policy for this line |
@@ -415,8 +441,8 @@ stops the start, or refuses the reload and keeps the previous list.
   configuration forgets the line's passes, which costs at most one more check, and the
   same configuration set again keeps them. A text check is never answered from memory. A held line is refused first.
 - **Checking before sending.** **Item B2 of 2026-10-28.** A line's `check_disclosure`
-  tool checks exactly one of `text`, a `path`, or a `paths` list of one to eight files
-  relative to its working directory, and answers `pass` or `fail` with how many lines
+  tool checks exactly one of `text`, a `path`, or a `paths` list of one to 64 files
+  relative to its working directory (**round 17, item 5**, the limit was eight, and is now the 64 passes a line remembers), and answers `pass` or `fail` with how many lines
   hold a listed term, compared as above, and never which term matched. The answer
   never names a matching file or line location, including when several
   files were supplied. File read failures also omit file names.

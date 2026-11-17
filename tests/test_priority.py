@@ -19,6 +19,8 @@ from claude_agent_sdk import SdkMcpTool
 from dromon import priority
 from dromon.activity import ActivityKind
 from dromon.driver import (
+    API_ONLY_MODELS,
+    DriverError,
     MESSAGE_END,
     MODELS,
     TOOL_RESULT,
@@ -331,6 +333,10 @@ def test_the_driver_s_own_interrupt_is_kept_and_the_steer_is_not_asked() -> None
 def test_every_packaged_driver_continues_at_both_new_events(
     model: str, strategy: Strategy
 ) -> None:
+    if model in API_ONLY_MODELS and strategy is not Strategy.API:
+        with pytest.raises(DriverError, match="only the api strategy"):
+            Driver.for_model(model, strategy)
+        return
     plain = Driver.for_model(model, strategy)
     plain.step(Event("turn_start"))
     before = plain.state

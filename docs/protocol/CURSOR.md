@@ -221,3 +221,15 @@ Run these in a throwaway directory before the probe.
    `--resume CHAT` in print mode continues it on a kept data directory and reports the
    same `session_id`, and what it does for an unknown chat.
 11. Check the account's usage-based pricing setting in Cursor's dashboard.
+
+## Gemini 4 drivers on 2026-11-16
+
+**Fact.** The operator's account listing names `gemini-4-argon-medium`,
+`gemini-4-carbon-medium` and `gemini-4-hydrogen-medium`. Packaged drivers cover each
+strategy and derive their settings from GPT-5.6 Luna medium. Their context windows
+are 1,000,000 tokens following the operator's model-page observation.
+**Inference.** The display names are `Gemini 4 Argon`, `Gemini 4 Carbon` and
+`Gemini 4 Hydrogen`. A different init display name is refused.
+**Not verified live.** Verify first through an operator turn that confirms the init
+name, credential source, tool routing and effective context limit. Cursor retains
+its existing partial isolation restrictions.

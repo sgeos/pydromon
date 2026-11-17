@@ -625,6 +625,58 @@ def test_a_new_path_forgets_what_was_read(rig: Rig) -> None:
     assert rig.scheduler.machine_decision().defer_turns
 
 
+def machinestatus_time(moment: datetime) -> str:
+    """``moment`` as the daemon writes a time, derived here and not copied from it."""
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_the_age_counts_to_now_and_not_to_the_read(rig: Rig) -> None:
+    """Round 17, item 2, confirmed before the change. The daemon keeps a read for
+    ``MACHINE_READ_SECONDS``, and the age it gave was the one at the read, so a line
+    told ``10 seconds ago`` was told it of a moment up to 15 seconds past."""
+    configured(rig)
+    rig.write("elevated", "swap use is 17000 MB", age=10)
+    first = rig.scheduler.machine_status()
+    assert first is not None and first.age_seconds == 10
+    rig.clock.now += timedelta(seconds=7)
+    # No new read, as the cache has not expired, yet the age moves with the clock.
+    second = rig.scheduler.machine_status()
+    assert second is not None and second.age_seconds == 17
+    assert second.level == "elevated" and second.reasons == first.reasons
+
+
+def test_the_sample_time_is_named_wherever_a_line_sees_the_status(rig: Rig) -> None:
+    """The refusal of a run, the note of a deferred turn, the warning a turn proceeds
+    with and the detail of ``line_status`` each carry the sample's own time, which a
+    line can place against its own clock however late it reads the note."""
+    configured(rig)
+    sampled = machinestatus_time(rig.clock.now - timedelta(seconds=10))
+    rig.write("critical", "kernel memory pressure is critical")
+    rig.mail()
+    rig.drain()
+    (to_line,) = rig.harness_notes("alpha")
+    assert f"sampled at {sampled}" in to_line
+    refusal = rig.scheduler._machine_run_refusal("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert refusal is not None and f"sampled at {sampled}" in refusal
+    view = rig.scheduler.machine_status_view()
+    assert view["sampled_at"] == sampled
+    rig.clock.now += timedelta(seconds=90)
+    rig.write("elevated", "swap use is 17000 MB", age=5)
+    rig.forget()
+    again = rig.scheduler.machine_status_view()
+    assert again["sampled_at"] == machinestatus_time(
+        rig.clock.now - timedelta(seconds=5)
+    )
+    assert again["age_seconds"] == 5
+
+
+def test_a_status_with_no_sample_names_no_sample_time(rig: Rig) -> None:
+    configured(rig)
+    view = rig.scheduler.machine_status_view()
+    assert view["level"] == "missing" and view["sampled_at"] is None
+    assert view["age_seconds"] is None
+
+
 def test_line_status_in_detail_gives_the_status_without_a_path(rig: Rig) -> None:
     configured(rig)
     rig.write("elevated", "swap use is 17000 MB")
@@ -635,6 +687,7 @@ def test_line_status_in_detail_gives_the_status_without_a_path(rig: Rig) -> None
         "level": "elevated",
         "acted_on_as": "elevated",
         "age_seconds": 10,
+        "sampled_at": machinestatus_time(rig.clock.now - timedelta(seconds=10)),
         "reasons": ["swap use is 17000 MB"],
         "problem": None,
         "monitor": None,
@@ -862,6 +915,12 @@ def test_a_missing_status_is_dated_by_the_daemons_first_sight(rig: Rig) -> None:
         rig.start_run()
     first = f"first saw it so at {START:%Y-%m-%dT%H:%M:%SZ}"
     assert "its file is missing" in str(caught.value) and first in str(caught.value)
+    # Round 17, item 4. The dating says it cannot see before the daemon started, and
+    # it does so wherever it is shown, here the refusal and ``line_status``.
+    assert "possibly earlier" in str(caught.value)
+    assert "cannot see before it started" in str(caught.value)
+    shown = rig.scheduler.machine_status_view()["monitor"]
+    assert isinstance(shown, str) and "possibly earlier" in shown
     assert rig.scheduler.machine_status_view()["monitor"] == (
         rig.scheduler._monitor_trouble(  # pyright: ignore[reportPrivateUsage]
             MachineStatus("missing", problem="no file is there")

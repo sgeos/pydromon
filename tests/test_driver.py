@@ -7,6 +7,7 @@ from importlib import resources
 import pytest
 
 from dromon.driver import (
+    API_ONLY_MODELS,
     INITIAL_STATE,
     INTERFACE_VERSION,
     ADAPTED_ENGINES,
@@ -26,7 +27,12 @@ from dromon.driver import (
 OPUS = "claude-opus-5-5"
 HAIKU = "claude-haiku-5-5"
 LUNA = "gpt-6-luna"
-EVERY_DRIVER = [(model, strategy) for model in ENGINE_OF for strategy in Strategy]
+EVERY_DRIVER = [
+    (model, strategy)
+    for model in ENGINE_OF
+    for strategy in Strategy
+    if model not in API_ONLY_MODELS or strategy is Strategy.API
+]
 
 NEW_DRIVERS = [
     ("claude-fable-5-2", "claude-fable-5-1"),
@@ -123,7 +129,7 @@ def test_each_strategy_accepts_exactly_its_credentials(
         assert driver.state == INITIAL_STATE
 
 
-@pytest.mark.parametrize("model", ENGINE_OF)
+@pytest.mark.parametrize("model", set(ENGINE_OF) - API_ONLY_MODELS)
 def test_metered_strategies_run_shorter_than_the_subscription(model: str) -> None:
     subscription = Driver.for_model(model, Strategy.SUBSCRIPTION).settings
     for metered in (Strategy.API, Strategy.FLEXIBLE):
@@ -320,7 +326,7 @@ DEVELOPMENT_TOOL_BUDGET = 100
 DEVELOPMENT_TURNS = 50
 
 
-@pytest.mark.parametrize("model", list(ENGINE_OF))
+@pytest.mark.parametrize("model", sorted(set(ENGINE_OF) - API_ONLY_MODELS))
 def test_subscription_drivers_allow_a_development_turn(model: str) -> None:
     # A line that develops software reads, edits and runs a gate many times in one
     # turn, so a subscription driver's budgets are sized for that. The per-line cost
@@ -383,3 +389,31 @@ def test_sol_and_terra_follow_the_luna_drivers_with_the_catalogues_window(
             luna.max_turns,
             luna.tool_budget,
         )
+
+
+@pytest.mark.parametrize("element", ["argon", "carbon", "hydrogen"])
+@pytest.mark.parametrize("strategy", Strategy)
+def test_gemini_cursor_settings_derive_from_luna(
+    element: str, strategy: Strategy
+) -> None:
+    model = f"cursor-agent:gemini-4-{element}-medium"
+    driver = Driver.for_model(model, strategy)
+    previous = Driver.for_model("cursor-agent:gpt-5.6-luna-medium", strategy)
+    assert driver.settings == replace(previous.settings, model=model)
+    assert driver.step(Event("init", reported_model(model))).tag is ActionTag.ACCEPT
+    assert (
+        driver.step(Event("init", reported_model(previous.settings.model))).tag
+        is ActionTag.REFUSE
+    )
+
+
+def test_pi_argon_derives_metered_settings_and_refuses_other_strategies() -> None:
+    model = "pi:google/gemini-4-argon"
+    driver = Driver.for_model(model, Strategy.API)
+    previous = Driver.for_model("pi:openai/gpt-6-sol", Strategy.API)
+    assert driver.settings == replace(
+        previous.settings, model=model, context_window=1048576
+    )
+    for strategy in (Strategy.SUBSCRIPTION, Strategy.FLEXIBLE):
+        with pytest.raises(DriverError, match="only the api strategy"):
+            Driver.for_model(model, strategy)

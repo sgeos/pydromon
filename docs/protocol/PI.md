@@ -237,3 +237,36 @@ Run these by hand, then one turn with `dromon probe --model pi:openai/gpt-6-luna
    turn's last one, and that a compacting turn's cost includes the summary call.
 10. **Review F7.** Before the first live turn, the operator confirms against the ChatGPT
    plan's terms that the plan may be drawn on through Pi.
+
+## Google and price evidence on 2026-11-16
+
+**Fact.** The installed Pi 1.5.2 `docs/providers.md` documents `GEMINI_API_KEY` for
+Google Gemini. The bundled provider registry in `dist/bundle/chunks/chunk-MMDXLZVS.js`
+provides no Google subscription sign-in. Dromon forwards only that documented key
+for the Google provider and packages only an api strategy Argon driver.
+The bundled model table confirms Argon's 1,048,576 token context window.
+No credential file was read and no model turn was run.
+
+**Fact.** The same bundled table prices the OpenAI responses variants of every
+GPT-6 model packaged for Pi. Input and output dollars per million tokens are
+0.1 and 0.5 for Luna, 2 and 10 for Sol, 10 and 50 for Astra, 2 and 10 for
+6.1-Sol and 1 and 5 for 6.1 Terra. Cache and larger input tiers have separate prices.
+These are Pi catalogue estimates and do not establish actual billing.
+
+**Fact.** The bundled Google table prices Argon at 2 input, 10 output and 0.1
+cache-read dollars per million tokens, with zero cache-write price.
+Dromon retains the known cost when Pi omits another call's cost or reports zero for
+nonzero usage. The report labels the total as partial and preserves the token counts.
+A turn with no priced call reports unknown cost. Interrupted turns retain the known
+part too. An explicit partial marker reaches scheduler accounting and the persisted
+cost record. The aggregate basis is a lower bound when a subtotal is known, and
+the unknown counts include the missing remainder once per turn or interrupted spend.
+Pi status always marks `limit_enforced` false because the dollar limit
+cannot bound unreported spend. Known costs still count toward the limit. This is a
+conservative engine-wide status policy, including priced models, because a future
+call may omit its cost. An operator must supply a separate billing bound rather
+than rely on this estimate to cap total spending.
+**Inference.** Zero with nonzero usage may indicate an unpriced model. It may also
+reflect legitimately free usage. Dromon cannot distinguish these from the total.
+Verify first with an operator turn that checks the selected provider and model,
+credential source, tool routing, context limit and reported cost.
