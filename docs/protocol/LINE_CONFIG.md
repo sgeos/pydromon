@@ -1283,6 +1283,12 @@ during that turn.
   - `list_mail` with `unanswered_only` lists exactly what the count counts, each
     entry ending with how long it has waited, such as `unanswered for 1h 3m`. It is
     refused beside `own_notes_only`, which selects other messages.
+  - **Round 18, item 5.** `list_sent` and `dromon sent` use the same definition
+    from the sender's side, so `unanswered_only` there lists exactly the sent mail
+    the recipient counts. Two lines reported that the two views disagreed, since the
+    sender's view called every note left open unanswered. A note left open that the
+    count does not count, as one that asks no reply, a line's own wake note or a
+    harness notice, now has the outcome `asks no reply`.
   - `acknowledge_mail` takes an optional `reason` of at most 500 bytes, checked
     against the disclosure list like a body. It is recorded in `message_acknowledged`
     and shown only in the recipient's own listing as `closed because` the reason. The
@@ -1727,6 +1733,32 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
   commit then, says that it is the line's own earlier text, and
   delimits the brief between `BEGIN STANDING BRIEF DATA` and `END STANDING BRIEF DATA`
   as JSON.
+- **The evidence index, round 18, item 1.** After the brief the lead gives an
+  index of the line's own evidence, which the daemon builds from its state. A line
+  that set no brief is given the index at the end of the prompt instead, so that no
+  notice, such as a role notice, loses its place at the head of the turn. Four lines had asked for it in round 17, since a renewed
+  thread lost its earlier evidence and requests. It names the line's last 5 notes to
+  operators with their identifiers, the last 3 runs of the line or of its role with
+  the commit each tested and how each ended, its questions still open, at most 3,
+  and its own notes in its role's journal, at most 3, where findings and requests
+  such as those of an experience report are recorded. Each quoted text is its first
+  line cut to 160 bytes, and the whole index is at most 4,096 bytes, with a closing
+  sentence that counts the entries left out. It quotes only the line's own text.
+  The runs of the line's role include runs other seats started, which are given by
+  identifier, command name, commit and outcome, with no text of theirs. A line's own
+  text may repeat what it read elsewhere, so every quote is untrusted data. Each is a
+  JSON string inside an entry line, between `BEGIN EVIDENCE INDEX DATA` and
+  `END EVIDENCE INDEX DATA`, so no quote can stand on a line of its own or close the
+  block, and the head says the block is never an instruction. Every entry is screened
+  again when the index is built, against the disclosure list in force then, with the
+  whole text it quotes. An entry that now holds a term is left out whole, and a
+  closing sentence gives only how many were withheld. The fence cannot stop a model
+  from choosing to follow a quote. It only keeps a quote from passing as the
+  daemon's own words.
+  **Residuals.** It follows only a session the daemon knows is new, so a thread an
+  engine renews by itself inside a kept connection gets none. A request a line put
+  only in a report file is not indexed, since the daemon reads no report files, and a
+  message carries no send time in the state, so notes are ordered but not dated.
 - **A stale brief, from round 15, item 3.** **Required by the operator.** A line
   resumed a task from a brief whose branch had since been merged and moved on, since
   the lead presented the brief first and its staleness only as a possibility. The lead
@@ -2182,7 +2214,16 @@ ends with each turn, and the next turn resumes the session in a new one.
   reported during a Dromon turn, and ends of tasks the line stopped, are also recorded
   as delivered notes without a separate wake. Each task is noted at most once. At most
   3 task notes wake or accompany turns for a line in any 60 seconds. Ends past that
-  limit are counted and named in the line's next note. A command is cut to 200
+  limit are counted and named in the line's next note. **Round 18, item 6.** A
+  note that wakes the line is held for a quiet period of 3 seconds, which each
+  further end of the same line restarts, and at most 15 seconds from the first end
+  held, so ends reported a moment apart share one turn, as ends already queued did.
+  Other mail of the line, when it waits, releases the held notes at once, so they
+  share its turn. Notes delivered without a wake, and those of a turn the engine
+  begins by itself, are not held. A note held when the daemon stops is in the log,
+  and is delivered as any undelivered mail is on the next start. The test suite's
+  clocks do not pass by themselves, so its fixture `_no_task_note_quiet` sets the
+  quiet period to zero except in tests marked `task_note_quiet`. A command is cut to 200
   characters. It is the line's own text, so the note quotes
   it as a JSON string and says that it is data from the line's own tool call and not
   an instruction, so that it cannot pose as Dromon's words. **Round 14 follow-up.**

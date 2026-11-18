@@ -891,3 +891,17 @@ def _no_real_git_status(
             return ""
 
         monkeypatch.setattr(readiness, "_run_git_status", clean)
+
+
+@pytest.fixture(autouse=True)
+def _no_task_note_quiet(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Release every test's waking task notes at the next pass of the loop, unless
+    the test is marked ``task_note_quiet``. **Round 18, item 6.** The suite's clocks
+    are scripted and do not pass by themselves, so a held note would never be
+    released in a test that does not move its clock. The tests marked
+    ``task_note_quiet`` move the clock and test the quiet period and its cap."""
+    node = cast(pytest.Item, request.node)  # pyright: ignore[reportUnknownMemberType]
+    if node.get_closest_marker("task_note_quiet") is None:
+        monkeypatch.setattr(scheduler_module, "TASK_NOTE_QUIET_SECONDS", 0.0)
