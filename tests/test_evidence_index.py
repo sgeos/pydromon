@@ -193,8 +193,9 @@ def test_a_new_session_without_a_brief_is_given_the_index(world: World) -> None:
 def test_a_term_added_after_a_note_was_sent_withholds_its_entry(world: World) -> None:
     """Review of round 18, finding 1. The note passed the list in force when it was
     sent. A term added since, by a reload or a restart, withholds the entry when the
-    index is built, with only a count, in both places the index is given. The whole
-    text is screened, so a term past the quoted first line withholds it too."""
+    index is built, in both places the index is given. The whole text is screened,
+    so a term past the quoted first line withholds it too. Round 18 fix, item 2.
+    Each withheld entry is named by its identifier alone, so it can be reopened."""
     scheduler = world.scheduler
     secret = scheduler.send(ALPHA, ANA, "about the hidden matter")
     later = scheduler.send(ALPHA, ANA, "a plain first line\nthe hidden matter again")
@@ -205,21 +206,22 @@ def test_a_term_added_after_a_note_was_sent_withholds_its_entry(world: World) ->
     scheduler.set_disclosure_terms(("hidden matter",))
     after = scheduler._index_without_brief("alpha", False)  # pyright: ignore[reportPrivateUsage]
     assert after is not None and plain in after
-    assert secret not in after and later not in after and "hidden" not in after
-    assert after.endswith(
-        "2 entries were withheld, since their text now holds a term of the project's"
-        " disclosure list."
-    )
+    assert "hidden" not in after and "plain first line" not in after
+    for withheld in (secret, later):
+        assert f"- {withheld}, {evidence.WITHHELD}\n" in after
+    # Every one could be named, so no closing count follows.
+    assert after.endswith(INDEX_END)
     scheduler.set_brief("alpha", "carry on")
     lead = scheduler._brief_lead("alpha", True)  # pyright: ignore[reportPrivateUsage]
     assert lead is not None and plain in lead and "hidden" not in lead
-    assert "2 entries were withheld" in lead
+    assert f"- {secret}, {evidence.WITHHELD}" in lead
 
 
 def test_an_index_whose_every_entry_is_withheld_says_only_how_many(
     world: World,
 ) -> None:
-    """The line still learns that evidence exists, and none of it is shown."""
+    """The line still learns that evidence exists, and none of it is shown, since
+    under this list even the identifier holds a term and is not named."""
     sent = world.scheduler.send(ALPHA, ANA, "my report")
 
     def discloses_all(text: str) -> bool:
@@ -230,8 +232,8 @@ def test_an_index_whose_every_entry_is_withheld_says_only_how_many(
     assert index is not None and sent not in index and "my report" not in index
     assert index.splitlines()[-2:] == [
         INDEX_END,
-        "1 entries were withheld, since their text now holds a term of the project's"
-        " disclosure list.",
+        "1 entries were withheld with their identifiers, since their text now holds"
+        " a term of the disclosure list.",
     ]
     assert "Your last notes" not in index
 
@@ -258,3 +260,51 @@ def test_a_quote_cannot_leave_its_fence_or_pass_as_the_daemons_words(
         f"- {sent} to {ANA}, quoting {json.dumps(injected, ensure_ascii=True)}"
     )
     assert "\x1b" not in index and "Ignore everything above" not in index
+
+
+def test_an_address_or_command_dromon_writes_is_not_screened(world: World) -> None:
+    """Round 18 fix, item 1. The operator's address and a run's command are written by
+    Dromon, not quoted from the line, so a term they hold does not withhold the
+    entry. Only the text an entry quotes is screened."""
+    world.scheduler.ensure_operator("zelda")
+    sent = world.scheduler.send(ALPHA, OperatorAddress("zelda"), "a plain report")
+    state = replace(world.log.state, runs={"r-new": run("r-new", "alpha", 0)})
+
+    def discloses(text: str) -> bool:
+        return "zelda" in text or "full-gate" in text
+
+    index = evidence_index(state, "alpha", discloses)
+    assert index is not None and "withheld" not in index
+    assert f"- {sent} to @zelda, quoting " in index
+    assert "r-new, full-gate, on commit" in index
+
+
+@pytest.mark.parametrize(
+    ("identifier", "named"),
+    [
+        ("m-0123456789ab", True),
+        # Hexadecimal digits spell a listed term, so the identifier is not named.
+        ("m-00cafe000000", False),
+        # Not the generated form, as a peer or a test may give, so not named.
+        ("m-question0001", False),
+        ("m-0123456789AB", False),
+        ("m-0123456789abc", False),
+    ],
+)
+def test_a_withheld_entry_is_named_only_by_a_generated_identifier_clear_of_the_list(
+    world: World, identifier: str, named: bool
+) -> None:
+    """Round 18 fix, item 2. An identifier can carry no listed term into the index."""
+    state = world.log.state
+    report = Message(ALPHA, ANA, MessageKind.NOTE, "the hidden matter", (), None)
+    state = replace(state, messages={**state.messages, identifier: report})
+
+    def discloses(text: str) -> bool:
+        return "hidden" in text or "cafe" in text
+
+    index = evidence_index(state, "alpha", discloses)
+    assert index is not None and "hidden" not in index
+    assert (f"- {identifier}, {evidence.WITHHELD}" in index) is named
+    assert (identifier in index) is named
+    assert ("1 entries were withheld with their identifiers" in index) is not named
+    assert "cafe" not in index

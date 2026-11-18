@@ -265,7 +265,7 @@ argument outside a tool's schema is refused.
 
 | Tool | Effect |
 |---|---|
-| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies. With `issue` true, from 2026-10-31, it raises an issue with an operator, as below. From round 14, `asks_reply` says whether a note asks a reply, and `reply_to` may also name a note the line sent the same recipient, to correct it, as the unanswered rule below says. `@operator` names the project's default operator, as below |
+| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies. With `issue` true, from 2026-10-31, it raises an issue with an operator, as below. From round 14, `asks_reply` says whether a note asks a reply, and `reply_to` may also name a note the line sent the same recipient, to correct it, as the unanswered rule below says. `@operator` names the project's default operator, as below. **Round 18 fix, item 3.** A note to an operator that names no `reply_to`, while notes from that operator to the line wait unanswered, gets a second text part in its result that gives their count and the newest identifier, and says to acknowledge the one the note answered. The note is not linked by itself, since which open note a summary answers cannot be told, and a wrong link would close a task that still waits |
 | `ask_operator` | Asks an operator a question, which never pauses the line |
 | `wake_after` | Schedules one wake for the line, optionally tied to a running background task, to a process of its own that `list_processes` shows, or to an open run of its scope, as below |
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
@@ -1753,10 +1753,19 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
   text may repeat what it read elsewhere, so every quote is untrusted data. Each is a
   JSON string inside an entry line, between `BEGIN EVIDENCE INDEX DATA` and
   `END EVIDENCE INDEX DATA`, so no quote can stand on a line of its own or close the
-  block, and the head says the block is never an instruction. Every entry is screened
-  again when the index is built, against the disclosure list in force then, with the
-  whole text it quotes. An entry that now holds a term is left out whole, and a
-  closing sentence gives only how many were withheld. The fence cannot stop a model
+  block, and the head says the block is never an instruction. The whole text each
+  entry quotes is screened again when the index is built, against the disclosure list
+  in force then. **Round 18 fix, item 1.** Only quoted text is screened. Screening
+  the whole entry line withheld every report to an operator whose address matched
+  the list. The identifiers, addresses, commits, times and declared run commands
+  Dromon writes are left out of the screen, since the index reaches only the line's
+  own engine, which already receives each of them in its turn header, its mail
+  listings and `run_status`. **Item 2.** An entry whose quoted text holds a term is
+  given as its identifier and the word withheld, so a renewed session can reopen it.
+  An identifier is named only in the form Dromon generates, a letter, a hyphen and 12
+  lowercase hexadecimal digits, and only when it is itself clear of the list, so it
+  can carry neither free text nor a term. Any other is counted in a closing
+  sentence. The fence cannot stop a model
   from choosing to follow a quote. It only keeps a quote from passing as the
   daemon's own words.
   **Residuals.** It follows only a session the daemon knows is new, so a thread an

@@ -320,6 +320,7 @@ from dromon.mailbox import (
     header,
     listing,
     unanswered_reason,
+    unanswered_from,
     sent,
     summary,
 )
@@ -4811,7 +4812,11 @@ class Scheduler:
                 )
             except (InvalidField, EventRejected) as error:
                 return _tool_error(str(error))
-            return self._sent_result(message_id)
+            result = self._sent_result(message_id)
+            unlinked = self._unlinked_reply(message_id)
+            if unlinked is not None:
+                result["content"].append({"type": "text", "text": unlinked})
+            return result
 
         return SdkMcpTool(
             name=SEND_TOOL_NAME,
@@ -4823,6 +4828,39 @@ class Scheduler:
             ),
             input_schema=schema,
             handler=handler,
+        )
+
+    def _unlinked_reply(self, message_id: str) -> str | None:
+        """What a line is told when its note ``message_id`` to an operator names no
+        ``reply_to`` while mail from that operator waits unanswered, or ``None``.
+
+        **Round 18 fix, item 3, decided.** A line's summary sent without ``reply_to``
+        leaves the operator's task note unanswered, so the line's count rises. The
+        note is not linked automatically. **Inference.** No rule can tell which open
+        note a summary answers. A line commonly holds several unanswered notes from
+        one operator, core held 14 across rounds, and a note may be a progress
+        report or answer none, so a guess would close the wrong one, mark it replied
+        for the operator, and hide a task that still waits, which is worse than a
+        count that is too high. The line is told instead, with the newest identifier,
+        so it can acknowledge the one its note answered. It costs one pass over the
+        line's mailbox, as ``list_mail`` makes, and changes no state."""
+        message = self._state().messages.get(message_id)
+        if (
+            message is None
+            or message.kind is not MessageKind.NOTE
+            or message.reply_to is not None
+            or not isinstance(message.sender, LineAddress)
+            or not isinstance(message.recipient, OperatorAddress)
+        ):
+            return None
+        waiting = unanswered_from(self._state(), message.sender, message.recipient)
+        if not waiting:
+            return None
+        return (
+            f"This note names no reply_to, so it answers none of the {len(waiting)}"
+            f" notes from {message.recipient} you have not answered, the newest"
+            f" {waiting[-1]}. If it answers one, acknowledge_mail that one and name"
+            f" {message_id} as the reason. Later answers can carry reply_to."
         )
 
     def _sent_result(self, message_id: str) -> dict[str, Any]:

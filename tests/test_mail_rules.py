@@ -8,7 +8,7 @@ recorded reason. ``@operator`` names the project's default operator."""
 
 import asyncio
 from dataclasses import replace
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -418,6 +418,53 @@ def test_the_senders_unanswered_is_the_recipients_count(world: World) -> None:
     # Once the recipient answers, the note leaves both views.
     world.call("acknowledge_mail", {"message_id": asked})
     assert sent(world.log.state, ANA, unanswered_only=True) == ([], 0)
+
+
+def sent_texts(world: World, args: Mapping[str, object]) -> list[str]:
+    """Every text part of a ``send_message`` result from alpha."""
+    tool = world.tool("send_message")
+
+    async def invoke() -> dict[str, Any]:
+        return await tool.handler(dict(args))
+
+    result = asyncio.run(invoke())
+    assert result.get("is_error") is not True, result
+    return [cast(str, part["text"]) for part in result["content"]]
+
+
+def test_a_note_to_an_operator_without_reply_to_says_what_waits(
+    world: World,
+) -> None:
+    """Round 18 fix, item 3. A summary sent without ``reply_to`` is not linked to an
+    open note, since which one it answers cannot be told. The line is told how many
+    of that operator's notes wait and the newest, and nothing is closed."""
+    first = world.deliver(world.scheduler.send(ANA, ALPHA, "task one"))
+    newest = world.deliver(world.scheduler.send(ANA, ALPHA, "task two"))
+    texts = sent_texts(world, {"to": "@ana", "body": "a summary"})
+    assert len(texts) == 2 and texts[0].startswith("sent as ")
+    summary_id = texts[0].removeprefix("sent as ")
+    assert "none of the 2 notes from @ana" in texts[1]
+    assert newest in texts[1] and first not in texts[1] and summary_id in texts[1]
+    assert world.unanswered(ALPHA) == 2
+    # A reply carries its link, so it is told nothing, and it closes only its note.
+    reply = {"to": "@ana", "body": "done", "reply_to": newest}
+    assert len(sent_texts(world, reply)) == 1
+    assert world.unanswered(ALPHA) == 1
+    texts = sent_texts(world, {"to": "@ana", "body": "another summary"})
+    assert "none of the 1 notes from @ana" in texts[1] and first in texts[1]
+
+
+def test_a_note_is_told_nothing_when_no_link_is_missing(world: World) -> None:
+    """No warning to a line, for an issue, for a reply, or when nothing waits."""
+    assert len(sent_texts(world, {"to": "@ana", "body": "nothing waits"})) == 1
+    asked = world.deliver(world.scheduler.send(ANA, ALPHA, "task"))
+    assert len(sent_texts(world, {"to": "beta", "body": "to a line"})) == 1
+    issue = {"to": "@ana", "body": "a problem", "issue": True}
+    assert len(sent_texts(world, issue)) == 1
+    reply = {"to": "@ana", "body": "done", "reply_to": asked}
+    assert len(sent_texts(world, reply)) == 1
+    # The reply closed the one note that waited, so a later note is told nothing.
+    assert len(sent_texts(world, {"to": "@ana", "body": "later"})) == 1
 
 
 def test_unanswered_and_own_notes_together_are_refused(world: World) -> None:
