@@ -283,6 +283,16 @@ checkable and skipped without refusing restart before adapter construction.
 Their launch arguments and configuration remain unverified by preflight. Any failure refuses
 restart before the client sends its restart request.
 
+**Round 19, item 1. A start time that does not read.** A record whose harness's start time
+cannot be read, while the process is there, is kept for the next sweeps, up to ten, with the
+count written into the record as `start_retries`, so a restart of the daemon continues the
+count. Nothing is signalled meanwhile. The record is removed at once when the time reads and
+differs, when no process holds the pid, or when it has none to read, as a record written
+before round 18. **Residual.** The count is of sweeps and not of time, so a failure that
+outlasts ten sweeps, which come at least as often as the scheduler's rest, ends the
+protection, in the safe direction, as the record is removed and the orphan is left to the
+operator.
+
 **Round 18, audit's finding, 2026-11-18. Records written before the upgrade.** The
 sweep signals a harness only when its record carries the harness's start time and the
 process now holding the pid started then. A launch record written by a launcher that started

@@ -2540,7 +2540,20 @@ daemon stops it, when the daemon stops or dies, and when the line's engine is st
   `ps` shows `<defunct>` is the exception, since it keeps its pid until it is reaped, and a
   leader that has gone leaves its group signalled, since a group number is not given to a new
   group while a member runs, but a leader that is there with a start time that cannot be read
-  is refused. A launcher or a harness whose start time cannot be told is taken as still
+  is refused. **Round 19, item 1.** That refusal does not remove the record at once, since
+  the failure can be a moment's and the harness can be the live one whose launcher has gone.
+  The record is kept for the next sweeps, and the number of sweeps that kept it,
+  `start_retries`, is written into it whole, through a temporary file and a rename, so it
+  survives a restart of the daemon. The temporary file has a unique random name, is created
+  with exclusive creation, no following of links and mode 0600, and is flushed to disk before
+  the rename, so a file or link planted at a name is refused and never followed or truncated,
+  a crash leaves the old record or the new, and the file is removed on a failure once this
+  call has created it. A port must keep all four. It is removed when the start time reads and differs, which
+  is another process, when no process holds the pid any more, when the count passes
+  `MAX_START_RETRIES`, 10, or when the count cannot be written, so the retries are bounded in
+  every case. A count that is not a whole number from 0 to the bound is read as the bound, so
+  damage shortens the retries. Nothing is signalled on a time that does not read, in any sweep.
+  A launcher or a harness whose start time cannot be told is taken as still
   running and held, so no sweep follows. **At the first restart onto this version** each
   record that an older launcher wrote and whose launcher is still in the table is left
   alone, so its engine goes on, and each such record whose launcher has exited is removed
