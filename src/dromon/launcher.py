@@ -849,8 +849,9 @@ def _started_as(pid: int, recorded: float | None) -> bool | None:
     """Whether the process now holding ``pid`` is the one that started at ``recorded``,
     read from the operating system, or ``None`` when that cannot be told, which is when
     nothing was recorded or the start time cannot be read. **Round 18, item 4.** Not
-    knowing is never taken as knowing, so a caller that gets ``None`` does what it did
-    before start times were recorded, which is to go by the executable's name."""
+    knowing is never taken as knowing. **Audit's finding, 2026-11-18.** A caller that
+    gets ``None`` fails closed and signals nothing, and no longer goes by the
+    executable's name."""
     if recorded is None:
         return None
     now = start_time(pid)
