@@ -37,7 +37,7 @@ from dromon.machinestatus import (
 from dromon.model import HARNESS, LineAddress, OperatorAddress, RunStarted
 from dromon.paths import ProjectPaths
 from dromon.projectconfig import ConfigFileError, ProjectConfig, parse as parse_project
-from dromon.scheduler import LineSpec, Scheduler
+from dromon.scheduler import START_RUN_TOOL_NAME, LineSpec, Scheduler
 
 HAIKU = "claude-haiku-5-5"
 ANA = OperatorAddress("ana")
@@ -422,7 +422,8 @@ def test_a_run_is_deferred_at_elevated_for_memory_swap_or_load(
     rig.write("elevated", reasons)
     with pytest.raises(runs.RunRefused, match="deferred") as caught:
         rig.start_run()
-    assert reasons in str(caught.value) and "wake_after" in str(caught.value)
+    assert reasons in str(caught.value)
+    assert machinestatus.RUNS_HELD_ADVICE in str(caught.value)
     assert "Nothing was started" in str(caught.value)
     assert rig.runs_started() == 0
 
@@ -693,6 +694,8 @@ def test_line_status_in_detail_gives_the_status_without_a_path(rig: Rig) -> None
         "monitor": None,
         "defers_runs": True,
         "defers_turns": False,
+        "advice": machinestatus.RUNS_HELD_ADVICE,
+        "policy": machinestatus.POLICY,
     }
     assert str(rig.status) not in str(view)
     missing = configured(rig)
@@ -742,6 +745,77 @@ def test_a_turn_proceeds_at_elevated_with_a_warning(rig: Rig) -> None:
     assert "swap use is 17000 MB" in prompt and "start nothing heavy" in prompt
     assert "deferred" not in prompt
     assert rig.harness_notes("@ana") == []
+
+
+def test_a_turn_at_elevated_for_disk_alone_is_not_told_to_hold_a_gate(
+    rig: Rig,
+) -> None:
+    """**Round 18, item 4.** The warning told the line to start nothing heavy, such
+    as a full gate, while ``decide`` let the gate start. It now gives the advice of
+    the decision, and a run started then does start."""
+    configured(rig)
+    rig.write("elevated", "data volume has 38 GB free")
+    rig.mail()
+    rig.drain()
+    (prompt,) = rig.prompts()
+    assert machinestatus.RUNS_ALLOWED_ADVICE in prompt
+    assert "start nothing heavy" not in prompt
+    # That a run then starts is test_a_run_is_not_deferred_at_ok_or_when_only_disk...
+    assert not rig.scheduler.machine_decision().defer_runs
+
+
+def test_the_warning_and_the_refusal_give_one_advice(rig: Rig) -> None:
+    """The turn's warning, the run's refusal and ``line_status`` name the same
+    sentence for the same status. The refusal comes first, since a drained rig
+    starts no more processes."""
+    configured(rig)
+    rig.write("elevated", "swap use is 17000 MB")
+    with pytest.raises(runs.RunRefused) as caught:
+        rig.start_run()
+    rig.mail()
+    rig.drain()
+    (prompt,) = rig.prompts()
+    shown = str(rig.scheduler.machine_status_view()["advice"])
+    assert shown == machinestatus.RUNS_HELD_ADVICE
+    assert shown in prompt and shown in str(caught.value)
+
+
+def test_the_start_run_tool_states_the_policy_for_runs(rig: Rig) -> None:
+    (tool,) = [
+        tool
+        for tool in rig.scheduler.own_tools("alpha")
+        if tool.name == START_RUN_TOOL_NAME
+    ]
+    assert tool.description.endswith(machinestatus.RUNS_HELD_WHEN)
+
+
+@pytest.mark.parametrize(
+    ("decision", "said"),
+    [
+        (Decision(), ""),
+        (Decision(defer_runs=True, warn=True), "RUNS_HELD_ADVICE"),
+        (Decision(defer_runs=True, defer_turns=True), "RUNS_HELD_ADVICE"),
+        (Decision(warn=True), "RUNS_ALLOWED_ADVICE"),
+        (Decision(defer_turns=True), "RUNS_ALLOWED_ADVICE"),
+    ],
+)
+def test_the_advice_follows_the_decision(decision: Decision, said: str) -> None:
+    assert machinestatus.advice(decision) == (
+        getattr(machinestatus, said) if said else ""
+    )
+
+
+def test_the_policy_names_the_disk_exception_for_runs_only() -> None:
+    """Each level the decision table holds, with the sentence it is told in."""
+    disk_elevated = decide(MachineStatus("elevated", ("data volume has 9 GB free",), 0))
+    disk_critical = decide(MachineStatus("critical", ("data volume has 2 GB free",), 0))
+    assert not disk_elevated.defer_runs and not disk_critical.defer_runs
+    assert disk_critical.defer_turns
+    assert "unless only free disk space raised it" in machinestatus.RUNS_HELD_WHEN
+    assert "critical, whatever raised it" in machinestatus.TURNS_HELD_WHEN
+    assert (
+        f"{machinestatus.RUNS_HELD_WHEN} {machinestatus.TURNS_HELD_WHEN}"
+    ) == machinestatus.POLICY
 
 
 @pytest.mark.parametrize("state", ["stale", "missing"])

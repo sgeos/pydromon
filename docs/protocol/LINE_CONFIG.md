@@ -345,17 +345,21 @@ and suggests `detail: true, lists: false` to omit the lists.
 **Round 16, item 3. The machine's status.** Where the project names a status file with
 `daemon.machine_status`, `line_status` in detail gives `machine_status`, with `configured`,
 `level`, `acted_on_as`, `age_seconds` counted to the moment of the answer, `sampled_at` (round 17), `reasons`, `problem`, `monitor`, `defers_runs` and
-`defers_turns`, never the file's path. `reasons` and `problem` are screened against the
+`defers_turns`, and from round 18 `advice`, the sentence the notices give for the
+current decision or `null` at `ok`, and `policy`, the whole rule in words, never the
+file's path. `reasons` and `problem` are screened against the
 disclosure list one by one. `monitor` is a sentence saying that the monitor looks stopped, since
 when and how the operator restores the gates, or `null` while the file is fresh. `level` is `ok`, `elevated` or `critical`, or
 `stale`, `missing` or `unreadable`, which are acted on as `elevated`. A line is affected in
-three ways, as [`RUNS.md`](../architecture/RUNS.md) sets out. Its `start_run` is refused
-as deferred, saying nothing was started and that it should wait with `wake_after`, when the
+three ways, as [`RUNS.md`](../architecture/RUNS.md) sets out. Its `start_run` is queued,
+or refused as deferred by a start that is not queued, saying nothing was started, when the
 status is `elevated` for memory, swap, load or an unknown reason, `critical`, or not to be
 relied on, and not when only free disk space raised it, since a gate uses processor and
 memory and not disk. A turn proceeds at `elevated` with a note leading its prompt, which
-says the machine is shared and asks the line to start nothing heavy, such as a full gate,
-and to say so in its report if it waits. A turn is not started at `critical`, and the
+says the machine is shared and gives the advice of the decision. Where runs are held back
+it asks the line to start nothing heavy, such as a full gate, and to say so in its
+report if it waits. Where only free disk space raised the level it says that runs are
+not held back and a full gate may start, which before round 18 it did not. A turn is not started at `critical`, and the
 line's mail waits. The line is told once by a note from the harness and the operator is
 told once, and the line's next prompt says how long its turn waited. A running turn and a
 running run are never stopped by the status. The file is read on a worker thread that the
