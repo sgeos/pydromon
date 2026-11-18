@@ -739,12 +739,67 @@ They are offered while the project declares a run command, or while the line's s
 has a run to read. The operator's `dromon run clear RUN` is the only way to clear a
 lost run by hand, and is offered to no line or external agent. So are `dromon run admit` and `dromon run admit-end`, which make and end the override of the machine status.
 
+## The bound of the runs answer
+
+**Round 19, the operator's defect of 2026-11-18.** `dromon run status` failed with "the
+daemon could not encode its response: the line exceeds 65536". **Fact, confirmed.** The
+answer held each scope's latest ten runs, and each run carried its note, which may be
+1,024 bytes, and the tail of its output, which may be 2,048. A project with forty lines
+and a few failed runs each is over the protocol's 64 KiB line, and the daemon cannot
+send such an answer at all, so the operator saw nothing and the queued runs, which the
+answer never held, were not visible either. The test that reproduces it builds forty
+lines with twelve failed runs each. With the bound removed it fails with the operator's
+own message, and the same runs give an answer under the line with it.
+
+**The rule.** A list answers with at most `limit` runs, 20 unless the client gives
+`--limit`, from 1 to 100, and with at most `RUNS_BUDGET_BYTES` of them as written in
+JSON. The budget is derived from the line limit, not guessed. It is the line limit,
+65,536 bytes, less `RUNS_RESERVE_BYTES`, 32,768, which is what the answer needs for
+everything but its runs. A test sums the worst case of each of those parts, the
+envelope, the override with a reason of the most the model allows, eight queued runs
+with the longest reason a view keeps, and the counts, using the characters that cost the
+most to write, and asserts that the sum is under two thirds of the reserve. That test
+found that a first guess of 16 KiB was too small, which is why the reserve is derived and
+checked. A second test asserts that the worst run the model allows takes at most half the
+budget as a list entry, so the budget never leaves an answer with no run for want of room,
+and that one run's whole view with the reserve is under the line. The count is a limit on
+work and on output, and it is the budget, not the count, that guarantees the fit.
+
+**Which runs.** Each scope offers its latest ten, as before. Of those, the runs that
+block their scope, open or lost, come first, since an operator looks for them, then the
+rest newest first by the order the log holds them. The page is cut at `limit` or at the
+first run that does not fit the budget, and is then grouped by scope as before. `total`
+is every run the log holds and `left_out` how many this page does not show. The client
+prints a line saying how many were left out, that `dromon run status RUN_ID` shows one
+run whole, and that `--limit` asks for more.
+
+**Smaller views.** A run in a list carries no note and no output tail, which are null
+there, since the list shows neither. One run's view carries both. `corrects`, which
+named every failed run a passing run corrected, and so was as long as the log, names the
+newest eight, with `corrects_left_out` for the rest. The client says "and N older".
+
+**Queued runs.** The answer gives `queued`, the runs that wait, in order, at most the
+queue's own bound of eight, each with its place, its command, the commit for a commit run
+and what holds it back now, cut to 512 bytes. The client prints them after the runs.
+
+**Failure modes.** A limit outside 1 to 100, a limit that is not a whole number, a limit
+with a run, and an unknown argument are refused as `bad_request`, and the client refuses
+a bad `--limit` before it asks. A budget so small that not even the first run fits gives
+no runs and counts them all as left out, which only a caller of the scheduler can ask
+for. **Residuals.** The list is not paged, so a run past the limit is reached by its
+identifier only, which an operator has from the log or from a receipt. The order is the
+log's, which is the order of starting, not of ending. The worst case of one run is
+derived from the model's limits as of this round, so a new text field in a run needs the
+test to be read again. Runs recorded before this round are shown as they were recorded.
+**Porting note.** A pure function of the state, a limit and a byte budget.
+
 **Round 14, item 11.** The operator reads runs with `dromon run status`, the request
 `runs`, which lists the latest ten runs of every scope with each run's command, line,
 start, end, exit code and output file, and with `dromon run status RUN` for one run
 with the rest of its receipt. Before this the operator read `run_ended` from the event
-log by hand. The request reads the log and records nothing. It is bounded by the
-number of scopes, since each scope gives at most ten runs.
+log by hand. The request reads the log and records nothing. **Round 19.** It was
+bounded by the number of scopes and not by anything else, which was the defect the
+next section describes.
 
 **Whether a run still covers the tree.** **Round 16, item 5, core's request of round
 15.** A gate that passed was read as covering a tree whose tracked files had changed

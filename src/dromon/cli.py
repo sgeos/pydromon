@@ -55,7 +55,12 @@ from dromon.configwarnings import config_warnings
 from dromon.lineconfig import EFFORTS, can_write_workdir
 from dromon.projectconfig import ProjectConfig
 from dromon.model import AgentAccess
-from dromon.protocol import Operation, ProtocolError
+from dromon.protocol import (
+    RUNS_LIMIT_DEFAULT,
+    RUNS_LIMIT_MAX,
+    Operation,
+    ProtocolError,
+)
 from dromon.scheduler import LineSpec, engine_factory
 from dromon import settings as engine_settings
 from dromon.sandbox import (
@@ -1232,12 +1237,20 @@ def _questions(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         )
         for text_line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"    {text_line}")
+        if entry.get("text_truncated") is True:
+            print("    [the text is cut to fit one answer, and the rest is in the log]")
         choices = entry.get("choices")
         if isinstance(choices, list) and choices:
             print(
                 "    choices: "
                 + " | ".join(str(c) for c in cast(list[object], choices))
             )
+    left_out = response.result.get("left_out")
+    if type(left_out) is int and left_out > 0:
+        print(
+            f"{left_out} more open questions did not fit this answer. Answer the"
+            " ones shown, and ask again."
+        )
     return exits.OK
 
 
@@ -2195,7 +2208,7 @@ def _run(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     first."""
     run_id: str | None = arguments.run_id
     if arguments.action == "status":
-        return _run_status(paths, run_id)
+        return _run_status(paths, run_id, arguments.limit)
     if arguments.action in ("admit", "admit-end"):
         return _run_admit(paths, arguments)
     if run_id is None:
@@ -2309,10 +2322,30 @@ def _ci_log(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     return exits.OK
 
 
-def _run_status(paths: ProjectPaths, run_id: str | None) -> int:
-    """Print every scope's recent runs, or one run with its whole receipt. Round
-    14, item 11, since an operator otherwise read ``run_ended`` from the log."""
+def _run_status(
+    paths: ProjectPaths, run_id: str | None, limit: int | None = None
+) -> int:
+    """Print the runs that matter, or one run with its whole receipt. Round 14, item
+    11, since an operator otherwise read ``run_ended`` from the log. **Round 19.** The
+    list is bounded, runs that block a scope first, then the newest, with the queued
+    runs and a line saying how many were left out and how to see one. ``limit`` is
+    checked here against the daemon's maximum, so a bad one is a usage error and no
+    request is made."""
+    if limit is not None and run_id is not None:
+        print(
+            "dromon run status: --limit is for the list, not for one run",
+            file=sys.stderr,
+        )
+        return exits.USAGE
+    if limit is not None and not 1 <= limit <= RUNS_LIMIT_MAX:
+        print(
+            f"dromon run status: --limit must be from 1 to {RUNS_LIMIT_MAX}",
+            file=sys.stderr,
+        )
+        return exits.USAGE
     args: dict[str, object] = {} if run_id is None else {"run_id": run_id}
+    if limit is not None:
+        args["limit"] = limit
     result = _call(paths, "run status", Operation.RUNS, args)
     if isinstance(result, int):
         return result
@@ -2331,7 +2364,13 @@ def _run_status(paths: ProjectPaths, run_id: str | None) -> int:
             for detail in _run_details(view):
                 print(f"  {detail}")
         return exits.OK
-    if not views:
+    queued = result.get("queued")
+    waiting = [
+        cast(dict[str, object], entry)
+        for entry in (cast(list[object], queued) if isinstance(queued, list) else [])
+        if isinstance(entry, dict)
+    ]
+    if not views and not waiting:
         print("no runs yet")
         return exits.OK
     scope: object = None
@@ -2340,7 +2379,35 @@ def _run_status(paths: ProjectPaths, run_id: str | None) -> int:
             scope = view.get("scope")
             print(scope)
         print(f"  {_run_row(view)}")
+    if waiting:
+        print("queued, waiting to start")
+        for entry in waiting:
+            print(f"  {_queued_row(entry)}")
+    left_out = result.get("left_out")
+    if type(left_out) is int and left_out > 0:
+        print(
+            f"{left_out} more runs are not shown, the oldest and those past the limit."
+            " dromon run status RUN_ID shows one run whole, and --limit N asks for"
+            f" more, to at most {RUNS_LIMIT_MAX}."
+        )
     return exits.OK
+
+
+def _queued_row(entry: dict[str, object]) -> str:
+    """One queued run on one line, for ``dromon run status``. **Round 19.**"""
+    on = entry.get("commit")
+    where = "" if on is None else f" on commit {on}"
+    waits = entry.get("waits")
+    why = (
+        "nothing holds it back now, so it starts on the next look"
+        if waits is None
+        else f"it waits, since {waits}"
+    )
+    return (
+        f"{entry.get('queue_id')} {entry.get('command')}{where} by"
+        f" {entry.get('line_id')}, position {entry.get('position')} of"
+        f" {entry.get('of')}, queued at {entry.get('queued_at')}, {why}"
+    )
 
 
 def _admission_row(view: dict[str, object]) -> str:
@@ -2386,6 +2453,9 @@ def _run_row(view: dict[str, object]) -> str:
     corrects = view.get("corrects")
     if isinstance(corrects, list) and corrects:
         row += ", corrects " + ", ".join(str(c) for c in cast(list[object], corrects))
+        more = view.get("corrects_left_out")
+        if type(more) is int and more > 0:
+            row += f" and {more} older"
     corrected_by = view.get("corrected_by")
     if corrected_by is not None:
         row += f", corrected by {corrected_by}"
@@ -2510,6 +2580,11 @@ def _role(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
                     f"retired role {gone['role_id']}, by {gone['by']} at"
                     f" {gone['retired_at']}"
                 )
+            retired_total = result.get("retired_total")
+            if type(retired_total) is int and retired_total > len(retired):
+                print(
+                    f"{retired_total - len(retired)} older retired roles are not shown"
+                )
         case "entry":
             print(
                 f"entry {result['entry_id']} of role {result['role_id']}, a"
@@ -2518,6 +2593,11 @@ def _role(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
                 f" {result['daemon_commit'] or 'unknown'}"
             )
             print(result["body"])
+            if result.get("body_truncated") is True:
+                print(
+                    f"[the body is cut to fit one answer. It is {result['chars']}"
+                    " characters, and the whole is in the log]"
+                )
         case "take" | "vacate":
             owner = result["owner"] or "no seat"
             print(
@@ -4105,6 +4185,13 @@ def build_parser() -> argparse.ArgumentParser:
                 default=default_operator(),
                 help="who clears it, admits runs or ends the override, default"
                 " %(default)s",
+            )
+            command.add_argument(
+                "--limit",
+                type=int,
+                help="for status, the most runs to list, default"
+                f" {RUNS_LIMIT_DEFAULT}, from 1 to {RUNS_LIMIT_MAX}. Runs that block"
+                " a scope come first and the daemon may give fewer to fit its line",
             )
             command.add_argument(
                 "--seconds",

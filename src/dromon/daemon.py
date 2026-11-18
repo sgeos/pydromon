@@ -233,6 +233,9 @@ from dromon.peering import (
 )
 from dromon.protocol import (
     MAX_LINE_BYTES,
+    RUNS_BUDGET_BYTES,
+    RUNS_LIMIT_DEFAULT,
+    RUNS_LIMIT_MAX,
     MAX_PEER_LINE_BYTES,
     PROTOCOL_VERSION,
     ErrorCode,
@@ -260,6 +263,17 @@ VIEW_PREVIEW_CHARACTERS: Final = 600
 
 VIEW_BUDGET_BYTES: Final = 40_000
 """Room for messages in a ``line_view`` response, below the 64 KiB line limit."""
+
+VIEW_QUESTIONS_BUDGET_BYTES: Final = MAX_LINE_BYTES - VIEW_BUDGET_BYTES - 8 * 1024
+"""Room for the open questions of a ``line_view`` response, **round 19.** What is left
+of the line after the messages and 8 KiB for the line's summary, the counts and the
+envelope. The summary is about 700 bytes."""
+
+ANSWER_BUDGET_BYTES: Final = 48 * 1024
+"""The most bytes, as written in JSON, of the entries of a ``questions`` answer or of
+the body of a ``role_entry`` answer. **Round 19.** Both grew with what the log holds, a
+question's text and a journal entry's body being as long as the model allows, which is
+over one protocol line of 64 KiB. This leaves 16 KiB for the answer's other fields."""
 
 REPLIES_BUDGET_BYTES: Final = 40_000
 """The most bytes, as written in JSON, of the entries and the echoed identifier that
@@ -975,9 +989,10 @@ class Daemon:
                     if not values:
                         retired = self.scheduler.retired_roles_view()
                         result["retired"] = cast(object, retired)
+                        result["retired_total"] = len(self.log.state.retired_roles)
                 case Operation.ROLE_ENTRY:
                     (entry_id,) = _text_args(request.args, ("entry_id",))
-                    result = self.scheduler.role_entry(entry_id)
+                    result = _bounded_entry(self.scheduler.role_entry(entry_id))
                 case Operation.ROLE_CREATE:
                     result = self._role_set(request.args, create=True)
                 case Operation.ROLE_UPDATE:
@@ -1046,13 +1061,7 @@ class Daemon:
                         "bytes": written.size,
                     }
                 case Operation.RUNS:
-                    names = ("run_id",) if "run_id" in request.args else ()
-                    values = _text_args(request.args, names)
-                    found = self.scheduler.runs_view(values[0] if values else None)
-                    result = {
-                        "runs": cast(object, found),
-                        "admission": cast(object, self.scheduler.admission_view()),
-                    }
+                    result = self._runs(request.args)
                 case Operation.OVERVIEW:
                     # Round 16, item 1. The line's own view, read only.
                     (line_id,) = _text_args(request.args, ("line_id",))
@@ -1407,12 +1416,14 @@ class Daemon:
         check_instructions(config.instructions, self.paths.root)
 
     def _questions(self, args: dict[str, object]) -> dict[str, object]:
-        """Open questions for ``operator``, or for every operator when it is omitted."""
+        """Open questions for ``operator``, or for every operator when it is omitted.
+        **Round 19.** The answer holds at most ``ANSWER_BUDGET_BYTES`` of them, oldest
+        first, with ``total`` and ``left_out`` so the reader knows what is not shown."""
         names = ("operator",) if "operator" in args else ()
         values = _text_args(args, names)
         operator = OperatorAddress(values[0]) if values else None
         found = self.scheduler.questions(operator)
-        return {"questions": [_question_summary(i, m) for i, m in found]}
+        return _bounded_questions([_question_summary(i, m) for i, m in found])
 
     def _answer(self, args: dict[str, object]) -> dict[str, object]:
         question_id, body, operator = _text_args(
@@ -1694,13 +1705,44 @@ class Daemon:
             for message_id, message in involved
             if message.status is QuestionStatus.OPEN and message.sender == address
         ]
+        # Round 19. The newest questions, each as long as the model allows, held to
+        # what the line has left after the messages.
+        asked = _bounded_questions(questions[-VIEW_LIMIT:], VIEW_QUESTIONS_BUDGET_BYTES)
         return {
             "line": dict(summaries[line_id]),
             "tick": self.scheduler.tick,
             "messages": messages,
             "total": len(involved),
-            "open_questions": questions[-VIEW_LIMIT:],
+            "open_questions": asked["questions"],
+            "open_questions_left_out": asked["left_out"],
         }
+
+    def _runs(self, args: dict[str, object]) -> dict[str, object]:
+        """The ``runs`` answer, bounded. **Round 19.** Arguments are ``run_id``, for one
+        run in whole, or ``limit``, at most ``RUNS_LIMIT_MAX`` and
+        ``RUNS_LIMIT_DEFAULT`` when left out, for a list, and not both. A list holds
+        at most ``limit`` runs and ``RUNS_BUDGET_BYTES`` of them, and gives ``total``
+        and ``left_out`` so the reader knows what it did not get and asks for one run
+        with ``run_id``."""
+        if not set(args) <= {"run_id", "limit"}:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "runs takes run_id or limit")
+        if "run_id" in args and "limit" in args:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, "limit is for the list, not for one run"
+            )
+        limit = args.get("limit", RUNS_LIMIT_DEFAULT)
+        if type(limit) is not int or not 1 <= limit <= RUNS_LIMIT_MAX:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST, f"limit must be in [1, {RUNS_LIMIT_MAX}]"
+            )
+        values = _text_args(
+            {"run_id": args["run_id"]} if "run_id" in args else {},
+            ("run_id",) if "run_id" in args else (),
+        )
+        page = self.scheduler.runs_page(
+            values[0] if values else None, limit, RUNS_BUDGET_BYTES
+        )
+        return {**page, "admission": cast(object, self.scheduler.admission_view())}
 
     def _line_activity(self, args: dict[str, object]) -> dict[str, object]:
         """The entries of a line's activity changed after revision ``after``.
@@ -2255,6 +2297,7 @@ class Daemon:
             "restart": self.scheduler.restart_status(),
             "lines": self.line_summaries(),
             "retired_lines": self.scheduler.retired_lines_view(),
+            "retired_lines_total": len(state.retired_lines),
             "scheduler": self.scheduler.fault_status(),
             "peers": [
                 report.wire(detail=True) for report in self.scheduler.peer_reports()
@@ -2411,6 +2454,69 @@ def _written(value: object) -> int:
     """The bytes ``value`` takes in a protocol line, which is written compactly and
     without escaping beyond JSON's own, as ``dromon.protocol`` writes it."""
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
+
+
+def _cut_to_written(text: str, limit: int) -> str:
+    """The longest start of ``text`` that takes at most ``limit`` bytes as written in
+    JSON, found by halving, so the loop runs at most as many times as ``text`` has
+    bits in its length. **Round 19.**"""
+    if _written(text) <= limit:
+        return text
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _written(text[:middle]) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low]
+
+
+def _bounded_questions(
+    entries: list[dict[str, object]], budget: int = ANSWER_BUDGET_BYTES
+) -> dict[str, object]:
+    """``entries`` as the answer to ``questions``, kept within ``budget`` bytes.
+    **Round 19.** A question's text is as long as the model allows, and the answer held
+    every open question, so it could pass the protocol's line. Entries are kept oldest
+    first until the next does not fit, and the rest are counted in ``left_out``. A first
+    entry that alone does not fit has its text cut, marked with ``text_truncated``,
+    so the answer is never empty for want of room. The full text stays in the log."""
+    kept: list[dict[str, object]] = []
+    room = budget
+    for entry in entries:
+        size = _written(entry) + 1
+        if size > room and not kept:
+            text = str(entry.get("text", ""))
+            others = _written({**entry, "text": "", "text_truncated": True}) + 1
+            entry = {
+                **entry,
+                "text": _cut_to_written(text, max(0, room - others)),
+                "text_truncated": True,
+            }
+            size = _written(entry) + 1
+        if size > room:
+            break
+        room -= size
+        kept.append(entry)
+    return {
+        "questions": kept,
+        "total": len(entries),
+        "left_out": len(entries) - len(kept),
+    }
+
+
+def _bounded_entry(view: dict[str, object]) -> dict[str, object]:
+    """A journal entry's view with its body kept within ``ANSWER_BUDGET_BYTES``, cut
+    and marked with ``body_truncated`` when it is longer. **Round 19.** A body may be
+    64 KiB, which with its fields is over one protocol line. ``chars`` keeps the whole
+    length."""
+    body = view.get("body")
+    if not isinstance(body, str):
+        return view
+    cut = _cut_to_written(body, ANSWER_BUDGET_BYTES)
+    if cut == body:
+        return view
+    return {**view, "body": cut, "body_truncated": True}
 
 
 def _question_summary(message_id: str, message: Message) -> dict[str, object]:

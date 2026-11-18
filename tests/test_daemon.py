@@ -553,9 +553,11 @@ def test_questions_lists_open_questions_for_an_operator(paths: ProjectPaths) -> 
                 "text": "Proceed?",
                 "choices": ["yes", "no"],
             }
-        ]
+        ],
+        "total": 1,
+        "left_out": 0,
     }
-    assert theirs.result == {"questions": []}
+    assert theirs.result == {"questions": [], "total": 0, "left_out": 0}
     assert every.result == mine.result
 
 
@@ -567,7 +569,11 @@ def test_answer_records_the_operators_reply(paths: ProjectPaths) -> None:
     assert response.ok
     with EventLog(paths.event_log) as log:
         assert log.state.messages[question_id].status is QuestionStatus.ANSWERED
-    assert request(paths, "questions", {"operator": "ana"}).result == {"questions": []}
+    assert request(paths, "questions", {"operator": "ana"}).result == {
+        "questions": [],
+        "total": 0,
+        "left_out": 0,
+    }
 
 
 @pytest.mark.parametrize(

@@ -20,6 +20,26 @@ PROTOCOL_VERSION: Final = 1
 MAX_LINE_BYTES: Final = 64 * 1024
 """Upper bound on one request or response line, including its newline."""
 
+RUNS_RESERVE_BYTES: Final = 32 * 1024
+"""What the ``runs`` answer keeps back from one line for everything but its runs,
+which is the envelope, the override, the queued runs and the counts. **Round 19.** The
+parts are bounded by the model and by the queue, and the worst case of each is summed
+by a test, which asserts that the sum is under this, so the reserve is derived and
+checked, not guessed."""
+
+RUNS_BUDGET_BYTES: Final = MAX_LINE_BYTES - RUNS_RESERVE_BYTES
+"""The bytes, as written in JSON, that the runs of one ``runs`` answer may take.
+**Round 19.** The daemon stops adding runs at this, so the line fits whatever the runs
+hold, and says how many it left out. A test asserts that the worst run the model allows
+fits alone, so an answer never has to be empty for want of room."""
+
+RUNS_LIMIT_DEFAULT: Final = 20
+"""The runs ``dromon run status`` asks for when ``--limit`` is not given."""
+
+RUNS_LIMIT_MAX: Final = 100
+"""The most runs a client may ask for. It bounds the work and the output of one answer.
+The budget above, and not this count, is what keeps the answer inside the line."""
+
 MAX_PEER_LINE_BYTES: Final = 8 * 1024 * 1024
 """Upper bound on one line on the peer socket, the bound of an encoded event, so the
 largest body a peer's policy may permit fits even when escaping multiplies its size."""

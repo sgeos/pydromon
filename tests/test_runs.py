@@ -1639,9 +1639,12 @@ def test_dromon_run_status_prints_runs_and_one_receipt(
         f" {LATER}, output /work/tmp/runs/r-{count}.out"
     )
     assert "line beta" in listed
-    assert listed[-1].endswith(
+    assert listed[-2].endswith(
         "still running as process 4321, output /work/tmp/runs/r-b.out"
     )
+    # Round 19. The two oldest runs of alpha are past its ten, and the list says so.
+    assert listed[-1].startswith("2 more runs are not shown"), listed[-1]
+    assert "dromon run status RUN_ID shows one run whole" in listed[-1]
     assert one[0].startswith("r-1 gate by alpha,")
     assert one[0].endswith(", corrected by r-2")
     assert one[1:3] == ["  scope: line alpha", "  previous: none"]
