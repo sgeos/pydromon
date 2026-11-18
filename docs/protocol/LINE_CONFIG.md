@@ -265,7 +265,7 @@ argument outside a tool's schema is refused.
 
 | Tool | Effect |
 |---|---|
-| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies. With `issue` true, from 2026-10-31, it raises an issue with an operator, as below. From round 14, `asks_reply` says whether a note asks a reply, and `reply_to` may also name a note the line sent the same recipient, to correct it, as the unanswered rule below says. `@operator` names the project's default operator, as below. **Round 18 fix, item 3.** A note to an operator that names no `reply_to`, while notes from that operator to the line wait unanswered, gets a second text part in its result that gives their count and the newest identifier, and says to acknowledge the one the note answered. The note is not linked by itself, since which open note a summary answers cannot be told, and a wrong link would close a task that still waits |
+| `send_message` | Sends a note to a line, an operator or the line itself, delivered in a later tick. With `priority` true, a note to another line is priority mail, rate limited, as [`PRIORITY.md`](PRIORITY.md) specifies. With `issue` true, from 2026-10-31, it raises an issue with an operator, as below. From round 14, `asks_reply` says whether a note asks a reply, and `reply_to` may also name a note the line sent the same recipient, to correct it, as the unanswered rule below says. `@operator` names the project's default operator, as below. **Round 18 fix, item 3.** A note to an operator that names no `reply_to`, while notes from that operator to the line wait unanswered, gets a second text part in its result that gives their count and the newest identifier, and says to acknowledge the one the note answered. The note is not linked by itself, since which open note a summary answers cannot be told, and a wrong link would close a task that still waits. **Round 19, item 1.** The text agrees with its count, one note or several |
 | `ask_operator` | Asks an operator a question, which never pauses the line |
 | `wake_after` | Schedules one wake for the line, optionally tied to a running background task, to a process of its own that `list_processes` shows, or to an open run of its scope, as below |
 | `list_mail`, `read_mail`, `acknowledge_mail` | Page through, open and acknowledge the line's mailbox |
@@ -1765,7 +1765,17 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
   An identifier is named only in the form Dromon generates, a letter, a hyphen and 12
   lowercase hexadecimal digits, and only when it is itself clear of the list, so it
   can carry neither free text nor a term. Any other is counted in a closing
-  sentence. The fence cannot stop a model
+  sentence. **Round 19, item 2, the premise, accepted by the operator.** The
+  engine is an external service, so the index leaves the machine for the engine's
+  provider with the rest of the prompt. Leaving Dromon's own words out of the screen
+  rests on the premise that the same engine is already given each of them
+  unscreened, the recipient address because the line named it, the default
+  operator in the turn header, and every run's command and commit in `run_status`.
+  A field later added to an entry that the engine is not otherwise given, or a
+  screen later added to one of those surfaces, breaks the premise, and the index
+  must then screen that part too. A test pins that `run_status` gives the command
+  and commit unscreened. **Item 1.** The closing sentences agree with their count,
+  "1 entry was" and "2 entries were". The fence cannot stop a model
   from choosing to follow a quote. It only keeps a quote from passing as the
   daemon's own words.
   **Residuals.** It follows only a session the daemon knows is new, so a thread an

@@ -39,11 +39,29 @@ screened the whole entry line, and the operator's address matched the list, so e
 report to that operator was withheld and a renewed session's index was nearly empty.
 The rest of a line is what Dromon writes, an identifier it generated, an address, a
 commit, a time, an outcome, or a run's command name from the project's declared runs.
-**Inference.** Leaving those out of the screen is safe because the index reaches only
-the line's own engine, which already receives each of them unscreened, its operators'
-addresses in every turn's header and mail listings, and the run commands and commits
-in ``run_status``, so the index discloses nothing the line was not already given. The
-list guards what leaves Dromon, and the index does not leave it.
+
+**The premise, round 19, item 2, accepted by the operator.** Leaving those out of the
+screen rests on one premise. The index reaches only the line's own engine, and that
+engine already receives each of them unscreened, its operators' addresses in every
+turn's header and mail listings, and the run commands and commits in ``run_status``.
+**Fact.** The engine is an external service. Its prompt, the index with it, leaves
+the machine for the engine's provider, so the round 18 wording, that the index does
+not leave Dromon, was wrong. **Inference.** The index still adds no exposure, because
+every unscreened part of it is something the same provider is already sent, or can be
+sent with one tool call, in the same line's sessions. An address in a report entry is
+one the line's engine itself wrote as the note's recipient, the turn header names the
+operator it asks by default, and ``run_status`` gives every run of the role, with its
+command and commit, to any seat that calls it. The screen's job here is the line's
+own quoted text, which the list may have caught up with since. **Failure mode.**
+The premise breaks if a part Dromon writes reaches the index without reaching the
+engine elsewhere, such as a field a later change adds to an entry, or if the turn
+header or a tool begins to screen what it gives. Either change must screen the same
+part here, and a test of a new entry's field should say which side it is on.
+
+**Number.** **Round 19, item 1.** The closing sentences agree with their count, "1
+entry was" and "2 entries were", where they read "1 entries" before. Only a count of
+exactly one is singular. The sentence is written whole for each case, rather than
+built from parts, so each reads as one sentence in the source.
 
 **Withheld entries.** **Round 18 fix, item 2.** An entry whose quoted text now holds a
 term is given without its text, as its identifier and the word withheld, so a renewed
@@ -260,10 +278,17 @@ def evidence_index(state: State, line_id: str, discloses: Discloses) -> str | No
         return None
     lines.append(INDEX_END)
     if left_out:
-        lines.append(f"{left_out} further entries were left out to keep this bounded.")
+        lines.append(
+            "1 further entry was left out to keep this bounded."
+            if left_out == 1
+            else f"{left_out} further entries were left out to keep this bounded."
+        )
     if unnamed:
         lines.append(
-            f"{unnamed} entries were withheld with their identifiers, since their text"
-            " now holds a term of the disclosure list."
+            "1 entry was withheld with its identifier, since its text now holds a"
+            " term of the disclosure list."
+            if unnamed == 1
+            else f"{unnamed} entries were withheld with their identifiers, since"
+            " their text now holds a term of the disclosure list."
         )
     return "\n".join(lines)
