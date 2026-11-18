@@ -47,6 +47,7 @@ from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon import engine as engine_module
 from dromon import hookpolicy
 from dromon.driver import Action, Credential, Driver, Event, Strategy, driver_resource
+from dromon.engine_environment import CLAUDE_ENGINE_ENVIRONMENT
 from dromon.launcher import StopPolicy
 from dromon.priority import SteeredDriver
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, McpServer, ToolPolicy
@@ -1133,6 +1134,59 @@ def test_the_ask_rule_joins_the_operator_rules_once() -> None:
     assert merged["permissions"] == {"ask": ["Bash", "Read"], "deny": ["Edit"]}
     replaced = engine_module.flag_settings({"permissions": "nonsense"}, ("Read",))
     assert replaced["permissions"] == {"ask": ["Read"]}
+
+
+TRUE_VALUES = ("1", "true", "yes", "on")
+"""What the bundled Claude Code 2.1.310 reads as true for its switch variables, read
+on 2026-11-18. A value it reads as false would force auto memory on."""
+
+
+def test_auto_memory_is_off_in_the_launch_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Round 18, item 2. The operator's auto-memory index reached every line, whose
+    # worktree sits inside the project directory.
+    monkeypatch.setattr(engine_module, "claude_cli", lambda: "/bin/claude")
+    environment = launch_environment(None, StopPolicy.KILL_ALL, None)
+    value = environment["CLAUDE_CODE_DISABLE_AUTO_MEMORY"]
+    assert value.lower() in TRUE_VALUES
+
+
+def test_the_launcher_filter_keeps_the_auto_memory_switch() -> None:
+    # The launcher keeps only listed variables, so an unlisted switch would be dropped
+    # before Claude Code starts.
+    assert "CLAUDE_CODE_DISABLE_AUTO_MEMORY" in CLAUDE_ENGINE_ENVIRONMENT
+
+
+@pytest.mark.parametrize(
+    "given",
+    [
+        None,
+        {},
+        {"autoMemoryEnabled": True, "env": {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "0"}},
+        {"autoMemoryEnabled": "yes", "env": "nonsense"},
+    ],
+)
+def test_the_flag_settings_turn_auto_memory_off_whatever_the_line_gives(
+    given: dict[str, object] | None,
+) -> None:
+    # The flag settings' env block comes after the global configuration's, and a
+    # value read as false there would force the memory on before the setting is read.
+    merged = engine_module.flag_settings(given)
+    assert merged["autoMemoryEnabled"] is False
+    block = cast(dict[str, object], merged["env"])
+    assert str(block["CLAUDE_CODE_DISABLE_AUTO_MEMORY"]).lower() in TRUE_VALUES
+    assert block["ENABLE_TOOL_SEARCH"] == "true"
+
+
+def test_every_claude_line_starts_with_auto_memory_off() -> None:
+    session = Scripted([init(), result()])
+    run(configured(DEFAULT_CONFIG, session))
+    options = session.options[0]
+    settings = json.loads(str(options.settings))
+    assert settings["autoMemoryEnabled"] is False
+    assert settings["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+    assert dict(options.env)["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
 
 
 @pytest.mark.parametrize("tools", [(), ("Read",), ("Read", "ViewImage")])

@@ -60,6 +60,12 @@ subscription draws on a plan's limits while API usage is charged for every token
 | `gpt_6_1_terra_subscription.kel` | GPT-6.1 Terra on Codex | subscription | medium | 200 | 400 |
 | `gpt_6_1_terra_api.kel` | GPT-6.1 Terra on Codex | api | low | 2 | 10 |
 | `gpt_6_1_terra_flexible.kel` | GPT-6.1 Terra on Codex | flexible | low | 2 | 10 |
+| `gpt_6_2_sol_subscription.kel` | GPT-6.2-Sol on Codex | subscription | medium | 200 | 400 |
+| `gpt_6_2_sol_api.kel` | GPT-6.2-Sol on Codex | api | low | 2 | 10 |
+| `gpt_6_2_sol_flexible.kel` | GPT-6.2-Sol on Codex | flexible | low | 2 | 10 |
+| `gpt_6_2_astra_subscription.kel` | GPT-6.2-Astra on Codex | subscription | medium | 200 | 400 |
+| `gpt_6_2_astra_api.kel` | GPT-6.2-Astra on Codex | api | low | 2 | 10 |
+| `gpt_6_2_astra_flexible.kel` | GPT-6.2-Astra on Codex | flexible | low | 2 | 10 |
 | `grok_4_7_subscription.kel` | Grok 4.7 on Grok Build | subscription | high | 200 | 400 |
 | `grok_4_7_build_fast_subscription.kel` | Grok 4.7 Build Fast on Grok Build | subscription | high | 200 | 400 |
 | `grok_4_7_api.kel` | Grok 4.7 on Grok Build | api | medium | 4 | 20 |
@@ -167,6 +173,29 @@ The Fable 5.2 window of 1,000,000 tokens and the Grok 4.7 Build Fast window of
 256,000 tokens remain inherited and independently unconfirmed. Verify first by
 checking the selected model and effective context limit in an operator turn before
 relying on either window for context management.
+
+**GPT-6.2-Sol and GPT-6.2-Astra, added on 2026-11-18** at the operator's direction.
+**Fact, from the operator's research of 2026-11-18.** OpenAI's API changelog and the
+Codex changelog date both models 2026-11-17, and Codex's model cache lists
+`gpt-6.2-sol` with a default window of 500,000 tokens and `gpt-6.2-astra` with 272,000,
+each selectable to 872,000. The cache calls `gpt-6.1-sol` and `gpt-6-astra` the
+previous generation. Pi 1.5.2 and Cursor Agent list neither model, so neither has a
+driver on those engines. **Inference, from those descriptions.** GPT-6.2-Sol succeeds
+GPT-6.1-Sol and GPT-6.2-Astra succeeds GPT-6-Astra, so each new driver copies its
+predecessor's for the same strategy, and a test derives every setting but the model.
+The default windows equal the predecessors', so the larger selectable window is not
+used. **Not verified.** Their prices in `dromon.prices` are the highest Codex
+placeholder, because the research records no published price and this line had no
+network to read one. No turn on either model has run through Dromon.
+
+Verify first, in one operator turn on each model under the subscription strategy.
+
+1. `dromon probe --model gpt-6.2-sol` and `--model gpt-6.2-astra` report the model
+   under exactly that name, since the drivers refuse any other.
+2. The operator's ChatGPT plan serves each model.
+3. Where Codex reports a context window for the turn, it is the default above.
+4. Before a metered line runs on either, replace both placeholder prices with
+   OpenAI's published prices.
 
 ## Engines
 

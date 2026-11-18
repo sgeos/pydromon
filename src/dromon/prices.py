@@ -65,6 +65,12 @@ PRICES: Final[Mapping[str, Price]] = {
     # from any price list, as none of these were.
     "gpt-6-sol": Price(5_000_000, 500_000, 40_000_000),
     "gpt-6-astra": Price(5_000_000, 500_000, 40_000_000),
+    # Round 18, the drivers for the models released on 2026-11-17. Added by engines
+    # on 2026-11-18 at the highest Codex placeholder above, as round 16 did. The
+    # operator's research of that day records no published price, and this line has
+    # no network to read one, so neither is a price read from the provider.
+    "gpt-6.2-sol": Price(5_000_000, 500_000, 40_000_000),
+    "gpt-6.2-astra": Price(5_000_000, 500_000, 40_000_000),
 }
 """Estimated prices by model. A model not here gets no estimate, so every model of an
 engine in ``dromon.scheduler.TOKEN_PRICED_ENGINES`` with a metered driver needs one,

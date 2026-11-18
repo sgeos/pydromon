@@ -6,6 +6,7 @@ from importlib import resources
 
 import pytest
 
+from dromon import prices
 from dromon.driver import (
     API_ONLY_MODELS,
     INITIAL_STATE,
@@ -389,6 +390,57 @@ def test_sol_and_terra_follow_the_luna_drivers_with_the_catalogues_window(
             luna.max_turns,
             luna.tool_budget,
         )
+
+
+GPT_6_2_SUCCESSORS = [
+    ("gpt-6.2-sol", "gpt-6.1-sol", 500000),
+    ("gpt-6.2-astra", "gpt-6-astra", 272000),
+]
+
+
+@pytest.mark.parametrize(("model", "predecessor", "window"), GPT_6_2_SUCCESSORS)
+@pytest.mark.parametrize("strategy", Strategy)
+def test_gpt_6_2_drivers_derive_from_their_predecessors(
+    model: str, predecessor: str, window: int, strategy: Strategy
+) -> None:
+    # Codex's model cache, read by the operator on 2026-11-18, calls each predecessor
+    # the previous generation and gives each new model the predecessor's default
+    # window. No turn on either has run through Dromon, so every setting but the model
+    # copies the predecessor's for the same strategy.
+    assert ENGINE_OF[model] == ENGINE_OF[predecessor] == "codex"
+    driver = Driver.for_model(model, strategy)
+    previous = Driver.for_model(predecessor, strategy).settings
+    assert driver.settings == replace(previous, model=model)
+    assert driver.settings.context_window == window
+    assert (
+        driver.step(Event("init", reported_model(predecessor))).tag is ActionTag.REFUSE
+    )
+    assert driver.step(Event("init", reported_model(model))).tag is ActionTag.ACCEPT
+
+
+@pytest.mark.parametrize(("model", "predecessor", "window"), GPT_6_2_SUCCESSORS)
+def test_gpt_6_2_drivers_carry_the_predecessors_placeholder_price(
+    model: str, predecessor: str, window: int
+) -> None:
+    # No published price was read, so each takes the highest Codex placeholder, which
+    # is also its predecessor's, and an estimate errs high.
+    del window
+    new = {name for name, _, _ in GPT_6_2_SUCCESSORS}
+    earlier = [
+        prices.PRICES[name]
+        for name, engine in ENGINE_OF.items()
+        if engine == "codex" and name in prices.PRICES and name not in new
+    ]
+    highest = max(
+        earlier,
+        key=lambda price: (
+            price.input_micro,
+            price.cached_input_micro,
+            price.output_micro,
+        ),
+    )
+    assert prices.PRICES[model] == highest == prices.PRICES[predecessor]
+    assert not prices.PRICES_VERIFIED
 
 
 @pytest.mark.parametrize("element", ["argon", "carbon", "hydrogen"])

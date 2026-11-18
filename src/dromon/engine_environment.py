@@ -18,6 +18,20 @@ TOOL_SEARCH_VARIABLE = "ENABLE_TOOL_SEARCH"
 TOOL_SEARCH_PINNED = "true"
 """Stable tool search keeps the tool schemas from changing between requests."""
 
+AUTO_MEMORY_VARIABLE = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+"""Claude Code's switch for auto memory. **Round 18, item 2. Read from the bundled
+Claude Code 2.1.310 on 2026-11-18, not verified by a live turn.** A line's worktree
+sits inside the operator's project directory, so Claude Code found the operator's
+auto-memory index for that project and loaded it into every line's context. Claude
+Code decides in this order. ``CLAUDE_CODE_SAFE_MODE`` and a restricted session turn
+the memory off. Then this variable turns it off when it reads as true, as ``1``,
+``true``, ``yes`` or ``on``, and forces it on when it reads as false, as ``0``,
+``false``, ``no`` or ``off``. Only when it is unset does the documented
+``autoMemoryEnabled`` setting decide, which defaults to on. Dromon therefore sets
+both, so that neither an inherited false value nor a settings file turns it back on."""
+AUTO_MEMORY_DISABLED = "1"
+"""The value that turns auto memory off."""
+
 SHELL_VARIABLE = "SHELL"
 """The absolute shell executable selected by the operator's daemon environment."""
 
@@ -70,6 +84,7 @@ CLAUDE_ENGINE_ENVIRONMENT: tuple[str, ...] = (
     "USER",
     "LOGNAME",
     TOOL_SEARCH_VARIABLE,
+    AUTO_MEMORY_VARIABLE,
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_AGENT_SDK_VERSION",
     "CLAUDE_CODE_SDK_READS_SESSION_STATE",

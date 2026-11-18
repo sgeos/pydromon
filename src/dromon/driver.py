@@ -50,6 +50,8 @@ ENGINE_OF: Final[dict[str, str]] = {
     "gpt-6-astra": "codex",
     "gpt-6.1-sol": "codex",
     "gpt-6.1-terra": "codex",
+    "gpt-6.2-sol": "codex",
+    "gpt-6.2-astra": "codex",
     "grok-4.7": "grok-build",
     "grok-4.7-build-fast": "grok-build",
     "pi:openai/gpt-6-luna": "pi",

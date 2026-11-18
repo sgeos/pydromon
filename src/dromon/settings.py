@@ -107,7 +107,17 @@ DROMON_PREFIX: Final = "DROMON_"
 """Variables Dromon gives a line's processes or its launcher, such as the process mark
 and the stop policy, which no line sets for itself."""
 
-PINNED_VARIABLES: Final = frozenset({"ENABLE_TOOL_SEARCH"})
+PINNED_REASONS: Final[dict[str, str]] = {
+    "ENABLE_TOOL_SEARCH": (
+        "so that the engine's tool schemas, and with them its prompt cache, stay stable"
+    ),
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": (
+        "so that no line loads the operator's auto-memory index for the project"
+    ),
+}
+"""Why Dromon pins each variable in ``PINNED_VARIABLES``, as a refusal says."""
+
+PINNED_VARIABLES: Final = frozenset(PINNED_REASONS)
 """Variables Dromon pins for every Claude Code line, so a line may not set them.
 **Row 4 of the T3 Code review.** ``ENABLE_TOOL_SEARCH`` decides whether the engine
 sends every tool schema in full or defers them behind its tool search. **Fact, read
@@ -115,7 +125,10 @@ from the bundled Claude Code 2.1.310 on 2026-10-26.** Unset, ``true`` or ``auto:
 keep tool search on, ``false`` or ``auto:100`` keep it off, and ``auto`` or ``auto:N``
 switch between the two by the share of the context window the schemas take, so the
 set of schemas sent can change between requests and rewrite the prompt cache.
-``dromon.engine`` pins it to ``true``."""
+``dromon.engine`` pins it to ``true``. **Round 18, item 2.**
+``CLAUDE_CODE_DISABLE_AUTO_MEMORY`` is pinned to ``1``, which turns auto memory off, as
+``dromon.engine_environment.AUTO_MEMORY_VARIABLE`` explains, since a value read as
+false would force it on."""
 
 
 def reserved_variable(name: str) -> bool:
@@ -260,8 +273,8 @@ def _env(value: object) -> dict[str, object]:
             _fail(f"settings.env name {name!r} is not a variable name", key)
         if name in PINNED_VARIABLES:
             _fail(
-                f"settings.env may not set {name}, which Dromon pins so that the"
-                " engine's tool schemas, and with them its prompt cache, stay stable",
+                f"settings.env may not set {name}, which Dromon pins"
+                f" {PINNED_REASONS[name]}",
                 key,
             )
         if name.startswith(DROMON_PREFIX):

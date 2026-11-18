@@ -167,6 +167,8 @@ from dromon.ceiling import (
 )
 from dromon.driver import TOOL_RESULT, ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine_environment import (
+    AUTO_MEMORY_DISABLED,
+    AUTO_MEMORY_VARIABLE,
     CLAUDE_SHELL_VARIABLE,
     SHELL_VARIABLE,
     TOOL_SEARCH_PINNED,
@@ -861,14 +863,21 @@ def flag_settings(
     file, ``~/.claude.json``, which no setting source governs. The flag settings.
     The managed policy settings. The process environment alone would lose to the
     first, so the pin is also set here, in the second, which comes after it. The
-    third is an administrator's, and Dromon does not override it."""
+    third is an administrator's, and Dromon does not override it.
+
+    **Round 18, item 2.** Auto memory is turned off for every line the same way, by
+    ``AUTO_MEMORY_VARIABLE`` in the env block and by the documented
+    ``autoMemoryEnabled`` setting, which replace whatever the line's own settings
+    give, as ``dromon.engine_environment.AUTO_MEMORY_VARIABLE`` explains."""
     merged = dict(settings or {})
     given = merged.get("env")
     block: dict[str, object] = (
         dict(cast(Mapping[str, object], given)) if isinstance(given, Mapping) else {}
     )
     block[TOOL_SEARCH_VARIABLE] = TOOL_SEARCH_PINNED
+    block[AUTO_MEMORY_VARIABLE] = AUTO_MEMORY_DISABLED
     merged["env"] = block
+    merged["autoMemoryEnabled"] = False
     if ask:
         merged["permissions"] = _with_ask_rules(merged.get("permissions"), ask)
     return merged
@@ -2206,8 +2215,9 @@ def launch_environment(
     temp: LineTemp | None = None,
 ) -> dict[str, str]:
     """The variables a Claude Code line's engine starts with, beside the daemon's own:
-    the pinned tool search, the line's process mark, what its launcher needs, and the
-    variables of ``git_ssh`` under the names ``launcher.relayed`` gives them.
+    the pinned tool search, auto memory turned off, the line's process mark, what its
+    launcher needs, and the variables of ``git_ssh`` under the names
+    ``launcher.relayed`` gives them.
 
     Each relayed name is set, empty for a line without the option, so a value the
     daemon's own environment holds under that name, which the Agent SDK merges in
@@ -2218,7 +2228,10 @@ def launch_environment(
     need no workaround. ``TMPDIR`` is a base variable the launcher's filter keeps, and
     ``UV_CACHE_DIR`` travels as a relayed variable, so only this value reaches the
     engine and never the daemon's own."""
-    environment = {TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED}
+    environment = {
+        TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED,
+        AUTO_MEMORY_VARIABLE: AUTO_MEMORY_DISABLED,
+    }
     if shell is not None:
         environment[SHELL_VARIABLE] = shell
         environment[CLAUDE_SHELL_VARIABLE] = shell
