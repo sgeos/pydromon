@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import gc
 import json
+import os
 import stat
 import sys
 import threading
@@ -1611,6 +1612,63 @@ def test_the_home_directory_is_written_as_a_tilde() -> None:
     assert evidence.home_masked("/home/x/a", "~") == "/home/x/a"
 
 
+# Round 18 audit of 5afb120. The shapes of its table, and the over-mask it found.
+
+AUDIT_HOME = "/home/alex"
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("cannot open /home/alex: denied", "cannot open ~: denied"),
+        ("path '/home/alex'", "path '~'"),
+        ('path "/home/alex"', 'path "~"'),
+        ("(/home/alex)", "(~)"),
+        ("in /home/alex.", "in ~."),
+        ("/home/alex, then", "~, then"),
+        ("/home/alex; then", "~; then"),
+        ("/home/alex/.codex/config.toml", "~/.codex/config.toml"),
+        ("HOME=/home/alex", "HOME=~"),
+        ("ends at /home/alex", "ends at ~"),
+        ("/HOME/Alex/x", "~/x"),
+    ],
+)
+def test_a_home_path_followed_by_what_ends_a_name_is_masked(
+    text: str, expected: str
+) -> None:
+    assert evidence.home_masked(text, AUDIT_HOME) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/private/home/alex/x",
+        "/mnt/home/alex/x",
+        "./home/alex/x",
+        "/home/alex2/a",
+        "/home/alex.old/a",
+        "/home/alex-b",
+        "/home/alex_b",
+    ],
+)
+def test_a_home_path_inside_a_longer_name_or_path_is_left(text: str) -> None:
+    assert evidence.home_masked(text, AUDIT_HOME) == text
+
+
+def test_the_home_the_links_resolve_to_is_masked_as_well(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    monkeypatch.setenv("HOME", str(link))
+    resolved = os.path.realpath(link)
+    assert resolved != str(link)
+    shown = evidence.home_masked(f"at {link}/a and {resolved}/b")
+    assert shown == "at ~/a and ~/b"
+
+
 def test_the_tail_masks_the_home_directory(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", "/home/x")
     tail = evidence.StderrTail()
@@ -1629,6 +1687,43 @@ def test_a_kept_engines_earlier_output_is_not_given_as_this_turns() -> None:
     tail.mark_turn()
     tail.append(b"Error: later\n")
     assert snapshot.text() == "Error: the cause"
+
+
+def test_a_secret_across_the_turn_mark_is_scrubbed_whole() -> None:
+    """Round 18 audit of 5afb120. Each part was scrubbed alone, so a literal written
+    partly before the mark and partly after matched in neither."""
+    literal = "secret-value"
+    half = len(literal) // 2
+
+    def scrub(text: str) -> str:
+        return credentials.scrub_text(text, [literal])
+
+    tail = evidence.StderrTail()
+    tail.append(f"old {literal[:half]}".encode())
+    tail.mark_turn()
+    tail.append(f"{literal[half:]} tail\n".encode())
+    shown = tail.text(scrub=scrub)
+    assert shown == "*** tail"
+    assert literal[half:] not in shown and literal[:half] not in shown
+
+
+def test_a_home_path_across_the_turn_mark_is_masked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", AUDIT_HOME)
+    tail = evidence.StderrTail()
+    tail.append(b"cannot open /home/al")
+    tail.mark_turn()
+    tail.append(b"ex: denied\n")
+    assert tail.text() == "~: denied"
+
+
+def test_a_turn_mark_inside_a_character_moves_to_its_start() -> None:
+    tail = evidence.StderrTail()
+    tail.append("café".encode()[:-1])
+    tail.mark_turn()
+    tail.append("é".encode()[-1:] + b" ok\n")
+    assert tail.text() == "é ok"
 
 
 def test_a_turn_mark_the_cut_passes_leaves_all_of_the_tail_current() -> None:

@@ -287,15 +287,40 @@ def _unscrubbed(text: str) -> str:
     return text
 
 
+HOME_BEFORE: Final = r"(?<![\w./-])"
+"""What may not precede a home path that is masked, a character of a name or a path,
+so that ``/private/home/x`` is not written ``/private~``."""
+HOME_AFTER: Final = r"(?![\w-]|\.[\w.-])"
+"""What may not follow it, a character that continues the last name of the path. A
+full stop followed by such a character continues it, as in ``/home/x.old``, and one
+that ends a sentence does not."""
+
+
 def home_masked(text: str, home: str | None = None) -> str:
     """``text`` with the home directory written ``~`` wherever it stands as a whole
-    path component. **Round 18 audit of ababdcd, finding 3.** An engine's refusal
-    names its configuration file by its full path, which holds the user's name. An
-    unknown home, or one that is the root, masks nothing."""
-    root = (os.path.expanduser("~") if home is None else home).rstrip("/")
-    if not root or root == "~":
-        return text
-    return re.sub(rf"{re.escape(root)}(?![^/\s])", "~", text)
+    path. **Round 18 audit of ababdcd, finding 3.** An engine's refusal names its
+    configuration file by its full path, which holds the user's name. ``home`` is
+    the one path to mask, and by default it is the home directory together with the
+    path its links resolve to, since an engine may print either. An unknown home, or
+    one that is the root, masks nothing.
+
+    **Round 18 audit of 5afb120.** The path is masked where the next character
+    cannot continue its last name, so a home followed by a colon, a quotation mark,
+    a parenthesis or a full stop that ends a sentence is masked, and not where a
+    name or a path runs on before it. The match ignores case, since macOS's file
+    system does. **Failure mode.** On a case-sensitive file system another
+    directory that differs from the home only in case is also written ``~``, and a
+    home that stands inside a longer path, as in ``/mnt/home/x``, keeps the name."""
+    if home is None:
+        given = os.path.expanduser("~")
+        roots = {given.rstrip("/"), os.path.realpath(given).rstrip("/")}
+    else:
+        roots = {home.rstrip("/")}
+    for root in sorted(roots, key=len, reverse=True):
+        if root and root != "~":
+            pattern = f"{HOME_BEFORE}{re.escape(root)}{HOME_AFTER}"
+            text = re.sub(pattern, "~", text, flags=re.IGNORECASE)
+    return text
 
 
 @dataclass(slots=True)
@@ -311,11 +336,12 @@ class StderrTail:
     and the scheduler renders it with ``with_tail`` into the closing reason alone.
 
     **Round 18 audit of ababdcd.** ``text`` applies the scrub it is given, the event
-    log's exact match of configured secrets, to the raw text of each part before
-    anything else, since a secret holding a line break or a run of spaces no longer
-    matched once the text was put on one line. It then writes the home directory as
-    ``~``. ``mark_turn`` divides a kept engine's earlier output from its current
-    turn's, so an old line is not given as the end of a later turn.
+    log's exact match of configured secrets, to the raw text before anything else,
+    since a secret holding a line break or a run of spaces no longer matched once the
+    text was put on one line. It then writes the home directory as ``~``.
+    ``mark_turn`` divides a kept engine's earlier output from its current turn's, so
+    an old line is not given as the end of a later turn, and the division is made
+    after the scrub and the home mask, as ``_parts`` says.
 
     **Failure modes.** Masking past the scrub is by the patterns of
     ``dromon.redact``, so a secret in another form that no one configured passes as
@@ -355,8 +381,34 @@ class StderrTail:
         """A copy that later output of a kept engine does not change."""
         return StderrTail(bytearray(self.raw), self.cut, self.turn_from)
 
-    def _lines(self, part: bytes, scrub: Scrub, cut: bool) -> list[str]:
-        text = home_masked(scrub(part.decode("utf-8", "replace")))
+    def _parts(self, scrub: Scrub) -> tuple[int, str, str]:
+        """Where the current turn begins, and the text before and after it, each
+        scrubbed and home masked. **Round 18 audit of 5afb120.** The scrub and the
+        home mask run once on the whole text and it is divided afterwards, since a
+        secret or a home path across the mark matched in neither part when each part
+        was scrubbed alone. The division is where the whole text and its earlier part,
+        each cleaned, first differ, so a secret across the mark goes, masked, with
+        the current part."""
+        mark = self.turn_from
+        # A mark inside a character moves to its start, so each part decodes as the
+        # whole does. A UTF-8 character has at most three continuation bytes.
+        for _ in range(3):
+            if 0 < mark < len(self.raw) and self.raw[mark] & 0xC0 == 0x80:
+                mark -= 1
+        earlier = bytes(self.raw[:mark]).decode("utf-8", "replace")
+        whole = home_masked(
+            scrub(earlier + bytes(self.raw[mark:]).decode("utf-8", "replace"))
+        )
+        cleaned = home_masked(scrub(earlier))
+        at = 0
+        for ours, theirs in zip(cleaned, whole, strict=False):
+            if ours != theirs:
+                break
+            at += 1
+        return mark, whole[:at], whole[at:]
+
+    @staticmethod
+    def _lines(text: str, cut: bool) -> list[str]:
         if cut:
             head, newline, rest = text.partition("\n")
             text = rest if newline else head.partition(" ")[2]
@@ -365,13 +417,13 @@ class StderrTail:
     def text(self, limit: int = STDERR_TAIL_BYTES, scrub: Scrub = _unscrubbed) -> str:
         """The tail scrubbed and masked, on one line of printable characters, and at
         most ``limit`` characters from its end. The scrub and the masking run on
-        everything kept before it is put on one line or cut to ``limit``."""
+        everything kept before it is divided at the mark, put on one line or cut to
+        ``limit``."""
         if limit <= 0:
             return ""
-        earlier = self._lines(bytes(self.raw[: self.turn_from]), scrub, self.cut)
-        current = self._lines(
-            bytes(self.raw[self.turn_from :]), scrub, self.cut and not self.turn_from
-        )
+        mark, before, after = self._parts(scrub)
+        earlier = self._lines(before, self.cut)
+        current = self._lines(after, self.cut and not mark)
 
         def own(lines: list[str]) -> list[str]:
             return [line for line in lines if not line.startswith(DIAGNOSTIC_PREFIX)]

@@ -491,18 +491,26 @@ through its real wrapper, does the same. The Claude Code test drives a substitut
 session that calls the SDK's callback and raises the SDK's error, so the SDK's own
 reading of standard error is not under test.
 
-- **Masking.** Each part of the tail is first scrubbed by the event log's exact match
-  of configured secrets, on its raw text, since a secret holding a line break or a run
-  of spaces did not match once the text was on one line, which the audit found. The
-  home directory is then written `~`, the launcher's notes are set aside as below, and
-  the rest is masked by `dromon.redact` before it is put on one line and cut to the
+- **Masking.** The whole tail is first scrubbed by the event log's exact match of
+  configured secrets, on its raw text, since a secret holding a line break or a run of
+  spaces did not match once the text was on one line, which the audit found. The home
+  directory is then written `~`, and only then is a kept engine's tail divided at its
+  turn mark, since a secret written across the mark matched in neither part when each
+  was scrubbed alone, which the second audit found. The home is masked wherever its
+  path is not run on by a name before it or after it, so a home followed by a colon, a
+  quotation mark or a full stop is masked and `/mnt/home/x` is left whole, in any case
+  of its letters, and both as the home is given and as its links resolve. The first
+  line of the error is home masked as well. The launcher's notes are set aside as below,
+  and the rest is masked by `dromon.redact` before it is put on one line and cut to the
   room. A part cut at its front drops everything before its first line break, or its
   first word when it has none, since the cut can part a credential from the name
   masking keys on or a configured secret from its start. The scheduler then screens
   the whole reason against the disclosure list and withholds it on a match, as
   `EVENT_LOG.md` says. A secret in a form no pattern names and no one configured
   passes the masking, as for a recording, and a configured secret that spans a line
-  break and is cut within its first line can leave its later lines.
+  break and is cut within its first line can leave its later lines. A home inside a
+  longer path, as `/mnt/home/x`, keeps its name, and on a file system that tells
+  case apart a directory that differs from the home only in case is also written `~`.
 - **A kept engine's turns.** A Codex or Claude Code kept session's tail lives as long
   as its process, so each reused turn marks where it began. What the engine wrote
   before that mark is given only when it has written nothing since, and then after

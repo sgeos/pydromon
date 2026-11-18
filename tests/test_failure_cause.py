@@ -555,6 +555,37 @@ def test_a_configured_secret_with_whitespace_in_the_tail_is_masked(
     assert secret.split()[0] not in encode(end)
 
 
+def test_a_secret_across_a_kept_turns_mark_is_masked(world: World) -> None:
+    """Round 18 audit of 5afb120, its own case, through the scheduler itself."""
+    literal = "secret-value"
+    world.log.secrets = lambda: (literal,)
+    tail = stderr_of("old secret-")
+    tail.mark_turn()
+    tail.append(b"value tail\n")
+    world.actions["alpha"] = raising(EngineClosed("transport vanished", stderr=tail))
+    world.turn()
+    end = last_end(world)
+    assert end.closing_reason == f"transport vanished{evidence.STDERR_JOINER}*** tail"
+    assert "ret-value" not in encode(end) and "secret-" not in encode(end)
+
+
+def test_the_first_line_of_the_reason_is_home_masked(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 18 audit of 5afb120. Only the tail was home masked."""
+    monkeypatch.setenv("HOME", "/home/alex")
+    tail = stderr_of("Error: cannot open /home/alex/.codex: denied\n")
+    error = EngineClosed("cannot open '/home/alex': denied", stderr=tail)
+    world.actions["alpha"] = raising(error)
+    world.turn()
+    end = last_end(world)
+    assert end.closing_reason == (
+        f"cannot open '~': denied{evidence.STDERR_JOINER}"
+        "Error: cannot open ~/.codex: denied"
+    )
+    assert "alex" not in encode(end)
+
+
 def test_a_disclosure_term_in_the_tail_withholds_the_reason(world: World) -> None:
     world.scheduler.set_disclosure_terms(("private diagnostic",))
     tail = stderr_of("Error: private diagnostic\n")
