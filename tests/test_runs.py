@@ -1644,7 +1644,10 @@ def test_dromon_run_status_prints_runs_and_one_receipt(
     )
     assert one[0].startswith("r-1 gate by alpha,")
     assert one[0].endswith(", corrected by r-2")
-    assert one[1:] == ["  scope: line alpha", "  previous: none"]
+    assert one[1:3] == ["  scope: line alpha", "  previous: none"]
+    # Round 18, item 2: the run's receipt adds what it tested, after the older fields.
+    assert one[3].startswith("  tested: "), one
+    assert len(one) == 5 and one[4].startswith("  tree digest: "), one
 
 
 # Round 15, item 2. A stop also ends the descendants below the supervisor that called

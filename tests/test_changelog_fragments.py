@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -788,6 +789,19 @@ def test_a_dry_run_changes_nothing(release_root: Path) -> None:
 
 UV_STAND_IN = """#!/bin/sh
 case "$*" in *pyright*) echo "$*" >> "$UV_LOG" ;; esac
+case "$*" in
+    *pytest*) [ -z "$UV_PYTEST_LOG" ] || {
+        echo "$*" >> "$UV_PYTEST_LOG"
+        # What a real pytest does with its base, which the gate must leave to its own.
+        all="$*"; base="${all#*--basetemp }"; base="${base%% *}"
+        [ ! -e "$base" ] || echo "existed $base" >> "$UV_PYTEST_LOG"
+        mkdir -p "$base/pytest-made-this"
+        [ -z "$UV_PYTEST_HOLD" ] || {
+            : > "$UV_PYTEST_HOLD.in"
+            while [ ! -e "$UV_PYTEST_HOLD" ]; do sleep 0.05; done
+        }
+    } ;;
+esac
 if [ -n "$UV_FAIL" ]; then
     case "$*" in *"$UV_FAIL"*) exit 3 ;; esac
 fi
@@ -796,7 +810,9 @@ case "$*" in
 esac
 exit 0
 """
-"""A `uv` that records each pyright call in `$UV_LOG`, fails a call containing
+"""A `uv` that records each pyright call in `$UV_LOG`, records a pytest call in
+`$UV_PYTEST_LOG` and makes its base, waiting there for the file `$UV_PYTEST_HOLD`
+when that is given, fails a call containing
 `$UV_FAIL`, prints `$UV_PYTHON_OUTPUT` for a `python` call, and succeeds for
 everything else, so check.sh runs end to end."""
 
@@ -1043,3 +1059,225 @@ def test_the_gate_fails_when_the_state_changes_cannot_be_used(tmp_path: Path) ->
         in done.stderr
     )
     assert "ok: pytest" not in done.stdout
+
+
+# Round 18, item 4. Each gate has a temporary test root of its own.
+
+
+def pytest_calls(log: Path) -> list[str]:
+    return log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+
+
+def basetemp_of(call: str) -> Path:
+    return Path(call.split("--basetemp ", 1)[1].split(" ", 1)[0])
+
+
+def test_a_gate_gives_pytest_a_base_of_its_own_and_removes_it(tmp_path: Path) -> None:
+    """Confirmed against the gate before the change, which passed no ``--basetemp``,
+    so pytest used the base every pytest of the user shares."""
+    root, stand_in = gate_repository(tmp_path)
+    shared = tmp_path / "shared-tmp"
+    shared.mkdir()
+    log = tmp_path / "pytest.log"
+    done = run_gate(
+        root,
+        stand_in,
+        UV_LOG=str(tmp_path / "uv.log"),
+        UV_PYTEST_LOG=str(log),
+        TMPDIR=str(shared),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    (call,) = pytest_calls(log)
+    base = basetemp_of(call)
+    assert base.parent.parent == shared and base.parent.name.startswith("dg.")
+    assert "pytest-of-" not in str(base.relative_to(shared))
+    assert list(shared.iterdir()) == [], "the gate left its root behind"
+
+
+def test_two_gates_at_once_have_two_roots_and_neither_touches_the_other(
+    tmp_path: Path,
+) -> None:
+    """Both gates are inside pytest at the same moment, each with its base made, and
+    the roots differ and exist together. Neither is removed by the other's end."""
+    root, stand_in = gate_repository(tmp_path)
+    shared = tmp_path / "shared-tmp"
+    shared.mkdir()
+    environment = {"PATH": f"{stand_in}:{os.environ['PATH']}", "TMPDIR": str(shared)}
+    gates: list[tuple[subprocess.Popen[str], Path, Path]] = []
+    for name in ("first", "second"):
+        log, hold = tmp_path / f"{name}.log", tmp_path / f"{name}.hold"
+        started = subprocess.Popen(  # noqa: S603
+            ["bash", "scripts/check.sh"],  # noqa: S607
+            cwd=root,
+            env={
+                **os.environ,
+                **environment,
+                "UV_LOG": str(tmp_path / f"{name}-uv.log"),
+                "UV_PYTEST_LOG": str(log),
+                "UV_PYTEST_HOLD": str(hold),
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        gates.append((started, log, hold))
+    try:
+        deadline = time.monotonic() + 120
+        while not all(Path(f"{hold}.in").exists() for _, _, hold in gates):
+            assert time.monotonic() < deadline, "a gate never reached pytest"
+            time.sleep(0.05)
+        bases = [basetemp_of(pytest_calls(log)[0]) for _, log, _ in gates]
+        assert bases[0] != bases[1] and bases[0].parent != bases[1].parent
+        assert all((base / "pytest-made-this").is_dir() for base in bases)
+        assert not any(
+            "existed" in line for _, log, _ in gates for line in pytest_calls(log)
+        )
+        for _, _, hold in gates[:1]:
+            hold.write_text("", encoding="utf-8")
+        first = gates[0][0]
+        assert first.wait(timeout=120) == 0, first.communicate()[0]
+        assert not bases[0].parent.exists(), "the first gate left its root"
+        assert (bases[1] / "pytest-made-this").is_dir(), (
+            "the first gate removed the second's"
+        )
+        gates[1][2].write_text("", encoding="utf-8")
+        second = gates[1][0]
+        assert second.wait(timeout=120) == 0, second.communicate()[0]
+    finally:
+        for started, _, hold in gates:
+            hold.write_text("", encoding="utf-8")
+            if started.poll() is None:
+                started.kill()
+            started.communicate()
+    assert list(shared.iterdir()) == []
+
+
+def test_a_failed_gate_still_removes_its_root(tmp_path: Path) -> None:
+    root, stand_in = gate_repository(tmp_path)
+    shared = tmp_path / "shared-tmp"
+    shared.mkdir()
+    done = run_gate(
+        root,
+        stand_in,
+        UV_LOG=str(tmp_path / "uv.log"),
+        UV_PYTEST_LOG=str(tmp_path / "pytest.log"),
+        UV_FAIL="pytest",
+        TMPDIR=str(shared),
+    )
+    assert done.returncode != 0
+    assert list(shared.iterdir()) == []
+
+
+def test_a_root_holding_an_unreadable_directory_is_still_removed(
+    tmp_path: Path,
+) -> None:
+    """A test killed mid-way leaves a directory its owner cannot enter, which a plain
+    ``rm`` would not remove. The gate restores access first."""
+    root, stand_in = gate_repository(tmp_path)
+    shared = tmp_path / "shared-tmp"
+    shared.mkdir()
+    # The stand-in makes the base, and a pytest that follows would leave this behind.
+    (stand_in / "uv").write_text(
+        UV_STAND_IN.replace(
+            'mkdir -p "$base/pytest-made-this"',
+            'mkdir -p "$base/closed/inner"; touch "$base/closed/inner/f";'
+            ' chmod 0 "$base/closed/inner"; chmod 0500 "$base/closed"',
+        ),
+        encoding="utf-8",
+    )
+    done = run_gate(
+        root,
+        stand_in,
+        UV_LOG=str(tmp_path / "uv.log"),
+        UV_PYTEST_LOG=str(tmp_path / "pytest.log"),
+        TMPDIR=str(shared),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "was not removed" not in done.stderr
+    assert list(shared.iterdir()) == []
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_a_gate_removes_its_root_and_nothing_outside_it(
+    tmp_path: Path, fail: bool
+) -> None:
+    """Review of a44ae0e, finding 4. The trap runs ``chmod -R`` and ``rm -rf`` on the
+    root. The shared directory beside it holds a file, a directory with a nested file
+    and a closed directory, and the root holds links to a directory and a file outside
+    it, as a pytest that made them would. Every one outside survives with its content
+    and its mode, the links are removed and not followed, and the root is gone."""
+    root, stand_in = gate_repository(tmp_path)
+    shared = tmp_path / "shared-tmp"
+    shared.mkdir()
+    keep_file = shared / "keep.txt"
+    keep_file.write_text("a neighbour's file", encoding="utf-8")
+    keep_dir = shared / "pytest-of-someone"
+    (keep_dir / "pytest-0").mkdir(parents=True)
+    (keep_dir / "pytest-0" / "result").write_text("kept", encoding="utf-8")
+    closed = shared / "closed-by-another"
+    closed.mkdir()
+    (closed / "inside").write_text("kept too", encoding="utf-8")
+    closed.chmod(0o500)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file").write_text("outside file", encoding="utf-8")
+    outside.chmod(0o500)
+    target = tmp_path / "target.txt"
+    target.write_text("target", encoding="utf-8")
+    target.chmod(0o400)
+    (stand_in / "uv").write_text(
+        UV_STAND_IN.replace(
+            'mkdir -p "$base/pytest-made-this"',
+            'mkdir -p "$base/own"; touch "$base/own/f";'
+            ' ln -s "$UV_OUTSIDE" "$base/dir-link";'
+            ' ln -s "$UV_TARGET" "$base/file-link"',
+        ),
+        encoding="utf-8",
+    )
+    before = {
+        path: path.stat().st_mode & 0o777
+        for path in (keep_file, keep_dir, closed, outside, target)
+    }
+    extra = {"UV_FAIL": "pytest"} if fail else {}
+    try:
+        done = run_gate(
+            root,
+            stand_in,
+            UV_LOG=str(tmp_path / "uv.log"),
+            UV_PYTEST_LOG=str(tmp_path / "pytest.log"),
+            UV_OUTSIDE=str(outside),
+            UV_TARGET=str(target),
+            TMPDIR=str(shared),
+            **extra,
+        )
+        assert (done.returncode != 0) is fail, done.stdout + done.stderr
+        assert sorted(entry.name for entry in shared.iterdir()) == sorted(
+            [keep_file.name, keep_dir.name, closed.name]
+        ), "the gate left its root, or removed what is not its own"
+        assert keep_file.read_text(encoding="utf-8") == "a neighbour's file"
+        assert (keep_dir / "pytest-0" / "result").read_text(encoding="utf-8") == "kept"
+        assert (closed / "inside").read_text(encoding="utf-8") == "kept too"
+        assert (outside / "file").read_text(encoding="utf-8") == "outside file"
+        assert target.read_text(encoding="utf-8") == "target"
+        after = {
+            path: path.stat().st_mode & 0o777
+            for path in (keep_file, keep_dir, closed, outside, target)
+        }
+        assert after == before, "a mode outside the root was changed"
+    finally:
+        closed.chmod(0o700)
+        outside.chmod(0o700)
+
+
+def test_a_gate_that_cannot_make_its_root_fails_and_says_so(tmp_path: Path) -> None:
+    root, stand_in = gate_repository(tmp_path)
+    done = run_gate(
+        root,
+        stand_in,
+        UV_LOG=str(tmp_path / "uv.log"),
+        UV_PYTEST_LOG=str(tmp_path / "pytest.log"),
+        TMPDIR=str(tmp_path / "no-such-directory"),
+    )
+    assert done.returncode != 0
+    assert "temporary test root could not be made" in done.stdout + done.stderr
+    assert pytest_calls(tmp_path / "pytest.log") == []

@@ -1,0 +1,1 @@
+The run_admitted and run_admission_ended events add run_admission to the derived state, and run_started and run_ended gain dirty_paths, admitted_by and coverage, which a receipt shows.

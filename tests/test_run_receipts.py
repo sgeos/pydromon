@@ -667,7 +667,7 @@ def test_the_receipt_names_the_worktree_commit_and_is_sent_once(
         (note,) = harness_notes(log, "alpha")
         assert (
             f"in its worktree at commit {head}, as the worktree's own"
-            f" {WORKDIR_HEAD_CLAIM}, with any uncommitted changes"
+            f" {WORKDIR_HEAD_CLAIM}, with a clean tree as it started"
         ) in note
         assert "exited with exit code 0" in note
         assert f"This end cancels your wake {wake_id}" in note

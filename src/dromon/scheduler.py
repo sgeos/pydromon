@@ -124,6 +124,7 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from pathlib import Path
 from typing import (
     Any,
@@ -335,7 +336,11 @@ from dromon.lineconfig import (
 )
 from dromon.model import (
     COMMIT_PATTERN,
+    DEFAULT_ADMIT_SECONDS,
     DEFAULT_QUEUE_MAX_AGE_SECONDS,
+    MAX_ADMIT_SECONDS,
+    MAX_ADMIT_REASON_BYTES,
+    MIN_ADMIT_SECONDS,
     MAX_BRIEF_ARTIFACTS,
     MAX_CLOSE_REASON_BYTES,
     MAX_LEASE_NOTE_BYTES,
@@ -383,6 +388,8 @@ from dromon.model import (
     MAX_QUEUE_REASON_BYTES,
     MAX_QUEUED_RUNS,
     QueueEnd,
+    RunAdmissionEnded,
+    RunAdmitted,
     RunDequeued,
     RunQueued,
     RunStarted,
@@ -1622,6 +1629,37 @@ _OVERRAN: Final = machinestatus.MachineStatus(
 """The status while a read of the file has not returned."""
 
 
+class Hold(StrEnum):
+    """What keeps a run from starting. **Round 18, item 3.** ``machine``, the status
+    defers runs. ``admission``, the operator's override admits one run at a time and one
+    is open. ``slot``, another line holds the project's slot lease."""
+
+    MACHINE = "machine"
+    ADMISSION = "admission"
+    SLOT = "slot"
+
+
+@dataclass(frozen=True, slots=True)
+class RunDeferral:
+    """Why a run cannot start now and what must change for it to. **Round 18, item
+    3.** Engines asked for one reason and one condition, since the start's refusal,
+    the queue's reason, ``run_status`` and the notes each worded the cause in their own
+    way, and a line could be told two things at once. Every surface now reads this one
+    value, built in ``Scheduler._run_deferral``, so they cannot disagree, and each
+    adds only its own advice. ``reason`` is a clause that follows ``since`` and
+    ``resumes`` one that follows ``it can start``. Both are fixed words and the
+    bounded, screened text the status file gave, never the file's path."""
+
+    hold: Hold
+    reason: str
+    resumes: str
+
+    def text(self) -> str:
+        """The deferral as one sentence, the form the queue stores and ``run_status``
+        shows."""
+        return f"{self.reason}, and it can start {self.resumes}"
+
+
 def _never_registered(_name: str) -> bool:
     return False
 
@@ -1852,6 +1890,8 @@ class _RunStart:
     directory: Path
     workdir: Path
     environment: dict[str, str]
+    admitted_by: str | None = None
+    """The operator whose override admitted the run, for its receipt."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -3005,6 +3045,11 @@ class Scheduler:
         self._machine_sampled_at: datetime | None = None
         self._run_slot: str | None = None
         self._queue_max_age = DEFAULT_QUEUE_MAX_AGE_SECONDS
+        self._admission_starting: set[str] = set()
+        """The lines whose start under the operator's override is under way, between
+        the check that admitted it and the record of the run, so two starts that wait
+        on the same check cannot both pass the override's one run at a time. **Round
+        18, item 1.**"""
         self._queue_task: asyncio.Task[None] | None = None
         """When the monitor's file was first seen unusable in the present spell, a
         stale one by its last sample, or ``None`` while the file is fresh or none is
@@ -3724,51 +3769,155 @@ class Scheduler:
         trouble = self._monitor_trouble(status)
         return "" if trouble is None else f" {trouble}"
 
-    def _run_wait_reason(self, line_id: str) -> str | None:
-        """Why a run of ``line_id`` waits now, or ``None`` when nothing holds it back.
-        **Round 17, item 1.** Two things hold a run back and both pass. The machine
-        status defers runs, which is read as ``machine_decision`` reads it and tells
-        nobody, since a queued run says so itself. And the project's slot, a lease
-        the project names in ``runs.slot_lease``, is held by another line, which is
-        the shared gate's one holder. The holder of the slot itself is never held
-        back by it. Nothing is recorded."""
-        status = self.machine_status()
-        if status is not None and self.machine_decision().defer_runs:
-            return (
-                f"the machine status defers runs, since {self._machine_words(status)}"
-                f"{self._machine_cause(status)}"
-            )
+    def _run_deferral(self, line_id: str) -> RunDeferral | None:
+        """Why a run of ``line_id`` cannot start now and what must change, or
+        ``None`` when nothing holds it back. **Round 18, item 3.** The one source every
+        surface reads. The machine status comes first, then the operator's override,
+        which may lift the status's deferral for one run, and then the project's slot,
+        a lease named in ``runs.slot_lease`` that another line holds. The holder of the
+        slot is never held back by it. Nothing is recorded, and nobody is told."""
+        machine = self._machine_deferral(line_id)
+        if machine is not None:
+            return machine
         slot = self._run_slot
         if slot is not None:
             held = self._live_lease(slot)
             if held is not None and held.line_id != line_id:
-                return (
-                    f"the slot, lease {slot}, is held by line {held.line_id} until"
-                    f" {held.expires}"
+                return RunDeferral(
+                    Hold.SLOT,
+                    f"the slot, lease {slot}, is held by line {held.line_id}",
+                    f"once that line releases it or it expires at {held.expires},"
+                    " whichever is first",
                 )
         return None
 
-    def _machine_run_refusal(self, line_id: str) -> str | None:
-        """Why a run of ``line_id`` is deferred by the machine's status, or ``None``.
-        Tells the operator once for the deferral. Nothing has started or been recorded
-        when it returns text."""
+    def _run_wait_reason(self, line_id: str) -> str | None:
+        """The deferral of a run of ``line_id`` as one sentence, or ``None``. The form
+        the queue stores. **Round 17, item 1**, now built from ``_run_deferral``."""
+        deferral = self._run_deferral(line_id)
+        return None if deferral is None else deferral.text()
+
+    def _active_admission(self) -> RunAdmitted | None:
+        """The operator's override of the machine status while it is recorded, not
+        ended and not past its expiry, or ``None``. The expiry is judged by the clock
+        here and never recorded, so it ends by itself. **Round 18, item 1.**"""
+        admitted = self._state().run_admission
+        if admitted is None or parse_due(admitted.expires_at) <= self._wall_clock():
+            return None
+        return admitted
+
+    def _open_run_besides(self, line_id: str) -> str | None:
+        """A sentence naming a run that is open, or being started, under another line,
+        or ``None``, for the override's one run at a time. Any scope's run counts, since
+        the override exists because the machine is pressed and a second gate would press
+        it more. A lost run that is not cleared counts as open, failing closed, since
+        the daemon cannot tell whether its command still runs, which is the case the
+        one run rule exists for. The line's own run is refused by another check.
+        **Round 18, item 1, and its review, finding 1.**"""
+        for run in self._state().runs.values():
+            started = run.started
+            if run.blocks and started.line_id != line_id:
+                if run.ended is None:
+                    return f"run {started.run_id} of line {started.line_id} is open"
+                return (
+                    f"run {started.run_id} of line {started.line_id} is lost and its"
+                    " command may still run"
+                )
+        for other in sorted(self._admission_starting):
+            if other != line_id:
+                return f"line {other} is starting a run"
+        return None
+
+    def _machine_resumption(self, status: machinestatus.MachineStatus) -> str:
+        """What must change for the machine status to stop deferring runs, in the words
+        of ``RunDeferral.resumes``. **Round 18, item 3.** At ``critical`` the override
+        does not apply and the words say so. A monitor that cannot be relied on adds
+        its own cause and how the operator restores it, which is the same sentence the
+        notes and ``line_status`` give."""
+        trouble = self._monitor_trouble(status)
+        if trouble is not None:
+            return (
+                "once the monitor writes a fresh status that reads ok or is raised by"
+                f" disk alone, or the operator admits one run with dromon run admit."
+                f" {trouble}"
+            )
+        if status.effective == "critical":
+            return (
+                "once the status falls below critical and reads ok or is raised by"
+                " disk alone, which the daemon reads at most every"
+                f" {MACHINE_READ_SECONDS:g} seconds from a file the monitor writes"
+                " about once a minute. The operator's override cannot admit a run at"
+                " critical"
+            )
+        return (
+            "once the status reads ok or is raised by disk alone, which the daemon"
+            f" reads at most every {MACHINE_READ_SECONDS:g} seconds from a file the"
+            " monitor writes about once a minute, or sooner when the operator admits"
+            " one run"
+            " with dromon run admit"
+        )
+
+    def _machine_deferral(self, line_id: str) -> RunDeferral | None:
+        """The machine status's hold on a run of ``line_id``, as the status and the
+        operator's override make it, or ``None``. **Round 18, items 1 and 3.** The
+        override lifts the hold at ``elevated``, and at a status that cannot be read,
+        which counts as elevated, for one run at a time, and never at ``critical``."""
         status = self.machine_status()
         if status is None or not self.machine_decision().defer_runs:
             return None
         words = self._machine_words(status)
-        cause = self._machine_cause(status)
+        admitted = self._active_admission()
+        if admitted is not None and status.effective != "critical":
+            busy = self._open_run_besides(line_id)
+            if busy is None:
+                return None
+            return RunDeferral(
+                Hold.ADMISSION,
+                f"the operator's override, made by {admitted.operator_id} until"
+                f" {admitted.expires_at}, admits one run at a time and {busy}, while"
+                f" {words}",
+                "once that run ends, or the status reads ok, or the override ends at"
+                f" {admitted.expires_at}",
+            )
+        return RunDeferral(
+            Hold.MACHINE,
+            f"the machine status defers runs, since {words}",
+            self._machine_resumption(status),
+        )
+
+    def _admitted_by(self, line_id: str) -> str | None:
+        """The operator whose override a start of ``line_id`` would run under now, or
+        ``None`` for a start the status allows without one. Read just after
+        ``_run_deferral`` finds nothing holding the run. **Round 18, item 1.**"""
+        status = self.machine_status()
+        if status is None or not self.machine_decision().defer_runs:
+            return None
+        admitted = self._active_admission()
+        if admitted is None or status.effective == "critical":
+            return None
+        return admitted.operator_id
+
+    def _machine_run_refusal(self, line_id: str) -> str | None:
+        """Why a run of ``line_id`` is deferred by the machine's status or the
+        override's one run at a time, or ``None``. Tells the operator once for the
+        deferral. Nothing has started or been recorded when it returns text.
+        **Round 18, item 3.** Built from ``_machine_deferral``."""
+        deferral = self._machine_deferral(line_id)
+        if deferral is None:
+            return None
         if "run" not in self._machine_noted:
             self._machine_noted.add("run")
             self._tell_operator(
                 line_id,
-                f"Dromon deferred a run of {line_id}, since {words}. It starts"
-                " nothing heavy until the status is ok again, and the line was told"
-                f" to wait and ask again.{cause}",
+                f"Dromon deferred a run of {line_id}, since {deferral.reason}. It"
+                " starts nothing heavy until then, and the line was told to wait and"
+                f" ask again. It can start {deferral.resumes}.",
             )
         return (
-            f"the run is deferred, since {words}. Nothing was started. This machine"
-            " is shared, so wait with wake_after and start it again once"
-            f" machine-status says ok, and say in your report that you waited.{cause}"
+            f"the run is deferred, since {deferral.reason}. Nothing was started. It can"
+            f" start {deferral.resumes}. This machine is shared, so wait with"
+            " wake_after and start it again then, or start it with the queue, which"
+            " begins it by itself, and say in your report that you waited"
         )
 
     def _note_turn_deferral(self, line_id: str) -> None:
@@ -3810,11 +3959,19 @@ class Scheduler:
             parts.append(f"Your turn was deferred for {waited} seconds by the status.")
         if status is not None and machinestatus.decide(status).warn:
             words = self._machine_words(status)
+            # Round 18, item 3. The condition is the run deferral's own, so this note
+            # and a refused start say one thing. Where the status does not defer runs,
+            # disk alone, there is none to give.
+            deferral = self._machine_deferral(line_id)
+            until = (
+                "it is ok"
+                if deferral is None
+                else f"a run can start, which is {deferral.resumes}"
+            )
             parts.append(
                 f"{words[:1].upper()}{words[1:]}. This machine is shared,"
-                " so start nothing heavy, such as a full gate, until it is ok, and"
+                f" so start nothing heavy, such as a full gate, until {until}, and"
                 " say so in your report if you wait. Your turn proceeds."
-                f"{self._machine_cause(status)}"
             )
         return "Dromon note: " + " ".join(parts) if parts else None
 
@@ -5625,12 +5782,54 @@ class Scheduler:
                 return self._enqueue_run(
                     line_id, command, previous, commit, arguments, waits
                 )
+        admitted_by = self._gate_start(line_id)
+        if admitted_by is None:
+            return await self._start_checked(line_id, command, latest_id, argv, commit)
+        try:
+            return await self._start_checked(
+                line_id, command, latest_id, argv, commit, admitted_by
+            )
+        finally:
+            self._admission_starting.discard(line_id)
+
+    def _gate_start(self, line_id: str) -> str | None:
+        """The last checks before a run starts, and for a start the operator's override
+        admits, the claim that makes it the one run at a time. Returns the operator
+        whose override admits the start, or ``None`` for one the status allows, and
+        raises ``RunRefused`` for a deferral, a held slot, or a start of this line
+        already claimed. **Round 18, item 1, and its review, finding 5.**
+
+        This is deliberately a plain function. The one run rule holds only because
+        nothing can run between the check that finds no other run open and the claim
+        that makes this one count, and a plain function cannot be interrupted by
+        another task. Adding an ``await`` here would let two starts both pass the check.
+        A test reads this source and fails if one is added. The caller releases the
+        claim in a ``finally`` once ``run_started`` is recorded or the start fails."""
         deferred = self._machine_run_refusal(line_id)
         if deferred is not None:
             raise runs.RunRefused(deferred)
         slot_held = self._slot_refusal(line_id)
         if slot_held is not None:
             raise runs.RunRefused(slot_held)
+        admitted_by = self._admitted_by(line_id)
+        if admitted_by is None:
+            return None
+        if line_id in self._admission_starting:
+            raise runs.RunRefused("a start of yours under the override is in progress")
+        self._admission_starting.add(line_id)
+        return admitted_by
+
+    async def _start_checked(
+        self,
+        line_id: str,
+        command: str,
+        latest_id: str | None,
+        argv: tuple[str, ...],
+        commit: str | None,
+        admitted_by: str | None = None,
+    ) -> RunStarted:
+        """The rest of ``start_run``, once nothing holds the run back. ``admitted_by``
+        is the operator whose override admitted it, which the run records."""
         if self._report_dir is None:
             raise runs.RunRefused("this daemon has no report directory for receipts")
         directory = self._report_dir
@@ -5644,7 +5843,15 @@ class Scheduler:
             RUN_ID_VARIABLE: run_id,
         }
         start = _RunStart(
-            line_id, command, argv, latest_id, run_id, directory, workdir, environment
+            line_id,
+            command,
+            argv,
+            latest_id,
+            run_id,
+            directory,
+            workdir,
+            environment,
+            admitted_by,
         )
         if commit is None:
             return await self._launch_run(start, None)
@@ -5665,17 +5872,15 @@ class Scheduler:
         """Why the project's slot keeps ``line_id`` from starting a run now, or
         ``None``. **Round 17, item 1.** A start without the queue is refused while
         another line holds the slot, as it is while the machine defers runs, and
-        says how to be kept in the queue instead."""
-        slot = self._run_slot
-        if slot is None:
-            return None
-        held = self._live_lease(slot)
-        if held is None or held.line_id == line_id:
+        says how to be kept in the queue instead. **Round 18, item 3.** The reason and
+        the condition are the deferral's own."""
+        deferral = self._run_deferral(line_id)
+        if deferral is None or deferral.hold is not Hold.SLOT:
             return None
         return (
-            f"the slot, lease {slot}, is held by line {held.line_id} until"
-            f" {held.expires}, so the run is not started. Start it again with the"
-            " queue, which keeps it until the slot is free"
+            f"the run is not started, since {deferral.reason}. It can start"
+            f" {deferral.resumes}. Start it again with the queue, which keeps it until"
+            " then"
         )
 
     def _queued_of(self, line_id: str) -> RunQueued | None:
@@ -5995,10 +6200,10 @@ class Scheduler:
         command_dir = None if checkout is None else checkout.tree
         # Round 16, item 5. Read before the launch, so a change made while the run
         # starts is a change after the tree it covers.
-        tree = (
-            None
+        tree, dirty = (
+            (None, None)
             if commit is not None
-            else await asyncio.to_thread(_tree_or_none, workdir)
+            else await asyncio.to_thread(_tree_state, workdir)
         )
         # Round 16, item 3. The commit a run in a worktree ran, read before its
         # command starts, so the receipt names it. A file read, as line_status does,
@@ -6048,6 +6253,8 @@ class Scheduler:
                     None if command_dir is None else str(command_dir),
                     tree,
                     head,
+                    dirty,
+                    start.admitted_by,
                 )
                 self._log.append(started)
             except BaseException:
@@ -6240,6 +6447,7 @@ class Scheduler:
             )
         waiting = self._queued_of(line_id)
         queue_text = "" if waiting is None else f"\n{self._queue_line(waiting)}"
+        queue_text += f"\n{self._start_words(line_id)}"
         if not found:
             return (
                 f"no runs yet, so previous is none. Declared commands: {declared}"
@@ -6267,6 +6475,47 @@ class Scheduler:
             + "\n".join(lines)
             + queue_text
         )
+
+    def _start_words(self, line_id: str) -> str:
+        """What a start of ``line_id`` meets now, for ``run_status``. **Round 18, items
+        1 and 3.** The operator's override, if one is recorded, with who made it, when
+        and until when, whether it applies, and then the one deferral, with the
+        condition that ends it, as every other surface words it. A line that reads this
+        needs nothing else to decide whether to start, queue or wait."""
+        lines: list[str] = []
+        view = self.admission_view()
+        if view is not None:
+            state = (
+                "It admits runs now."
+                if view["active"]
+                else (
+                    "It has expired."
+                    if view["expired"]
+                    else "It does not apply while the status is critical."
+                    if view["critical"]
+                    else "It is standing by, since no run is deferred now."
+                )
+            )
+            reason = view["reason"]
+            why = f", saying {reason!r}" if isinstance(reason, str) and reason else ""
+            lines.append(
+                f"Operator override: {view['operator']} admitted runs, one at a time,"
+                f" at {view['admitted_at']}, until {view['expires_at']}{why}. {state}"
+            )
+        deferral = self._run_deferral(line_id)
+        if deferral is not None:
+            lines.append(
+                f"A start now would be deferred, since {deferral.reason}, and it can"
+                f" start {deferral.resumes}."
+            )
+        elif self._admitted_by(line_id) is not None:
+            lines.append(
+                "A start now would run under the operator's override, which the run's"
+                " receipt records."
+            )
+        else:
+            lines.append("Nothing holds a start back now.")
+        return "\n".join(lines)
 
     def runs_view(self, run_id: str | None) -> list[dict[str, object]]:
         """Supervised runs for an operator, as plain data. **Round 14, item 11.**
@@ -6455,6 +6704,92 @@ class Scheduler:
         self.ensure_operator(operator.operator_id)
         return self._clear_run(run_id, operator.operator_id)
 
+    def admit_runs(
+        self, operator: OperatorAddress, seconds: int | None, reason: str
+    ) -> RunAdmitted:
+        """``operator`` admits runs while the machine status defers them, one at a time,
+        for ``seconds``, or ``DEFAULT_ADMIT_SECONDS`` when ``None``. **Round 18, item
+        1.** Recorded as ``run_admitted``, the operator's decision with its time and
+        expiry, replacing any earlier one. Raises ``EventRejected``, recording nothing,
+        for a duration outside ``MIN_ADMIT_SECONDS`` to ``MAX_ADMIT_SECONDS``, a reason
+        over ``MAX_ADMIT_REASON_BYTES``, a daemon that reads no status, and a status
+        that is critical, which no override admits. A status that cannot be read counts
+        as elevated and is admitted, since a dead monitor is the case the operator ran
+        gates by hand for. The override ends at its expiry with no event, and a run it
+        admitted is never stopped by that."""
+        length = DEFAULT_ADMIT_SECONDS if seconds is None else seconds
+        if (
+            type(length) is not int
+            or not MIN_ADMIT_SECONDS <= length <= MAX_ADMIT_SECONDS
+        ):
+            raise EventRejected(
+                f"an override lasts {MIN_ADMIT_SECONDS} to {MAX_ADMIT_SECONDS} seconds"
+            )
+        text = reason.strip()
+        if len(text.encode("utf-8", "replace")) > MAX_ADMIT_REASON_BYTES:
+            raise EventRejected(
+                f"the reason is over {MAX_ADMIT_REASON_BYTES} bytes, which is its limit"
+            )
+        status = self.machine_status()
+        if status is None:
+            raise EventRejected(
+                "this daemon reads no machine status, so no run is deferred by one and"
+                " there is nothing to override"
+            )
+        if status.effective == "critical":
+            raise EventRejected(
+                "the machine status is critical, and no override admits a run at"
+                " critical. It can be made when the status is elevated or ok"
+            )
+        self.ensure_operator(operator.operator_id)
+        now = self._wall_clock()
+        event = RunAdmitted(
+            operator.operator_id,
+            format_due(now),
+            format_due(now + timedelta(seconds=length)),
+            text,
+        )
+        self._log.append(event)
+        self._work.set()
+        return event
+
+    def end_admission(self, operator: OperatorAddress) -> RunAdmissionEnded:
+        """``operator`` ends the override before it expires. **Round 18, item 1.** A
+        run it admitted runs on. Raises ``EventRejected`` when none is recorded."""
+        if self._state().run_admission is None:
+            raise EventRejected("no override of the machine status is recorded")
+        self.ensure_operator(operator.operator_id)
+        event = RunAdmissionEnded(operator.operator_id, format_due(self._wall_clock()))
+        self._log.append(event)
+        return event
+
+    def admission_view(self) -> dict[str, object] | None:
+        """The recorded override as plain data for an operator or ``run_status``, or
+        ``None`` when none is recorded. ``active`` is whether it admits runs now, which
+        is false past its expiry and at a critical status, so a reader never takes a
+        recorded override for a live one. ``standing_by`` is a live override while no
+        run is deferred, which admits nothing until the status defers runs again.
+        **Round 18, item 1, and its review, finding 3.**"""
+        admitted = self._state().run_admission
+        if admitted is None:
+            return None
+        status = self.machine_status()
+        live = self._active_admission() is not None
+        critical = status is not None and status.effective == "critical"
+        # Review finding 3. An override made while nothing is deferred admits nothing
+        # yet, so it stands by and is never shown as admitting runs.
+        deferring = status is not None and self.machine_decision().defer_runs
+        return {
+            "operator": admitted.operator_id,
+            "admitted_at": admitted.admitted_at,
+            "expires_at": admitted.expires_at,
+            "reason": admitted.reason,
+            "active": live and not critical and deferring,
+            "standing_by": live and not critical and not deferring,
+            "expired": not live,
+            "critical": critical,
+        }
+
     def _clear_run(self, run_id: str, operator_id: str | None) -> RunCleared:
         """Record that ``run_id`` no longer blocks its scope, by ``operator_id`` or,
         with ``None``, because no process is left in its supervisor's group or
@@ -6483,6 +6818,7 @@ class Scheduler:
                 note,
                 format_due(self._wall_clock()),
                 tail,
+                finding.coverage,
             )
         )
         self._run_children.pop(finding.run_id, None)
@@ -16496,6 +16832,8 @@ def _run_view(
         "checkout": started.checkout,
         "tree": started.tree,
         "workdir_commit": started.workdir_commit,
+        "dirty_paths": started.dirty_paths,
+        "admitted_by": started.admitted_by,
         "workdir": started.workdir,
         "output_file": started.output_file,
         "pid": started.pid,
@@ -16507,6 +16845,11 @@ def _run_view(
         "output_digest": None if ended is None else ended.output_digest,
         "note": None if ended is None else ended.note,
         "output_tail": None if ended is None else ended.output_tail,
+        "coverage": (
+            None
+            if ended is None or ended.coverage is None
+            else {name: count for name, count in ended.coverage}
+        ),
         "blocks": run.blocks,
         "cleared_at": None if cleared is None else cleared.cleared_at,
         "cleared_by": None if cleared is None else cleared.operator_id,
@@ -16515,16 +16858,19 @@ def _run_view(
     }
 
 
-def _tree_or_none(directory: Path) -> str | None:
-    """``readiness.tree_digest`` of ``directory``, or ``None`` where it cannot be
-    read, so a run starts whether or not its tree can be read. Blocking."""
-    found = _tree_or_failure(directory)
-    # A failure word is a ``StrEnum``, and so also a ``str``, so it is tested first.
-    return (
-        None
-        if isinstance(found, (readiness.ReadFailure, readiness.Uncovered))
-        else found
-    )
+def _tree_state(directory: Path) -> tuple[str | None, int | None]:
+    """The tree digest of ``directory`` and the count of paths ``git status`` listed,
+    from one read, each ``None`` where it cannot be known, so a run starts whether or
+    not its tree can be read. **Round 18, item 2.** A tree whose digest cannot tell a
+    change still counts its paths, since a receipt can say it was not clean without
+    the digest. Blocking."""
+    try:
+        snapshot = readiness.tree_snapshot(directory)
+    except readiness.ReadinessUnknown:
+        return None, None
+    except readiness.TreeUncovered as error:
+        return None, error.dirty
+    return snapshot.digest, snapshot.dirty
 
 
 def _tree_or_failure(directory: Path) -> TreeNow:
@@ -16580,23 +16926,69 @@ def _tree_text(started: RunStarted, tree_now: TreeNow | None) -> str:
     )
 
 
+def _dirty_words(started: RunStarted) -> str:
+    """What the tree held as a worktree run started, beyond its commit, and the digest
+    of it, for the receipt. **Round 18, item 2.** Two lines asked that an old success
+    not pass for current verification, so a receipt says whether the tested tree was
+    clean, which commit it was on, and a digest that a later reading can compare. A
+    count the daemon could not read is unknown and is never worded as clean. The count
+    and the digest are what the daemon read from git before the command started, and
+    the line can change the tree after, which ``run_status`` compares for the latest
+    run."""
+    count = started.dirty_paths
+    if count is None:
+        state = "with its uncommitted state unknown, since git status was not read"
+    elif count == 0:
+        state = "with a clean tree as it started"
+    else:
+        noun = "path" if count == 1 else "paths"
+        state = (
+            f"with {count} changed or untracked {noun} as it started, so it did not"
+            " test the commit alone"
+        )
+    digest = (
+        ", with no tree digest recorded"
+        if started.tree is None
+        else f", tree digest {started.tree}"
+    )
+    return f"{state}{digest}"
+
+
+def _coverage_words(ended: RunEnded) -> str:
+    """The counts the output's final line gave, as a sentence to append to a run's
+    note, or nothing. **Round 18, item 2.** They are the output's own claim, which a
+    writing line can shape, so they are labelled as that, exactly as the quoted summary
+    is."""
+    if ended.coverage is None:
+        return ""
+    counts = ", ".join(f"{count} {name}" for name, count in ended.coverage)
+    return f". Coverage counts of the output's own final line, unverified: {counts}"
+
+
 def _run_line(run: Run) -> str:
     """One run as a line reads it, with its receipt once it has ended."""
     started = run.started
     on = (
-        f" on commit {started.commit}"
+        f" on commit {started.commit}, checked out by the daemon and so clean"
         if started.commit is not None
         # Round 16, item 3. The receipt names the commit a worktree run ran, as
-        # the worktree's own claim after the review of 16de365.
+        # the worktree's own claim after the review of 16de365. Round 18, item 2. It
+        # also says what the tree held beyond that commit, and the digest of it.
         else f" in its worktree at commit {started.workdir_commit}, as the"
-        f" worktree's own {WORKDIR_HEAD_CLAIM}, with any uncommitted changes"
+        f" worktree's own {WORKDIR_HEAD_CLAIM}, {_dirty_words(started)}"
         if started.workdir_commit is not None
-        else ""
+        else f" in its worktree, {_dirty_words(started)}"
+    )
+    admitted = (
+        ""
+        if started.admitted_by is None
+        else f", under the override of operator {started.admitted_by}, which admitted"
+        " it while the machine status deferred runs"
     )
     head = (
-        f"run {started.run_id} of {started.command}{on} by line {started.line_id},"
-        f" started {started.started_at}, output {started.output_file} in"
-        f" {started.workdir}"
+        f"run {started.run_id} of {started.command}{on}{admitted} by line"
+        f" {started.line_id}, started {started.started_at}, output"
+        f" {started.output_file} in {started.workdir}"
     )
     ended = run.ended
     if ended is None:
@@ -16609,6 +17001,7 @@ def _run_line(run: Run) -> str:
         + ("" if ended.output_digest is None else f" of SHA-256 {ended.output_digest}")
     )
     note = f". {ended.note}" if ended.note else ""
+    note += _coverage_words(ended)
     cleared = run.cleared
     if ended.status is not RunStatus.LOST:
         settled = ""
