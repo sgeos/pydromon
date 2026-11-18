@@ -6,6 +6,8 @@ derived from the line limit, and it gives the queued runs. ``docs/architecture/R
 is normative."""
 
 import json
+import shutil
+import tempfile
 from collections.abc import Generator, Iterable
 from dataclasses import replace
 from pathlib import Path
@@ -104,8 +106,29 @@ def project(tmp_path: Path) -> Generator[Path]:
     yield tmp_path
 
 
+# Pytest's temporary paths, named after long tests, can put the daemon's socket past
+# the Unix socket path limit on macOS, so each project's runtime directory is a short
+# one of its own, as the short_runtime fixture gives elsewhere.
+_SHORT_RUNTIMES: dict[Path, Path] = {}
+
+
+def runtime_for(project: Path) -> Path:
+    """The short runtime directory path for ``project``, the same on every call."""
+    if project not in _SHORT_RUNTIMES:
+        _SHORT_RUNTIMES[project] = Path(tempfile.mkdtemp(prefix="dr")) / "run"
+    return _SHORT_RUNTIMES[project]
+
+
+@pytest.fixture(autouse=True)
+def _remove_short_runtimes() -> Generator[None]:
+    yield
+    for runtime in _SHORT_RUNTIMES.values():
+        shutil.rmtree(runtime.parent, ignore_errors=True)
+    _SHORT_RUNTIMES.clear()
+
+
 def daemon_for(project: Path, log: EventLog, scheduler: Scheduler) -> Daemon:
-    paths = project_paths(project, project / "run")
+    paths = project_paths(project, runtime_for(project))
     paths.state_dir.mkdir(mode=0o700, exist_ok=True)
     return Daemon(
         paths,
@@ -599,7 +622,7 @@ def client_for(
         return daemon.respond((json.dumps(line) + "\n").encode())
 
     monkeypatch.setattr(cli, "call", call)
-    return ("--project", str(project), "--runtime-dir", str(project / "run"))
+    return ("--project", str(project), "--runtime-dir", str(runtime_for(project)))
 
 
 def test_the_client_lists_a_bounded_answer_and_says_what_it_left_out(
@@ -651,7 +674,7 @@ def test_the_client_lists_queued_runs(
 ) -> None:
     rig.set_level("elevated")
     queued = rig.queue("alpha")
-    rig.root.joinpath("run").mkdir(exist_ok=True)
+    runtime_for(rig.root).mkdir(mode=0o700, exist_ok=True)
     base = client_for(
         rig.root, daemon_for(rig.root, rig.log, rig.scheduler), monkeypatch
     )
