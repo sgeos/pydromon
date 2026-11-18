@@ -33,10 +33,12 @@ from claude_agent_sdk import (
 )
 
 from dromon.driver import Action, Driver, Event, Strategy, driver_resource
-from dromon import launcher, redact
+from dromon import evidence, launcher, redact
 from dromon.activity import ActivityKind, ActivityLog
 from dromon.ceiling import HARD_REASON, STOP_REASON, Choice
 from dromon.engine import (
+    AUTO_MEMORY_DISABLED,
+    AUTO_MEMORY_VARIABLE,
     CONSENT_FALLBACK,
     FALLBACK_SUBTYPES,
     HALT_REASON,
@@ -281,6 +283,27 @@ def test_a_kept_line_sends_its_next_prompt_on_the_same_connection(
     # The reused connection was asked to report its init again, in its own mode.
     assert connection.modes == ["default"]
     assert connection.closed
+
+
+def test_a_reused_claude_connection_marks_where_its_turn_began(
+    tmp_path: Path,
+) -> None:
+    """Round 18 audit of ababdcd, finding 3. What the kept engine wrote before a turn
+    is not given as that turn's end."""
+    factory = Factory([[say("one"), result()], [say("two"), result("session-1")]])
+    engine = line(factory, tmp_path)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        kept = engine._kept  # pyright: ignore[reportPrivateUsage]
+        assert kept is not None
+        kept.stderr.append(b"warning: an old complaint\n")
+        await engine.run_turn("second")
+        assert kept.stderr.turn_from == len(kept.stderr.raw)
+        assert kept.stderr.text().startswith(evidence.EARLIER_LABEL)
+        await engine.close()
+
+    asyncio.run(go())
 
 
 def test_a_line_without_keep_session_does_not_use_a_kept_connection(
@@ -2798,14 +2821,15 @@ def test_the_pin_is_also_in_the_flag_settings_env_block(tmp_path: Path) -> None:
     )
     text = engine.options().settings
     assert text is not None
-    assert json.loads(text)["env"] == {
-        "SCCACHE_DIR": "/cache",
+    # Round 18, item 2. Auto memory is turned off in the same block.
+    pinned = {
         TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED,
+        AUTO_MEMORY_VARIABLE: AUTO_MEMORY_DISABLED,
     }
-    assert flag_settings(None) == {"env": {TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED}}
-    assert flag_settings({"env": "odd"}) == {
-        "env": {TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED}
-    }
+    assert json.loads(text)["env"] == {"SCCACHE_DIR": "/cache", **pinned}
+    alone = {"env": pinned, "autoMemoryEnabled": False}
+    assert flag_settings(None) == alone
+    assert flag_settings({"env": "odd"}) == alone
 
 
 def test_a_missing_launcher_refuses_the_turn(

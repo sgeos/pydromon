@@ -82,7 +82,7 @@ from dromon.activity import ActivityKind, Observer, ignore
 from dromon.capabilities import GROK as GROK_CAPABILITIES
 from dromon.capabilities import Known
 from dromon.driver import TOOL_RESULT, ActionTag, Credential, Driver, Event, Strategy
-from dromon.engine import EngineRefused, TurnReport, read_instructions
+from dromon.engine import EngineClosed, EngineRefused, TurnReport, read_instructions
 from dromon import launcher
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
@@ -1724,59 +1724,75 @@ class GrokLine:
         credential: Credential | None = None
         session_id: str | None = None
         stop = "refused"
-        async with self._connect(arguments, self.cwd, environment) as connection:
+        tail = evidence.StderrTail()
+        start_failure: EngineRefused | None = None
+        token = evidence.ENGINE_STDERR.set(tail)
+        try:
+            async with self._connect(arguments, self.cwd, environment) as connection:
 
-            async def dispatch(message: dict[str, Any]) -> None:
-                await self._dispatch(message, turn)
+                async def dispatch(message: dict[str, Any]) -> None:
+                    await self._dispatch(message, turn)
 
-            self._client = acp.Client(connection, dispatch)
-            try:
-                self._client.deadline = (
-                    asyncio.get_running_loop().time() + START_SECONDS
-                )
-                stage = "initialize"
+                self._client = acp.Client(connection, dispatch)
                 try:
-                    credential = await self._start(turn)
-                    stage = "open session"
-                    session_id = await self._open_session(turn)
-                except TimeoutError as error:
-                    raise EngineRefused(
-                        f"Grok start timed out during {stage}"
-                    ) from error
-                if turn.refusal is None and not check_only:
-                    stop = await self._prompt(session_id, prompt, turn)
-                    unconfirmed = turn.unconfirmed_refusal()
-                    if unconfirmed is not None:
-                        await self._cancel(turn, unconfirmed)
-            except (acp.RpcError, EngineRefused) as error:
-                # A transport failure while cancelling does not replace the stop cause.
-                turn.refusal = turn.refusal or turn.unconfirmed_refusal()
-                if turn.refusal is not None:
-                    raise EngineRefused(turn.refusal) from error
-                if turn.interrupted_for is not None:
-                    stop = "cancelled"
-                elif isinstance(error, acp.RpcError):
-                    raise EngineRefused(
-                        f"the engine refused a request: {error}"
-                    ) from error
-                else:
-                    raise
-            except TimeoutError:
-                # Closing the connection stops Grok if its turn exceeds the bound.
-                turn.refusal = turn.refusal or turn.unconfirmed_refusal()
-                if turn.refusal is None and turn.interrupted_for is None:
-                    now = asyncio.get_running_loop().time()
-                    turn.refusal = (
-                        f"Grok turn reached its absolute cap of "
-                        f"{ABSOLUTE_TURN_SECONDS} seconds"
-                        if turn.absolute_deadline is not None
-                        and now >= turn.absolute_deadline
-                        else f"Grok turn had no activity for {TURN_SECONDS} seconds"
+                    self._client.deadline = (
+                        asyncio.get_running_loop().time() + START_SECONDS
                     )
-                stop = "cancelled"
-            finally:
-                turn.refusal = turn.refusal or turn.unconfirmed_refusal()
-                self._client = None
+                    stage = "initialize"
+                    try:
+                        credential = await self._start(turn)
+                        stage = "open session"
+                        session_id = await self._open_session(turn)
+                    except TimeoutError as error:
+                        start_failure = EngineRefused(
+                            f"Grok start timed out during {stage}"
+                        )
+                        raise start_failure from error
+                    if turn.refusal is None and not check_only:
+                        stop = await self._prompt(session_id, prompt, turn)
+                        unconfirmed = turn.unconfirmed_refusal()
+                        if unconfirmed is not None:
+                            await self._cancel(turn, unconfirmed)
+                except (acp.RpcError, EngineRefused) as error:
+                    # A transport failure while cancelling does not replace the stop
+                    # cause.
+                    turn.refusal = turn.refusal or turn.unconfirmed_refusal()
+                    if turn.refusal is not None:
+                        raise EngineRefused(turn.refusal) from error
+                    if turn.interrupted_for is not None:
+                        stop = "cancelled"
+                    elif isinstance(error, acp.RpcError):
+                        raise EngineRefused(
+                            f"the engine refused a request: {error}"
+                        ) from error
+                    else:
+                        raise
+                except TimeoutError:
+                    # Closing the connection stops Grok if its turn exceeds the bound.
+                    turn.refusal = turn.refusal or turn.unconfirmed_refusal()
+                    if turn.refusal is None and turn.interrupted_for is None:
+                        now = asyncio.get_running_loop().time()
+                        turn.refusal = (
+                            f"Grok turn reached its absolute cap of "
+                            f"{ABSOLUTE_TURN_SECONDS} seconds"
+                            if turn.absolute_deadline is not None
+                            and now >= turn.absolute_deadline
+                            else f"Grok turn had no activity for {TURN_SECONDS} seconds"
+                        )
+                    stop = "cancelled"
+                finally:
+                    turn.refusal = turn.refusal or turn.unconfirmed_refusal()
+                    self._client = None
+        except EngineClosed as error:
+            # The connection's exit has ended the process and drained its standard
+            # error, so the tail holds what the engine said as it closed.
+            raise EngineClosed(str(error), stderr=tail.snapshot()) from error
+        except EngineRefused as error:
+            if error is not start_failure:
+                raise
+            raise EngineRefused(str(error), stderr=tail.snapshot()) from error
+        finally:
+            evidence.ENGINE_STDERR.reset(token)
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
         if credential is None or session_id is None:

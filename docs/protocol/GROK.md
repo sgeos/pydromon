@@ -1117,6 +1117,40 @@ transport. Inference. There is no documented per-session tool omission control
 safe to use here. No new flag or metadata field is sent. Existing feature switches
 remain in use. This finding does not establish that an undocumented control is absent.
 
+**Round 18, item 3, checked on 2026-11-18.** The operator asked again for a
+documented way to remove Grok's own `write`, `todo_write`, plan mode, scheduler and
+monitor tools from a session, since a call to one fails the turn and Grok's usage
+balance is exhausted, so no live turn is possible. **Fact.** The bundled guides under
+`~/.grok/docs/user-guide` are dated 2026-10-23, the text the checks of 2026-11-01 and
+2026-11-11 read. Read again, they give the following.
+
+- `14-headless-mode.md` documents `--tools` and `--disallowed-tools` for `grok -p`
+  and the terminal interface only. It also says that on the daemon route an entry
+  naming `monitor`, a `scheduler_*` tool or `enter_plan_mode` removes nothing and
+  only warns, and so does `TodoWrite`. So even where the flag is accepted, it does not
+  remove four of the five tools on that route.
+- `15-agent-mode.md` lists the options of `grok agent` as `--model`,
+  `--always-approve`, `--reauth`, `--agent-profile` and `--leader`, and no tool list.
+  Grok Build 1.0.70's `grok agent` refused `--deny` with status 2, as pull request 128
+  records. **Inference.** It would refuse `--disallowed-tools` the same way. Not run,
+  since a line may not start Grok.
+- `--agent-profile` and the `agentProfile` field of `session/new` select an agent,
+  and `16-subagents.md` says an agent controls tool availability. The guide gives no
+  format for restricting the main session's tools, and says the profile file is not
+  loaded on the daemon route. **Hypothesis.** A profile with a `tools` list might narrow
+  the main session on the other route. Not applied. If it were wrong it could remove
+  `read_file` from every Grok line, and no live turn can check it.
+- `19-plan-mode.md` says `grok agent stdio` ignores `--permission-mode plan`. That
+  concerns entering plan mode, not removing its tools.
+- `05-configuration.md` documents `GROK_GOAL=0` as turning `/goal` off. With
+  workflows off, `/goal` is driven by the `update_goal` tool. **Inference.** The switch
+  may withdraw `update_goal`, which is not one of the five tools named. Not applied,
+  since the guide does not say so.
+
+**Conclusion.** No documented way exists to remove the five tools from Dromon's
+`grok agent stdio` session, so nothing is changed. The fixed `PreToolUse` denial and
+Dromon's per-call refusal remain the controls, with their failure modes stated above.
+
 Fact. Every Grok session receives a brief rule directing reports through
 `write_scratch`, called through `use_tool` with inline `tool_input` arguments.
 The session digest includes a report-rule version so existing sessions renew.

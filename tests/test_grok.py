@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 import tomllib
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
@@ -23,13 +24,14 @@ import pytest
 from claude_agent_sdk import SdkMcpTool
 from imagesamples import png
 
+from dromon import evidence
 from dromon import grok as grok_module
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon.agents import AgentError, LineTokens
 from dromon.daemon import Daemon
 from dromon.driver import Credential, Driver, Strategy
 from dromon.priority import SteeredDriver
-from dromon.engine import EnginePlanLimit, EngineRefused, TurnReport
+from dromon.engine import EngineClosed, EnginePlanLimit, EngineRefused, TurnReport
 from dromon.eventlog import EventLog
 from dromon.evidence import IN, OUT, Recording, Replay, read_recording, replay_factory
 from dromon.grok import (
@@ -4731,3 +4733,84 @@ def test_a_home_that_cannot_hold_a_log_directory_leaves_the_server_without_one(
         home=home,
     )
     assert target._bridge_log_path() is None  # pyright: ignore[reportPrivateUsage]
+
+
+# Round 18 follow-up of 2026-11-18. The tail of the agent's standard error.
+
+SPOKEN_REFUSAL = "Error: the agent refused its configuration"
+
+REFUSING_GROK = (
+    "import sys\n"
+    f"sys.stderr.write({SPOKEN_REFUSAL!r} + ' api_key=abc123secret\\n')\n"
+    "sys.exit(1)\n"
+)
+
+STALLED_GROK = (
+    "import sys\n"
+    f"sys.stderr.write({SPOKEN_REFUSAL!r} + ' api_key=abc123secret\\n')\n"
+    "sys.stderr.flush()\n"
+    "sys.stdin.read()\n"
+)
+
+
+def real_agent_line(
+    project: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    script: str,
+) -> GrokLine:
+    """A Grok line whose agent is a real process, started through the adapter's own
+    process wrapper, from a script named ``grok`` on the path."""
+    directory = tmp_path / "bin"
+    directory.mkdir()
+    agent = directory / "grok"
+    agent.write_text(f"#!{sys.executable}\n{script}")
+    agent.chmod(0o755)
+    monkeypatch.setenv("PATH", str(directory))
+    workspace, home, state = project
+    return GrokLine(
+        grok(),
+        workspace,
+        mcp_tools=[SEND],
+        protected=(state,),
+        bridge=["dromon-bridge", "--line", "alpha"],
+        line_token="tok",  # noqa: S106, a test token
+        environment={},
+        home=home,
+    )
+
+
+def test_a_grok_start_refusal_reaches_the_closing_reason_masked(
+    project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with pytest.raises(EngineClosed) as raised:
+        run(real_agent_line(project, monkeypatch, tmp_path, REFUSING_GROK))
+    reason = evidence.with_tail(str(raised.value), raised.value.stderr)
+    assert reason.startswith("the engine closed its connection")
+    assert SPOKEN_REFUSAL in reason
+    assert "api_key=***" in reason and "abc123secret" not in reason
+    assert len(reason) <= evidence.CLOSING_REASON_CHARACTERS
+
+
+def test_a_grok_start_that_times_out_names_what_the_agent_said(
+    project: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(grok_module, "START_SECONDS", 0.5)
+    with pytest.raises(EngineRefused) as raised:
+        run(real_agent_line(project, monkeypatch, tmp_path, STALLED_GROK))
+    reason = evidence.with_tail(str(raised.value), raised.value.stderr)
+    assert reason.startswith("Grok start timed out during initialize")
+    assert SPOKEN_REFUSAL in reason
+    assert "api_key=***" in reason and "abc123secret" not in reason
+
+
+def test_a_closed_test_connection_keeps_its_reason(
+    project: tuple[Path, Path, Path],
+) -> None:
+    """A test's own connection has no standard error, so the reason of its closed
+    connection is as it always was."""
+    server = FakeGrok([chunk("partial")])
+    server.answer_prompt = False
+    with pytest.raises(EngineClosed) as raised:
+        run(line(server, project))
+    assert str(raised.value) == "the engine closed its connection during the turn"

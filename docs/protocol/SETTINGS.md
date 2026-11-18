@@ -105,6 +105,20 @@ names, so that one can be copied from `.claude/settings.json`.
   after it. **Residual.** Managed policy settings are copied last, whatever Dromon
   passes, and could still set it. An MCP server may not refer to either kind of
   variable.
+- **Auto memory off.** **Round 18, item 2, decided by the operator on 2026-11-18.** A
+  line's worktree sits inside the operator's project directory, so Claude Code found
+  the operator's auto-memory index for the project and loaded it into every line.
+  Dromon now starts every Claude Code line with `CLAUDE_CODE_DISABLE_AUTO_MEMORY` set
+  to `1`, in the process environment and in the flag settings' env block, and with
+  `autoMemoryEnabled` set to `false` in the flag settings, and `env` may not set the
+  variable to any value. **Fact, read from the bundled Claude Code 2.1.310 on
+  2026-11-18.** The settings schema describes `autoMemoryEnabled` as "Enable
+  auto-memory for this project. When false, Claude will not read from or write to the
+  auto-memory directory." The variable is read first. A value of `1`, `true`, `yes`
+  or `on` turns auto memory off, and `0`, `false`, `no` or `off` forces it on, so
+  the setting alone would lose to an inherited false value. **Not verified by a live
+  turn.** That a line's context no longer holds the index is inferred from the code.
+  **Residual.** Managed policy settings are copied last and could turn it on.
 - **Strict keys.** Any other key, `permissions.defaultMode` included, is an error.
   Rules are sorted and deduplicated, hooks keep their order, and documents are stored
   as canonical JSON. At most 256 entries are accepted in any array or table, and each
