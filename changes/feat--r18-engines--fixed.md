@@ -6,3 +6,11 @@ Type: Fixed
   settings may not set the variable. This was read from the bundled Claude Code
   2.1.310 and has not been checked in a live turn. `SETTINGS.md` records the order in
   which Claude Code reads the two.
+- A turn whose engine closed its connection or failed to start named only that, so a
+  line whose engine refused its configuration at start could not tell why. Codex,
+  Claude Code and Grok now keep the last 4 KiB of their engine's standard error, and
+  the error of such a turn ends with as much of it as the 240 characters of the
+  closing reason allow, masked, with the launcher's own notes giving way to the
+  engine's. A Claude Code process that ends under the Agent SDK is now recorded as
+  `engine_closed` rather than as an engine error. `ENGINES.md` records the rule and
+  its limits.

@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk._internal.transport import Transport
 
-from dromon import acp, cli, codex, evidence, exits, grok
+from dromon import acp, cli, codex, evidence, exits, grok, launcher
 from dromon.capabilities import (
     CAPABILITY_NAMES,
     CLAUDE_CODE,
@@ -57,6 +57,7 @@ from dromon.evidence import (
 )
 from dromon.jsonlines import json_lines_factory
 from dromon.lineconfig import LineConfig
+from dromon.model import FailureCause, InvalidField, LineTurnEnded
 from dromon.paths import PathError, project_paths
 
 HAIKU = "claude-haiku-5-5"
@@ -1478,3 +1479,121 @@ def test_startup_diagnostics_are_bounded_masked_and_drained_without_a_recording(
     assert "sk-invented-value" not in text
     assert "Authorization: ***" in text
     assert "\n" not in text
+
+
+# The tail of an engine's standard error, round 18 follow-up of 2026-11-18.
+
+
+def test_the_tail_keeps_only_its_last_bytes() -> None:
+    tail = evidence.StderrTail()
+    tail.append(b"a" * evidence.STDERR_TAIL_BYTES)
+    assert not tail.cut
+    tail.append(b"bc")
+    assert len(tail.raw) == evidence.STDERR_TAIL_BYTES
+    assert tail.cut
+    assert bytes(tail.raw).endswith(b"bc")
+
+
+def test_the_tail_masks_a_credential_and_shows_one_printable_line() -> None:
+    tail = evidence.StderrTail()
+    tail.append(b"Error: refused\x1b[0m\nAuthorization: Bearer abc123secret\n")
+    tail.append(b"retry with api_token=def456secret\r\n")
+    shown = tail.text()
+    assert "abc123secret" not in shown and "def456secret" not in shown
+    assert shown.count("***") >= 2 and "api_token=***" in shown
+    assert shown.isprintable() and "\n" not in shown
+
+
+def test_a_cut_that_parts_a_credential_from_its_name_drops_the_value() -> None:
+    """The cut falls right after ``api_token=``, so the value starts the tail with
+    no name for masking to key on. The partial first word is dropped."""
+    secret = b"S3CRETVALUE"
+    name = b"api_token="
+    tail = evidence.StderrTail()
+    tail.append(name)
+    tail.append(secret + b" " + b"z" * (evidence.STDERR_TAIL_BYTES - len(secret) - 1))
+    assert bytes(tail.raw).startswith(secret)
+    assert secret.decode() not in tail.text()
+
+
+def test_a_shorter_text_starts_at_a_whole_word() -> None:
+    tail = evidence.StderrTail()
+    tail.append(b"alpha bravo charlie delta")
+    assert tail.text(len("charlie delta")) == "charlie delta"
+    assert tail.text(len("harlie delta")) == "delta"
+    assert tail.text(0) == ""
+
+
+def test_explain_fits_the_closing_reason_and_keeps_the_message_first() -> None:
+    tail = evidence.StderrTail()
+    tail.append(("word " * 200 + "Error: the last words").encode())
+    message = "the engine closed its connection during the turn"
+    explained = tail.explain(message)
+    assert explained.startswith(message + evidence.STDERR_JOINER)
+    assert explained.endswith("Error: the last words")
+    assert len(explained) <= evidence.CLOSING_REASON_CHARACTERS
+
+
+def test_explain_leaves_a_message_alone_without_a_tail_or_room() -> None:
+    message = "the engine closed its connection during the turn"
+    assert evidence.StderrTail().explain(message) == message
+    tail = evidence.StderrTail()
+    tail.append(b"Error: something")
+    crowded = "x" * (
+        evidence.CLOSING_REASON_CHARACTERS
+        - len(evidence.STDERR_JOINER)
+        - evidence.MIN_TAIL_CHARACTERS
+        + 1
+    )
+    assert tail.explain(crowded) == crowded
+    assert tail.explain("first\nsecond").startswith("first" + evidence.STDERR_JOINER)
+
+
+def test_the_closing_reason_bound_is_the_events_own() -> None:
+    """Derived from ``LineTurnEnded``'s own check, so the two cannot drift."""
+    bound = evidence.CLOSING_REASON_CHARACTERS
+    LineTurnEnded(
+        "alpha", None, True, True, FailureCause.ENGINE_CLOSED, None, "x" * bound
+    )
+    with pytest.raises(InvalidField):
+        LineTurnEnded(
+            "alpha",
+            None,
+            True,
+            True,
+            FailureCause.ENGINE_CLOSED,
+            None,
+            "x" * (bound + 1),
+        )
+
+
+def test_the_drain_keeps_the_tail_its_context_names(tmp_path: Path) -> None:
+    async def go() -> evidence.StderrTail:
+        tail = evidence.StderrTail()
+        token = evidence.ENGINE_STDERR.set(tail)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import sys; sys.stderr.write('Error: refused token=abc123secret')",
+                stderr=asyncio.subprocess.PIPE,
+            )
+            draining = evidence.start_draining(process, None)
+        finally:
+            evidence.ENGINE_STDERR.reset(token)
+        await process.wait()
+        await evidence.stop_draining(draining)
+        return tail
+
+    shown = asyncio.run(go()).text()
+    assert shown == "Error: refused token=***"
+
+
+def test_the_launchers_notes_give_way_to_what_the_engine_said() -> None:
+    note = f"{launcher.DIAGNOSTIC_PREFIX} the process table could not be read"
+    tail = evidence.StderrTail()
+    tail.append(f"Error: refused at start\n{note}\n".encode())
+    assert tail.text() == "Error: refused at start"
+    alone = evidence.StderrTail()
+    alone.append(f"{launcher.DIAGNOSTIC_PREFIX} cannot start codex: denied\n".encode())
+    assert alone.text() == f"{launcher.DIAGNOSTIC_PREFIX} cannot start codex: denied"

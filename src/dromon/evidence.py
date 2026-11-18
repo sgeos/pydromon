@@ -101,6 +101,7 @@ from pathlib import Path
 from typing import Any, Final, cast
 
 from dromon import redact
+from dromon.launcher import DIAGNOSTIC_PREFIX
 
 FORMAT_VERSION: Final = 1
 MAX_FRAMES: Final = 20_000
@@ -260,15 +261,114 @@ STARTUP_STDERR: ContextVar[StartupDiagnostics | None] = ContextVar(
 )
 
 
+STDERR_TAIL_BYTES: Final = 4096
+"""How much of an engine's standard error a line keeps, its last bytes only."""
+
+CLOSING_REASON_CHARACTERS: Final = 240
+"""The bound of ``LineTurnEnded.closing_reason``, which the scheduler cuts the first
+line of a failed turn's error to. A test derives it from the event's own check."""
+
+MIN_TAIL_CHARACTERS: Final = 24
+"""The shortest tail worth giving. A message that leaves less room goes without it."""
+
+STDERR_JOINER: Final = ". Its standard error ended with: "
+
+
+@dataclass(slots=True)
+class StderrTail:
+    """The last ``STDERR_TAIL_BYTES`` of one engine process's standard error, kept so
+    that a turn that ends with a closed connection or a failed start can say what
+    the engine said as it ended. **Round 18 follow-up of 2026-11-18.** Before it,
+    standard error was kept only while a probe recorded, so a line whose engine
+    refused its configuration at start saw only that the connection closed.
+
+    It is held in memory only, for the life of its process, and never written as
+    it is. ``text`` masks it, so only masked text leaves it. **Failure modes.**
+    Masking is by the patterns of ``dromon.redact``, so a secret in another form
+    passes as it is, which is why the scheduler also screens the closing reason
+    against the disclosure list and withholds it on a match. The bytes are cut from
+    the front, which can leave a credential's value without the name that masking
+    keys on, so a cut tail drops its first word before it is shown. An engine that
+    writes after it closes its output, or a reader the engine's transport cancels
+    first, can leave the last words out. The launcher shares the stream and writes
+    its notes after the engine ends, so its lines are shown only when the engine
+    wrote none. An engine that writes a line beginning as the launcher's hides that
+    line from the reason and from nothing else."""
+
+    raw: bytearray = field(default_factory=bytearray)
+    cut: bool = False
+
+    def append(self, chunk: bytes) -> None:
+        self.raw.extend(chunk)
+        excess = len(self.raw) - STDERR_TAIL_BYTES
+        if excess > 0:
+            del self.raw[:excess]
+            self.cut = True
+
+    def text(self, limit: int = STDERR_TAIL_BYTES) -> str:
+        """The tail masked, on one line of printable characters, and at most
+        ``limit`` characters from its end. Masking runs on everything kept before
+        any cut, and a cut drops the partial first word."""
+        lines = self.raw.decode("utf-8", "replace").splitlines()
+        own = [line for line in lines if not line.startswith(DIAGNOSTIC_PREFIX)]
+        # The launcher writes its notes after the engine has ended, which would
+        # crowd out what the engine said. They are shown only when the engine said
+        # nothing, as when the launcher could not start it.
+        kept = own if any(line.strip() for line in own) else lines
+        masked = redact.mask("\n".join(kept))
+        words = "".join(c if c.isprintable() else " " for c in masked).split()
+        if self.cut and words:
+            words = words[1:]
+        shown = " ".join(words)
+        if limit <= 0:
+            return ""
+        if len(shown) <= limit:
+            return shown
+        start = len(shown) - limit
+        rest = shown[start:]
+        if shown[start - 1] == " ":
+            return rest
+        _, _, whole = rest.partition(" ")
+        return whole
+
+    def explain(self, message: str) -> str:
+        """``message`` with as much of the tail as the closing reason has room for,
+        or ``message`` unchanged when the tail is empty or the room is too small.
+        ``message`` keeps its own first words, by which the scheduler maps a stop
+        to its fixed wording."""
+        first = message.split("\n", 1)[0]
+        room = CLOSING_REASON_CHARACTERS - len(first) - len(STDERR_JOINER)
+        if room < MIN_TAIL_CHARACTERS:
+            return message
+        shown = self.text(room)
+        if not shown:
+            return message
+        return f"{first}{STDERR_JOINER}{shown}"
+
+
+ENGINE_STDERR: ContextVar[StderrTail | None] = ContextVar(
+    "dromon_engine_stderr",
+    default=None,
+)
+"""Where ``drain_stderr`` keeps the tail of the engine it reads, set by an adapter
+around the start of its engine's process, so the draining task, which copies the
+context as it is created, keeps the same tail for the life of the process. **Porting
+note.** A port passes the tail to the drain explicitly."""
+
+
 async def drain_stderr(
     stream: asyncio.StreamReader, recording: Recording | None
 ) -> None:
     """Read an engine's standard error to its end, so the engine never blocks on
-    it, keeping what a recording's bound allows, and nothing without one."""
+    it, keeping what a recording's bound allows, and the last bytes in the tail
+    ``ENGINE_STDERR`` names, for a closing reason."""
+    tail = ENGINE_STDERR.get()
     while True:
         chunk = await stream.read(4096)
         if not chunk:
             return
+        if tail is not None:
+            tail.append(chunk)
         diagnostics = STARTUP_STDERR.get()
         if diagnostics is not None:
             diagnostics.append(chunk)

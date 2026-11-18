@@ -473,6 +473,47 @@ A descendant left running that holds standard error open delays the end of a
 connection by at most 10 seconds, the bound on that read, where the null device once
 cost nothing.
 
+**The tail in a closing reason.** Round 18 follow-up of 2026-11-18. A Codex line whose
+app-server refused its configuration at start saw only that the engine closed its
+connection, because standard error was kept only while a probe recorded, as the round
+18 diagnosis found. Codex, Claude Code and Grok now keep the last 4 KiB of their
+engine's standard error in memory for the life of the process, in
+`dromon.evidence.StderrTail`, which the drain fills for Codex and Grok and the Agent
+SDK's callback fills for Claude Code. A turn that ends with `EngineClosed`, and a Grok
+start that times out, end their error with as much of the tail as the 240 characters
+of `line_turn_ended.closing_reason` leave room for, so the scheduler records it as the
+closing reason, with the error's own first words kept for its fixed stop wording.
+Fact, shown by tests. The refusal of Codex 0.166.0 reaches the error through the real
+process wrapper, a credential the engine wrote is masked, and a Grok refusal at start,
+through its real wrapper, does the same. The Claude Code test drives a substitute
+session that calls the SDK's callback and raises the SDK's error, so the SDK's own
+reading of standard error is not under test.
+
+- **Masking.** The tail is masked by `dromon.redact` over all it keeps before any cut,
+  and a tail cut at its front drops its partial first word, which may be a credential
+  parted from the name masking keys on. The scheduler then masks, scrubs and screens
+  the whole first line, as `EVENT_LOG.md` says, and withholds it on a disclosure match.
+  A secret in a form no pattern names passes the masking, as for a recording.
+- **The launcher's notes.** The launcher shares the stream and writes its notes, which
+  begin with `launcher.DIAGNOSTIC_PREFIX`, after the engine ends, which crowded the
+  engine's refusal out of the reason in the first test. They are shown only when the
+  engine wrote nothing, as when the launcher could not start it.
+- **Claude Code.** The Agent SDK pipes standard error only when given a callback, so
+  every Claude Code line now gives one, which also writes each line to the daemon's
+  standard error, where the engine's own went before. A `ProcessError` or
+  `CLIConnectionError` from the SDK, other than a `ResultError` or a
+  `CLINotFoundError`, is now raised as `EngineClosed`, whose definition it meets, so
+  it is recorded with the cause `engine_closed` and the class `EngineClosed` rather
+  than as an engine error, and the line receives the fixed stop note for a closed
+  connection. A kept connection whose process ended names the tail in the refusal it
+  always gave.
+- **Failure modes.** The SDK cancels its standard error reader when it disconnects,
+  so a line the engine wrote in the instant before it ended may be missing.
+  Inference, not observed. A Claude Code start that times out at initialize, and
+  Cursor, Antigravity and Pi, whose drain also fills a tail when one is set, do not
+  yet name it. A daemon start check already prints its own startup diagnostics, so a
+  check that fails this way prints the tail twice.
+
 **A failed write.** Review of 2026-10-27, finding R3. A write to the recording that
 fails, such as on a full disk, ends the recording and is noted, and the turn goes on.
 The probe still prints its report, says the recording is incomplete, and exits with a

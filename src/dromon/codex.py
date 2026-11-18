@@ -1199,6 +1199,9 @@ class _Kept:
     this connection, from the items the engine reported, oldest first, bounded by
     ``MAX_OWN_COMMANDS``. A listed terminal is the line's only if it matches one, so
     the line never depends on the engine's scoping by thread."""
+    stderr: evidence.StderrTail = field(default_factory=evidence.StderrTail)
+    """The tail of the app-server's standard error, for the reason of a turn that
+    ends with its connection closed."""
 
 
 def turn_usage(turn: _Turn) -> dict[str, int] | None:
@@ -1438,24 +1441,35 @@ class CodexLine:
             )
         turn = _Turn()
         compaction: tuple[dict[str, int | str | None], _Turn] | None = None
-        async with self._connect(arguments, self.cwd, environment) as connection:
-            self._connection = connection
-            try:
-                credential = await self._start(turn)
-                thread_id = await self._open_thread(turn)
-                if turn.refusal is None:
-                    await self._check_isolation(thread_id, turn)
-                if turn.refusal is None and request is not None:
-                    note, compaction = await self._compact_thread(
-                        thread_id, turn, request
-                    )
-                    prompt = f"{note}\n\n{prompt}"
-                if turn.refusal is None and not check_only:
-                    await self._run(thread_id, prompt, turn)
-            except _RpcError as error:
-                raise EngineRefused(f"the engine refused a request: {error}") from error
-            finally:
-                self._connection = None
+        tail = evidence.StderrTail()
+        token = evidence.ENGINE_STDERR.set(tail)
+        try:
+            async with self._connect(arguments, self.cwd, environment) as connection:
+                self._connection = connection
+                try:
+                    credential = await self._start(turn)
+                    thread_id = await self._open_thread(turn)
+                    if turn.refusal is None:
+                        await self._check_isolation(thread_id, turn)
+                    if turn.refusal is None and request is not None:
+                        note, compaction = await self._compact_thread(
+                            thread_id, turn, request
+                        )
+                        prompt = f"{note}\n\n{prompt}"
+                    if turn.refusal is None and not check_only:
+                        await self._run(thread_id, prompt, turn)
+                except _RpcError as error:
+                    raise EngineRefused(
+                        f"the engine refused a request: {error}"
+                    ) from error
+                finally:
+                    self._connection = None
+        except EngineClosed as error:
+            # The connection's exit has ended the process and drained its standard
+            # error, so the tail holds what the engine said as it closed.
+            raise EngineClosed(tail.explain(str(error))) from error
+        finally:
+            evidence.ENGINE_STDERR.reset(token)
         if turn.refusal is not None:
             raise EngineRefused(turn.refusal)
         if turn.limit is not None and turn.status != "completed":
@@ -2143,6 +2157,8 @@ class CodexLine:
         fingerprint: str,
     ) -> _Kept:
         stack = AsyncExitStack()
+        tail = evidence.StderrTail()
+        token = evidence.ENGINE_STDERR.set(tail)
         try:
             inner = await stack.enter_async_context(
                 self._connect(arguments, self.cwd, environment)
@@ -2150,7 +2166,10 @@ class CodexLine:
         except BaseException:
             await stack.aclose()
             raise
+        finally:
+            evidence.ENGINE_STDERR.reset(token)
         kept = _Kept(stack, _Routed(inner, self._between), fingerprint, self._clock())
+        kept.stderr = tail
         loop = asyncio.get_running_loop()
         kept.pump = loop.create_task(kept.routed.pump())
         # Review F12. A connection that dies without a close withdraws its ceiling
@@ -2556,11 +2575,14 @@ class CodexLine:
         except _RpcError as error:
             await self.close()
             raise EngineRefused(f"the engine refused a request: {error}") from error
-        except Exception:
+        except Exception as error:
             died = not kept.routed.alive
             await self.close()
             if died:
                 self._notes.append(DIED_NOTE)
+            if isinstance(error, EngineClosed):
+                # The close has ended the process and drained its standard error.
+                raise EngineClosed(kept.stderr.explain(str(error))) from error
             raise
         finally:
             self._in_turn = False

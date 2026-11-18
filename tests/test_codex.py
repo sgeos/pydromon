@@ -40,7 +40,7 @@ from dromon.codex import (
 from dromon.daemon import check_engines
 from dromon.driver import Credential, Driver, Strategy
 from dromon.priority import SteeredDriver
-from dromon.engine import EnginePlanLimit, EngineRefused, TurnReport
+from dromon.engine import EngineClosed, EnginePlanLimit, EngineRefused, TurnReport
 from dromon.evidence import IN, OUT, Recording, Replay, read_recording, replay_factory
 from dromon.launcher import (
     LAUNCH_MARK_VARIABLE,
@@ -2254,3 +2254,67 @@ def test_cancelled_start_check_closes_its_connection_without_a_prompt(
         assert "turn/start" not in server.methods()
 
     asyncio.run(check())
+
+
+# Round 18 follow-up of 2026-11-18. The tail of the app-server's standard error.
+
+START_REFUSAL = (
+    "config defines `[permissions]` profiles but does not set `default_permissions`"
+)
+"""The start refusal Codex 0.166.0 gave, as commit 14b7fc3 records it."""
+
+REFUSING_CODEX = (
+    "import sys\n"
+    f"sys.stderr.write('Error: ' + {START_REFUSAL!r} + ' token=abc123secret\\n')\n"
+    "sys.exit(1)\n"
+)
+
+
+@pytest.mark.parametrize("keep_session", [False, True])
+def test_a_start_refusal_reaches_the_closing_reason_with_its_credential_masked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keep_session: bool
+) -> None:
+    """A real app-server process, through the adapter's own process wrapper, refuses
+    its configuration at start and exits. The turn's error names the refusal within
+    the closing reason's bound, with the credential the engine wrote masked."""
+    directory = tmp_path / "bin"
+    directory.mkdir()
+    script = directory / "codex"
+    script.write_text(f"#!{sys.executable}\n{REFUSING_CODEX}")
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", str(directory))
+    target = CodexLine(
+        luna(),
+        tmp_path,
+        config=LineConfig(keep_session=keep_session),
+        mcp_tools=[RECORD],
+        environment={"PATH": str(directory)},
+        server_lister=lambda env: [],
+    )
+
+    async def go() -> None:
+        try:
+            await target.run_turn("read your assignment")
+        finally:
+            await target.close()
+
+    with pytest.raises(EngineClosed) as raised:
+        asyncio.run(go())
+    reason = str(raised.value)
+    assert reason.startswith("the engine closed its connection during the turn")
+    assert START_REFUSAL in reason
+    assert "token=***" in reason and "abc123secret" not in reason
+    assert len(reason) <= evidence.CLOSING_REASON_CHARACTERS
+
+
+def test_a_closed_connection_without_standard_error_keeps_its_reason() -> None:
+    """A connection with no standard error to read, as a test's own is, closes
+    with the reason it always had."""
+
+    class Silent(FakeServer):
+        async def receive(self) -> dict[str, Any] | None:
+            return None
+
+    with pytest.raises(EngineClosed) as raised:
+        run(line(Silent([])))
+    assert str(raised.value) == "the engine closed its connection during the turn"
