@@ -24,6 +24,7 @@ line tools, MCP servers, hooks and credentials, so it deserves the review any su
 does. MCP servers may refer to secrets in the daemon's environment instead.
 """
 
+import json
 import re
 import tomllib
 from collections.abc import Mapping
@@ -287,9 +288,10 @@ class DefaultProfile:
     profile's in the file. ``sandbox`` and ``settings`` merge under the client's, so the
     client cannot drop a list entry the profile adds, such as a denial or an ask rule,
     and a client sandbox that weakens one of ``HELD_SANDBOX_KEYS`` is refused, **round
-    18, addendum 2, item 1**. Every other scalar the client sets wins. The profile's
-    ``git_ssh``, ``limits``, ``wake`` and ``may_own`` are not applied, since each is
-    authority or policy the file gives the lines it names, and ``configwarnings`` says
+    18, addendum 2, item 1, and addendum 3**. Every other scalar the client sets
+    wins. The profile's ``git_ssh``, ``limits``, ``wake`` and ``may_own`` are not
+    applied, since each is authority or policy the file gives the lines it names, and
+    ``configwarnings`` says
     so for ``git_ssh``. A profile that grants ``secrets`` is refused, since a
     client-created line is granted none."""
 
@@ -302,20 +304,63 @@ class DefaultProfile:
     git_ssh: bool
 
 
-HELD_SANDBOX_KEYS: Final[tuple[tuple[tuple[str, ...], bool], ...]] = (
+HELD_SANDBOX_KEYS: Final[tuple[tuple[tuple[str, ...], bool | None], ...]] = (
+    # Round 18, addendum 2, item 1. The switches that turn the sandbox off or make it
+    # optional.
     (("enabled",), True),
     (("failIfUnavailable",), True),
     (("filesystem", "disabled"), False),
+    # Round 18, addendum 3. Scalars that open a boundary, the first three of them
+    # operator only in a project file.
+    (("allowAppleEvents",), False),
+    (("allowNestedUserNamespaces",), False),
+    (("network", "allowAllUnixSockets"), False),
+    (("enableWeakerNestedSandbox",), False),
+    (("enableWeakerNetworkIsolation",), False),
+    (("network", "strictAllowlist"), True),
+    (("network", "allowLocalBinding"), False),
+    # Neutralised when the engine's settings are built, and refused here as well, so
+    # that the client sees the refusal rather than a document silently not taken.
+    (("allowUnsandboxedCommands",), False),
+    (("excludedCommands",), None),
+    # Operator only, with no value established here as the secure one.
+    (("network", "tlsTerminate"), None),
+    # A door out of the sandbox, rather than a path or a domain inside it. A proxy
+    # port hands the domain filtering to a proxy Dromon does not run, a Unix socket can
+    # reach a service outside the sandbox, and so can a Mach service.
+    (("network", "httpProxyPort"), None),
+    (("network", "socksProxyPort"), None),
+    (("network", "allowUnixSockets"), None),
+    (("network", "allowMachLookup"), None),
 )
-"""The sandbox scalars a client may not weaken under a default profile, each with its
-secure value, which is also what the profile gives when it leaves the key unset.
+"""The sandbox keys a client may not weaken under a default profile, the one list of
+them. Each has the only value a client may give it, which is also what the line runs
+with when no layer sets the key, or ``None`` for a key a client may not set at all.
+A key the profile sets itself may be given the profile's own value, since that is the
+operator's choice and repeating it weakens nothing.
+
 **Round 18, addendum 2, item 1.** The sandbox layers merge with the more specific
 scalar winning, and the client's layer is the more specific, so a client document
 that set ``enabled`` false, ``failIfUnavailable`` false or ``filesystem.disabled``
 true switched off, or made optional, the sandbox that carries the profile's denials.
 An unset key counts as the secure value, since the daemon gives a Claude Code line an
-enabled sandbox and fills in ``failIfUnavailable`` when no layer sets them, and
-``filesystem.disabled`` is false unless a layer sets it."""
+enabled sandbox, fills in ``failIfUnavailable`` and ``network.strictAllowlist`` when no
+layer sets them, and forces ``allowUnsandboxedCommands`` false.
+
+**Round 18, addendum 3.** The same holds for every other key that weakens the sandbox
+or that a project file may not set, so the list fails closed over them all. What a
+client may still send is a key not listed here. That is a list entry that grants a
+path or a domain inside the sandbox, ``allowWrite``, ``allowRead`` and
+``allowedDomains``, which the credential and protected path checks still bound, a
+denial, which only strengthens it, ``autoAllowBashIfSandboxed``, which concerns
+permission prompts and not the sandbox's bounds, and ``ignoreViolations``.
+
+**Residuals.** That ``ignoreViolations`` only quietens reports and opens nothing is an
+inference from Claude Code's documentation, not tested. Whether an ``allowRead`` entry
+lifts a profile's ``denyRead`` entry inside it is not tested either, and the profile
+this project names denies writes, not reads. A key Claude Code adds later is refused by
+the parser as unknown until Dromon lists it, and a test fails when the parser lists a
+key this list and its test's allowed keys both leave out, so it cannot pass unseen."""
 
 
 def _value_at(document: Mapping[str, object], path: tuple[str, ...]) -> object:
@@ -334,23 +379,23 @@ def _value_at(document: Mapping[str, object], path: tuple[str, ...]) -> object:
 
 def _refuse_weakening(profile: DefaultProfile, own: SandboxConfig | None) -> None:
     """Raise ``ConfigError`` naming the first key of ``HELD_SANDBOX_KEYS`` that the
-    client's sandbox sets to the weaker value while the profile does not. Fail closed,
-    rather than letting the profile's value win silently, so the client learns that
-    its document was not taken as sent. A client may set the secure value, or the
-    weaker one where the profile itself sets it."""
+    client's sandbox sets to a value other than the one it may give, while the profile
+    does not set that value itself. Fail closed, rather than letting the profile's
+    value win silently, so the client learns that its document was not taken as sent.
+    A client may set the secure value, or any value the profile itself sets."""
     if own is None:
         return
     given = own.document()
     held = {} if profile.sandbox is None else profile.sandbox.document()
     for path, secure in HELD_SANDBOX_KEYS:
         value = _value_at(given, path)
-        if value is None or value == secure:
+        if value is None or (secure is not None and value == secure):
             continue
         if _value_at(held, path) == value:
             continue
         key = ".".join(path)
         raise ConfigError(
-            f"sandbox.{key} {str(value).lower()} would weaken the sandbox of profile"
+            f"sandbox.{key} {json.dumps(value)} would weaken the sandbox of profile"
             f" {profile.name!r}, which daemon.default_profile applies to this line, so"
             f" it is refused. Leave sandbox.{key} unset, or name the line in the"
             " project file"

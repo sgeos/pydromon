@@ -45,5 +45,12 @@ Type: Fixed
   `enabled` false, `failIfUnavailable` false or `filesystem.disabled` true, which
   the profile does not set itself, is refused with an error naming the key, since
   it switched off the sandbox that carries the profile's denials.
+- The same refusal now covers every other client sandbox key that weakens the
+  sandbox or that a project file may not set, such as `allowAppleEvents`,
+  `network.allowAllUnixSockets`, `network.strictAllowlist` false, proxy ports, Unix
+  sockets and Mach services. `allowUnsandboxedCommands` true and
+  `excludedCommands`, which the build already neutralised, are now refused too, so
+  the client is told. Grants of paths and domains and every denial are still
+  accepted.
 - A sandbox grant spelled in another Unicode normalisation form of a credential
   path or a protected directory is refused, as one in another letter case is.

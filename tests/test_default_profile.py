@@ -12,7 +12,7 @@ import json
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
@@ -27,6 +27,7 @@ from dromon.eventlog import EventLog
 from dromon.lineconfig import DEFAULT_CONFIG, ConfigError
 from dromon.paths import ProjectPaths, project_paths
 from dromon.projectconfig import (
+    HELD_SANDBOX_KEYS,
     ConfigFileError,
     ProjectConfig,
     apply_default_profile,
@@ -35,6 +36,7 @@ from dromon.projectconfig import (
     parse,
 )
 from dromon.protocol import Response
+from dromon.sandbox import TABLES
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
 
 HAIKU = "claude-haiku-5-5"
@@ -311,19 +313,142 @@ def test_dromon_config_names_the_profile(
     )
 
 
-# Round 18, addendum 2, item 1.
+# Round 18, addendum 2, item 1, and addendum 3.
+
+SAMPLES: dict[tuple[str, ...], tuple[object, ...]] = {
+    ("excludedCommands",): (["git"],),
+    ("network", "tlsTerminate"): (True, False),
+    ("network", "httpProxyPort"): (8080,),
+    ("network", "socksProxyPort"): (1080,),
+    ("network", "allowUnixSockets"): (["/var/run/other.sock"],),
+    ("network", "allowMachLookup"): (["com.example.service"],),
+}
+"""A valid value for each key a client may not set at all. Every other held key is
+refused at the boolean that is not its secure one."""
+
+
+def nested(path: tuple[str, ...], value: object) -> dict[str, object]:
+    """A sandbox document that sets only ``path`` to ``value``."""
+    document: dict[str, object] = {path[-1]: value}
+    for step in reversed(path[:-1]):
+        document = {step: document}
+    return document
+
+
+def refused_values(path: tuple[str, ...], secure: bool | None) -> tuple[object, ...]:
+    return SAMPLES[path] if secure is None else (not secure,)
+
 
 HELD = [
-    pytest.param({"enabled": False}, "sandbox.enabled", id="enabled"),
     pytest.param(
-        {"failIfUnavailable": False}, "sandbox.failIfUnavailable", id="fail-if"
-    ),
-    pytest.param(
-        {"filesystem": {"disabled": True}},
-        "sandbox.filesystem.disabled",
-        id="filesystem-disabled",
-    ),
+        nested(path, value),
+        "sandbox." + ".".join(path),
+        id=".".join(path) + "=" + json.dumps(value),
+    )
+    for path, secure in HELD_SANDBOX_KEYS
+    for value in refused_values(path, secure)
 ]
+
+ALLOWED: dict[tuple[str, ...], object] = {
+    ("autoAllowBashIfSandboxed",): False,
+    ("ignoreViolations",): {"git *": ["/work/out"]},
+    ("filesystem", "allowWrite"): ["/work/out"],
+    ("filesystem", "denyWrite"): ["/work/own"],
+    ("filesystem", "denyRead"): ["/work/private"],
+    ("filesystem", "allowRead"): ["/work/docs"],
+    ("network", "allowedDomains"): ["example.com", "*.example.org"],
+    ("network", "deniedDomains"): ["example.net"],
+    ("credentials", "files"): [{"path": "/work/token", "mode": "deny"}],
+    ("credentials", "envVars"): [{"name": "SOME_TOKEN", "mode": "deny"}],
+}
+"""Every key a client may still set under a default profile, with a value for it."""
+
+
+def test_every_sandbox_key_is_either_held_or_allowed() -> None:
+    """So a key the parser learns later has to be placed on one side, rather than
+    reaching a client unexamined. Derived from the parser's own tables."""
+    known = {
+        (key,) if table == "" else (table, key)
+        for table, keys in TABLES.items()
+        for key, spec in keys.items()
+        if spec.check is not None
+    }
+    held = {path for path, _ in HELD_SANDBOX_KEYS}
+    assert not held & set(ALLOWED)
+    assert held | set(ALLOWED) == known
+    assert {path for path, secure in HELD_SANDBOX_KEYS if secure is None} == set(
+        SAMPLES
+    )
+
+
+def test_the_keys_addendum_3_names_are_held() -> None:
+    held = {".".join(path) for path, _ in HELD_SANDBOX_KEYS}
+    named = {
+        "allowAppleEvents",
+        "allowNestedUserNamespaces",
+        "network.allowAllUnixSockets",
+        "enableWeakerNestedSandbox",
+        "network.strictAllowlist",
+        "allowUnsandboxedCommands",
+        "excludedCommands",
+    }
+    assert named <= held
+
+
+def test_a_client_may_still_add_grants_and_denials() -> None:
+    """The negative path. Entries inside the sandbox's bounds are accepted, and are
+    united with the profile's."""
+    profile = parse("version = 1\n" + PROFILE).default_profile
+    sandbox: dict[str, object] = {}
+    for path, value in ALLOWED.items():
+        table = sandbox if len(path) == 1 else sandbox.setdefault(path[0], {})
+        assert isinstance(table, dict)
+        cast(dict[str, object], table)[path[-1]] = value
+    config, applied = apply_default_profile(profile, HAIKU, {"sandbox": sandbox})
+    assert applied and config.sandbox is not None
+    given = config.sandbox.document()
+    filesystem = given["filesystem"]
+    network = given["network"]
+    assert isinstance(filesystem, dict) and isinstance(network, dict)
+    assert cast(dict[str, object], filesystem)["allowWrite"] == ["/work/out"]
+    assert cast(dict[str, object], filesystem)["denyWrite"] == [
+        "/work/.git/objects",
+        "/work/own",
+    ]
+    assert cast(dict[str, object], network)["allowedDomains"] == [
+        "*.example.org",
+        "example.com",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("path", "value"), [pytest.param(p, v, id=".".join(p)) for p, v in ALLOWED.items()]
+)
+def test_each_allowed_key_is_accepted_alone(
+    path: tuple[str, ...], value: object
+) -> None:
+    profile = parse("version = 1\n" + PROFILE).default_profile
+    _, applied = apply_default_profile(profile, HAIKU, {"sandbox": nested(path, value)})
+    assert applied
+
+
+def test_a_list_the_profile_sets_itself_may_be_repeated_and_not_widened() -> None:
+    """A key a client may not set at all may still be given the profile's own value,
+    as for the switches, and any other value of it is refused."""
+    text = PROFILE.replace(
+        "[profiles.claude.sandbox.filesystem]",
+        '[profiles.claude.sandbox.network]\nallowUnixSockets = ["/run/a.sock"]\n'
+        "[profiles.claude.sandbox.filesystem]",
+    )
+    profile = parse("version = 1\n" + text).default_profile
+    same = {"sandbox": nested(("network", "allowUnixSockets"), ["/run/a.sock"])}
+    _, applied = apply_default_profile(profile, HAIKU, same)
+    assert applied
+    wider = {
+        "sandbox": nested(("network", "allowUnixSockets"), ["/run/a.sock", "/run/b"])
+    }
+    with pytest.raises(ConfigError, match="sandbox.network.allowUnixSockets"):
+        apply_default_profile(profile, HAIKU, wider)
 
 
 @pytest.mark.parametrize(("sandbox", "key"), HELD)
@@ -370,15 +495,18 @@ def test_the_same_document_is_accepted_without_a_profile_or_on_another_engine(
 
 def test_the_secure_value_is_accepted() -> None:
     profile = parse("version = 1\n" + PROFILE).default_profile
-    secure = {
-        "enabled": True,
-        "failIfUnavailable": True,
-        "filesystem": {"disabled": False},
-    }
+    secure: dict[str, object] = {}
+    for path, value in HELD_SANDBOX_KEYS:
+        if value is None:
+            continue
+        table = secure if len(path) == 1 else secure.setdefault(path[0], {})
+        assert isinstance(table, dict)
+        cast(dict[str, object], table)[path[-1]] = value
     config, applied = apply_default_profile(profile, HAIKU, {"sandbox": secure})
     assert applied and config.sandbox is not None
     given = config.sandbox.document()
     assert given["enabled"] is True and given["failIfUnavailable"] is True
+    assert given["allowUnsandboxedCommands"] is False
 
 
 def test_a_weaker_value_the_profile_sets_itself_is_accepted() -> None:

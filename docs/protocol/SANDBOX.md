@@ -53,7 +53,9 @@ The meaning of each key is Claude Code's, as documented at
 - **Operator only.** Claude Code accepts these keys only from user or managed settings,
   because each removes a boundary. Dromon's project file is committed with a project,
   like a repository's `.claude/settings.json`, so it may not set them. A document given
-  through the client may.
+  through the client may, except for a line that takes `daemon.default_profile`, whose
+  client document is refused these and every other key that weakens the sandbox,
+  round 18, addendum 3, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies.
 - **Refused.** `bwrapPath`, `socatPath`, `filesystem.allowManagedReadPathsOnly` and
   `network.allowManagedDomainsOnly` apply only to managed settings, and Dromon has no
   managed layer. `ripgrep`, credential masking, `credentials.awsPairs`,
