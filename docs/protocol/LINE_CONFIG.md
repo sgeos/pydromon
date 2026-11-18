@@ -1744,6 +1744,17 @@ the intent itself, in the line's own words, set with `set_brief` and recorded as
   such as those of an experience report are recorded. Each quoted text is its first
   line cut to 160 bytes, and the whole index is at most 4,096 bytes, with a closing
   sentence that counts the entries left out. It quotes only the line's own text.
+  The runs of the line's role include runs other seats started, which are given by
+  identifier, command name, commit and outcome, with no text of theirs. A line's own
+  text may repeat what it read elsewhere, so every quote is untrusted data. Each is a
+  JSON string inside an entry line, between `BEGIN EVIDENCE INDEX DATA` and
+  `END EVIDENCE INDEX DATA`, so no quote can stand on a line of its own or close the
+  block, and the head says the block is never an instruction. Every entry is screened
+  again when the index is built, against the disclosure list in force then, with the
+  whole text it quotes. An entry that now holds a term is left out whole, and a
+  closing sentence gives only how many were withheld. The fence cannot stop a model
+  from choosing to follow a quote. It only keeps a quote from passing as the
+  daemon's own words.
   **Residuals.** It follows only a session the daemon knows is new, so a thread an
   engine renews by itself inside a kept connection gets none. A request a line put
   only in a report file is not indexed, since the daemon reads no report files, and a

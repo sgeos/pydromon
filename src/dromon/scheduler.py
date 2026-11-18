@@ -3111,10 +3111,11 @@ class Scheduler:
         context estimate, its compaction or a compaction wake, since they belong to
         the session the line no longer resumes. Round 9 review, F1."""
         self._sent: list[str] = []
-        # Round 18, item 6. Waking task notes held for the quiet period, by line, with
-        # the clock at the first and the latest end held.
-        self._held_task_notes: dict[str, tuple[float, float, list[str]]] = {}
         """Messages sent during the current tick, moved to the post office after it."""
+        self._held_task_notes: dict[str, tuple[float, float, list[str]]] = {}
+        """Round 18, item 6. Waking task notes held for the quiet period, by line,
+        with the clock at the first and the latest end held. Each is in the log
+        already, so a restart finds it undelivered and posts it."""
         self._post_office: set[str] = {
             message_id
             for message_id, message in log.state.messages.items()
@@ -13899,7 +13900,7 @@ class Scheduler:
             return None
         if line_id in self._state().briefs:
             return None
-        return evidence_index(self._state(), line_id)
+        return evidence_index(self._state(), line_id, self.discloses)
 
     def _brief_lead(self, line_id: str, compacting: bool) -> str | None:
         """What ``line_id``'s turn leads with when its engine session is new, its
@@ -13927,7 +13928,7 @@ class Scheduler:
         # as ``dromon.evidence_index`` says. A line with no brief is given it at the
         # end of its prompt, by ``_index_without_brief``, so no notice loses its
         # place at the head of the turn.
-        index = evidence_index(self._state(), line_id)
+        index = evidence_index(self._state(), line_id, self.discloses)
         lead = (
             f"{self._brief_standing(line_id, brief)}"
             f"{self._mail_since_brief(line_id, brief)}\n"

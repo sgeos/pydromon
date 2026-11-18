@@ -1910,3 +1910,24 @@ def test_held_task_notes_join_other_mail_at_once(world: World) -> None:
     ]
     prompt = world.engines["alpha"].prompts[-1]
     assert noted is not None and noted in prompt and other in prompt
+
+
+@pytest.mark.task_note_quiet
+def test_a_task_note_held_when_the_daemon_stops_is_delivered_after_it(
+    tmp_path: Path,
+) -> None:
+    """Review of round 18, finding 6. The hold is kept in memory only, but the note
+    is in the log from the end on, so the restarted daemon posts it as any mail it
+    finds undelivered, and the line is woken by it."""
+    world = World(tmp_path / "events.sqlite")
+    world.run("start")
+    noted = world.scheduler.background_ended("alpha", BackgroundEnd("a", "x", "done"))
+    assert noted is not None and world.scheduler.seconds_until_task_notes()
+    assert noted not in [m for m, _ in world.scheduler.deliverable("alpha")]
+    world.log.close()
+    restarted = World(tmp_path / "events.sqlite")
+    assert restarted.scheduler.seconds_until_task_notes() is None
+    assert noted in [m for m, _ in restarted.scheduler.deliverable("alpha")]
+    restarted.run()
+    assert noted in restarted.engines["alpha"].prompts[-1]
+    restarted.log.close()
