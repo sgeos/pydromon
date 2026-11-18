@@ -14,7 +14,7 @@ from claude_agent_sdk import (
     ToolPermissionContext,
 )
 
-from dromon import cli, exits
+from dromon import cli, exits, security_paths
 from dromon.daemon import check_sandboxes, protected_dirs
 from dromon.driver import Driver, Strategy
 from dromon.engine import ClaudeCodeLine, permission_gate
@@ -35,6 +35,8 @@ from dromon.sandbox import (
     SandboxError,
     blocks_unsandboxed,
     effective,
+    folded_path,
+    host_unavailable_reason,
     merge,
     parse_sandbox,
     sandbox_from_settings,
@@ -262,12 +264,28 @@ def test_explicit_choices_override_the_unattended_defaults() -> None:
     settings = effective(sandbox(chosen), ROOT, PROTECTED)
     assert settings is not None
     assert settings["failIfUnavailable"] is False
-    assert settings["allowUnsandboxedCommands"] is True
     assert settings["network"] == {"strictAllowlist": False}
+    # Round 18 follow-up, item 2. Forced, since an unsandboxed command reads every
+    # path the sandbox denies.
+    assert settings["allowUnsandboxedCommands"] is False
+
+
+def test_an_enabled_sandbox_with_excluded_commands_is_refused() -> None:
+    with pytest.raises(SandboxError, match="excludedCommands run outside") as caught:
+        effective(sandbox(FULL), ROOT, PROTECTED)
+    assert caught.value.key == "excludedCommands"
+
+
+def test_a_disabled_sandbox_may_name_excluded_commands() -> None:
+    document = {"enabled": False, "excludedCommands": ["git"]}
+    assert effective(sandbox(document), ROOT, PROTECTED) == document
 
 
 def test_relative_paths_resolve_against_the_project_root() -> None:
-    settings = effective(sandbox(FULL), ROOT, PROTECTED)
+    confined = {
+        name: value for name, value in FULL.items() if name != "excludedCommands"
+    }
+    settings = effective(sandbox(confined), ROOT, PROTECTED)
     assert settings is not None
     filesystem = cast(dict[str, list[str]], settings["filesystem"])
     assert filesystem["denyWrite"] == with_real(
@@ -418,7 +436,13 @@ def test_the_factory_merges_the_project_sandbox_under_each_line() -> None:
         },
         operator=True,
     )
-    assert engine.sandbox == effective(merge([project, own, grant]), ROOT, PROTECTED)
+    credentials = security_paths.claude_credentials()
+    assert engine.sandbox == effective(
+        merge([project, own, grant]),
+        ROOT,
+        (*PROTECTED, *credentials),
+        ungrantable=credentials,
+    )
     network = cast(dict[str, object], (engine.sandbox or {})["network"])
     assert network["allowedDomains"] == ["github.com", "pypi.org"]
 
@@ -577,6 +601,86 @@ def test_dromon_config_reports_each_lines_sandbox(
     assert out.count(", sandboxed") == 2
 
 
+def test_dromon_config_reports_the_sandbox_the_build_gives(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round 18, last pass, item 2. Confirmed before the change, a Claude Code line
+    that no layer enables or disables was reported as having no sandbox settings,
+    while the daemon builds it with an enabled one. A Codex line takes no document."""
+    state = tmp_path / ".dromon"
+    state.mkdir(mode=0o700)
+    (state / "dromon.toml").write_text(
+        "version = 1\n"
+        "[lines.plain]\nmodel = 'claude-haiku-5-5'\n"
+        "[lines.open]\nmodel = 'claude-haiku-5-5'\n"
+        "[lines.open.sandbox]\nenabled = false\n"
+        "[lines.shut]\nmodel = 'claude-haiku-5-5'\n"
+        "[lines.shut.sandbox]\nenabled = true\n"
+        "[lines.other]\nmodel = 'gpt-6-sol'\n"
+    )
+    argv = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "config"]
+    assert cli.main(argv) == exits.OK
+    lines = {
+        text.split(":")[0]: text
+        for text in capsys.readouterr().out.splitlines()
+        if text.startswith("line ")
+    }
+    assert ", sandboxed by default," in lines["line plain"]
+    assert (
+        ", not sandboxed, its shell can read the credential paths,"
+        in lines["line open"]
+    )
+    assert ", sandboxed," in lines["line shut"]
+    assert ", no sandbox settings," in lines["line other"]
+
+
+def test_dromon_config_refuses_a_line_its_build_would_refuse(
+    tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round 18, last pass, item 2. The summary reads the built document, so a
+    line whose layers name ``excludedCommands`` and leave ``enabled`` unset, which the
+    build refuses, is refused here too rather than shown as unsandboxed."""
+    state = tmp_path / ".dromon"
+    state.mkdir(mode=0o700)
+    (state / "dromon.toml").write_text(
+        "version = 1\n[lines.a]\nmodel = 'claude-haiku-5-5'\n"
+        "[lines.a.sandbox]\nexcludedCommands = ['git']\n"
+    )
+    argv = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "config"]
+    assert cli.main(argv) == exits.FAILURE
+    assert "line a: sandbox.excludedCommands run outside" in capsys.readouterr().err
+
+
+def test_the_document_example_is_accepted(
+    monkeypatch: pytest.MonkeyPatch, _empty_daemon_home: Path
+) -> None:
+    """Round 18, last pass, item 3. The example in ``SANDBOX.md`` is checked as the
+    build checks a line's document, with ``~`` the daemon's home, so an example that
+    grants a path the build refuses fails here."""
+    text = (
+        Path(__file__).parent.parent / "docs" / "protocol" / "SANDBOX.md"
+    ).read_text(encoding="utf-8")
+    section = text.split("## Document", 1)[1]
+    example = section.split("```json\n", 1)[1].split("```", 1)[0]
+    monkeypatch.setenv("HOME", str(_empty_daemon_home))
+    document = parse_sandbox(json.loads(example), operator=False)
+    assert document.enabled
+    credentials = security_paths.claude_credentials()
+    found = effective(
+        document, _empty_daemon_home / "work", credentials, ungrantable=credentials
+    )
+    assert found is not None
+    refused = json.loads(example)
+    refused["filesystem"]["allowWrite"] = ["~/.kube"]
+    with pytest.raises(SandboxError, match="credential path"):
+        effective(
+            parse_sandbox(refused, operator=False),
+            _empty_daemon_home / "work",
+            credentials,
+            ungrantable=credentials,
+        )
+
+
 # One real turn, on the operator's subscription.
 
 
@@ -708,3 +812,142 @@ def test_a_line_that_re_links_an_allowed_directory_gains_nothing(
         assert filesystem["allowRead"] == [str(entry)]
         for name in ("allowWrite", "allowRead"):
             assert not any(str(outside) in path for path in filesystem[name])
+
+
+# Round 18, last pass, item 7. A host where the sandbox cannot start.
+
+
+@pytest.mark.parametrize(
+    ("found", "said"),
+    [
+        pytest.param({"bwrap", "socat"}, None, id="both"),
+        pytest.param({"socat"}, "since bwrap is not on", id="no-bwrap"),
+        pytest.param({"bwrap"}, "since socat is not on", id="no-socat"),
+        pytest.param(set[str](), "since bwrap and socat are not on", id="neither"),
+    ],
+)
+def test_a_linux_host_needs_bubblewrap_and_socat(
+    found: set[str], said: str | None
+) -> None:
+    reason = host_unavailable_reason(
+        "Linux", lambda name: f"/usr/bin/{name}" if name in found else None
+    )
+    if said is None:
+        assert reason is None
+    else:
+        assert reason is not None and said in reason
+
+
+def test_another_host_is_not_checked() -> None:
+    """Its sandbox is built in, by the bundle's own text, so nothing is looked for."""
+
+    def nothing(name: str) -> str | None:
+        raise AssertionError(f"looked for {name}")
+
+    assert host_unavailable_reason("Other", nothing) is None
+
+
+def test_the_start_check_names_each_line_that_would_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Claude Code line sandboxed by default or by its file is named, one whose
+    sandbox is disabled and a line on another engine are not, and a line created
+    through the client is named too. Nothing is said on a host that can start it."""
+    from dromon import daemon
+    from dromon.eventlog import EventLog
+    from dromon.scheduler import Scheduler
+
+    def never(spec: object, tools: object) -> object:
+        raise AssertionError("no engine may start")
+
+    config = parse(
+        "version = 1\n"
+        "[lines.plain]\nmodel = 'claude-haiku-5-5'\n"
+        "[lines.open]\nmodel = 'claude-haiku-5-5'\n"
+        "[lines.open.sandbox]\nenabled = false\n"
+        "[lines.other]\nmodel = 'gpt-6-sol'\n"
+    )
+    with EventLog(tmp_path / "events.jsonl") as log:
+        scheduler = Scheduler(log, never, hold_wakes=True)  # pyright: ignore[reportArgumentType]
+        scheduler.create_line("made", "claude-haiku-5-5", Strategy.SUBSCRIPTION)
+        monkeypatch.setattr(daemon, "sandbox_host_problem", lambda: None)
+        assert daemon.unavailable_sandbox_warning(config, log, scheduler) is None
+        monkeypatch.setattr(daemon, "sandbox_host_problem", lambda: "it cannot start")
+        warning = daemon.unavailable_sandbox_warning(config, log, scheduler)
+        assert warning is not None
+        assert warning.startswith(
+            "it cannot start, so the Claude Code lines plain, made,"
+        )
+        assert "open" not in warning and "other" not in warning
+        quiet = parse(
+            "version = 1\n[lines.open]\nmodel = 'claude-haiku-5-5'\n"
+            "[lines.open.sandbox]\nenabled = false\n"
+        )
+        with EventLog(tmp_path / "empty.jsonl") as empty:
+            bare = Scheduler(empty, never, hold_wakes=True)  # pyright: ignore[reportArgumentType]
+            assert daemon.unavailable_sandbox_warning(quiet, empty, bare) is None
+
+
+def test_dromond_s_check_says_so_before_any_turn(
+    tmp_path: Path,
+    short_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``dromond --check``, which ``dromon check-engines`` and the restart preflight
+    run, prints the warning and still passes, so the host's other lines can start."""
+    from dromon import daemon
+
+    paths = project_paths(tmp_path, short_runtime)
+    paths.state_dir.mkdir(mode=0o700)
+    (paths.state_dir / "dromon.toml").write_text(
+        "version = 1\n[lines.plain]\nmodel = 'claude-haiku-5-5'\n"
+    )
+    monkeypatch.setattr(daemon, "sandbox_host_problem", lambda: "it cannot start")
+    assert daemon.run(paths, check_only=True) == exits.OK
+    err = capsys.readouterr().err
+    assert "dromond: warning: it cannot start, so the Claude Code lines plain," in err
+
+
+# Round 18, addendum 2, item 2.
+
+
+@pytest.mark.parametrize(
+    ("one", "other"),
+    [
+        pytest.param("/h/caf\u00e9", "/h/cafe\u0301", id="composed-and-decomposed"),
+        pytest.param("/h/CAF\u00c9", "/h/cafe\u0301", id="and-in-another-case"),
+        pytest.param("/h/\u212b", "/h/\u00e5", id="angstrom-sign-and-letter"),
+        pytest.param("/h/Stra\u00dfe", "/h/STRASSE", id="sharp-s"),
+        pytest.param(
+            "/h/\u03b1\u0345\u0301",
+            "/h/\u03b1\u0301\u0345",
+            id="marks-in-either-order",
+        ),
+    ],
+)
+def test_names_a_volume_treats_as_one_fold_alike(one: str, other: str) -> None:
+    """Canonical caseless matching, both sides through the one function. The last
+    pair needs the decomposition before the folding as well as after, since folding
+    the combining iota subscript makes it a letter, which fixes its place."""
+    assert one != other
+    assert folded_path(one) == folded_path(other)
+
+
+@pytest.mark.parametrize(
+    ("one", "other"),
+    [
+        pytest.param("/h/cafe", "/h/caf\u00e9", id="an-accent-is-a-letter"),
+        pytest.param("/h/x\u00b2", "/h/x2", id="a-superscript-is-not-canonical"),
+    ],
+)
+def test_names_that_differ_stay_apart(one: str, other: str) -> None:
+    """The negative path. The compatibility forms, such as a superscript digit, are
+    not folded together, since a volume opens them as different names. A ligature is
+    folded with its letters by case folding itself, which only refuses more."""
+    assert folded_path(one) != folded_path(other)
+
+
+def test_the_folded_form_is_stable() -> None:
+    once = folded_path("/H/Cafe\u0301/\u1e9e")
+    assert folded_path(once) == once

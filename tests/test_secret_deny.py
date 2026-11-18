@@ -78,12 +78,16 @@ def test_both_secret_directories_are_denied_to_a_sandboxed_claude_line(
         assert f"Read(/{real}/**)" in rules and f"Edit(/{real}/**)" in rules
 
 
-def test_the_file_tools_are_denied_them_without_a_sandbox(tmp_path: Path) -> None:
-    """A line with no enabled sandbox has no shell denial at all, as for every
-    protected directory, and its file tools are still kept out."""
+def test_the_file_tools_are_denied_them_with_a_disabled_sandbox(
+    tmp_path: Path,
+) -> None:
+    """A line whose sandbox is disabled has no shell denial at all, as for every
+    protected directory, and its file tools are still kept out. Round 18 follow-up,
+    item 1. A line with no sandbox document is given an enabled one, so only an
+    explicit enabled false leaves the shell unconfined."""
     root, worktree, root_secret, own_secret = layout(tmp_path)
-    engine = built(root, LineConfig(workdir=str(worktree)))
-    assert engine.sandbox is None
+    engine = built(root, LineConfig(workdir=str(worktree)), {"enabled": False})
+    assert engine.sandbox == {"enabled": False}
     assert engine.settings is not None
     rules = cast(dict[str, list[str]], engine.settings["permissions"])["deny"]
     for secret in (root_secret, own_secret):
@@ -109,7 +113,11 @@ def test_an_absent_secret_directory_adds_nothing(tmp_path: Path) -> None:
     assert engine.sandbox is not None
     filesystem = cast(dict[str, list[str]], engine.sandbox["filesystem"])
     assert not any(path.endswith("/secret") for path in filesystem["denyRead"])
-    assert engine.settings is None
+    # The credential paths are always denied, round 18 follow-up, item 4, so the
+    # settings hold their rules and none for a secret directory.
+    assert engine.settings is not None
+    rules = cast(dict[str, list[str]], engine.settings["permissions"])["deny"]
+    assert not any("/secret" in rule for rule in rules)
 
 
 @pytest.mark.parametrize("key", ["allowRead", "allowWrite"])

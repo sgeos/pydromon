@@ -21,6 +21,7 @@ from dromon import (
     linetemp,
     priority,
     readiness,
+    security_paths,
     spawn,
 )
 from dromon import scheduler as scheduler_module
@@ -807,6 +808,19 @@ def _no_machine_hook_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     view-only line is refused where that policy switches hooks off. A test of the
     reader names its directories. Round 14."""
     monkeypatch.setattr(hookpolicy, "MANAGED_DIRECTORIES", ())
+
+
+@pytest.fixture(autouse=True)
+def _empty_daemon_home(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Give every test an empty daemon home, so the credential paths a Claude Code
+    line is denied are the ones the test makes and never what the machine running the
+    tests holds. **Round 18, the operator's security fix.** A test of the real home
+    imports ``daemon_home`` by name at collection, before this replaces it."""
+    home = Path(os.path.realpath(tmp_path_factory.mktemp("daemon-home")))
+    monkeypatch.setattr(security_paths, "daemon_home", lambda: home)
+    return home
 
 
 @pytest.fixture(autouse=True)

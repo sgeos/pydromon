@@ -546,8 +546,13 @@ def test_read_access_refuses_each_way_out_of_the_claude_sandbox(
     with pytest.raises(EngineRefused, match=reason):
         engine_factory(str(root))(haiku_spec(config), [])
     # The same configuration with write access is accepted, so the refusal is the
-    # read access's own.
+    # read access's own. Round 18 follow-up, item 2. Excluded commands are refused
+    # for every line now, with the sandbox's own error.
     writer = config_from_document(document)
+    if reason == "excludedCommands":
+        with pytest.raises(SandboxError, match="excludedCommands run outside"):
+            engine_factory(str(root))(haiku_spec(writer), [])
+        return
     assert isinstance(engine_factory(str(root))(haiku_spec(writer), []), ClaudeCodeLine)
 
 
@@ -595,13 +600,20 @@ def test_an_unsandboxed_line_does_not_read_the_git_pointers(tmp_path: Path) -> N
     root = real(tmp_path)
     _, _, tree = linked_worktree(root)
     (tree / ".git").write_text("broken\n")
-    engine = engine_factory(str(root))(haiku_spec(LineConfig(workdir=str(tree))), [])
-    assert isinstance(engine, ClaudeCodeLine) and engine.sandbox is None
+    disabled = parse_sandbox({"enabled": False}, operator=False)
+    engine = engine_factory(str(root), project_sandbox=disabled)(
+        haiku_spec(LineConfig(workdir=str(tree))), []
+    )
+    assert isinstance(engine, ClaudeCodeLine) and engine.sandbox == {"enabled": False}
     sandboxed = engine_factory(
         str(root), project_sandbox=parse_sandbox({"enabled": True}, operator=False)
     )
     with pytest.raises(SandboxError, match="does not name a git directory"):
         sandboxed(haiku_spec(LineConfig(workdir=str(tree))), [])
+    # Round 18 follow-up, item 1. A line no layer enables or disables is sandboxed,
+    # so it reads the pointers too.
+    with pytest.raises(SandboxError, match="does not name a git directory"):
+        engine_factory(str(root))(haiku_spec(LineConfig(workdir=str(tree))), [])
 
 
 def test_a_workdir_gone_or_protected_at_build_ends_the_turn(tmp_path: Path) -> None:
@@ -821,7 +833,17 @@ def test_the_daemon_refuses_a_file_whose_workdir_is_not_allowed(
         check_sandboxes(parse(head + "workdir = '.dromon'\n"), paths)
     _, _, tree = linked_worktree(tmp_path)
     (tree / ".git").write_text("broken\n")
-    check_sandboxes(parse(head + f"workdir = '{tree}'\n"), paths)
+    check_sandboxes(
+        parse(
+            "version = 1\n[sandbox]\nenabled = false\n"
+            f"[lines.a]\nmodel = 'claude-haiku-5-5'\nworkdir = '{tree}'\n"
+        ),
+        paths,
+    )
+    # Round 18 follow-up, item 1. A Claude Code line no layer enables or disables is
+    # checked with the sandbox its build gives it.
+    with pytest.raises(SandboxError, match="does not name a git directory"):
+        check_sandboxes(parse(head + f"workdir = '{tree}'\n"), paths)
     with pytest.raises(SandboxError, match="does not name a git directory"):
         check_sandboxes(
             parse(

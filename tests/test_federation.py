@@ -377,8 +377,9 @@ def test_a_claude_code_line_needs_its_sandbox_beside_peers(
     paths: ProjectPaths,
 ) -> None:
     config = project_with_peers(paths)
-    with pytest.raises(SandboxError, match="without an enabled sandbox"):
-        check_sandbox_required(config, "a", OPUS, DEFAULT_CONFIG)
+    # Round 18 follow-up, item 1. A line no layer enables or disables is given an
+    # enabled sandbox at its build, so it is judged sandboxed.
+    check_sandbox_required(config, "a", OPUS, DEFAULT_CONFIG)
     sandboxed = replace(
         DEFAULT_CONFIG, sandbox=parse_sandbox({"enabled": True}, operator=True)
     )
@@ -388,9 +389,9 @@ def test_a_claude_code_line_needs_its_sandbox_beside_peers(
     )
     with pytest.raises(SandboxError, match="without an enabled sandbox"):
         check_sandbox_required(config, "a", OPUS, disabled)
-    check_sandbox_required(ProjectConfig(), "a", OPUS, DEFAULT_CONFIG)
+    check_sandbox_required(ProjectConfig(), "a", OPUS, disabled)
     accepted = project_with_peers(paths, "accept_unconfined = true")
-    check_sandbox_required(accepted, "a", OPUS, DEFAULT_CONFIG)
+    check_sandbox_required(accepted, "a", OPUS, disabled)
 
 
 # Several inbound tls peers, once each certificate names its own key.

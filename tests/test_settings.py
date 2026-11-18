@@ -9,7 +9,7 @@ from typing import cast
 
 import pytest
 
-from dromon import cli, exits
+from dromon import cli, exits, security_paths
 from dromon.driver import Driver, Strategy
 from dromon.engine import ClaudeCodeLine, EngineRefused, flag_settings
 from dromon.lineconfig import (
@@ -29,6 +29,7 @@ from dromon.scheduler import LineSpec, engine_factory
 from dromon.settings import (
     SettingsConfig,
     SettingsError,
+    credential_rules,
     effective,
     merge,
     parse_settings,
@@ -480,14 +481,19 @@ def test_the_factory_merges_project_settings_under_each_line() -> None:
     )
     engine = build(spec, [])
     assert isinstance(engine, ClaudeCodeLine)
-    assert engine.settings == effective(merge([project, own]), PROTECTED)
+    # Round 18 follow-up, item 4. The credential paths are always denied, so the
+    # expected settings carry their rules and paths as the build adds them.
+    credentials = security_paths.claude_credentials()
+    denials = settings({"permissions": {"deny": credential_rules(credentials)}})
+    protected = (*PROTECTED, *credentials)
+    assert engine.settings == effective(merge([project, own, denials]), protected)
     handed = engine.settings or {}
     deny = cast(dict[str, list[str]], handed["permissions"])["deny"]
     assert {"Bash(curl *)", "Bash(git push *)"} <= set(deny)
     assert handed["env"] == {"A": "l"}
     bare = build(LineSpec("beta", "claude-haiku-5-5", Strategy.SUBSCRIPTION), [])
     assert isinstance(bare, ClaudeCodeLine)
-    assert bare.settings == effective(project, PROTECTED)
+    assert bare.settings == effective(merge([project, denials]), protected)
 
 
 # The project file.

@@ -175,6 +175,7 @@ from dromon import (
 )
 from dromon.linetemp import LineTemp
 from dromon.security_paths import project_secret_paths
+from dromon import security_paths
 from dromon.handoff import Handoff
 from dromon.handoff import select as select_handoff
 from dromon import requestkeys
@@ -225,7 +226,15 @@ from dromon.engine_environment import (
 from dromon import proposals as proposal_store
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon import settings as engine_settings
-from dromon.sandbox import SandboxConfig, SandboxError, effective, merge, parse_sandbox
+from dromon.sandbox import (
+    SandboxConfig,
+    SandboxError,
+    claude_default,
+    effective,
+    explicitly_disabled,
+    merge,
+    parse_sandbox,
+)
 from dromon import gitssh
 from dromon import codetree
 from dromon.gitssh import GitSshAccess, sandbox_layer, unreadable
@@ -2361,6 +2370,19 @@ def engine_factory(
                 cost_mark=spec.cost_mark,
             )
         merged = merge([project_sandbox, spec.config.sandbox])
+        # Round 18 follow-up, item 1. Default deny. A line no layer gives an enabled or
+        # disabled sandbox is given an enabled one, so its shell is held by the
+        # credential denials below. An explicit enabled false stays the operator's
+        # choice, and is warned of here and by configwarnings.
+        if explicitly_disabled(merged):
+            print(
+                f"dromond: line {spec.line_id} runs Claude Code with its sandbox"
+                " disabled, so its shell can read the credential paths under the"
+                " daemon's home, which only its file tools are denied",
+                file=sys.stderr,
+            )
+        else:
+            merged = claude_default(merged)
         settings = engine_settings.merge([project_settings, spec.config.settings])
         if spec.config.workdir_access is WorkdirAccess.READ:
             refusal = claude_read_only_refusal(
@@ -2455,7 +2477,16 @@ def engine_factory(
         # denied to Claude Code lines as they have been to Codex and Grok lines since
         # round 9, in the sandbox for the shell and in the settings for the file tools.
         # A layer that grants one of them back is refused, as for any protected path.
-        sandbox = effective(merged, workdir, engine_protected, guarded)
+        # Round 18, the operator's security fix. The known credential paths under the
+        # daemon's real home are denied the same way, as they are to Codex and Grok
+        # lines, and the file tools are kept from each path itself as well, since a
+        # credential may be a file. Claude Code keeps none of them, as
+        # security_paths.CLAUDE_CODE_EXEMPT explains.
+        credentials = security_paths.claude_credentials()
+        claude_protected = (*engine_protected, *credentials)
+        sandbox = effective(
+            merged, workdir, claude_protected, guarded, ungrantable=credentials
+        )
         if enabled and git_ssh is not None and sandbox is not None:
             denied = unreadable(git_ssh, sandbox)
             if denied is not None:
@@ -2469,6 +2500,19 @@ def engine_factory(
                     settings,
                     engine_settings.parse_settings(
                         {"permissions": {"deny": _read_only_path_rules(read_only)}}
+                    ),
+                ]
+            )
+        if credentials:
+            settings = engine_settings.merge(
+                [
+                    settings,
+                    engine_settings.parse_settings(
+                        {
+                            "permissions": {
+                                "deny": engine_settings.credential_rules(credentials)
+                            }
+                        }
                     ),
                 ]
             )
@@ -2492,7 +2536,7 @@ def engine_factory(
             session_id=spec.session_id,
             sandbox=sandbox,
             settings=engine_settings.effective(
-                settings, engine_protected, write_protected
+                settings, claude_protected, write_protected
             ),
             observe=spec.observe,
             mark=spec.mark,
@@ -2538,13 +2582,20 @@ def _check_engine_supports(driver: Driver, config: LineConfig) -> None:
     unbounded = cost_bound_refusal(driver.settings.engine, driver.settings.strategy)
     if unbounded is not None:
         raise ConfigError(unbounded)
-    if config.fresh_session_each_turn and driver.settings.engine not in {
+    reason = engine_config_refusal(driver.settings.engine, config)
+    if reason is not None:
+        raise ConfigError(reason)
+
+
+def engine_config_refusal(engine: str, config: LineConfig) -> str | None:
+    """Why ``engine`` cannot run ``config``, whatever the strategy, or ``None``. Also
+    used by the daemon's start check of ``[daemon] default_profile``, round 18, last
+    pass, item 6, so a profile its own engine refuses refuses the project file."""
+    if config.fresh_session_each_turn and engine not in {
         ENGINE_NAME_CLAUDE,
         codex.ENGINE_NAME,
     }:
-        raise ConfigError(
-            "fresh_session_each_turn is supported only by Claude Code and Codex"
-        )
+        return "fresh_session_each_turn is supported only by Claude Code and Codex"
     checks = {
         codex.ENGINE_NAME: codex.unsupported,
         grok.ENGINE_NAME: grok.unsupported,
@@ -2552,11 +2603,8 @@ def _check_engine_supports(driver: Driver, config: LineConfig) -> None:
         cursor.ENGINE_NAME: cursor.line_refusal,
         antigravity.ENGINE_NAME: antigravity.line_refusal,
     }
-    check = checks.get(driver.settings.engine)
-    if check is not None:
-        reason = check(config)
-        if reason is not None:
-            raise ConfigError(reason)
+    check = checks.get(engine)
+    return None if check is None else check(config)
 
 
 def _no_notice(peer_id: str, message_id: str) -> None:
