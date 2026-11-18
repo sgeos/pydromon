@@ -164,6 +164,7 @@ relay = "tail"          # the route of operator ana's mail
 | `daemon.operator` | identifier | `operator` | The default operator. It also declares that operator, whom a peer may reach before that operator has sent anything, as decision 25 of [`FEDERATION.md`](../architecture/FEDERATION.md) specifies. The built-in default declares no one |
 | `daemon.tick_seconds` | number in [0, 60] | 1 | The maximum tick wait in seconds. Zero waits for events and due timers |
 | `daemon.require_sandbox` | boolean | `false` | Whether every Claude Code line must run with an enabled sandbox, as below |
+| `daemon.default_profile` | profile name | none | The profile a line created or configured through the client takes when the file does not declare it and it runs on the engine of the profile's `model`, as below. Added in round 18 |
 | `daemon.disclosure_terms` | path | none | The project's disclosure list, relative to the project root, as below |
 | `daemon.machine_status` | path | none | The file the machine's monitor writes its status to, read before a run or a turn starts, as [`RUNS.md`](../architecture/RUNS.md) specifies. A leading `~` is the home directory and a relative path is relative to the project root. Nothing is read, and nothing is deferred, unless it is set. A reload applies it. No line's sandbox or file tools may write the file or its directory. A status that is stale, missing or unreadable defers runs until the monitor writes again, so the operator restores gates by restarting the monitor or removing this key and reloading. Added on 2026-11-11 |
 | `read_only_paths` | list of relative paths | empty | Existing files or directories denied writes under every line's resolved workdir. Symbolic links are resolved and targets must remain inside that workdir |
@@ -356,6 +357,32 @@ with operator authority, as [`SANDBOX.md`](SANDBOX.md) records. **Round 18 follo
 A Claude Code line that no layer enables or disables is given an enabled sandbox at
 its build, so this check and the peers' check below count it as sandboxed. Only an
 explicit `enabled` false fails them.
+
+**Default profile, round 18, last pass, item 6.** A line created through a client,
+or by an agent through the client's operations, names no profile, so before this key it
+took none of the denials and ask rules a profile gives the lines the file declares.
+With `daemon.default_profile` naming a profile, `create_line` builds such a line's
+configuration from that profile under the client's `config`, when the line's model runs
+on the same engine as the profile's `model`. The profile's tool keys are replaced whole
+by any key the client sends, as a line's own key replaces its profile's in the file, and
+its `sandbox` and `settings` merge under the client's, so the client cannot drop a
+denial or rule the profile adds. `configure_line` does the same for a line the file
+does not declare, so a later configuration cannot drop them either. A line the file
+declares takes the file's definition, as before. A line on another engine is created
+as the client sent it, so a profile for Claude Code never reaches a Codex, Grok, Pi,
+Cursor or Antigravity line. The file is refused at load when the key names no profile,
+a profile with no `model`, or a profile that grants `secrets`, since a client-created
+line is granted none, and at start when the profile's own engine could not run it, as
+an Antigravity profile cannot, since a daemon refuses every Antigravity line. The
+profile's `git_ssh`, `limits`, `wake` and `may_own` are not applied, since each is
+authority or policy the file gives the lines it names, and `dromon config` and
+`dromond` warn when the profile sets `git_ssh`. **Lines that already exist.** The key
+changes nothing in the event log, so a line created before it was named keeps its
+configuration until it is configured again. `dromon configure LINE` with the options
+the line was created with applies the profile from the line's next turn. The command
+replaces the line's whole configuration, so options such as `--workdir` must be given
+again. **Residual.** `rebind_line` moving a line onto Claude Code from another engine
+does not apply the profile, and a line so moved takes it at its next configure.
 
 **Peers.** **Added on 2026-10-28, step 2 of phase 1 of
 [`FEDERATION.md`](../architecture/FEDERATION.md).** Each declared peer's runtime

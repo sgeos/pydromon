@@ -67,16 +67,38 @@ reached the keychain service and was answered that no such item exists. Whether 
 item holding a sign-in is returned depends on the keychain's own access rules, and was
 not tested, since the test would read a credential.
 
-**Round 18 follow-up, item 5. Not added.** ``~/Library/Keychains``,
-``~/.config/gcloud`` and ``~/.azure`` are not listed, since the list also binds Codex
-and Grok lines and that could not be settled for Grok. **Fact, read from Grok 1.0.70
-on 2026-11-18.** Its binary carries the Google default credentials loader, which reads
+**Round 18 follow-up, item 5.** ``~/Library/Keychains``, ``~/.config/gcloud`` and
+``~/.azure`` are not in ``CREDENTIAL_PATHS``, since that list also binds Codex and
+Grok lines and that could not be settled for Grok. They are in
+``CLAUDE_CODE_ONLY_PATHS`` instead, which only Claude Code lines take."""
+
+CLAUDE_CODE_ONLY_PATHS: Final = (
+    Path("Library/Keychains"),
+    Path(".config/gcloud"),
+    Path(".azure"),
+)
+"""Credential paths denied to Claude Code lines only, as ``CREDENTIAL_PATHS`` is, with
+the same refusal of a grant that could reach one. **Round 18, last pass, item 5, the
+operator's decision on the audit line's suggestion.**
+
+**Why not to every engine. Fact, read from Grok 1.0.70 on 2026-11-18.** Its binary
+carries the Google default credentials loader, which reads
 ``.config/gcloud/application_default_credentials.json``, and its own sandbox code names
 ``Library/Keychains/login.keychain-db`` and ``metadata.keychain-db``. **Inference.**
-Grok's own process may be held by the profile that carries these denials, as the
+Grok's own process may be held by the profile that carries the denials, as the
 exemption of its sign-in suggests, so a denial could break a path of Grok's own that
 was not traced. Codex reaches Google Cloud through the ``gcloud`` command on its own
-host, by its own text, and no Dromon line is configured for that provider."""
+host, by its own text.
+
+**Why Claude Code can take them. Inference.** The denials bind the line's shell
+commands and the tools the model calls, and not the engine's own process, as
+``CLAUDE_CODE_EXEMPT`` records, so the engine's sign-in, which is a keychain item and
+not a file it reads through the shell, is not reached by them. **Residual.** The
+keychain service is not a path. A command in the sandbox that asks the service for an
+item is answered by the service's own process, which no file denial binds, as the
+audit line observed. **Hypothesis, not tested.** A command whose keychain library opens
+the login keychain's file itself, rather than asking the service, now fails, and a
+command that signs in to Google Cloud or Azure from the shell finds no credentials."""
 
 
 def daemon_home() -> Path:
@@ -89,12 +111,15 @@ def daemon_home() -> Path:
 
 
 def credential_paths(
-    home: Path, exempt: Collection[Path] = frozenset()
+    home: Path,
+    exempt: Collection[Path] = frozenset(),
+    extra: tuple[Path, ...] = (),
 ) -> tuple[Path, ...]:
-    """Each entry of ``CREDENTIAL_PATHS`` other than those in ``exempt``, whether or not
-    it exists, under ``home`` as given and under its real form, and also by the entry's
-    own real path when the entry exists and a link makes that differ, in order and
-    without repeats.
+    """Each entry of ``CREDENTIAL_PATHS``, and then of ``extra``, other than those in
+    ``exempt``, whether or not it exists, under ``home`` as given and under its real
+    form, and also by the entry's own real path when the entry exists and a link makes
+    that differ, in order and without repeats. ``extra`` is for the paths only one
+    engine is denied, such as ``CLAUDE_CODE_ONLY_PATHS``.
 
     **Round 18, the operator's security fix.** Several forms are given, since a deny
     rule for Claude Code's file tools matches the path the tool is handed, and a
@@ -108,15 +133,20 @@ def credential_paths(
     denied by its name and by its target.
 
     Raises ``ValueError`` for an ``exempt`` entry that is not listed, since a misspelt
-    exemption would otherwise exempt nothing and say nothing."""
+    exemption would otherwise exempt nothing and say nothing, and for an ``extra``
+    entry that is not relative or that leaves the home."""
     if not home.is_absolute():
         raise ValueError(f"the home {home} is not an absolute path")
-    unknown = sorted(str(path) for path in exempt if path not in CREDENTIAL_PATHS)
+    for relative in extra:
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            raise ValueError(f"not a path within the home: {relative}")
+    listed = (*CREDENTIAL_PATHS, *extra)
+    unknown = sorted(str(path) for path in exempt if path not in listed)
     if unknown:
         raise ValueError(f"not a listed credential path: {', '.join(unknown)}")
     homes = (Path(os.path.normpath(home)), Path(os.path.realpath(home)))
     found: list[Path] = []
-    for relative in CREDENTIAL_PATHS:
+    for relative in listed:
         if relative in exempt:
             continue
         for base in homes:
@@ -134,8 +164,9 @@ def claude_credentials() -> tuple[Path, ...]:
     """The credential paths denied to every Claude Code line, read when its engine is
     built and when ``dromond`` checks the project file, so a path made later is denied
     from the line's next build. Looked up through the module, so ``daemon_home`` can be
-    replaced in tests."""
-    return credential_paths(daemon_home(), CLAUDE_CODE_EXEMPT)
+    replaced in tests. **Round 18, last pass, item 5.** With
+    ``CLAUDE_CODE_ONLY_PATHS``, which no other engine is denied."""
+    return credential_paths(daemon_home(), CLAUDE_CODE_EXEMPT, CLAUDE_CODE_ONLY_PATHS)
 
 
 def project_secret_paths(project_root: Path, workdir: Path) -> tuple[Path, ...]:

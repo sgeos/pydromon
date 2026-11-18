@@ -154,6 +154,20 @@ def sandbox_warnings(config: ProjectConfig) -> list[str]:
     return found
 
 
+def default_profile_warnings(config: ProjectConfig) -> list[str]:
+    """One sentence when ``[daemon] default_profile`` names a profile that sets
+    ``git_ssh``, which a line created through the client does not take, **round 18,
+    last pass, item 6**, so the operator is not left to think it does."""
+    profile = config.default_profile
+    if profile is None or not profile.git_ssh:
+        return []
+    return [
+        f"daemon.default_profile names profile {profile.name!r}, which sets git_ssh,"
+        " and a line created through the client is not given the [git_ssh] agent. Name"
+        " the line in the project file to give it the agent"
+    ]
+
+
 def config_warnings(config: ProjectConfig, root: Path) -> list[str]:
     """Every warning for ``config``, whose project is ``root``, in a fixed order, so
     that a client and a daemon give the same list."""
@@ -161,4 +175,5 @@ def config_warnings(config: ProjectConfig, root: Path) -> list[str]:
         *slash_warnings(config, root),
         *read_only_warnings(config),
         *sandbox_warnings(config),
+        *default_profile_warnings(config),
     ]

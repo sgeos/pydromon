@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Final, cast
 
 from dromon.disclosure import DisclosureError, accepted_entries
-from dromon.driver import MODELS, Strategy
+from dromon.driver import ENGINE_OF, MODELS, Strategy
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.lineconfig import (
     ConfigError,
@@ -109,6 +109,7 @@ DAEMON_KEYS: Final = frozenset(
         "operator",
         "tick_seconds",
         "require_sandbox",
+        "default_profile",
         "disclosure_terms",
         "disclosure_accepted",
         "machine_status",
@@ -273,6 +274,57 @@ class LineDefinition:
 
 
 @dataclass(frozen=True, slots=True)
+class DefaultProfile:
+    """The profile ``[daemon] default_profile`` names, as a client-created line takes
+    it. **Round 18, last pass, item 6.** A line created through the client named no
+    profile and took none, so a Claude Code line made that way had none of the
+    ``.git`` write denials and ask rules this project's profile gives its lines.
+
+    ``engine`` is the engine of the profile's ``model``, and only a line on that engine
+    takes the profile, so a profile for Claude Code never reaches an Antigravity, Codex
+    or Grok line. ``tools`` are the profile's own tool keys, as the file gives them,
+    which a key the client sends replaces whole, as a line's own key replaces its
+    profile's in the file. ``sandbox`` and ``settings`` merge under the client's, so the
+    client cannot drop a denial the profile adds. The profile's ``git_ssh``, ``limits``,
+    ``wake`` and ``may_own`` are not applied, since each is authority or policy the file
+    gives the lines it names, and ``configwarnings`` says so for ``git_ssh``. A profile
+    that grants ``secrets`` is refused, since a client-created line is granted none."""
+
+    name: str
+    model: str
+    engine: str
+    tools: dict[str, object]
+    sandbox: SandboxConfig | None
+    settings: SettingsConfig | None
+    git_ssh: bool
+
+
+def apply_default_profile(
+    profile: DefaultProfile | None, model: str, document: Mapping[str, object]
+) -> tuple[LineConfig, bool]:
+    """The configuration a client-created line on ``model`` with the client's
+    ``document`` runs with, and whether ``profile`` was applied, which it is only for
+    a line on the profile's engine. Raises ``ConfigError`` as
+    ``config_from_document`` does."""
+    own = config_from_document(document)
+    if profile is None or ENGINE_OF.get(model) != profile.engine:
+        return own, False
+    tools = {
+        **profile.tools,
+        **{key: value for key, value in document.items() if key not in LAYERED_KEYS},
+    }
+    base = config_from_document(tools)
+    return (
+        replace(
+            base,
+            sandbox=merge([profile.sandbox, own.sandbox]),
+            settings=engine_settings.merge([profile.settings, own.settings]),
+        ),
+        True,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class RoleDefinition:
     """A ``[roles.NAME]`` table. Its seats are lines the same file declares."""
 
@@ -365,6 +417,8 @@ class ProjectConfig:
     relays: RelayConfig = NO_RELAYS
     """The project's relays to operators and each operator's route, none by
     default, so operators' mail waits for a client as before."""
+    default_profile: DefaultProfile | None = None
+    """The profile a client-created line on its engine takes, or ``None``."""
 
 
 def config_path(state_dir: Path) -> Path:
@@ -539,6 +593,9 @@ class _Reader:
             )
         read_only_paths = self.read_only_paths(top.get("read_only_paths", []))
         profiles = self.profiles(top.get("profiles", {}))
+        default_profile = self.default_profile(
+            daemon.get("default_profile"), profiles, limits, wake
+        )
         lines_table = top.get("lines", {})
         if not isinstance(lines_table, dict):
             raise self.fail("lines", "must be a table")
@@ -582,6 +639,7 @@ class _Reader:
             lines=lines,
             roles=roles,
             relays=relays,
+            default_profile=default_profile,
         )
 
     def read_only_paths(self, value: object) -> tuple[str, ...]:
@@ -940,6 +998,51 @@ class _Reader:
             found[name] = self.table(profile, f"profiles.{name}", PROFILE_KEYS)
         return found
 
+    def default_profile(
+        self,
+        value: object,
+        profiles: Mapping[str, dict[str, object]],
+        limits: Limits,
+        wake: int,
+    ) -> DefaultProfile | None:
+        """``[daemon] default_profile``, checked whole as a line naming it would be,
+        so a profile a client-created line could not run with refuses the file and
+        not the line's creation."""
+        if value is None:
+            return None
+        key = "daemon.default_profile"
+        if not isinstance(value, str) or value not in profiles:
+            raise self.fail(key, f"names no profile: {value!r}")
+        profile = profiles[value]
+        if profile.get("model") not in MODELS:
+            raise self.fail(
+                key,
+                f"names profile {value!r}, which names no model, so the engine of"
+                " the lines it applies to is unknown",
+            )
+        if "secrets" in profile:
+            raise self.fail(
+                key,
+                f"names profile {value!r}, which grants secrets, and a line created"
+                " through the client is granted none",
+            )
+        definition = self.line(
+            value, {"profile": value}, profiles, limits, wake, key=key
+        )
+        return DefaultProfile(
+            name=value,
+            model=definition.model,
+            engine=ENGINE_OF[definition.model],
+            tools={
+                name: item
+                for name, item in profile.items()
+                if name in TOOL_KEYS and name != "secrets"
+            },
+            sandbox=definition.config.sandbox,
+            settings=definition.config.settings,
+            git_ssh=definition.git_ssh,
+        )
+
     def line(
         self,
         line_id: str,
@@ -947,8 +1050,9 @@ class _Reader:
         profiles: Mapping[str, dict[str, object]],
         limits: Limits,
         wake: int,
+        key: str | None = None,
     ) -> LineDefinition:
-        key = f"lines.{line_id}"
+        key = key or f"lines.{line_id}"
         if ID_PATTERN.fullmatch(line_id) is None:
             raise self.fail(key, "is not a valid line identifier")
         own = self.table(value, key, LINE_KEYS)

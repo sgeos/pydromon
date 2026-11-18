@@ -25,3 +25,19 @@ Type: Fixed
 - Every credential path is denied whether or not it exists, and under the home as
   named and by its real path, so a file made after a line's engine was built, or
   reached through a linked home, is no longer open.
+- A sandbox grant that differs from a credential path or a protected directory
+  only in letter case, such as `~/.SSH`, is refused, since a volume that ignores
+  case names the same directory by it.
+- Claude Code lines alone are also denied `~/Library/Keychains`,
+  `~/.config/gcloud` and `~/.azure`, with the same refusal of grants. Codex and
+  Grok lines are not, since Grok reads two of them itself. The keychain service
+  is not a path, and a query to it is not stopped.
+- `dromon config` reports each line's sandbox as the build gives it, such as
+  `sandboxed by default`, rather than the merge of its layers.
+- A new `[daemon] default_profile` names a profile that lines created or
+  configured through the client take, when they run on the profile's engine, so
+  they get the profile's sandbox denials and ask rules. Lines that already exist
+  take it when next configured.
+- On a Linux host without `bwrap` or `socat`, a start, `dromond --check` and
+  `dromon check-engines` warn of every Claude Code line whose sandbox is enabled,
+  since each would fail at its first turn.

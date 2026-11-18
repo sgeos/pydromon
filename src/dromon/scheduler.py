@@ -2581,13 +2581,20 @@ def _check_engine_supports(driver: Driver, config: LineConfig) -> None:
     unbounded = cost_bound_refusal(driver.settings.engine, driver.settings.strategy)
     if unbounded is not None:
         raise ConfigError(unbounded)
-    if config.fresh_session_each_turn and driver.settings.engine not in {
+    reason = engine_config_refusal(driver.settings.engine, config)
+    if reason is not None:
+        raise ConfigError(reason)
+
+
+def engine_config_refusal(engine: str, config: LineConfig) -> str | None:
+    """Why ``engine`` cannot run ``config``, whatever the strategy, or ``None``. Also
+    used by the daemon's start check of ``[daemon] default_profile``, round 18, last
+    pass, item 6, so a profile its own engine refuses refuses the project file."""
+    if config.fresh_session_each_turn and engine not in {
         ENGINE_NAME_CLAUDE,
         codex.ENGINE_NAME,
     }:
-        raise ConfigError(
-            "fresh_session_each_turn is supported only by Claude Code and Codex"
-        )
+        return "fresh_session_each_turn is supported only by Claude Code and Codex"
     checks = {
         codex.ENGINE_NAME: codex.unsupported,
         grok.ENGINE_NAME: grok.unsupported,
@@ -2595,11 +2602,8 @@ def _check_engine_supports(driver: Driver, config: LineConfig) -> None:
         cursor.ENGINE_NAME: cursor.line_refusal,
         antigravity.ENGINE_NAME: antigravity.line_refusal,
     }
-    check = checks.get(driver.settings.engine)
-    if check is not None:
-        reason = check(config)
-        if reason is not None:
-            raise ConfigError(reason)
+    check = checks.get(engine)
+    return None if check is None else check(config)
 
 
 def _no_notice(peer_id: str, message_id: str) -> None:

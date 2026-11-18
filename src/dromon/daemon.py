@@ -37,6 +37,7 @@ import json
 import contextlib
 import fcntl
 import os
+import platform
 import shutil
 import signal
 import ssl
@@ -53,7 +54,7 @@ from typing import Any, Final, Protocol, cast
 from claude_agent_sdk import SdkMcpTool
 from OpenSSL.SSL import Context as OpenSSLContext
 
-from dromon.scheduler import StartCheckEngine
+from dromon.scheduler import StartCheckEngine, engine_config_refusal
 from dromon import __version__, exits, fleet, grok, peercred, registry, restart, runs
 from dromon import credentials, evidence, mcpstates, spawn
 from dromon import proposals as proposal_store
@@ -133,6 +134,7 @@ from dromon.lineconfig import (
 from dromon.projectconfig import (
     ConfigFileError,
     ProjectConfig,
+    apply_default_profile,
     config_path,
     declared_operators,
     load,
@@ -142,6 +144,7 @@ from dromon.sandbox import (
     SandboxError,
     claude_default,
     effective,
+    host_unavailable_reason,
     merge,
 )
 from dromon import gitssh
@@ -1163,7 +1166,10 @@ class Daemon:
             chosen = Strategy(strategy)
         except ValueError as error:
             raise DriverError(f"unknown strategy {strategy!r}") from error
-        config = _config_arg(args) if "config" in args else DEFAULT_CONFIG
+        # Round 18, last pass, item 6. A line created through the client takes the
+        # project's default profile, when one is named and the line runs on its
+        # engine, under what the client sent.
+        config = self._client_config(model, args)
         self._check_workdir(config)
         check_sandbox_required(self.project, line_id, model, config)
         raw_limits = args.get("limits", {})
@@ -1192,6 +1198,19 @@ class Daemon:
             self.log.append(initial_override)
         return {"line_id": line_id}
 
+    def _client_config(self, model: str, args: dict[str, object]) -> LineConfig:
+        """The configuration a line created or configured through the client runs
+        with, which is the client's ``config``, under the project's default profile
+        when the line runs on its engine, as ``projectconfig.DefaultProfile``
+        describes."""
+        raw = args.get("config", {})
+        if not isinstance(raw, dict):
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "config is not an object")
+        config, _ = apply_default_profile(
+            self.project.default_profile, model, cast(dict[str, object], raw)
+        )
+        return config
+
     def _configure_line(self, args: dict[str, object]) -> dict[str, object]:
         texts = {key: value for key, value in args.items() if key != "config"}
         (line_id,) = _text_args(texts, ("line_id",))
@@ -1199,11 +1218,17 @@ class Daemon:
             raise ProtocolError(ErrorCode.BAD_REQUEST, "configure_line needs a config")
         if line_id not in self.log.state.lines:
             raise EventRejected(f"no line {line_id}")
-        config = _config_arg(args)
-        self._check_workdir(config)
-        check_sandbox_required(
-            self.project, line_id, self.scheduler.model_of(line_id), config
+        model = self.scheduler.model_of(line_id)
+        # Round 18, last pass, item 6. A line the project file does not declare takes
+        # the default profile again, so a configure cannot drop the denials it adds.
+        # A declared line takes what the file gives it at the next start or reload.
+        config = (
+            _config_arg(args)
+            if line_id in self.project.lines
+            else self._client_config(model, args)
         )
+        self._check_workdir(config)
+        check_sandbox_required(self.project, line_id, model, config)
         lost = self.tasks_lost([line_id])
         self.scheduler.configure_line(line_id, config)
         return {"line_id": line_id, **lost}
@@ -3713,6 +3738,48 @@ def check_lines_sandboxed(
         )
 
 
+def sandbox_host_problem() -> str | None:
+    """``sandbox.host_unavailable_reason`` for the host the daemon runs on. A function
+    of its own, so tests give a host of their own."""
+    return host_unavailable_reason(platform.system(), shutil.which)
+
+
+def unavailable_sandbox_warning(
+    config: ProjectConfig, log: EventLog, scheduler: Scheduler
+) -> str | None:
+    """A warning naming every Claude Code line, declared or created through the
+    client, whose sandbox is enabled while the host cannot start one, or ``None``.
+    **Round 18, last pass, item 7.** Such a line fails at its first turn, so a start,
+    ``dromond --check`` and ``dromon check-engines`` say so before any turn. A warning
+    and not a refusal, since the host's other lines can run, and a refusal would also
+    stop ``dromon restart``, whose preflight runs the same check."""
+    reason = sandbox_host_problem()
+    if reason is None:
+        return None
+    found = [
+        (line_id, definition.model, definition.config)
+        for line_id, definition in sorted(config.lines.items())
+    ] + [
+        (line_id, scheduler.model_of(line_id), scheduler.effective_config(line_id))
+        for line_id in sorted(set(log.state.lines) - set(config.lines))
+    ]
+    held: list[str] = []
+    for line_id, model, line in found:
+        if ENGINE_OF.get(model) != CLAUDE_CODE_ENGINE:
+            continue
+        merged = line_sandbox(config.sandbox, model, line)
+        if merged is not None and merged.enabled:
+            held.append(line_id)
+    if not held:
+        return None
+    return (
+        f"{reason}, so the Claude Code lines {', '.join(held)}, whose sandbox is"
+        " enabled, will each fail at their first turn. Install what is missing, or"
+        " set enabled false for a line knowing its shell can then read the credential"
+        " paths"
+    )
+
+
 def machine_status_path(config: ProjectConfig, paths: ProjectPaths) -> Path | None:
     """The machine monitor's status file the project names, with a leading ``~`` the
     home directory and a relative path relative to the project root, or ``None`` when
@@ -3783,8 +3850,18 @@ def check_grok_profiles(
 
 def check_engines(config: ProjectConfig) -> None:
     """Refuse a project file that gives a Codex line a sandbox or settings through the
-    project's own tables, which the line's engine cannot honour. Raises ``ValueError``.
-    A line's own tables are checked when the line is created or configured."""
+    project's own tables, which the line's engine cannot honour, or that names a
+    ``default_profile`` its own engine cannot run. Raises ``ValueError``. A line's own
+    tables are checked when the line is created or configured."""
+    profile = config.default_profile
+    if profile is not None:
+        given, _ = apply_default_profile(profile, profile.model, {})
+        reason = engine_config_refusal(profile.engine, given)
+        if reason is not None:
+            raise ValueError(
+                f"daemon.default_profile names profile {profile.name!r}, which a line"
+                f" created through the client on its engine could not run: {reason}"
+            )
     if config.sandbox is None and config.settings is None:
         return
     outside = sorted(
@@ -4347,6 +4424,9 @@ def run(
                 config.run_queue_max_age_seconds,
             )
             check_lines_sandboxed(config, log, scheduler)
+            unavailable = unavailable_sandbox_warning(config, log, scheduler)
+            if unavailable is not None:
+                print(f"dromond: warning: {unavailable}", file=sys.stderr)
             check_roles(scheduler, log, config)
             apply_project(scheduler, log, config)
             report_unsealed(scheduler)

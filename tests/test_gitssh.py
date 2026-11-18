@@ -723,6 +723,31 @@ def test_the_daemon_refuses_an_agent_socket_in_a_credential_path(
     assert set(git_ssh_access(parse(disabled), paths, {})) == {"alpha"}
 
 
+@pytest.mark.parametrize("granted", ["{home}", "{home}/.s*"])
+def test_the_git_ssh_check_refuses_a_grant_above_a_credential_path(
+    files: Path,
+    agent: str,
+    short_runtime: Path,
+    _empty_daemon_home: Path,
+    granted: str,
+) -> None:
+    """Round 18, last pass, item 4. The audit line found that the credential paths
+    could be dropped from ``git_ssh_access``'s own check with no test failing, since
+    every test of a grant reached it through ``check_sandboxes``. This calls the
+    ``[git_ssh]`` check alone, on a line whose own sandbox grants the home or a pattern
+    that reaches its ssh directory, which no protected-directory rule refuses, so only
+    the credential check can. The same line without ``git_ssh`` is
+    not checked by it."""
+    entry = granted.format(home=_empty_daemon_home)
+    grant = f"[lines.alpha.sandbox.filesystem]\nallowRead = [{entry!r}]\n"
+    paths = paths_for(files, short_runtime)
+    with pytest.raises(SandboxError, match="credential path"):
+        git_ssh_access(
+            parse(project_with(agent, line="git_ssh = true\n" + grant)), paths, {}
+        )
+    assert git_ssh_access(parse(project_with(agent, line=grant)), paths, {}) == {}
+
+
 def test_dromond_exits_on_an_inherited_agent_without_a_socket(
     files: Path,
     short_runtime: Path,

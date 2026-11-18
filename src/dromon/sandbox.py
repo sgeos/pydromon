@@ -371,13 +371,14 @@ def _with_real_forms(paths: Iterable[str]) -> list[str]:
 
 def _within(path: str, directory: Path) -> bool:
     """Whether ``path``, with a leading ``~`` expanded as Claude Code expands it, lies
-    in ``directory``."""
+    in ``directory``, compared in folded case for the reason ``_overlaps`` gives."""
     expanded = os.path.expanduser(path)
     if not expanded.startswith("/"):
         return False
     # Real paths on both sides, so a symbolic link such as macOS's /tmp cannot
     # disguise a protected directory.
-    real, guarded = os.path.realpath(expanded), os.path.realpath(directory)
+    real = os.path.realpath(expanded).casefold()
+    guarded = os.path.realpath(directory).casefold()
     return os.path.commonpath([real, guarded]) == guarded
 
 
@@ -432,10 +433,21 @@ def _grant_base(path: str) -> str:
 
 def _overlaps(base: str, guarded: Path) -> bool:
     """Whether ``base`` is ``guarded``, an ancestor of it or inside it, compared by
-    real path on both sides."""
+    real path on both sides and in folded case.
+
+    **Round 18, last pass, item 1.** A grant spelled in another case, such as
+    ``.SSH`` for ``.ssh``, names the same directory on a volume that ignores case,
+    and ``realpath`` keeps the case it was given, so the comparison as text let it
+    through. The comparison is folded always, rather than only where the volume is
+    found to ignore case, since that is a property of each directory and not of the
+    platform, a volume can be mounted from elsewhere, and a test that asks the volume
+    would differ from host to host. **Cost.** On a volume that keeps case apart, a
+    grant of a different directory whose name differs from a listed path only in case
+    is refused too, which an operator can rename around."""
     if not base.startswith("/"):
         return False
-    real, guard = os.path.realpath(base), os.path.realpath(guarded)
+    real = os.path.realpath(base).casefold()
+    guard = os.path.realpath(guarded).casefold()
     return os.path.commonpath([real, guard]) in (real, guard)
 
 
@@ -578,6 +590,42 @@ def _grant_real_workdir(filesystem: dict[str, object], root: Path) -> None:
     granted = cast(list[str], filesystem.get("allowWrite", []))
     if real not in granted:
         filesystem["allowWrite"] = sorted({*granted, real})
+
+
+LINUX_SANDBOX_TOOLS: Final = ("bwrap", "socat")
+"""The commands Claude Code's sandbox needs on Linux, found on the engine's ``PATH``.
+**Fact, read from the bundled Claude Code 2.1.327 on 2026-11-18.** Its dependency
+check reports ``bubblewrap (bwrap) not installed`` and ``socat not installed`` when
+either is missing there, and with ``failIfUnavailable`` true it then refuses to run a
+command. Its seatbelt sandbox is built into the other supported platform, and needs
+nothing installed. A missing seccomp filter only weakens the sandbox and is not
+checked."""
+
+
+def host_unavailable_reason(
+    system: str, which: Callable[[str], str | None]
+) -> str | None:
+    """Why Claude Code's sandbox cannot start on a host whose ``platform.system()``
+    is ``system`` and whose commands ``which`` finds, or ``None`` when nothing is
+    known to be missing. **Round 18, last pass, item 7.** A Claude Code line that no
+    layer enables or disables now gets an enabled sandbox with ``failIfUnavailable``
+    true, so on such a host its first turn fails, which a start check can say before
+    any turn. **Assumption.** The engine runs with the daemon's ``PATH``, as the
+    launcher passes it. **Residual.** Only missing commands are found. A host whose
+    kernel refuses the user namespaces bubblewrap needs, as some containers do, passes
+    this check and still fails at the first turn, since finding that would start a
+    sandbox."""
+    if system != "Linux":
+        return None
+    missing = [name for name in LINUX_SANDBOX_TOOLS if which(name) is None]
+    if not missing:
+        return None
+    return (
+        "Claude Code's sandbox cannot start on this host, since "
+        + " and ".join(missing)
+        + (" is" if len(missing) == 1 else " are")
+        + " not on the daemon's PATH"
+    )
 
 
 def blocks_unsandboxed(

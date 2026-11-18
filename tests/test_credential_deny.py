@@ -40,6 +40,7 @@ from dromon.sandbox import SandboxError, parse_sandbox
 from dromon.scheduler import LineSpec, engine_factory
 from dromon.security_paths import (
     CLAUDE_CODE_EXEMPT,
+    CLAUDE_CODE_ONLY_PATHS,
     CREDENTIAL_PATHS,
     credential_paths,
 )
@@ -496,3 +497,152 @@ def test_the_warnings_name_a_disabled_line_and_an_overridden_key() -> None:
         sandbox_warnings(parse("version = 1\n[lines.b]\nmodel = 'claude-haiku-5-5'\n"))
         == []
     )
+
+
+# Round 18, last pass.
+
+
+@pytest.mark.parametrize("key", ["allowRead", "allowWrite"])
+@pytest.mark.parametrize(
+    "granted",
+    [
+        pytest.param("{home}/.SSH", id="a-listed-directory"),
+        pytest.param("{home}/.Ssh/id_test", id="inside-one"),
+        pytest.param("{upper}", id="the-home"),
+        pytest.param("{home}/.CONFIG/*", id="a-pattern-above-one"),
+        pytest.param("{home}/LIBRARY", id="above-a-claude-only-one"),
+    ],
+)
+def test_a_grant_in_another_case_is_refused(
+    tmp_path: Path, key: str, granted: str
+) -> None:
+    """Round 18, last pass, item 1. Confirmed before the change, a grant of the
+    ``.SSH`` spelling was accepted, and a volume that ignores case names the ssh
+    directory by it. The comparison is folded on every host, so this holds on a
+    volume that keeps case apart too."""
+    home = security_paths.daemon_home()
+    entry = granted.format(home=home, upper=str(home).upper())
+    own = parse_sandbox({"filesystem": {key: [entry]}}, operator=False)
+    with pytest.raises(SandboxError, match="credential path|Dromon protects"):
+        built(tmp_path, LineConfig(sandbox=own))
+
+
+def test_a_grant_of_a_protected_directory_in_another_case_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Round 18, last pass, item 1. The refusal of a grant inside a protected
+    directory, such as the project's secret directory, is folded as well."""
+    (tmp_path / "secret").mkdir()
+    own = parse_sandbox(
+        {"filesystem": {"allowRead": [str(tmp_path / "SECRET" / "x")]}},
+        operator=False,
+    )
+    with pytest.raises(SandboxError, match="directory Dromon protects"):
+        built(tmp_path, LineConfig(sandbox=own))
+    other = parse_sandbox(
+        {"filesystem": {"allowRead": [str(tmp_path / "secrets")]}}, operator=False
+    )
+    built(tmp_path, LineConfig(sandbox=other))
+
+
+def test_the_claude_code_only_paths_are_denied_to_claude_lines_alone(
+    tmp_path: Path,
+) -> None:
+    """Round 18, last pass, item 5. Denied in the shell and to the file tools of a
+    Claude Code line, missing or not, and not part of the list Codex and Grok lines
+    take."""
+    home = security_paths.daemon_home()
+    only = tuple(home / entry for entry in CLAUDE_CODE_ONLY_PATHS)
+    assert {str(entry) for entry in CLAUDE_CODE_ONLY_PATHS} == {
+        "Library/Keychains",
+        ".config/gcloud",
+        ".azure",
+    }
+    assert not set(CLAUDE_CODE_ONLY_PATHS) & set(CREDENTIAL_PATHS)
+    assert set(only) <= set(security_paths.claude_credentials())
+    assert not set(only) & set(credential_paths(home))
+    engine = built(tmp_path)
+    assert_shell_denied(engine, only)
+    assert_tools_denied(engine, only)
+
+
+def test_grok_is_not_denied_the_claude_code_only_paths(tmp_path: Path) -> None:
+    """Round 18, last pass, item 5. Grok's own binary reads two of them, so its
+    profile's list is unchanged."""
+    from dromon import grok
+
+    home = Path(os.path.realpath(tmp_path))
+    for entry in CLAUDE_CODE_ONLY_PATHS:
+        (home / entry).mkdir(parents=True)
+    (home / ".ssh").mkdir()
+    found = grok._credential_paths(home)  # pyright: ignore[reportPrivateUsage]
+    assert home / ".ssh" in found
+    assert not {home / entry for entry in CLAUDE_CODE_ONLY_PATHS} & set(found)
+
+
+@pytest.mark.parametrize(
+    "granted",
+    [
+        pytest.param("{home}/Library", id="above-the-keychains"),
+        pytest.param("{home}/Library/Keychains/login.keychain-db", id="a-keychain"),
+        pytest.param("{home}/.config/gcloud", id="gcloud"),
+        pytest.param("{home}/.azure/*", id="inside-azure"),
+        pytest.param("{home}/Lib*", id="a-pattern-above-them"),
+    ],
+)
+def test_a_grant_of_a_claude_code_only_path_is_refused(
+    tmp_path: Path, granted: str
+) -> None:
+    home = security_paths.daemon_home()
+    entry = granted.format(home=home)
+    own = parse_sandbox({"filesystem": {"allowRead": [entry]}}, operator=False)
+    with pytest.raises(SandboxError, match="credential path|Dromon protects"):
+        built(tmp_path, LineConfig(sandbox=own))
+
+
+@pytest.mark.parametrize(
+    "granted", ["{home}/Library/Caches", "{home}/.config/gcloudx", "{home}/.azurex"]
+)
+def test_a_grant_beside_a_claude_code_only_path_is_accepted(
+    tmp_path: Path, granted: str
+) -> None:
+    entry = granted.format(home=security_paths.daemon_home())
+    own = parse_sandbox({"filesystem": {"allowWrite": [entry]}}, operator=False)
+    assert (
+        entry in filesystem_of(built(tmp_path, LineConfig(sandbox=own)))["allowWrite"]
+    )
+
+
+@pytest.mark.parametrize(
+    "extra", [Path("/abs"), Path("../up"), Path("a/../../up"), Path()]
+)
+def test_an_extra_entry_outside_the_home_is_refused(
+    tmp_path: Path, extra: Path
+) -> None:
+    with pytest.raises(ValueError, match="not a path within the home"):
+        credential_paths(tmp_path, extra=(extra,))
+
+
+def test_an_extra_entry_may_be_exempted(tmp_path: Path) -> None:
+    home = Path(os.path.realpath(tmp_path))
+    extra = (Path(".azure"),)
+    assert home / ".azure" in credential_paths(home, extra=extra)
+    assert home / ".azure" not in credential_paths(home, set(extra), extra)
+
+
+def test_the_daemon_checks_a_project_sandbox_with_no_lines(
+    tmp_path: Path, short_runtime: Path
+) -> None:
+    """Round 18, last pass, from the audit line's re-check. A project file that
+    declares no line has its own sandbox checked for grants above a credential path,
+    which no line's check then covers."""
+    paths = project_paths(tmp_path, short_runtime)
+    paths.state_dir.mkdir()
+    home = str(security_paths.daemon_home())
+    text = (
+        "version = 1\n[sandbox]\nenabled = true\n"
+        f"[sandbox.filesystem]\nallowRead = [{home!r}]\n"
+    )
+    with pytest.raises(SandboxError, match="credential path"):
+        check_sandboxes(parse(text), paths)
+    check_sandboxes(parse(text.replace(home, home + "/.cache/uv")), paths)
