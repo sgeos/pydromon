@@ -76,6 +76,13 @@ class Operation(StrEnum):
     """Operator only. Not offered to external agents or lines. Added in round 14."""
     RUN_CLEAR = "run_clear"
     """Operator only. Not offered to external agents or lines. Task of 2026-10-31."""
+    RUN_ADMIT = "run_admit"
+    """Operator only. Not offered to external agents or lines. Records the operator's
+    override of the machine status, which admits one run at a time while it defers
+    runs. Added in round 18, item 1."""
+    RUN_ADMIT_END = "run_admit_end"
+    """Operator only. Not offered to external agents or lines. Ends the override before
+    it expires. Added in round 18, item 1."""
     SCRATCH_PLACE = "scratch_place"
     """Operator only. Not offered to external agents or lines. Writes a file the
     operator gives into a line's scratch, for ``dromon ci-log``. Task of 2026-11-05,

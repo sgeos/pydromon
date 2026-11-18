@@ -436,6 +436,10 @@ refused for itself and not deferred, since the check comes after the request's o
 Mail the line has already answered is still delivered without a turn, since that costs
 the machine nothing.
 
+**Round 18.** The operator can admit one run at a time while the status defers runs, at
+`elevated` and never at `critical`, as the override below describes, and the deferral is
+worded once for every surface, as the section on that says.
+
 **Stale, missing, unreadable.** A sample older than three minutes, a file that is not
 there, is not a regular file, is over 64 KiB, or names no level or time Dromon knows, is
 treated as `elevated` and reported as what it is, so a monitor that stopped is seen and
@@ -506,6 +510,139 @@ gives the status in detail, as [`LINE_CONFIG.md`](../protocol/LINE_CONFIG.md) sa
 deferral's record is the harness notes, since the daemon's memory of what it told is not
 in the event log, and a restart tells once again.
 
+## One deferral for every surface
+
+**Round 18, item 3, as engines asked.** A run that could not start was worded in four
+places, the refusal of a start, the reason a queue stored, the notes, and `run_status`,
+which gave no cause at all. A line could read two different sentences about one hold.
+`Scheduler._run_deferral` now builds the one value, a `RunDeferral` with a `hold`, a
+`reason` and a `resumes`. The hold is `machine`, `admission` or `slot`. The reason is
+what holds the run, in fixed words and the bounded, screened text of the status file.
+The resumption is what must change for it to start. Every surface reads that value and
+adds only its own advice.
+
+| Surface | What it says of the hold |
+|---|---|
+| The refusal of a start | `the run is deferred, since REASON`, then `it can start RESUMES`, and that the line waits or uses the queue |
+| The queued run's reason, and its place in `run_status` | The deferral as one sentence, `REASON, and it can start RESUMES` |
+| `run_status`, for every line | `A start now would be deferred, since REASON, and it can start RESUMES`, or that nothing holds a start back |
+| The note to the operator, for a machine or override hold | The same reason and resumption, once for the deferral |
+| The warning a turn proceeds with | The resumption of the run deferral, so the advice to start nothing heavy ends where the refusal says it does |
+
+The reason of a monitor that cannot be relied on carries the sentence of round 16 that
+says how long it looks stopped and how the operator restores the gates, and the
+resumption names the override. A turn's deferral at `critical` keeps its own wording,
+since it is the deferral of a turn and not of a run, and it shares the status words.
+**Failure modes.** The deferral is computed at the moment it is read and recorded
+nowhere, so two surfaces read a few seconds apart can differ when the status or the slot
+changed between them, and each is true when read. **Residual.** The notes already sent
+keep the words of their day.
+
+## The operator's override
+
+**Round 18, item 1, the operator's request.** The daemon defers a run at any machine
+level but `ok`, and on 2026-11-16 memory pressure from applications outside Dromon held
+every line for hours. The operator ran the gates by hand, which left no record and no
+limit. The operator can now admit runs while the status defers them, with
+`dromon run admit`. The decision is the daemon's own record, `run_admitted`, with the
+operator, the time and the expiry, and the reason the operator gave.
+
+- **What it lifts.** The deferral at `elevated`, and at a status that cannot be relied
+  on, which counts as elevated, so a monitor that died is covered, which is the case the
+  operator met. It never lifts `critical`, where nothing starts. The request is refused
+  at `critical`, and an override made earlier does not apply while the status is
+  `critical`. It applies again when the status falls to `elevated`, within its expiry.
+- **One run at a time.** While the override applies, a start is admitted only when no
+  other line has a run open or is starting one. Any scope's run counts, since the
+  machine is pressed and a second gate would press it more. A start that waits is
+  refused with the open run named, or kept by the queue, which begins it when that run
+  ends. Two starts that reach the check at the same moment cannot both pass, since the
+  first holds its place until its run is recorded. A lost run that is not cleared is not
+  counted, since the daemon cannot tell whether it runs. **Inference.** The operator's
+  wording of one run at a time is read as one run on the machine, not one in each scope.
+- **What it leaves.** Every other refusal stands, and so does the project's slot. A
+  holder of the slot is not admitted past another line's lease.
+- **Expiry.** The span is 60 seconds to four hours, an hour by default. It ends by
+  itself and nothing is recorded at the expiry, since the reader judges it by the clock.
+  `dromon run admit-end` records `run_admission_ended` to end it earlier. A second
+  `run_admitted` replaces the first, which is how the operator extends or shortens it.
+  A run that was admitted runs on when the override ends, since only the operator
+  decides to stop work.
+- **What is recorded.** The run's `run_started` names the operator in `admitted_by`, so
+  a receipt says that the run started at a status the project defers runs at, by a
+  decision that the log holds with its time and expiry. `run_status` shows the override
+  to every line, with who made it, when and until when, whether it applies, and the
+  reason. The operator's `dromon run status` shows the same.
+- **Trust.** Only the operator can make it. The request is not offered to lines or to
+  external agents. The reason is free text and is scrubbed as other recorded text is.
+
+**Failure modes.** A daemon with no machine status file refuses the request, since no
+run is deferred by a status there. The override is state in the log, so a restart keeps
+it, and a daemon from before it refuses the log, which the rollback floor names.
+**Residuals.** An override is not tied to a gate or a line, so any line may start under
+it, and the operator who wants a single line to run leaves the others without work or
+stops them. The one run at a time is read from the log and from the starts under way
+in this daemon, so a supervised run that a restart left open is counted by its record
+and a run that the process table shows and the log does not is not. **Porting note.** A
+single optional record in the state, replaced whole, and an expiry read from the clock.
+
+## What a receipt says it tested
+
+**Round 18, item 2, as two lines asked.** A passing run was read as verification of the
+current tree long after the tree had moved. The receipt now says what the run tested, so
+an old success cannot pass for a current one.
+
+- **The tested commit.** For a commit run, the full commit the daemon checked out, and
+  the receipt says so and that the tree is clean, since the checkout holds nothing else.
+  For a run in a working directory, the commit that `HEAD` named when it started, as
+  the worktree's own claim, which is the wording of round 16.
+- **Whether the tree was clean.** `run_started.dirty_paths` counts every path that
+  `git status` listed when the run started, changed or untracked, so zero is a clean
+  tree and anything else says the run did not test the commit alone. The digest and the
+  count come from one read of the status, so they describe the same moment. A count that
+  could not be read is recorded as nothing and worded as unknown, and is never worded as
+  clean. A tree whose digest cannot tell a change, as round 16 describes, still records
+  the count, since the status was read.
+- **The digest.** The SHA-256 of `readiness.tree_digest`, which `run_status` showed only
+  as a comparison, is now part of the receipt line, so a later reading can be compared
+  with it by hand.
+- **The counts.** `run_ended.coverage` holds the counts of pytest's final line, a name
+  of a fixed list and a whole number for each, read from the same line as the quoted
+  summary so the two cannot disagree. They carry no text, a number over a billion makes
+  the whole line unreadable, and a line that gives a name twice keeps the first.
+- **Who admitted it.** `admitted_by`, from the override above.
+
+`run_status` shows each in the run's line, and the operator's `dromon run status RUN`
+shows them as lines of their own. **Trust.** The counts and the summary are the output's
+own claim, which a writing line can shape, so they are labelled unverified wherever they
+are shown. The dirty count and the digest are what the daemon read before the command
+started, and the line can change the tree after, which round 16's comparison reports for
+the latest run. **Residuals.** Untracked paths count as dirty but are not in the digest.
+A run started before this round has none of the fields and its receipt says its state
+is unknown. A forged final line in the output yields forged counts, as it yields a forged
+summary.
+
+## A gate's temporary test root
+
+**Round 18, item 4, this line's own request.** Every pytest of a user shared one base
+directory below the temporary directory, whose numbered subdirectories each session
+makes, counts and prunes. Two gates at once could prune or repair a directory that the
+other was using, and on 2026-11-16 one failed with a `FileExistsError` in a fixture
+shared with the other. `scripts/check.sh` now makes a directory of its own with
+`mktemp -d`, hands pytest a base inside it with `--basetemp`, and removes it when the
+gate ends, whether it passed or failed, or was stopped by a signal that the shell handles. The test suite repairs what a
+killed session left by walking the parent of its base, which is now this gate's own
+directory, so it never reaches another gate's. The directory's name is short, since the
+path of a Unix domain socket is bounded. A directory that a killed test left unreadable is
+made readable before it is removed. **Failure modes.** A gate that cannot make its
+directory fails at once and says where. A directory that cannot be removed is reported
+as a warning and does not fail a gate that passed. **Residual.** A gate killed with
+`SIGKILL` runs no exit handler and leaves its directory, which the operator removes. It
+is small, and no later gate reads it. **Inference.** The declared run `full-gate` runs this script, so it has the same
+isolation, which this line could not check since the project file that declares it is
+closed to lines. A test that makes its own directory outside the base, as the
+socket tests do with a short one, is isolated by its own name and not by this.
+
 ## A lost run
 
 A lost run's supervisor is gone without a receipt, so its command may still run, in a
@@ -558,13 +695,13 @@ tree changed for another reason, since the daemon cannot tell why a run passed.
 | Tool | Effect |
 |---|---|
 | `start_run` | Arguments `command` and `previous`, `commit` for a commit command only, and `arguments` for a command with parameters only. Starts the declared command, and answers with the run's identifier and output file |
-| `run_status` | No arguments. The scope's latest ten runs, newest first, with what `previous` must be and the declared commands. Since the task of 2026-11-05 it reconciles an open run first, and gives the latest run's tail where it failed |
+| `run_status` | No arguments. The scope's latest ten runs, newest first, with what `previous` must be and the declared commands. Since the task of 2026-11-05 it reconciles an open run first, and gives the latest run's tail where it failed. **Round 18.** Each run's line says what it tested, and the answer ends with the operator's override and the one deferral, or that nothing holds a start back |
 | `stop_run` | Argument `run_id`, the scope's open run. Signals its supervisor after checking its start time again |
 | `wake_after` | **Task of 2026-11-05, item 2.** Its `task_id` may name an open run of the line's scope. The run's end withdraws the wake, and its `Run ended` note, with the exit, wakes the line and names the wake it cancelled. A run of another scope, or one that has ended, is refused, the latter with its receipt. A run that outlives the timeout lets the wake fire as usual |
 
 They are offered while the project declares a run command, or while the line's scope
 has a run to read. The operator's `dromon run clear RUN` is the only way to clear a
-lost run by hand, and is offered to no line or external agent.
+lost run by hand, and is offered to no line or external agent. So are `dromon run admit` and `dromon run admit-end`, which make and end the override of the machine status.
 
 **Round 14, item 11.** The operator reads runs with `dromon run status`, the request
 `runs`, which lists the latest ten runs of every scope with each run's command, line,
@@ -619,7 +756,7 @@ reads every end without a tail and refuses the log once a failed run's tail is
 recorded. **Round 15 review.** `disclosure_checked` gained `checked_bytes` the same
 way, so a daemon from before it refuses the log once a `check_disclosure` call is
 recorded. **Round 16, item 5.** `run_started` gained `tree` the same way, so a daemon
-from before it refuses the log once a run records its tree. **Round 17, item 1.** `run_queued` and `run_dequeued` are new kinds, so a daemon from before them refuses the log once a start is queued.
+from before it refuses the log once a run records its tree. **Round 17, item 1.** `run_queued` and `run_dequeued` are new kinds, so a daemon from before them refuses the log once a start is queued. **Round 18.** `run_admitted` and `run_admission_ended` are new kinds, and `run_started` gained `dirty_paths` and `admitted_by` and `run_ended` gained `coverage`, each left out when null, so a daemon from before them refuses the log once one is recorded. Nearly every run in a working directory records `dirty_paths` from then on, so the floor is the commit that first wrote one.
 
 ## Descendants in a session of their own
 

@@ -1,7 +1,7 @@
 """Canonical encoding of events and strict decoding of untrusted payloads."""
 
 import json
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import pytest
 
@@ -29,6 +29,11 @@ from dromon.model import (
     MessageSent,
     OperatorAddress,
     RoleDeclared,
+    RunAdmissionEnded,
+    RunAdmitted,
+    RunEnded,
+    RunStarted,
+    RunStatus,
     WakeScheduled,
 )
 
@@ -336,3 +341,94 @@ def test_a_malformed_reviews_is_refused(reviews: object, reason: str) -> None:
     data = json.loads(encode(RoleDeclared("docs", "tmp/worktrees/docs")))["data"]
     with pytest.raises(DecodeError, match=reason):
         decode(wire("role_declared", {**data, "reviews": reviews}))
+
+
+# Round 18, items 1 and 2. The fields of a receipt and the operator's override.
+
+RUN_END = RunEnded("r-1", RunStatus.EXITED, 0, None, None, "", "2026-11-18T08:00:00Z")
+RUN_START = RunStarted(
+    "r-1",
+    "alpha",
+    None,
+    None,
+    "gate",
+    ("true",),
+    "/work",
+    "tmp/runs/r-1.out",
+    4321,
+    "2026-11-18T08:00:00Z",
+    "2026-11-18T08:00:00Z",
+)
+
+
+def test_the_receipt_fields_are_left_out_of_the_wire_when_null() -> None:
+    """So a log of runs that record none of them stays readable by a daemon that
+    predates them, as the field table says."""
+    start = json.loads(encode(RUN_START))["data"]
+    assert not {"dirty_paths", "admitted_by"} & set(start)
+    assert "coverage" not in json.loads(encode(RUN_END))["data"]
+    assert decode(encode(RUN_START)) == RUN_START and decode(encode(RUN_END)) == RUN_END
+
+
+def test_the_receipt_fields_round_trip_and_a_clean_count_is_written() -> None:
+    """Zero is a count, not an absence, so a clean tree is written."""
+    clean = replace(RUN_START, dirty_paths=0, admitted_by="ana")
+    data = json.loads(encode(clean))["data"]
+    assert data["dirty_paths"] == 0 and data["admitted_by"] == "ana"
+    assert decode(encode(clean)) == clean
+    counted = replace(RUN_END, coverage=(("passed", 3), ("skipped", 0)))
+    assert json.loads(encode(counted))["data"]["coverage"] == ["passed=3", "skipped=0"]
+    assert decode(encode(counted)) == counted
+
+
+@pytest.mark.parametrize(
+    ("coverage", "reason"),
+    [
+        (["passed"], "name=digits"),
+        (["passed="], "name=digits"),
+        (["passed=-1"], "name=digits"),
+        (["passed=1.5"], "name=digits"),
+        (["passed=٣"], "name=digits"),
+        (["passed=1", "passed=2"], "twice or not at all"),
+        (["unknown=1"], "twice or not at all"),
+        ([], "has a result"),
+        ("passed=1", "not an array"),
+        ([1], "is not a str"),
+    ],
+)
+def test_malformed_counts_are_refused(coverage: object, reason: str) -> None:
+    data = json.loads(encode(RUN_END))["data"]
+    with pytest.raises(DecodeError, match=reason):
+        decode(wire("run_ended", {**data, "coverage": coverage}))
+
+
+def test_a_dirty_count_that_is_not_a_whole_number_is_refused() -> None:
+    data = json.loads(encode(RUN_START))["data"]
+    with pytest.raises(DecodeError, match="not a whole number"):
+        decode(wire("run_started", {**data, "dirty_paths": "3"}))
+    with pytest.raises(DecodeError):
+        decode(wire("run_started", {**data, "dirty_paths": -1}))
+
+
+def test_the_override_events_round_trip_and_name_every_field() -> None:
+    admitted = RunAdmitted("ana", "2026-11-18T08:00:00Z", "2026-11-18T09:00:00Z", "why")
+    ended = RunAdmissionEnded("ana", "2026-11-18T08:30:00Z")
+    for event in (admitted, ended):
+        assert decode(encode(event)) == event
+    assert set(json.loads(encode(admitted))["data"]) == {
+        "operator_id",
+        "admitted_at",
+        "expires_at",
+        "reason",
+    }
+
+
+def test_an_override_event_with_a_span_outside_the_bounds_is_refused() -> None:
+    data = {
+        "operator_id": "ana",
+        "admitted_at": "2026-11-18T08:00:00Z",
+        "expires_at": "2026-11-18T08:00:30Z",
+        "reason": "",
+    }
+    with pytest.raises(DecodeError, match="an override lasts"):
+        decode(wire("run_admitted", data))

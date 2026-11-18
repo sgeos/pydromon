@@ -518,7 +518,29 @@ done < <(printf '%s\n' "$ci_versions")
 ((${#checked_versions[@]} > 0)) || fail "the workflow lists no Python version to check"
 pass "pyright strict, for Linux and macOS, on Python ${checked_versions[*]}"
 
+# Each gate has a temporary test root of its own. **Round 18, item 4.** Every pytest of
+# a user shared one base, $TMPDIR/pytest-of-USER, whose numbered directories each session
+# makes, counts and prunes, so two gates at once could prune or repair a directory the
+# other was using, and one failed with a FileExistsError in a shared fixture on
+# 2026-11-16. The root is made here, with a name no other gate holds, and removed at the
+# end, so a gate touches nothing of another. The base is a directory below it, so the
+# test suite's walk of its base's parent, which repairs what a killed session left,
+# reaches only this gate's own. The name is short, since a path of a Unix domain socket
+# is bounded.
+gate_root="$(mktemp -d "${TMPDIR:-/tmp}/dg.XXXXXX")" ||
+    fail "the gate's temporary test root could not be made in ${TMPDIR:-/tmp}"
+
+remove_gate_root() {
+    # A test killed mid-way can leave a directory its owner cannot read, which rm
+    # would not enter, so the owner's access is restored first.
+    chmod -R u+rwX "$gate_root" 2>/dev/null || true
+    rm -rf "$gate_root" ||
+        printf 'check.sh: warning: the temporary test root %s was not removed\n' \
+            "$gate_root" >&2
+}
+trap remove_gate_root EXIT
+
 # Warnings are errors. pytest exits non-zero when it collects nothing, so an empty
 # selection fails here rather than passing.
-uv run --no-sync pytest -W error -p dromon.testreport "$@"
+uv run --no-sync pytest -W error -p dromon.testreport --basetemp "$gate_root/base" "$@"
 pass "pytest"
