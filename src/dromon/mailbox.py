@@ -187,6 +187,17 @@ def counts_unanswered(state: State, message: Message) -> bool:
     )
 
 
+def unanswered_from(state: State, owner: Address, sender: Address) -> list[str]:
+    """The messages from ``sender`` in ``owner``'s mailbox that ``counts_unanswered``
+    counts, oldest first. **Round 18 fix, item 3.** The send result reads it to tell
+    a line that a note it sent without ``reply_to`` closes none of them."""
+    return [
+        message_id
+        for message_id, message in mailbox(state, owner)
+        if message.sender == sender and counts_unanswered(state, message)
+    ]
+
+
 def is_open_issue(message_id: str, message: Message, replied: set[str]) -> bool:
     """Whether ``message`` is an issue its recipient has not yet closed by a reply
     or an acknowledgement."""

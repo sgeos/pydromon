@@ -32,11 +32,26 @@ seat, another line or an operator is quoted. An operator's mail is the line's in
 not its evidence, and the line reads it with ``list_mail``.
 
 **Disclosure.** Each text was screened when it was sent or recorded, but the list may
-have changed since, by a reload or a restart. Every entry is screened again when the
-index is built, with the whole text it quotes and the entry as given, against the list
-in force then, as a fired wake's note is. An entry that now holds a term is left out
-whole, and only the count of such entries is given, so neither its quote nor which
-entry it was is shown.
+have changed since, by a reload or a restart. The whole text each entry quotes is
+screened again when the index is built, against the list in force then, as a fired
+wake's note is. **Round 18 fix, item 1.** Only quoted text is screened. The first fix
+screened the whole entry line, and the operator's address matched the list, so every
+report to that operator was withheld and a renewed session's index was nearly empty.
+The rest of a line is what Dromon writes, an identifier it generated, an address, a
+commit, a time, an outcome, or a run's command name from the project's declared runs.
+**Inference.** Leaving those out of the screen is safe because the index reaches only
+the line's own engine, which already receives each of them unscreened, its operators'
+addresses in every turn's header and mail listings, and the run commands and commits
+in ``run_status``, so the index discloses nothing the line was not already given. The
+list guards what leaves Dromon, and the index does not leave it.
+
+**Withheld entries.** **Round 18 fix, item 2.** An entry whose quoted text now holds a
+term is given without its text, as its identifier and the word withheld, so a renewed
+session can still open it with ``read_mail`` or ``role_status``, which apply their own
+screens. An identifier is named only when it has the form ``new_id`` gives, a letter,
+a hyphen and 12 lowercase hexadecimal digits, and is itself clear of the list, so it
+can carry no free text and no listed term. Any other identifier, such as one a peer
+chose, is not named, and a closing sentence counts such entries.
 
 **Residuals.** The index is given only where the scheduler knows the session is new.
 An engine that renews its own thread inside a kept connection without telling the
@@ -52,6 +67,7 @@ fixed bounds, which maps onto a bounded fold in Rust and in Keleusma.
 """
 
 import json
+import re
 from collections.abc import Callable
 from typing import Final
 
@@ -84,8 +100,15 @@ _CLOSING_RESERVE: Final = 200
 Discloses = Callable[[str], bool]
 """Whether a text holds a term of the disclosure list in force now."""
 
-Entry = tuple[str, tuple[str, ...]]
-"""An entry as given, with the whole texts it quotes, which are screened with it."""
+Entry = tuple[str, str, tuple[str, ...]]
+"""An entry's identifier, the entry as given, and the whole texts it quotes, which
+alone are screened."""
+
+GENERATED_ID: Final = re.compile(r"[a-z]-[0-9a-f]{12}")
+"""The form of an identifier ``dromon.scheduler.new_id`` gives, the only form a
+withheld entry is named by."""
+
+WITHHELD: Final = "withheld, since its text now holds a term of the disclosure list"
 
 
 def cut_text(text: str, limit: int) -> str:
@@ -96,6 +119,13 @@ def cut_text(text: str, limit: int) -> str:
     if len(encoded) <= limit:
         return first
     return encoded[: max(0, limit - 3)].decode("utf-8", "ignore") + "..."
+
+
+def nameable(identifier: str, discloses: Discloses) -> bool:
+    """Whether a withheld entry may be named by ``identifier``, which holds only when
+    it has the generated form and is itself clear of the list. Hexadecimal digits
+    can still spell a short term, which the second check withholds."""
+    return GENERATED_ID.fullmatch(identifier) is not None and not discloses(identifier)
 
 
 def _quote(text: str) -> str:
@@ -117,7 +147,7 @@ def _reports(state: State, line_id: str) -> list[Entry]:
         ):
             quoted = _quote(message.body)
             entry = f"- {message_id} to {message.recipient}, quoting {quoted}"
-            found.append((entry, (message.body,)))
+            found.append((message_id, entry, (message.body,)))
             if len(found) == MAX_REPORTS:
                 break
     return found
@@ -143,7 +173,7 @@ def _runs(state: State, line_id: str) -> list[Entry]:
             exit_text = "" if code is None else f" with exit code {code}"
             outcome = f"{run.ended.status.value}{exit_text} at {run.ended.ended_at}"
         entry = f"- {run_id}, {started.command}, on {commit}, {outcome}"
-        found.append((entry, (started.command,)))
+        found.append((run_id, entry, ()))
         if len(found) == MAX_RUNS:
             break
     return found
@@ -157,7 +187,7 @@ def _questions(state: State, line_id: str) -> list[Entry]:
             continue
         quoted = _quote(message.body)
         entry = f"- {message_id} to {message.recipient}, quoting {quoted}"
-        found.append((entry, (message.body,)))
+        found.append((message_id, entry, (message.body,)))
         if len(found) == MAX_QUESTIONS:
             break
     return found
@@ -170,7 +200,7 @@ def _notes(state: State, line_id: str) -> list[Entry]:
         if noted.line_id != line_id or noted.kind is not RoleNoteKind.NOTE:
             continue
         entry = f"- {entry_id} at {noted.noted_at}, quoting {_quote(noted.body)}"
-        found.append((entry, (noted.body,)))
+        found.append((entry_id, entry, (noted.body,)))
         if len(found) == MAX_NOTES:
             break
     return found
@@ -179,7 +209,8 @@ def _notes(state: State, line_id: str) -> list[Entry]:
 def evidence_index(state: State, line_id: str, discloses: Discloses) -> str | None:
     """The index of ``line_id``'s own evidence, or ``None`` when it has none or the
     line is unknown. At most ``MAX_EVIDENCE_BYTES`` bytes of UTF-8. ``discloses``
-    is the disclosure list in force now, and every entry is screened with it."""
+    is the disclosure list in force now, and the text each entry quotes is screened
+    with it."""
     if line_id not in state.lines:
         return None
     sections = (
@@ -198,15 +229,17 @@ def evidence_index(state: State, line_id: str, discloses: Discloses) -> str | No
     lines = [head, INDEX_BEGIN]
     used = sum(len(text.encode("utf-8")) + 1 for text in (head, INDEX_BEGIN, INDEX_END))
     left_out = 0
-    withheld = 0
+    unnamed = 0
     budget = MAX_EVIDENCE_BYTES - _CLOSING_RESERVE
     for title, entries_of in sections:
         entries: list[str] = []
-        for entry, texts in entries_of(state, line_id):
-            if any(discloses(text) for text in (*texts, entry)):
-                withheld += 1
-            else:
+        for identifier, entry, texts in entries_of(state, line_id):
+            if not any(discloses(text) for text in texts):
                 entries.append(entry)
+            elif nameable(identifier, discloses):
+                entries.append(f"- {identifier}, {WITHHELD}")
+            else:
+                unnamed += 1
         if not entries:
             continue
         title_line = f"{title}."
@@ -223,14 +256,14 @@ def evidence_index(state: State, line_id: str, discloses: Discloses) -> str | No
                 continue
             lines.append(entry)
             used += size
-    if len(lines) == 2 and not withheld:
+    if len(lines) == 2 and not unnamed:
         return None
     lines.append(INDEX_END)
     if left_out:
         lines.append(f"{left_out} further entries were left out to keep this bounded.")
-    if withheld:
+    if unnamed:
         lines.append(
-            f"{withheld} entries were withheld, since their text now holds a term of"
-            " the project's disclosure list."
+            f"{unnamed} entries were withheld with their identifiers, since their text"
+            " now holds a term of the disclosure list."
         )
     return "\n".join(lines)
