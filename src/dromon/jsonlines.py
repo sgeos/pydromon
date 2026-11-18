@@ -129,7 +129,7 @@ class Process:
 
     def __init__(
         self,
-        process: asyncio.subprocess.Process,
+        process: spawn.ChildProcess,
         policy: StopPolicy = StopPolicy.KILL_ALL,
         recording: evidence.Recording | None = None,
     ) -> None:

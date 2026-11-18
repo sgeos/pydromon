@@ -921,7 +921,7 @@ def test_a_process_list_that_cannot_be_parsed_is_unreadable(text: str) -> None:
 def test_the_real_session_search_finds_a_live_session_member(tmp_path: Path) -> None:
     """``getsid`` is asked of each process the stood-in list names, as on macOS,
     whose ``ps`` gives no session."""
-    child = subprocess.Popen(  # noqa: S603
+    child = spawn.start(
         [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
     )
     try:
@@ -1289,7 +1289,7 @@ def test_a_command_that_ignores_sigterm_is_killed_after_the_grace(
     tmp_path: Path,
 ) -> None:
     ready = tmp_path / "ready"
-    child = subprocess.Popen(  # noqa: S603
+    child = spawn.start(
         [
             sys.executable,
             "-c",
@@ -1310,9 +1310,7 @@ def test_a_command_that_ignores_sigterm_is_killed_after_the_grace(
 
 
 def test_a_command_that_ends_unstopped_is_never_signalled(tmp_path: Path) -> None:
-    child = subprocess.Popen(  # noqa: S603
-        [sys.executable, "-c", "pass"], process_group=0
-    )
+    child = spawn.start([sys.executable, "-c", "pass"], process_group=0)
     assert runs.Supervision().wait(child) == 0
 
 
@@ -1661,7 +1659,7 @@ def sleeper(
     if ignore_term:
         code += " signal.signal(signal.SIGTERM, signal.SIG_IGN);"
     code += " time.sleep(60)"
-    return subprocess.Popen(  # noqa: S603
+    return spawn.start(
         [sys.executable, "-c", code],
         start_new_session=own_session,
         process_group=None if own_session else 0,
@@ -1902,7 +1900,7 @@ def test_a_stop_that_never_comes_never_walks_the_table() -> None:
     def walk() -> list[TreeRow]:
         raise AssertionError("no stop was noted, so nothing may be walked")
 
-    child = subprocess.Popen([sys.executable, "-c", "pass"], process_group=0)  # noqa: S603
+    child = spawn.start([sys.executable, "-c", "pass"], process_group=0)
     assert runs.Supervision(walk, unchanged).wait(child) == 0
 
 

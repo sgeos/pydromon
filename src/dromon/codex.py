@@ -688,7 +688,7 @@ type ServerLister = Callable[[Mapping[str, str]], Sequence[str | ListedServer]]
 class _Process:
     def __init__(
         self,
-        process: asyncio.subprocess.Process,
+        process: spawn.ChildProcess,
         recording: evidence.Recording | None = None,
     ) -> None:
         self._process = process

@@ -2471,9 +2471,18 @@ daemon stops it, when the daemon stops or dies, and when the line's engine is st
   its group `SIGCONT`. It records a stop the launcher did not finish as
   `stop_unverified`, which `line_status` shows as `processes.stop_unverified`, and
   what still ran as `processes_left` with the cause `swept`. It touches no group whose
-  leader now runs another executable, or whose pid a running launcher's record
-  claims, and when the process table cannot be read it touches nothing and the record
-  waits. It reads the table whenever a record is unfinished, or its launcher's pid no
+  leader is another process than the harness the record names, or whose pid a running
+  launcher's record claims, and when the process table cannot be read it touches nothing
+  and the record waits. **Round 18, item 4.** The launcher records when it and its harness
+  started, as the kernel gives it, from `/proc` on Linux and `libproc` on macOS, and the
+  sweep tells the harness by that start time and not by the executable's name, so a pid given
+  to another process is not taken for the harness, and a harness that replaced itself with a
+  program of another name is not taken for another process. A record with no start time, as
+  an older launcher writes, is judged by the name as before. Immediately before each signal the
+  sweep reads the start time again, so a pid reused after the table was read is not signalled.
+  On Linux the harness is held by a `pidfd` for the signal, which closes the window, and on
+  macOS no handle names a process, so the window is only made small. It reads the
+  table whenever a record is unfinished, or its launcher's pid no
   longer answers a signal, so a sweep costs one `ps` while any engine runs. A
   launcher counts as exited when its pid is gone, when `ps` shows it `<defunct>`, or
   when its harness has another parent, since a running launcher stays its harness's

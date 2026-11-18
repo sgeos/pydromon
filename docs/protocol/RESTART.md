@@ -283,6 +283,26 @@ checkable and skipped without refusing restart before adapter construction.
 Their launch arguments and configuration remain unverified by preflight. Any failure refuses
 restart before the client sends its restart request.
 
+**Round 18, item 1. The launch smoke check.** After the engine startup checks the
+preflight runs `dromon.launchsmoke`. For each of the six engine kinds, and under both stop
+policies, it starts a stand-in harness through the function that the engine's adapter
+starts its harness with, so the same launcher and module command run, waits for the
+launcher's launch record, and runs the daemon's own sweep, `launcher.sweep_launches`,
+twice while the launchers live. A launch survives when the sweep ended nothing, removed
+no record, and its launcher and harness still run and are recognised as running. It starts no
+model, spends nothing, and its launches write their records to a private directory, so its
+sweep cannot reach a process that is not its own. A launch that does not survive refuses
+the restart and names the kind and the policy. **A process table that cannot be read.**
+Where `ps` cannot run the sweep touches nothing, so the daemon is safe, but nothing was
+shown, and the check prints `UNVERIFIED` with the reason and does not count it as a pass.
+The preflight then goes on, since it runs outside any sandbox and a limit of the machine
+it ran on is not a reason to refuse a restart. **Why it exists.** Pull request 157 changed
+the command that starts the launcher, and the sweep then took every live launcher of a
+Claude Code or Grok line for an exited one and ended its engine. No gate saw it, because none
+kept a launched engine alive past a sweep. **Limit.** Claude Code's start is run from the
+launcher script and the environment of `engine.launch_environment`, not through the Agent SDK,
+which would need a model.
+
 Fact. Codex reuses launch preparation, initialization, account reading, fresh thread
 creation and isolation checks. Grok reuses home and profile validation,
 initialization and fresh session creation with its model and server checks.

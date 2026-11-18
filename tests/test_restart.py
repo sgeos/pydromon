@@ -26,7 +26,8 @@ from typing import Any, Final, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import cli, client, daemon, eventlog, exits, fleet, registry, restart, spawn
+from dromon import cli, client, daemon, eventlog, exits, fleet, launcher, launchsmoke
+from dromon import registry, restart, spawn
 from dromon.registry import REGISTRY_DIR_ENV
 from dromon.activity import ActivityKind
 from dromon.configview import Overrides
@@ -2224,6 +2225,96 @@ def test_check_mode_runs_effective_lines_without_changing_the_live_log(
     assert checked == ["alpha", "gamma"]
     assert digest(paths.event_log) == before
     assert leftovers(paths) == []
+
+
+def _smoke_report(
+    survived: bool, unverified: str | None = None
+) -> launchsmoke.SmokeReport:
+    if unverified is not None:
+        return launchsmoke.SmokeReport((), unverified)
+    return launchsmoke.SmokeReport(
+        (
+            launchsmoke.SmokeResult(
+                "grok-build",
+                launcher.StopPolicy.KILL_ALL,
+                survived,
+                "survived" if survived else "the sweep ended it",
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("report", "status", "said"),
+    [
+        (_smoke_report(True), exits.OK, "1 of 1 launches survived"),
+        (_smoke_report(False), exits.FAILURE, "grok-build under kill_all FAILED"),
+        (_smoke_report(True, "ps cannot be run"), exits.OK, "UNVERIFIED"),
+    ],
+)
+def test_the_preflight_runs_the_launch_smoke_after_the_engine_checks(
+    live: World,
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    report: launchsmoke.SmokeReport,
+    status: int,
+    said: str,
+) -> None:
+    """A launcher that the successor's sweep would end refuses the restart before the
+    running daemon is stopped. A table that cannot be read is said, and goes on."""
+    config_path(paths.state_dir).write_text(AGREEING)
+    order: list[str] = []
+
+    async def engines(target: Daemon, socket_path: Path) -> bool:
+        del target, socket_path
+        order.append("engines")
+        return True
+
+    async def smoke() -> launchsmoke.SmokeReport:
+        order.append("smoke")
+        return report
+
+    monkeypatch.setattr(daemon, "check_engine_launches", engines)
+    monkeypatch.setattr(launchsmoke, "check_launches", smoke)
+    assert daemon.run(paths, check_only=True, launch_checks=True) == status
+    assert order == ["engines", "smoke"]
+    assert said in capsys.readouterr().err
+
+
+def test_a_failed_engine_check_does_not_run_the_launch_smoke(
+    live: World, paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path(paths.state_dir).write_text(AGREEING)
+    ran: list[str] = []
+
+    async def engines(target: Daemon, socket_path: Path) -> bool:
+        del target, socket_path
+        return False
+
+    async def smoke() -> launchsmoke.SmokeReport:
+        ran.append("smoke")
+        return _smoke_report(True)
+
+    monkeypatch.setattr(daemon, "check_engine_launches", engines)
+    monkeypatch.setattr(launchsmoke, "check_launches", smoke)
+    assert daemon.run(paths, check_only=True, launch_checks=True) == exits.FAILURE
+    assert ran == []
+
+
+def test_a_check_without_launch_checks_does_not_run_the_launch_smoke(
+    live: World, paths: ProjectPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path(paths.state_dir).write_text(AGREEING)
+    ran: list[str] = []
+
+    async def smoke() -> launchsmoke.SmokeReport:
+        ran.append("smoke")
+        return _smoke_report(True)
+
+    monkeypatch.setattr(launchsmoke, "check_launches", smoke)
+    assert daemon.run(paths, check_only=True) == exits.OK
+    assert ran == []
 
 
 def test_startup_tool_handlers_refuse_without_running_the_original(

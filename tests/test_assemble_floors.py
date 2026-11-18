@@ -5,7 +5,6 @@ history made here, with a merge whose subject is GitHub's, as ``main`` holds the
 """
 
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -19,6 +18,7 @@ from assemble_floors import (
     rows,
     written,
 )
+from dromon import spawn
 
 TABLE = f"""# Event log
 
@@ -33,8 +33,13 @@ After the table.
 def git(root: Path, *arguments: str) -> str:
     found = shutil.which("git")
     assert found is not None
-    return subprocess.run(  # noqa: S603
-        [found, *arguments], cwd=root, check=True, capture_output=True, text=True
+    return spawn.run(
+        [found, *arguments],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=300,
     ).stdout.strip()
 
 

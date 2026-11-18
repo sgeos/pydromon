@@ -2,7 +2,6 @@
 
 import os
 import select
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -10,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from dromon import testreport
+from dromon import spawn
 
 
 def test_omitted_test_report_is_grouped_and_bounded(tmp_path: Path) -> None:
@@ -23,7 +23,7 @@ def test_omitted_test_report_is_grouped_and_bounded(tmp_path: Path) -> None:
         "    pass\n",
         encoding="utf-8",
     )
-    result = subprocess.run(  # noqa: S603
+    result = spawn.run(
         [
             sys.executable,
             "-m",
@@ -38,6 +38,7 @@ def test_omitted_test_report_is_grouped_and_bounded(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
+        timeout=300,
     )
     assert result.returncode == 0, result.stderr
     assert "sample missing capability" in result.stdout
@@ -50,7 +51,7 @@ def test_omitted_test_report_is_grouped_and_bounded(tmp_path: Path) -> None:
 def _run_sample(tmp_path: Path, source: str, *arguments: str) -> str:
     sample = tmp_path / "test_kinds.py"
     sample.write_text(source, encoding="utf-8")
-    result = subprocess.run(  # noqa: S603
+    result = spawn.run(
         [
             sys.executable,
             "-m",
@@ -66,6 +67,7 @@ def _run_sample(tmp_path: Path, source: str, *arguments: str) -> str:
         capture_output=True,
         text=True,
         check=False,
+        timeout=300,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     return result.stdout
@@ -278,7 +280,7 @@ def test_a_slow_run_names_its_test_in_the_log_past_capture(tmp_path: Path) -> No
         encoding="utf-8",
     )
     environment = {**os.environ, testreport.SESSION_REPORT_ENV: "0.4"}
-    result = subprocess.run(  # noqa: S603
+    result = spawn.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "dromon.testreport", str(sample)],
         capture_output=True,
         text=True,

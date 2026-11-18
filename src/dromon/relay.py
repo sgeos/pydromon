@@ -353,7 +353,7 @@ class _StderrTail:
             os.close(self._read)
 
 
-async def _feed(process: "asyncio.subprocess.Process", payload: bytes) -> None:
+async def _feed(process: spawn.ChildProcess, payload: bytes) -> None:
     """Feed the command its input and wait for it to exit. Standard error is read by
     the ``_StderrTail`` the caller made, and not waited for."""
     stdin = process.stdin
@@ -373,7 +373,7 @@ ATTACHED_WAIT_SECONDS: Final = 3.0
 """How long ending a command waits for the walk that finds its descendants."""
 
 
-async def _end_group(process: "asyncio.subprocess.Process") -> None:
+async def _end_group(process: spawn.ChildProcess) -> None:
     """Kill the command's process group and its descendants, and reap the command.
 
     **Round 15, item 2.** The walk finds the descendants by ancestry, which includes

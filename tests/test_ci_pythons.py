@@ -1,11 +1,11 @@
 """The Python versions the gate type-checks are those the workflow tests. Round 15."""
 
-import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 from ci_pythons import WorkflowError, versions
+from dromon import spawn
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "ci_pythons.py"
@@ -79,21 +79,23 @@ def test_other_keys_and_comments_that_mention_python_are_not_versions() -> None:
 def test_the_real_workflow_lists_versions_and_the_command_prints_them() -> None:
     expected = versions((ROOT / ".github" / "workflows" / "ci.yml").read_text())
     assert expected, "the workflow lists no version"
-    result = subprocess.run(  # noqa: S603
+    result = spawn.run(
         [sys.executable, "-I", str(SCRIPT), str(ROOT / ".github/workflows/ci.yml")],
         capture_output=True,
         text=True,
         check=False,
+        timeout=300,
     )
     assert result.returncode == 0 and result.stdout.split() == expected
 
 
 def test_the_command_fails_on_a_missing_or_unreadable_workflow(tmp_path: Path) -> None:
-    result = subprocess.run(  # noqa: S603
+    result = spawn.run(
         [sys.executable, "-I", str(SCRIPT), str(tmp_path / "absent.yml")],
         capture_output=True,
         text=True,
         check=False,
+        timeout=300,
     )
     assert result.returncode == 1 and result.stdout == ""
     assert "ci_pythons.py" in result.stderr

@@ -100,7 +100,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, cast
 
-from dromon import redact
+from dromon import redact, spawn
 
 FORMAT_VERSION: Final = 1
 MAX_FRAMES: Final = 20_000
@@ -289,7 +289,7 @@ kept it."""
 
 
 def start_draining(
-    process: asyncio.subprocess.Process, recording: Recording | None
+    process: spawn.ChildProcess, recording: Recording | None
 ) -> asyncio.Task[None] | None:
     """A task that reads ``process``'s standard error to its end, into ``recording``
     when one is active, or ``None`` when the process has no piped standard error."""

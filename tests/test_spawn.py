@@ -333,12 +333,19 @@ def test_the_land_runner_reports_a_stall_as_its_own_status(
 
 CALLS = {"run", "Popen", "check_output", "check_call", "call", "getoutput"}
 ASYNC_CALLS = {"create_subprocess_exec", "create_subprocess_shell"}
-ASYNC_KNOWN = {"relay.py", "pi.py", "codex.py", "jsonlines.py", "grok.py"}
-"""The modules that start a child on the event loop, which runs ``Popen`` on the loop's
-own thread and cannot be moved to another. They are the known residual that
-``dromon.spawn`` names, and since round 17 they start through ``spawn.subprocess_exec``,
-which gives them the descriptor handling of ``start`` and not its bound. A new one fails
-the tests below, so the residual cannot grow unseen."""
+ASYNC_KNOWN = {
+    "relay.py",
+    "pi.py",
+    "codex.py",
+    "jsonlines.py",
+    "grok.py",
+    "launchsmoke.py",
+}
+"""The modules that start a child on the event loop. Since round 17 they start through
+``spawn.subprocess_exec``, and since round 18, item 3, that start is bounded as
+``spawn.start`` is, because ``asyncio``'s own function runs ``Popen`` on the loop's
+thread, where a stall stops the loop and no bound can end it. A new one fails the tests
+below, so no child is started on the loop by a path that has no bound."""
 
 
 def called(path: Path, names: set[str], owner: str) -> list[int]:
@@ -372,9 +379,11 @@ def test_no_module_starts_a_child_without_spawn_but_those_it_names() -> None:
     assert all(reason for reason in spawn.EXEMPT.values())
 
 
-def test_the_asyncio_starts_are_the_known_residual_and_go_through_spawn() -> None:
+def test_no_module_starts_a_child_with_asyncios_own_function_and_all_use_spawn() -> (
+    None
+):
     direct = {path.name for path in modules() if called(path, ASYNC_CALLS, "asyncio")}
-    assert direct == {"spawn.py"}, "a module starts a child on the loop by itself"
+    assert direct == set(), "a module starts a child on the loop, which has no bound"
     through = {
         path.name for path in modules() if called(path, {"subprocess_exec"}, "spawn")
     }
@@ -2645,9 +2654,7 @@ def test_a_sampler_that_does_not_end_is_killed_and_reported(tmp_path: Path) -> N
     reason="needs the macOS sampler",
 )
 def test_the_macos_sampler_gives_the_stack_of_a_real_child() -> None:
-    child = subprocess.Popen(  # noqa: S603  # direct on purpose
-        [sys.executable, "-I", "-c", "import time; time.sleep(60)"]
-    )
+    child = spawn.start([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
     try:
         text = spawn.sample_process(child.pid)
     finally:
@@ -2855,14 +2862,14 @@ def test_a_start_on_the_loop_leaves_the_closing_to_the_child_where_that_is_the_s
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(spawn.CHILD_CLOSES_ENV, "1")
-    seen: list[dict[str, Any]] = []
-    real = asyncio.create_subprocess_exec
+    seen: list[dict[str, object]] = []
+    real = spawn._REAL_POPEN  # pyright: ignore[reportPrivateUsage]
 
-    async def record(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:  # noqa: ANN401
+    def record(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
         seen.append(dict(kwargs))
-        return await real(*args, **kwargs)
+        return real(*args, **kwargs)  # type: ignore[arg-type]  # noqa: S603  # direct on purpose
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", record)
+    monkeypatch.setattr(spawn.subprocess, "Popen", record)
 
     async def go() -> None:
         process = await spawn.subprocess_exec(*TRUE)
@@ -2876,14 +2883,14 @@ def test_a_start_on_the_loop_without_the_fork_lock_is_left_to_the_child(
     hygiene: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(spawn, "_FORK_INSTALLED", [False])
-    seen: list[dict[str, Any]] = []
-    real = asyncio.create_subprocess_exec
+    seen: list[dict[str, object]] = []
+    real = spawn._REAL_POPEN  # pyright: ignore[reportPrivateUsage]
 
-    async def record(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:  # noqa: ANN401
+    def record(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
         seen.append(dict(kwargs))
-        return await real(*args, **kwargs)
+        return real(*args, **kwargs)  # type: ignore[arg-type]  # noqa: S603  # direct on purpose
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", record)
+    monkeypatch.setattr(spawn.subprocess, "Popen", record)
 
     async def go() -> None:
         process = await spawn.subprocess_exec(*TRUE)
@@ -2900,15 +2907,15 @@ def test_a_start_on_the_loop_whose_sweep_did_not_run_is_killed_and_fails(
         del sweep
 
     monkeypatch.setattr(spawn, "_sweep_inheritable", skip)
-    made: list[asyncio.subprocess.Process] = []
-    real = asyncio.create_subprocess_exec
+    made: list[subprocess.Popen[Any]] = []
+    real = spawn._REAL_POPEN  # pyright: ignore[reportPrivateUsage]
 
-    async def record(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:  # noqa: ANN401
-        process = await real(*args, **kwargs)
+    def record(*args: object, **kwargs: object) -> subprocess.Popen[Any]:
+        process = real(*args, **kwargs)  # type: ignore[arg-type]  # noqa: S603  # direct on purpose
         made.append(process)
         return process
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", record)
+    monkeypatch.setattr(spawn.subprocess, "Popen", record)
 
     async def go() -> None:
         with pytest.raises(OSError, match="sweep did not run"):
@@ -2917,7 +2924,7 @@ def test_a_start_on_the_loop_whose_sweep_did_not_run_is_killed_and_fails(
             )
 
     asyncio.run(go())
-    assert len(made) == 1 and made[0].returncode is not None
+    assert len(made) == 1 and made[0].poll() is not None
 
 
 def test_a_sweep_that_cannot_list_fails_a_start_on_the_loop_and_makes_no_child(

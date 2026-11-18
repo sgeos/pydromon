@@ -19,6 +19,7 @@ import pytest
 from dromon import BRIDGE_LOG_VARIABLE, acp
 from dromon.bridgelog import MAX_LOG_BYTES, MAX_RECORD_BYTES
 from dromon.privatefiles import open_log
+from dromon import spawn
 
 INITIALIZE = json.dumps(
     {
@@ -40,7 +41,7 @@ def _python(
     environment = {k: v for k, v in os.environ.items() if k != BRIDGE_LOG_VARIABLE}
     if log is not None:
         environment[BRIDGE_LOG_VARIABLE] = str(log)
-    return subprocess.run(  # noqa: S603
+    return spawn.run(
         [sys.executable, "-I", "-c", code],
         capture_output=True,
         text=True,
@@ -244,13 +245,37 @@ def test_the_total_log_cap_stops_many_individually_small_records(
     assert MAX_LOG_BYTES // 2 < len(data) <= MAX_LOG_BYTES
 
 
+MAX_ROOT_BYTES = 40
+"""The longest project root the fixture accepts. The socket path inside it has a limit
+of 103 bytes on macOS, and the bridge adds its runtime directory and a socket name."""
+
+
+def short_project_root() -> Path:
+    """A new directory whose path fits ``MAX_ROOT_BYTES``. **Round 18.** The default
+    temporary directory is tried first, since an agent sandbox allows it and its own
+    ``TMPDIR`` is short, and ``/tmp`` second, which the sandbox refuses and which the
+    long default on macOS needs. With neither, the test is skipped and says why, because
+    a root too long for the socket would fail for a reason that is not the test's."""
+    refused: list[str] = []
+    for parent in (tempfile.gettempdir(), "/tmp"):  # noqa: S108  # the short fallback
+        try:
+            root = Path(tempfile.mkdtemp(prefix="pj", dir=parent))
+        except OSError as error:
+            refused.append(f"{parent} is not writable ({error.strerror})")
+            continue
+        if len(os.fsencode(root)) <= MAX_ROOT_BYTES:
+            return root
+        shutil.rmtree(root, ignore_errors=True)
+        refused.append(f"{parent} is longer than {MAX_ROOT_BYTES} bytes")
+    pytest.skip("no short writable directory: " + "; ".join(refused))
+
+
 @pytest.fixture
 def private_project() -> Generator[Path]:
     """A project whose ``.dromon``, ``.dromon/run`` and ``secret`` cannot be read, as a
     Grok line's profile makes them. A mode of 000 is the closest a test has to a
     sandbox rule, since a test cannot apply one inside the sandbox that runs it."""
-    # A short path, since the socket path inside it has a limit of 103 bytes.
-    root = Path(tempfile.mkdtemp(prefix="pj", dir="/tmp"))
+    root = short_project_root()
     (root / ".dromon" / "run").mkdir(parents=True)
     (root / "secret").mkdir()
     (root / "secret" / "key").write_text("not for lines", encoding="utf-8")
@@ -270,7 +295,7 @@ def test_the_bridge_answers_initialize_with_the_private_directories_unreadable(
     """Review of the Grok failure of 2026-11-16, item 2. The handshake answers before
     any tool call reaches the daemon, so it must not need a path the profile denies."""
     root = private_project
-    result = subprocess.run(  # noqa: S603
+    result = spawn.run(
         [
             sys.executable,
             "-I",
@@ -294,3 +319,24 @@ def test_the_bridge_answers_initialize_with_the_private_directories_unreadable(
     assert result.returncode == 0, result.stderr
     answer = json.loads(result.stdout.splitlines()[0])
     assert answer["id"] == 1 and answer["result"]["serverInfo"]["name"] == "dromon"
+
+
+def test_a_root_too_long_for_the_socket_is_skipped_with_the_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    long = tmp_path / ("d" * MAX_ROOT_BYTES)
+    long.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(long))
+    real = tempfile.mkdtemp
+
+    def refuse_tmp(prefix: str, dir: str) -> str:  # noqa: A002
+        if dir == "/tmp":  # noqa: S108
+            raise PermissionError(1, "Operation not permitted")
+        return real(prefix=prefix, dir=dir)
+
+    monkeypatch.setattr(tempfile, "mkdtemp", refuse_tmp)
+    with pytest.raises(pytest.skip.Exception) as raised:
+        short_project_root()
+    assert "is longer than" in str(raised.value)
+    assert "/tmp is not writable" in str(raised.value)  # noqa: S108
+    assert list(long.iterdir()) == [], "the too-long root was removed"

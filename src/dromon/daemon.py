@@ -196,7 +196,7 @@ from dromon.model import (
     State,
     parse_any_address,
 )
-from dromon import launcher
+from dromon import launcher, launchsmoke
 from dromon.paths import PathError, ProjectPaths, ensure_private_dir, project_paths
 from dromon.forwarder import (
     Connector,
@@ -3937,6 +3937,19 @@ ENGINE_CHECK_SECONDS: Final = 90
 """The no-prompt startup deadline for each configured line."""
 
 
+async def check_launch_survival() -> bool:
+    """Run the launch smoke check and print its report, and say whether the restart
+    may go on. **Round 18, item 1.** A launcher that the sweep would end fails the
+    check, which is the defect that pull request 157 shipped. A process table that
+    cannot be read is said, and does not fail it, since the sweep touches nothing
+    where it cannot read the table, and the preflight is not made to refuse a restart
+    on a limit of the machine it ran on. ``dromon.launchsmoke`` says why."""
+    report = await launchsmoke.check_launches()
+    for line in report.lines():
+        print(f"dromond: {line}", file=sys.stderr)
+    return report.passed or report.unverified is not None
+
+
 async def check_engine_launches(daemon: Daemon, socket_path: Path) -> bool:
     """Check each effective line through the production factory without a prompt.
 
@@ -4264,6 +4277,10 @@ def run(
                         if not asyncio.run(
                             check_engine_launches(daemon, scratch / "lines.sock")
                         ):
+                            return exits.FAILURE
+                        # Round 18, item 1. After the engines start, a stand-in of
+                        # each kind must survive the sweep that the successor runs.
+                        if not asyncio.run(check_launch_survival()):
                             return exits.FAILURE
                     # Round 16 review, finding 2. Read last, after the engine
                     # checks, so it is as near the stop as the check comes.

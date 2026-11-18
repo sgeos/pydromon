@@ -25,6 +25,7 @@ from dromon.scheduler import (
     LineSpec,
     Scheduler,
 )
+from dromon import spawn
 
 HAIKU = "claude-haiku-5-5"
 AT = "2026-10-31T09:00:00Z"
@@ -35,12 +36,11 @@ WAIT_SECONDS = 30
 def git(directory: Path, *arguments: str) -> str:
     """Run git in ``directory`` for the test's own setup, apart from the daemon's
     reads, which go through ``dromon.spawn``."""
-    import subprocess
 
     environment = {
         name: value for name, value in os.environ.items() if not name.startswith("GIT_")
     }
-    done = subprocess.run(  # noqa: S603
+    done = spawn.run(
         [  # noqa: S607
             "git",
             "-C",
@@ -57,6 +57,7 @@ def git(directory: Path, *arguments: str) -> str:
         capture_output=True,
         text=True,
         env=environment,
+        timeout=300,
     )
     return done.stdout.strip()
 

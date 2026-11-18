@@ -32,7 +32,6 @@ import hashlib
 import os
 import re
 import shutil
-import subprocess
 import sys
 from collections.abc import Generator, Iterator, Mapping
 from contextlib import contextmanager
@@ -44,6 +43,7 @@ import pytest
 
 from dromon import model, statesnapshot
 from dromon.model import DisclosureChecked, Event, HoldCause, State
+from dromon import spawn
 
 PIN_DIRECTORY = Path(__file__).parent / "state_pins"
 
@@ -371,11 +371,12 @@ def test_a_stray_file_does_not_stop_the_package_importing(tmp_path: Path) -> Non
         " from dromon import statesnapshot as s;"
         " print(s.STATE_VERSION, s.FOUND_STATE_CHANGES.ignored, s.__file__)"
     )
-    found = subprocess.run(  # noqa: S603
+    found = spawn.run(
         [sys.executable, "-I", "-c", probe, str(copy.parent)],
         capture_output=True,
         text=True,
         check=True,
+        timeout=300,
     ).stdout.split()
     assert found[0] == statesnapshot.STATE_VERSION
     assert found[1] == "('base.txt.orig',)"

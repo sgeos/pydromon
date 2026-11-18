@@ -12,7 +12,6 @@ import os
 import shlex
 import socket
 import stat
-import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -44,6 +43,7 @@ from dromon.paths import ProjectPaths, project_paths
 from dromon.projectconfig import ConfigFileError, ProjectConfig, parse
 from dromon.sandbox import SandboxError, parse_sandbox
 from dromon.scheduler import LineSpec, engine_factory
+from dromon import spawn
 
 
 def blob(*fields: bytes) -> str:
@@ -484,11 +484,12 @@ def test_a_space_in_a_path_survives_the_shell_git_uses() -> None:
     are compared with the words intended."""
     access = access_at(Path("/key files/a b"), "/run/my agent.sock")
     command = ssh_command(access)
-    echoed = subprocess.run(  # noqa: S603
+    echoed = spawn.run(
         ["/bin/sh", "-c", "printf '%s\\n' " + command.removeprefix("ssh ")],
         capture_output=True,
         text=True,
         check=True,
+        timeout=300,
     )
     assert ["ssh", *echoed.stdout.splitlines()] == shlex.split(command)
     assert f'IdentityAgent="{access.socket}"' in echoed.stdout.splitlines()

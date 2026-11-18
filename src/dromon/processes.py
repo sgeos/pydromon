@@ -43,6 +43,7 @@ import queue
 import threading
 import secrets
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -1099,6 +1100,186 @@ def identity_of(pid: int, timeout: float = IDENTITY_SECONDS) -> tuple[int, str] 
         return int(fields[0]), " ".join(fields[1:])
     except ValueError:
         return None
+
+
+START_TIME_PLATFORMS: Final = ("linux", "darwin")
+"""The platforms on which ``start_time`` gives a reading."""
+
+START_TOLERANCE_SECONDS: Final = 0.05
+"""How far two readings of one process's start time may differ and still be the same
+process. A reading is exact on macOS, to the microsecond, and on Linux to a clock tick,
+which is 10 milliseconds at the usual rate, and the two are never compared across
+those. The tolerance is far below the time in which a pid can be reused."""
+
+ROW_START_TOLERANCE_SECONDS: Final = 2.0
+"""How far a row's ``lstart``, which has whole seconds and goes through local time, may
+differ from a direct reading of the same process's start time."""
+
+_PROC_PIDTBSDINFO: Final = 3
+"""The ``proc_pidinfo`` flavor that fills ``proc_bsdinfo``, from ``sys/proc_info.h``."""
+
+_BSDINFO_BYTES: Final = 136
+"""The size of ``proc_bsdinfo``, whose last 16 bytes are the two 64-bit start times,
+in seconds and then microseconds. **Fact, checked on macOS on 2026-11-18.**
+``proc_pidinfo`` filled exactly this many bytes, and the time read for a child fell
+within the interval in which its parent started it, to the microsecond. **Not
+checked.** Other macOS releases, for which a call that fills another size is refused
+and not guessed at."""
+
+
+def parse_proc_stat_start(text: str, boot_time: float, ticks: float) -> float | None:
+    """The start time, in seconds since the epoch, that ``/proc/PID/stat``'s text gives,
+    or ``None`` when it is not in that form. The command name is the second field and
+    is in parentheses that it may itself contain, so the fields are counted from the
+    last closing one. The twenty-second field, ``starttime``, is in clock ticks since
+    boot."""
+    close = text.rfind(")")
+    if close < 0 or ticks <= 0:
+        return None
+    fields = text[close + 1 :].split()
+    # The state is the third field of the file, so the first field after the name is
+    # index 0 here and the twenty-second field of the file is index 19.
+    if len(fields) < 20 or not fields[19].isdecimal():
+        return None
+    return boot_time + int(fields[19]) / ticks
+
+
+def _linux_start(pid: int) -> float | None:
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as handle:
+            text = handle.read(4096)
+        with open("/proc/stat", encoding="utf-8", errors="replace") as handle:
+            booted = next(
+                (
+                    line
+                    for line in handle.read(65536).splitlines()
+                    if line[:6] == "btime "
+                ),
+                "",
+            )
+        return parse_proc_stat_start(
+            text, float(booted.split()[1]), float(os.sysconf("SC_CLK_TCK"))
+        )
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _darwin_start(pid: int) -> float | None:
+    try:
+        import ctypes  # noqa: PLC0415
+
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        raw = (ctypes.c_char * _BSDINFO_BYTES)()
+        if lib.proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, raw, _BSDINFO_BYTES) != (
+            _BSDINFO_BYTES
+        ):
+            return None
+        seconds, micros = struct.unpack_from("<QQ", raw.raw, _BSDINFO_BYTES - 16)
+        return seconds + micros / 1_000_000
+    except (OSError, AttributeError, ValueError, struct.error):
+        return None
+
+
+def start_time(pid: int) -> float | None:
+    """When ``pid`` started, in seconds since the epoch, as the kernel gives it, or
+    ``None`` when no such process exists or the platform gives no reading. **Round 18,
+    item 4.** A pid is reused, and a start time is the identity that tells the process
+    that held it from the one that holds it now, since a process's start time never
+    changes and a new process has a later one. The reading is made without starting a
+    process, from ``/proc`` on Linux and from ``libproc`` on macOS, so it takes
+    microseconds and works where ``ps`` cannot run or is slow, which the ``ps``-based
+    ``identity_of`` does not. **Porting hazard.** ``ctypes`` and the layout of
+    ``proc_bsdinfo`` are platform details, and a Rust port reads both through ``libc``
+    or the ``procfs`` crate. **Not read.** Platforms other than these two, where this
+    gives ``None`` and every caller falls back to what it did before."""
+    if type(pid) is not int or pid <= 0:
+        return None
+    if sys.platform == "linux":
+        return _linux_start(pid)
+    if sys.platform == "darwin":
+        return _darwin_start(pid)
+    return None
+
+
+def same_start(recorded: float | None, now: float | None) -> bool:
+    """Whether two readings of a start time name one process. Not knowing is never a
+    match, so a missing reading on either side is not."""
+    return (
+        recorded is not None
+        and now is not None
+        and abs(recorded - now) <= START_TOLERANCE_SECONDS
+    )
+
+
+def signal_if_started(pid: int, number: int, started: float) -> bool:
+    """Signal ``pid`` only if it is the process that started at ``started``, and say
+    whether it was signalled. **Round 18, item 4.** On Linux the process is first held
+    by a ``pidfd``, which names the process and never the number, so a pid reused
+    after the check cannot receive the signal, and the window is closed. Elsewhere the
+    start time is read again immediately before ``os.kill``, which leaves the time
+    between those two calls, microseconds with no process started in it, and not the
+    seconds that a table read before the decision leaves. **Residual, macOS.** No
+    handle names a process there, so that window is not closed, only made small."""
+    if type(pid) is not int or pid <= 1:
+        return False
+    opener = getattr(os, "pidfd_open", None)
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if sys.platform == "linux" and opener is not None and sender is not None:
+        try:
+            descriptor = opener(pid)
+        except OSError:
+            return False
+        try:
+            if not same_start(started, start_time(pid)):
+                return False
+            sender(descriptor, number)
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(descriptor)
+    if not same_start(started, start_time(pid)):
+        return False
+    try:
+        os.kill(pid, number)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def signal_group_if_started(group: int, number: int, started: float) -> bool:
+    """Signal process group ``group`` unless its leader's pid now belongs to another
+    process, and say whether any process of the group remained, as
+    ``launcher.signal_group`` does, so ``0`` asks. **Round 18, item 4.** A group
+    outlives its leader, and while any member runs the number cannot be given to a new
+    group, so a leader that is gone is no reason to refuse. A leader that is there with
+    another start time is a new process that took the number after the group ended,
+    and its group is not the one meant, so nothing is sent. **Residual.** The check
+    and ``killpg`` are two calls, and no handle names a group on either platform."""
+    if type(group) is not int or group <= 1:
+        return False
+    leader = start_time(group)
+    if leader is not None and not same_start(started, leader):
+        return False
+    try:
+        os.killpg(group, number)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def row_is_same_process(row: TreeRow, now: float | None) -> bool:
+    """Whether ``now``, a direct reading of the start time of ``row.pid``, is that of
+    the process ``row`` listed. A row that was listed without a start time cannot be
+    checked, and is taken as it was before this check existed. A process that cannot
+    be read is gone."""
+    if row.started == "":
+        return True
+    if now is None:
+        # A platform with no reading cannot tell, and is taken as it was before.
+        return sys.platform not in START_TIME_PLATFORMS
+    listed = lstart_epoch(row.started)
+    return listed is not None and abs(listed - now) <= ROW_START_TOLERANCE_SECONDS
 
 
 def deepest_first(rows: Sequence[TreeRow]) -> list[TreeRow]:

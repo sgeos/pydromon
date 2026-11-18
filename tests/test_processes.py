@@ -1040,7 +1040,7 @@ def test_the_start_time_of_a_walk_is_the_one_the_identity_check_reads() -> None:
     """With the real ``ps``. The two readings are of one process and must agree to the
     character, or a real stop would turn every descendant away as changed. Only the
     full gate, outside a sandbox, runs this."""
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    child = spawn.start([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         rows = attached(os.getpid())
         assert rows is not None

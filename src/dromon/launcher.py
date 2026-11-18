@@ -127,6 +127,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final, cast
 
+from dromon import spawn
 from dromon.modulecommand import module_command
 from dromon.processes import (
     LAUNCHER_NAMES,
@@ -134,6 +135,11 @@ from dromon.processes import (
     TreeReadFailure,
     TreeRow,
     descendants,
+    row_is_same_process,
+    same_start,
+    signal_group_if_started,
+    signal_if_started,
+    start_time,
     tree_or_reason,
 )
 from dromon.engine_environment import (
@@ -543,7 +549,7 @@ async def sweep_group(group: int) -> None:
 
 
 async def end(
-    process: asyncio.subprocess.Process,
+    process: spawn.ChildProcess,
     policy: StopPolicy,
     *,
     close_input: bool,
@@ -713,6 +719,15 @@ class LaunchRecord:
     launched_ns: int | None = None
     """When the launcher wrote the record, in nanoseconds of the wall clock, from the
     record's name, or ``None`` when the name does not carry it."""
+    launcher_started: float | None = None
+    """When the launcher process started, in seconds since the epoch, as
+    ``processes.start_time`` read it as the launcher wrote the record, or ``None`` for a
+    record that has none. **Round 18, item 4.** A pid is reused, and a process that
+    started later is not the launcher, whatever its command says."""
+    harness_started: float | None = None
+    """The same for the harness. It stays the harness's identity through a change of
+    its command, as a script engine that replaces itself with a native program makes,
+    which the executable's name does not."""
 
 
 def launched_at(path: Path) -> int | None:
@@ -720,6 +735,16 @@ def launched_at(path: Path) -> int | None:
     as ``main`` writes it, or ``None`` for another name."""
     _, _, stamp = path.name.removesuffix(LAUNCH_SUFFIX).partition("-")
     return int(stamp) if stamp.isascii() and stamp.isdigit() else None
+
+
+def _started_of(value: object) -> float | None:
+    """A start time a record carries, or ``None`` when it carries none or one that is
+    not a positive finite number, which is then treated as absent and never trusted,
+    so a sweep falls back to the executable's name for that record."""
+    if type(value) not in (int, float):
+        return None
+    number = float(cast(float, value))
+    return number if 0 < number < float("inf") else None
 
 
 def parse_launch(path: Path, raw: bytes) -> LaunchRecord | None:
@@ -754,6 +779,8 @@ def parse_launch(path: Path, raw: bytes) -> LaunchRecord | None:
         StopPolicy(str(policy)),
         done,
         launched_at(path),
+        _started_of(fields.get("launcher_started")),
+        _started_of(fields.get("harness_started")),
     )
 
 
@@ -818,21 +845,59 @@ DEFUNCT: Final = "<defunct>"
 been reaped, on macOS and on Linux alike."""
 
 
+def _started_as(pid: int, recorded: float | None) -> bool | None:
+    """Whether the process now holding ``pid`` is the one that started at ``recorded``,
+    read from the operating system, or ``None`` when that cannot be told, which is when
+    nothing was recorded or the start time cannot be read. **Round 18, item 4.** Not
+    knowing is never taken as knowing, so a caller that gets ``None`` does what it did
+    before start times were recorded, which is to go by the executable's name."""
+    if recorded is None:
+        return None
+    now = start_time(pid)
+    return None if now is None else same_start(recorded, now)
+
+
+def _is_harness(record_command: str, harness: TreeRow, started: float | None) -> bool:
+    """Whether the process listed as ``harness`` is the harness the record names. By its
+    recorded start time when there is one and it can be read, which survives a harness
+    that replaced itself with another program, and else by the recorded executable's
+    name, as before."""
+    known = _started_as(harness.pid, started)
+    return record_command in harness.command if known is None else known
+
+
 def launcher_running(
-    rows: Sequence[TreeRow], pid: int, harness: int | None = None, command: str = ""
+    rows: Sequence[TreeRow],
+    pid: int,
+    harness: int | None = None,
+    command: str = "",
+    *,
+    launcher_started: float | None = None,
+    harness_started: float | None = None,
 ) -> bool:
     """Whether ``rows`` hold a launcher under ``pid`` that still holds its harness. A
     pid reused by any other process is not one, nor a launcher that has exited and
     not been reaped, nor one whose ``harness``, recognised by ``command``, now has
     another parent, since a running launcher stays its harness's parent until it
-    reaps it. **Third live run of N1, 2026-10-26.**"""
+    reaps it. **Third live run of N1, 2026-10-26.**
+
+    **Round 18, item 4, and audit's finding on 162.** The name was all that told a
+    launcher from another process that was given its pid, so a launcher whose pid went
+    to another launcher was taken as running, and a harness that had replaced itself
+    with a program of another name was never held to its parent. With the start times
+    the launcher recorded, ``launcher_started`` and ``harness_started``, a process that
+    started at another time is another process, whatever it is called, and the
+    harness is recognised by when it started and not by its name. A start time that
+    was not recorded or cannot be read leaves the earlier behaviour."""
     row = next((row for row in rows if row.pid == pid), None)
     if row is None or row.has_marker("<defunct>"):
         return False
     if not any(row.has_marker(name) for name in LAUNCHER_NAMES):
         return False
+    if _started_as(pid, launcher_started) is False:
+        return False
     held = next((row for row in rows if row.pid == harness), None)
-    if held is None or command not in held.command:
+    if held is None or not _is_harness(command, held, harness_started):
         return True
     return held.ppid == pid
 
@@ -849,7 +914,7 @@ def _answers(pid: int) -> bool:
 
 def read_rows() -> list[TreeRow] | TreeReadFailure:
     """The daemon's user's processes, or why they cannot be read."""
-    return tree_or_reason(os.getuid())
+    return tree_or_reason(os.getuid(), with_start=True)
 
 
 async def sweep_launches(
@@ -893,7 +958,14 @@ async def sweep_launches(
         record
         for record in records
         if record not in suspect
-        or launcher_running(rows, record.launcher, record.harness, record.command)
+        or launcher_running(
+            rows,
+            record.launcher,
+            record.harness,
+            record.command,
+            launcher_started=record.launcher_started,
+            harness_started=record.harness_started,
+        )
     ]
     claimed = {record.harness for record in running}
     swept: list[Swept] = []
@@ -914,7 +986,9 @@ async def _sweep_one(
     skipped = None
     if claimed:
         skipped = "another launch's harness now holds its pid"
-    elif leader is not None and record.command not in leader.command:
+    elif leader is not None and not _is_harness(
+        record.command, leader, record.harness_started
+    ):
         skipped = "another process now holds the harness's pid"
     found = {row.pid: row for row in rows if row.pgid == harness}
     if leader is not None:
@@ -934,9 +1008,9 @@ async def _sweep_one(
         return await _end_found(record, found)
     ended: tuple[int, ...] = ()
     if not record.done and leader is not None:
-        _send(harness, signal.SIGKILL)
+        _signal_harness(record, signal.SIGKILL)
         ended = (harness,)
-    signal_group(harness, signal.SIGCONT)
+    _signal_group(record, signal.SIGCONT)
     left = (
         ()
         if record.done
@@ -954,23 +1028,51 @@ async def _sweep_one(
     )
 
 
+def _signal_group(record: LaunchRecord, number: int) -> bool:
+    """``launcher.signal_group`` for the record's harness group, unless the harness's
+    pid now belongs to another process, as ``processes.signal_group_if_started``
+    checks, when the record has the harness's start time. **Round 18, item 4.**"""
+    if record.harness_started is None:
+        return signal_group(record.harness, number)
+    return signal_group_if_started(record.harness, number, record.harness_started)
+
+
+def _signal_harness(record: LaunchRecord, number: int) -> None:
+    """Signal the record's harness, if its pid is still the harness's, which is told
+    from its start time when the record has one, and from nothing otherwise."""
+    if record.harness_started is None:
+        _send(record.harness, number)
+    else:
+        signal_if_started(record.harness, number, record.harness_started)
+
+
+def _signal_found(row: TreeRow, number: int) -> None:
+    """Signal a process the sweep listed, unless its pid now belongs to another
+    process. The process is checked now, against the start time its row carried, so a
+    process that ended and was replaced since the table was read, which in a sweep of
+    several records can be seconds, is not signalled. A row without a start time is
+    signalled as before. **Round 18, item 4.**"""
+    if row_is_same_process(row, start_time(row.pid)):
+        _send(row.pid, number)
+
+
 async def _end_found(record: LaunchRecord, found: Mapping[int, TreeRow]) -> Swept:
     """``KILL_ALL``: end the group and what else was found, within a bound."""
     harness = record.harness
     others = sorted(pid for pid, row in found.items() if row.pgid != harness)
-    signal_group(harness, signal.SIGTERM)
-    signal_group(harness, signal.SIGCONT)
+    _signal_group(record, signal.SIGTERM)
+    _signal_group(record, signal.SIGCONT)
     for pid in others:
-        _send(pid, signal.SIGTERM)
-        _send(pid, signal.SIGCONT)
+        _signal_found(found[pid], signal.SIGTERM)
+        _signal_found(found[pid], signal.SIGCONT)
     for _ in range(int(EXIT_SECONDS / CHECK_SECONDS)):
-        if not signal_group(harness, 0) and not any(_alive(pid) for pid in others):
+        if not _signal_group(record, 0) and not any(_alive(pid) for pid in others):
             break
         await asyncio.sleep(CHECK_SECONDS)
-    signal_group(harness, signal.SIGKILL)
+    _signal_group(record, signal.SIGKILL)
     for pid in others:
         if _alive(pid):
-            _send(pid, signal.SIGKILL)
+            _signal_found(found[pid], signal.SIGKILL)
     await asyncio.sleep(CHECK_SECONDS)
     left = tuple(row for pid, row in sorted(found.items()) if _alive(pid))
     return Swept(
@@ -1294,10 +1396,17 @@ def write_launch(
     command: str,
     policy: StopPolicy,
     done: bool,
+    *,
+    launcher_started: float | None = None,
+    harness_started: float | None = None,
 ) -> Path | None:
     """Write or rewrite the launcher's record of its harness, as the module's account
-    of review N1 says."""
-    document = {
+    of review N1 says. **Round 18, item 4.** It also records when the launcher and its
+    harness started, from the operating system, which the daemon's sweep compares with
+    the start time of whatever holds the pid at the sweep, so a pid that was given to
+    another process is told from the process it was. A start time that could not be
+    read is left out."""
+    document: dict[str, object] = {
         "v": 1,
         "mark": mark,
         "launcher": os.getpid(),
@@ -1306,6 +1415,10 @@ def write_launch(
         "policy": policy.value,
         "done": done,
     }
+    if launcher_started is not None:
+        document["launcher_started"] = launcher_started
+    if harness_started is not None:
+        document["harness_started"] = harness_started
     return _write_private(target, document)
 
 
@@ -1517,6 +1630,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 127
     if relay is not None:
         relay.start()
+    started_launcher, started_harness = start_time(me), start_time(child.pid)
     record = (
         None
         if report is None
@@ -1527,6 +1641,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             target,
             policy,
             done=False,
+            launcher_started=started_launcher,
+            harness_started=started_harness,
         )
     )
     exits = ExitWatch(child.pid)
@@ -1555,7 +1671,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         _report_left(report, mark, cause, left, listed)
     exits.close()
     if record is not None:
-        write_launch(record, mark, child.pid, target, policy, done=True)
+        write_launch(
+            record,
+            mark,
+            child.pid,
+            target,
+            policy,
+            done=True,
+            launcher_started=started_launcher,
+            harness_started=started_harness,
+        )
     status = reap(child)
     return 1 if policy is StopPolicy.KILL_ALL and not stop_verified else status
 

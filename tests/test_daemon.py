@@ -6,7 +6,6 @@ import os
 import signal
 import socket
 import stat
-import subprocess
 import sys
 import threading
 import time
@@ -46,6 +45,7 @@ from dromon.protocol import (
 from dromon.scheduler import LineEngine, LineSpec, Scheduler
 from dromon.launcher import StopPolicy, TreeRow
 from dromon.mailbox import counts_unanswered
+from dromon import spawn
 
 HAIKU = "claude-haiku-5-5"
 
@@ -944,7 +944,7 @@ def test_a_second_daemon_exits_without_disturbing_the_first(
 ) -> None:
     paths, _ = running
     # A fixed argument vector built from the interpreter and test paths.
-    second = subprocess.run(  # noqa: S603
+    second = spawn.run(
         [
             sys.executable,
             "-m",
