@@ -336,7 +336,19 @@ check and still fails at the first turn, since finding that would start a sandbo
    a property of each directory, a volume may be mounted from elsewhere, and the
    answer would differ between hosts and so between test runs. **Cost.** On a volume
    that keeps case apart, a grant of another directory whose name differs from a
-   listed path only in case is refused too. **Residual, from the audit line,
+   listed path only in case is refused too. **Round 18, addendum 2, item 2. Fact,
+   confirmed before the change.** A grant spelled with a decomposed accent, a letter
+   and a combining mark, was accepted under a home spelled with the composed letter,
+   and a volume that ignores the normalisation form opens the same directory for
+   both. Both sides of both refusals now pass through `sandbox.folded_path`, which
+   decomposes, folds case and decomposes again, Unicode's canonical caseless
+   matching. The canonical form is used and not the compatibility form, since a
+   volume equates canonically equivalent names and not, for example, a superscript
+   digit and the digit. **Cost.** As with case, a different directory whose name
+   differs only in normalisation form is refused on a volume that keeps the forms
+   apart. **Residual, untested.** The file-tool deny rules are written in the form the
+   home is spelled in, and whether Claude Code's own matcher folds case or form was
+   not tested. **Residual, from the audit line,
    untested.** `$HOME/.ssh` and `~other/.ssh` are accepted as text that is neither
    absolute nor home-relative. Whether the engine expands either was not tested.
    *A second list for Claude Code, item 5.* `security_paths.CLAUDE_CODE_ONLY_PATHS`

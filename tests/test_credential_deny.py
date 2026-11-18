@@ -646,3 +646,66 @@ def test_the_daemon_checks_a_project_sandbox_with_no_lines(
     with pytest.raises(SandboxError, match="credential path"):
         check_sandboxes(parse(text), paths)
     check_sandboxes(parse(text.replace(home, home + "/.cache/uv")), paths)
+
+
+# Round 18, addendum 2, item 2.
+
+COMPOSED = "café"
+DECOMPOSED = "café"
+
+
+@pytest.fixture
+def accented_home(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """A daemon home whose name holds an accented letter in the composed form, with
+    an ssh directory in it, as the audit line's spelling gap needed."""
+    base = Path(os.path.realpath(tmp_path_factory.mktemp("accented")))
+    accented = base / COMPOSED
+    (accented / ".ssh").mkdir(parents=True)
+    monkeypatch.setattr(security_paths, "daemon_home", lambda: accented)
+    return accented
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        pytest.param("", id="the-home"),
+        pytest.param("/.ssh", id="a-listed-directory"),
+        pytest.param("/.ssh/id_test", id="inside-one"),
+        pytest.param("/.S*", id="a-pattern-in-another-case-too"),
+    ],
+)
+def test_a_grant_in_another_normalisation_form_is_refused(
+    tmp_path: Path, accented_home: Path, suffix: str
+) -> None:
+    """Round 18, addendum 2, item 2. Confirmed before the change, a grant spelled with
+    a decomposed accent was accepted under a home spelled with a composed one, while
+    a volume that ignores the normalisation form opens the same directory for both.
+    The comparison is normalised on both sides, on every host."""
+    spelled = str(accented_home.parent / DECOMPOSED) + suffix
+    assert spelled != str(accented_home) + suffix
+    own = parse_sandbox({"filesystem": {"allowRead": [spelled]}}, operator=False)
+    with pytest.raises(SandboxError, match="credential path|Dromon protects"):
+        built(tmp_path, LineConfig(sandbox=own))
+
+
+def test_a_grant_of_a_name_that_only_looks_alike_is_accepted(
+    tmp_path: Path, accented_home: Path
+) -> None:
+    """The negative path. A name without the accent is another name in every form, so
+    a grant of it is not refused."""
+    plain = str(accented_home.parent / "cafe")
+    own = parse_sandbox({"filesystem": {"allowRead": [plain]}}, operator=False)
+    built(tmp_path, LineConfig(sandbox=own))
+
+
+def test_a_protected_directory_in_another_normalisation_form_is_refused(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / COMPOSED
+    (root / "secret").mkdir(parents=True)
+    spelled = str(tmp_path / DECOMPOSED / "secret" / "x")
+    own = parse_sandbox({"filesystem": {"allowRead": [spelled]}}, operator=False)
+    with pytest.raises(SandboxError, match="directory Dromon protects"):
+        built(root, LineConfig(sandbox=own))

@@ -164,7 +164,7 @@ relay = "tail"          # the route of operator ana's mail
 | `daemon.operator` | identifier | `operator` | The default operator. It also declares that operator, whom a peer may reach before that operator has sent anything, as decision 25 of [`FEDERATION.md`](../architecture/FEDERATION.md) specifies. The built-in default declares no one |
 | `daemon.tick_seconds` | number in [0, 60] | 1 | The maximum tick wait in seconds. Zero waits for events and due timers |
 | `daemon.require_sandbox` | boolean | `false` | Whether every Claude Code line must run with an enabled sandbox, as below |
-| `daemon.default_profile` | profile name | none | The profile a line created or configured through the client takes when the file does not declare it and it runs on the engine of the profile's `model`, as below. Added in round 18 |
+| `daemon.default_profile` | profile name | none | The profile a line created or configured through the client takes when the file does not declare it and it runs on the engine of the profile's `model`, as below. A client `config` that weakens the profile's sandbox switches is refused. Added in round 18 |
 | `daemon.disclosure_terms` | path | none | The project's disclosure list, relative to the project root, as below |
 | `daemon.machine_status` | path | none | The file the machine's monitor writes its status to, read before a run or a turn starts, as [`RUNS.md`](../architecture/RUNS.md) specifies. A leading `~` is the home directory and a relative path is relative to the project root. Nothing is read, and nothing is deferred, unless it is set. A reload applies it. No line's sandbox or file tools may write the file or its directory. A status that is stale, missing or unreadable defers runs until the monitor writes again, so the operator restores gates by restarting the monitor or removing this key and reloading. Added on 2026-11-11 |
 | `read_only_paths` | list of relative paths | empty | Existing files or directories denied writes under every line's resolved workdir. Symbolic links are resolved and targets must remain inside that workdir |
@@ -365,8 +365,29 @@ With `daemon.default_profile` naming a profile, `create_line` builds such a line
 configuration from that profile under the client's `config`, when the line's model runs
 on the same engine as the profile's `model`. The profile's tool keys are replaced whole
 by any key the client sends, as a line's own key replaces its profile's in the file, and
-its `sandbox` and `settings` merge under the client's, so the client cannot drop a
-denial or rule the profile adds. `configure_line` does the same for a line the file
+its `sandbox` and `settings` merge under the client's, the client's being the more
+specific layer, so a scalar both set takes the client's value and the lists of both
+are united. **The guarantee, round 18, addendum 2, item 1.** What a client cannot
+remove is every list entry the profile adds, which are its settings rules, such as
+`ask` and `deny`, and its sandbox lists, such as `filesystem.denyWrite`, together
+with the sandbox that carries them. A client document that sets `sandbox.enabled`
+false, `sandbox.failIfUnavailable` false or `sandbox.filesystem.disabled` true is
+refused with an error naming the key, unless the profile itself sets that value,
+since each would switch off or make optional the sandbox that carries the profile's
+denials. An unset key counts as its secure value, which the daemon fills in for a
+Claude Code line. The refusal fails closed rather than letting the profile's value
+win silently, so the client learns that its document was not taken as sent. **What
+a client may still change.** It may replace any tool key, such as `builtin_tools`,
+add entries to any list, including `allowWrite`, `allowRead` and `allowedDomains`,
+whose grants are refused only where they reach a credential path or a directory
+Dromon protects, and set any other sandbox scalar, such as
+`enableWeakerNestedSandbox` or `network.strictAllowlist`, where its own value wins.
+An `allow` settings rule the client adds does not remove the profile's `ask` or
+`deny` rules, and that Claude Code applies a `deny` before an `allow` is an inference
+from its documentation that was not tested here. **Residual.** The guarantee is
+against a client or an agent with manage access weakening the profile's sandbox
+switches, and not against every widening of a line, which the operator at a client
+may make by design. `configure_line` does the same for a line the file
 does not declare, so a later configuration cannot drop them either. A line the file
 declares takes the file's definition, as before. A line on another engine is created
 as the client sent it, so a profile for Claude Code never reaches a Codex, Grok, Pi,

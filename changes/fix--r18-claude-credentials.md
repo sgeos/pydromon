@@ -41,3 +41,9 @@ Type: Fixed
 - On a Linux host without `bwrap` or `socat`, a start, `dromond --check` and
   `dromon check-engines` warn of every Claude Code line whose sandbox is enabled,
   since each would fail at its first turn.
+- Under `daemon.default_profile`, a client document whose sandbox sets
+  `enabled` false, `failIfUnavailable` false or `filesystem.disabled` true, which
+  the profile does not set itself, is refused with an error naming the key, since
+  it switched off the sandbox that carries the profile's denials.
+- A sandbox grant spelled in another Unicode normalisation form of a credential
+  path or a protected directory is refused, as one in another letter case is.

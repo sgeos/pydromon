@@ -41,6 +41,7 @@ unchanged. Path resolution uses ``os.path``, which matches POSIX semantics only.
 import json
 import os
 import re
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -369,16 +370,39 @@ def _with_real_forms(paths: Iterable[str]) -> list[str]:
     return sorted(forms)
 
 
+def folded_path(path: str) -> str:
+    """``path`` in Unicode's canonical caseless form, decomposed, folded and decomposed
+    again, as the Unicode standard's definition D145 of canonical caseless matching
+    gives, so that two spellings a volume treats as one name compare equal.
+
+    **Round 18, addendum 2, item 2.** Folding case alone let a grant spelled in the
+    decomposed form of an accented letter, ``e`` and a combining acute accent, pass a
+    guard spelled in the composed form, since the two strings differ while a volume
+    that ignores the normalisation form opens the same directory for both. Both sides
+    of every comparison go through this one function, so neither can be normalised
+    and the other not. **Choice.** The canonical form, NFD, and not the compatibility
+    form, NFKD, since a volume equates canonical equivalents and not compatibility
+    ones, such as a superscript digit and the digit. Case folding itself joins a few
+    such pairs, such as a ligature and its letters, which only refuses more.
+    **Cost.** As with case, a different directory whose name differs from a guarded
+    one only in normalisation form is refused on a volume that keeps the forms apart.
+    **Porting note.** A port needs the same Unicode version's tables to fold the same
+    names."""
+    decomposed = unicodedata.normalize("NFD", path)
+    return unicodedata.normalize("NFD", decomposed.casefold())
+
+
 def _within(path: str, directory: Path) -> bool:
     """Whether ``path``, with a leading ``~`` expanded as Claude Code expands it, lies
-    in ``directory``, compared in folded case for the reason ``_overlaps`` gives."""
+    in ``directory``, compared in the form ``folded_path`` gives, for the reasons
+    ``_overlaps`` and it give."""
     expanded = os.path.expanduser(path)
     if not expanded.startswith("/"):
         return False
     # Real paths on both sides, so a symbolic link such as macOS's /tmp cannot
     # disguise a protected directory.
-    real = os.path.realpath(expanded).casefold()
-    guarded = os.path.realpath(directory).casefold()
+    real = folded_path(os.path.realpath(expanded))
+    guarded = folded_path(os.path.realpath(directory))
     return os.path.commonpath([real, guarded]) == guarded
 
 
@@ -433,7 +457,7 @@ def _grant_base(path: str) -> str:
 
 def _overlaps(base: str, guarded: Path) -> bool:
     """Whether ``base`` is ``guarded``, an ancestor of it or inside it, compared by
-    real path on both sides and in folded case.
+    real path on both sides and in the folded form ``folded_path`` gives.
 
     **Round 18, last pass, item 1.** A grant spelled in another case, such as
     ``.SSH`` for ``.ssh``, names the same directory on a volume that ignores case,
@@ -446,8 +470,8 @@ def _overlaps(base: str, guarded: Path) -> bool:
     is refused too, which an operator can rename around."""
     if not base.startswith("/"):
         return False
-    real = os.path.realpath(base).casefold()
-    guard = os.path.realpath(guarded).casefold()
+    real = folded_path(os.path.realpath(base))
+    guard = folded_path(os.path.realpath(guarded))
     return os.path.commonpath([real, guard]) in (real, guard)
 
 

@@ -309,3 +309,119 @@ def test_dromon_config_names_the_profile(
     assert "default profile: claude, for lines on claude-code" in (
         capsys.readouterr().out
     )
+
+
+# Round 18, addendum 2, item 1.
+
+HELD = [
+    pytest.param({"enabled": False}, "sandbox.enabled", id="enabled"),
+    pytest.param(
+        {"failIfUnavailable": False}, "sandbox.failIfUnavailable", id="fail-if"
+    ),
+    pytest.param(
+        {"filesystem": {"disabled": True}},
+        "sandbox.filesystem.disabled",
+        id="filesystem-disabled",
+    ),
+]
+
+
+@pytest.mark.parametrize(("sandbox", "key"), HELD)
+def test_a_client_sandbox_that_weakens_the_profile_s_is_refused(
+    sandbox: dict[str, object], key: str
+) -> None:
+    """Confirmed before the change, each of these was accepted, and the line's sandbox
+    kept the profile's denials in a document that was disabled or optional."""
+    profile = parse("version = 1\n" + PROFILE).default_profile
+    with pytest.raises(ConfigError, match=f"{key} .* profile 'claude'"):
+        apply_default_profile(profile, HAIKU, {"sandbox": sandbox})
+
+
+@pytest.mark.parametrize(("sandbox", "key"), HELD)
+def test_the_daemon_refuses_it_at_create_and_configure(
+    paths: ProjectPaths, sandbox: dict[str, object], key: str
+) -> None:
+    with attached(paths, loaded(paths, PROFILE)) as client:
+        refused = client.ask("create_line", create("beta", HAIKU, {"sandbox": sandbox}))
+        assert not refused.ok and key in (refused.error_message or "")
+        assert "beta" not in client.daemon.log.state.lines
+        client.ok("create_line", create("beta", HAIKU))
+        refused = client.ask(
+            "configure_line", {"line_id": "beta", "config": {"sandbox": sandbox}}
+        )
+        assert not refused.ok and key in (refused.error_message or "")
+        given = client.daemon.scheduler.effective_config("beta")
+        assert given.sandbox is not None
+        assert "/work/.git/objects" in json.dumps(given.sandbox.document())
+
+
+@pytest.mark.parametrize(("sandbox", "key"), HELD)
+def test_the_same_document_is_accepted_without_a_profile_or_on_another_engine(
+    sandbox: dict[str, object], key: str
+) -> None:
+    """The negative paths. The refusal guards a profile's sandbox, so it applies only
+    where a profile is applied."""
+    document = {"sandbox": sandbox}
+    apply_default_profile(None, HAIKU, document)
+    profile = parse("version = 1\n" + PROFILE).default_profile
+    _, applied = apply_default_profile(profile, CODEX, document)
+    assert not applied
+
+
+def test_the_secure_value_is_accepted() -> None:
+    profile = parse("version = 1\n" + PROFILE).default_profile
+    secure = {
+        "enabled": True,
+        "failIfUnavailable": True,
+        "filesystem": {"disabled": False},
+    }
+    config, applied = apply_default_profile(profile, HAIKU, {"sandbox": secure})
+    assert applied and config.sandbox is not None
+    given = config.sandbox.document()
+    assert given["enabled"] is True and given["failIfUnavailable"] is True
+
+
+def test_a_weaker_value_the_profile_sets_itself_is_accepted() -> None:
+    """The profile's own choice is the operator's, so a client that repeats it is not
+    weakening anything."""
+    text = PROFILE.replace(
+        "[profiles.claude.sandbox.filesystem]",
+        "[profiles.claude.sandbox]\nfailIfUnavailable = false\n"
+        "[profiles.claude.sandbox.filesystem]",
+    )
+    profile = parse("version = 1\n" + text).default_profile
+    config, _ = apply_default_profile(
+        profile, HAIKU, {"sandbox": {"failIfUnavailable": False}}
+    )
+    assert config.sandbox is not None
+    assert config.sandbox.document()["failIfUnavailable"] is False
+    with pytest.raises(ConfigError, match="sandbox.enabled"):
+        apply_default_profile(profile, HAIKU, {"sandbox": {"enabled": False}})
+
+
+def test_the_client_s_layer_is_the_more_specific() -> None:
+    """Pins the merge order. A scalar both layers set takes the client's value, here a
+    stronger one over the profile's weaker one and a key that is not held, and the
+    lists keep the profile's entries first. This fails if the layers are swapped."""
+    text = PROFILE.replace(
+        "[profiles.claude.sandbox.filesystem]",
+        "[profiles.claude.sandbox]\nfailIfUnavailable = false\n"
+        "autoAllowBashIfSandboxed = true\n"
+        "[profiles.claude.sandbox.filesystem]",
+    )
+    profile = parse("version = 1\n" + text).default_profile
+    own = {
+        "sandbox": {
+            "failIfUnavailable": True,
+            "autoAllowBashIfSandboxed": False,
+            "filesystem": {"denyWrite": ["/work/own"]},
+        }
+    }
+    config, _ = apply_default_profile(profile, HAIKU, own)
+    assert config.sandbox is not None
+    given = config.sandbox.document()
+    assert given["failIfUnavailable"] is True
+    assert given["autoAllowBashIfSandboxed"] is False
+    assert json.dumps(given["filesystem"]) == json.dumps(
+        {"denyWrite": ["/work/.git/objects", "/work/own"]}
+    )

@@ -35,6 +35,7 @@ from dromon.sandbox import (
     SandboxError,
     blocks_unsandboxed,
     effective,
+    folded_path,
     host_unavailable_reason,
     merge,
     parse_sandbox,
@@ -906,3 +907,47 @@ def test_dromond_s_check_says_so_before_any_turn(
     assert daemon.run(paths, check_only=True) == exits.OK
     err = capsys.readouterr().err
     assert "dromond: warning: it cannot start, so the Claude Code lines plain," in err
+
+
+# Round 18, addendum 2, item 2.
+
+
+@pytest.mark.parametrize(
+    ("one", "other"),
+    [
+        pytest.param("/h/caf\u00e9", "/h/cafe\u0301", id="composed-and-decomposed"),
+        pytest.param("/h/CAF\u00c9", "/h/cafe\u0301", id="and-in-another-case"),
+        pytest.param("/h/\u212b", "/h/\u00e5", id="angstrom-sign-and-letter"),
+        pytest.param("/h/Stra\u00dfe", "/h/STRASSE", id="sharp-s"),
+        pytest.param(
+            "/h/\u03b1\u0345\u0301",
+            "/h/\u03b1\u0301\u0345",
+            id="marks-in-either-order",
+        ),
+    ],
+)
+def test_names_a_volume_treats_as_one_fold_alike(one: str, other: str) -> None:
+    """Canonical caseless matching, both sides through the one function. The last
+    pair needs the decomposition before the folding as well as after, since folding
+    the combining iota subscript makes it a letter, which fixes its place."""
+    assert one != other
+    assert folded_path(one) == folded_path(other)
+
+
+@pytest.mark.parametrize(
+    ("one", "other"),
+    [
+        pytest.param("/h/cafe", "/h/caf\u00e9", id="an-accent-is-a-letter"),
+        pytest.param("/h/x\u00b2", "/h/x2", id="a-superscript-is-not-canonical"),
+    ],
+)
+def test_names_that_differ_stay_apart(one: str, other: str) -> None:
+    """The negative path. The compatibility forms, such as a superscript digit, are
+    not folded together, since a volume opens them as different names. A ligature is
+    folded with its letters by case folding itself, which only refuses more."""
+    assert folded_path(one) != folded_path(other)
+
+
+def test_the_folded_form_is_stable() -> None:
+    once = folded_path("/H/Cafe\u0301/\u1e9e")
+    assert folded_path(once) == once

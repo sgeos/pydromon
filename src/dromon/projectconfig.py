@@ -285,10 +285,13 @@ class DefaultProfile:
     or Grok line. ``tools`` are the profile's own tool keys, as the file gives them,
     which a key the client sends replaces whole, as a line's own key replaces its
     profile's in the file. ``sandbox`` and ``settings`` merge under the client's, so the
-    client cannot drop a denial the profile adds. The profile's ``git_ssh``, ``limits``,
-    ``wake`` and ``may_own`` are not applied, since each is authority or policy the file
-    gives the lines it names, and ``configwarnings`` says so for ``git_ssh``. A profile
-    that grants ``secrets`` is refused, since a client-created line is granted none."""
+    client cannot drop a list entry the profile adds, such as a denial or an ask rule,
+    and a client sandbox that weakens one of ``HELD_SANDBOX_KEYS`` is refused, **round
+    18, addendum 2, item 1**. Every other scalar the client sets wins. The profile's
+    ``git_ssh``, ``limits``, ``wake`` and ``may_own`` are not applied, since each is
+    authority or policy the file gives the lines it names, and ``configwarnings`` says
+    so for ``git_ssh``. A profile that grants ``secrets`` is refused, since a
+    client-created line is granted none."""
 
     name: str
     model: str
@@ -299,16 +302,78 @@ class DefaultProfile:
     git_ssh: bool
 
 
+HELD_SANDBOX_KEYS: Final[tuple[tuple[tuple[str, ...], bool], ...]] = (
+    (("enabled",), True),
+    (("failIfUnavailable",), True),
+    (("filesystem", "disabled"), False),
+)
+"""The sandbox scalars a client may not weaken under a default profile, each with its
+secure value, which is also what the profile gives when it leaves the key unset.
+**Round 18, addendum 2, item 1.** The sandbox layers merge with the more specific
+scalar winning, and the client's layer is the more specific, so a client document
+that set ``enabled`` false, ``failIfUnavailable`` false or ``filesystem.disabled``
+true switched off, or made optional, the sandbox that carries the profile's denials.
+An unset key counts as the secure value, since the daemon gives a Claude Code line an
+enabled sandbox and fills in ``failIfUnavailable`` when no layer sets them, and
+``filesystem.disabled`` is false unless a layer sets it."""
+
+
+def _value_at(document: Mapping[str, object], path: tuple[str, ...]) -> object:
+    """The value at ``path``, which is not empty, in ``document``, or ``None`` where a
+    step is missing."""
+    if not path:
+        raise ValueError("an empty key path")
+    current: Mapping[str, object] = document
+    for step in path[:-1]:
+        inner = current.get(step)
+        if not isinstance(inner, dict):
+            return None
+        current = cast(dict[str, object], inner)
+    return current.get(path[-1])
+
+
+def _refuse_weakening(profile: DefaultProfile, own: SandboxConfig | None) -> None:
+    """Raise ``ConfigError`` naming the first key of ``HELD_SANDBOX_KEYS`` that the
+    client's sandbox sets to the weaker value while the profile does not. Fail closed,
+    rather than letting the profile's value win silently, so the client learns that
+    its document was not taken as sent. A client may set the secure value, or the
+    weaker one where the profile itself sets it."""
+    if own is None:
+        return
+    given = own.document()
+    held = {} if profile.sandbox is None else profile.sandbox.document()
+    for path, secure in HELD_SANDBOX_KEYS:
+        value = _value_at(given, path)
+        if value is None or value == secure:
+            continue
+        if _value_at(held, path) == value:
+            continue
+        key = ".".join(path)
+        raise ConfigError(
+            f"sandbox.{key} {str(value).lower()} would weaken the sandbox of profile"
+            f" {profile.name!r}, which daemon.default_profile applies to this line, so"
+            f" it is refused. Leave sandbox.{key} unset, or name the line in the"
+            " project file"
+        )
+
+
 def apply_default_profile(
     profile: DefaultProfile | None, model: str, document: Mapping[str, object]
 ) -> tuple[LineConfig, bool]:
     """The configuration a client-created line on ``model`` with the client's
     ``document`` runs with, and whether ``profile`` was applied, which it is only for
     a line on the profile's engine. Raises ``ConfigError`` as
-    ``config_from_document`` does."""
+    ``config_from_document`` does, and for a client sandbox that weakens one of
+    ``HELD_SANDBOX_KEYS``.
+
+    **Order.** The profile is the less specific layer and the client's the more, so a
+    scalar both set takes the client's value, as a line's own key wins over its
+    profile's in the file, and the lists of both are united. The held keys are the
+    exception, refused rather than reordered, and a test pins the order."""
     own = config_from_document(document)
     if profile is None or ENGINE_OF.get(model) != profile.engine:
         return own, False
+    _refuse_weakening(profile, own.sandbox)
     tools = {
         **profile.tools,
         **{key: value for key, value in document.items() if key not in LAYERED_KEYS},
