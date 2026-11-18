@@ -6,6 +6,7 @@ from importlib import resources
 
 import pytest
 
+from dromon import prices
 from dromon.driver import (
     API_ONLY_MODELS,
     INITIAL_STATE,
@@ -15,9 +16,11 @@ from dromon.driver import (
     ENGINES,
     MAX_SETTINGS,
     MODELS,
+    Action,
     ActionTag,
     Driver,
     DriverError,
+    DriverState,
     Event,
     Strategy,
     driver_resource,
@@ -189,6 +192,28 @@ def test_tool_uses_are_counted_and_the_budget_interrupts() -> None:
         ActionTag.INTERRUPT,
         "tool_budget",
         3,
+    )
+
+
+@pytest.mark.parametrize(("model", "strategy"), EVERY_DRIVER)
+def test_every_driver_interrupts_just_past_its_own_declared_budget(
+    model: str, strategy: Strategy
+) -> None:
+    # Round 18 audit, low finding. The settings tests compare what a driver declares,
+    # so a driver whose own check moved from greater to greater or equal still passed.
+    # This one steps each packaged driver to the budget it declares and one past it.
+    driver = Driver.for_model(model, strategy)
+    budget = driver.settings.tool_budget
+    assert budget >= 1
+    driver.step(Event("turn_start"))
+    for used in range(1, budget + 1):
+        allowed = driver.step(Event("tool_use", "Read"))
+        assert (allowed.tag, allowed.number) == (ActionTag.CONTINUE, used)
+    over = driver.step(Event("tool_use", "Read"))
+    assert (over.tag, over.text, over.number) == (
+        ActionTag.INTERRUPT,
+        "tool_budget",
+        budget + 1,
     )
 
 
@@ -391,6 +416,57 @@ def test_sol_and_terra_follow_the_luna_drivers_with_the_catalogues_window(
         )
 
 
+GPT_6_2_SUCCESSORS = [
+    ("gpt-6.2-sol", "gpt-6.1-sol", 500000),
+    ("gpt-6.2-astra", "gpt-6-astra", 272000),
+]
+
+
+@pytest.mark.parametrize(("model", "predecessor", "window"), GPT_6_2_SUCCESSORS)
+@pytest.mark.parametrize("strategy", Strategy)
+def test_gpt_6_2_drivers_derive_from_their_predecessors(
+    model: str, predecessor: str, window: int, strategy: Strategy
+) -> None:
+    # Codex's model cache, read by the operator on 2026-11-18, calls each predecessor
+    # the previous generation and gives each new model the predecessor's default
+    # window. No turn on either has run through Dromon, so every setting but the model
+    # copies the predecessor's for the same strategy.
+    assert ENGINE_OF[model] == ENGINE_OF[predecessor] == "codex"
+    driver = Driver.for_model(model, strategy)
+    previous = Driver.for_model(predecessor, strategy).settings
+    assert driver.settings == replace(previous, model=model)
+    assert driver.settings.context_window == window
+    assert (
+        driver.step(Event("init", reported_model(predecessor))).tag is ActionTag.REFUSE
+    )
+    assert driver.step(Event("init", reported_model(model))).tag is ActionTag.ACCEPT
+
+
+@pytest.mark.parametrize(("model", "predecessor", "window"), GPT_6_2_SUCCESSORS)
+def test_gpt_6_2_drivers_carry_the_predecessors_placeholder_price(
+    model: str, predecessor: str, window: int
+) -> None:
+    # No published price was read, so each takes the highest Codex placeholder, which
+    # is also its predecessor's, and an estimate errs high.
+    del window
+    new = {name for name, _, _ in GPT_6_2_SUCCESSORS}
+    earlier = [
+        prices.PRICES[name]
+        for name, engine in ENGINE_OF.items()
+        if engine == "codex" and name in prices.PRICES and name not in new
+    ]
+    highest = max(
+        earlier,
+        key=lambda price: (
+            price.input_micro,
+            price.cached_input_micro,
+            price.output_micro,
+        ),
+    )
+    assert prices.PRICES[model] == highest == prices.PRICES[predecessor]
+    assert not prices.PRICES_VERIFIED
+
+
 @pytest.mark.parametrize("element", ["argon", "carbon", "hydrogen"])
 @pytest.mark.parametrize("strategy", Strategy)
 def test_gemini_cursor_settings_derive_from_luna(
@@ -417,3 +493,41 @@ def test_pi_argon_derives_metered_settings_and_refuses_other_strategies() -> Non
     for strategy in (Strategy.SUBSCRIPTION, Strategy.FLEXIBLE):
         with pytest.raises(DriverError, match="only the api strategy"):
             Driver.for_model(model, strategy)
+
+
+def scripted_turn(driver: Driver, model: str) -> list[tuple[Action, DriverState]]:
+    """Every action and state of one ordinary turn, with the model's own name."""
+    events = [
+        Event("credential", "api"),
+        Event("credential", "subscription"),
+        Event("init", reported_model(model)),
+        Event("turn_start"),
+        Event("tool_use", "Read"),
+        Event("text", "", 5),
+        Event("result", "success", 3),
+        Event("turn_start"),
+        Event("something_new", "x", 9),
+    ]
+    return [(driver.step(event), driver.state) for event in events]
+
+
+SUCCESSORS = [
+    *((model, predecessor) for model, predecessor, _ in GPT_6_2_SUCCESSORS),
+    *NEW_DRIVERS,
+]
+
+
+@pytest.mark.parametrize(("model", "predecessor"), SUCCESSORS)
+@pytest.mark.parametrize("strategy", Strategy)
+def test_new_drivers_decide_a_turn_as_their_predecessors_do(
+    model: str, predecessor: str, strategy: Strategy
+) -> None:
+    # The derivation tests compare settings, and this compares what the driver's own
+    # code decides, with the model's name the only difference.
+    new = scripted_turn(Driver.for_model(model, strategy), model)
+    old = scripted_turn(Driver.for_model(predecessor, strategy), predecessor)
+    renamed = {model: predecessor, reported_model(model): reported_model(predecessor)}
+    assert [
+        (replace(action, text=renamed.get(action.text, action.text)), state)
+        for action, state in new
+    ] == old

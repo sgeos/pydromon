@@ -10,6 +10,8 @@ import asyncio
 import json
 import re
 import os
+import sys
+import threading
 from collections.abc import (
     AsyncGenerator,
     AsyncIterator,
@@ -26,8 +28,12 @@ import pytest
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    CLINotFoundError,
     Message,
+    PermissionMode,
     PermissionResultAllow,
+    ProcessError,
+    ResultError,
     PermissionResultDeny,
     RateLimitEvent,
     RateLimitInfo,
@@ -45,15 +51,19 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import RateLimitStatus
 from dromon.activity import ActivityKind, ActivityLog, Observer, ignore
 from dromon import engine as engine_module
+from dromon import evidence
 from dromon import hookpolicy
 from dromon.driver import Action, Credential, Driver, Event, Strategy, driver_resource
+from dromon.engine_environment import CLAUDE_ENGINE_ENVIRONMENT
 from dromon.launcher import StopPolicy
 from dromon.priority import SteeredDriver
 from dromon.lineconfig import DEFAULT_CONFIG, LineConfig, McpServer, ToolPolicy
 from dromon.engine import (
     API_ENVIRONMENT,
     BILLING_LIMIT,
+    ENGINE_CLOSED_PREFIX,
     ConfinementBreach,
+    EngineClosed,
     EnginePlanLimit,
     KEY_SOURCES,
     MCP_SERVER_NAME,
@@ -1135,6 +1145,59 @@ def test_the_ask_rule_joins_the_operator_rules_once() -> None:
     assert replaced["permissions"] == {"ask": ["Read"]}
 
 
+TRUE_VALUES = ("1", "true", "yes", "on")
+"""What the bundled Claude Code 2.1.310 reads as true for its switch variables, read
+on 2026-11-18. A value it reads as false would force auto memory on."""
+
+
+def test_auto_memory_is_off_in_the_launch_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Round 18, item 2. The operator's auto-memory index reached every line, whose
+    # worktree sits inside the project directory.
+    monkeypatch.setattr(engine_module, "claude_cli", lambda: "/bin/claude")
+    environment = launch_environment(None, StopPolicy.KILL_ALL, None)
+    value = environment["CLAUDE_CODE_DISABLE_AUTO_MEMORY"]
+    assert value.lower() in TRUE_VALUES
+
+
+def test_the_launcher_filter_keeps_the_auto_memory_switch() -> None:
+    # The launcher keeps only listed variables, so an unlisted switch would be dropped
+    # before Claude Code starts.
+    assert "CLAUDE_CODE_DISABLE_AUTO_MEMORY" in CLAUDE_ENGINE_ENVIRONMENT
+
+
+@pytest.mark.parametrize(
+    "given",
+    [
+        None,
+        {},
+        {"autoMemoryEnabled": True, "env": {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "0"}},
+        {"autoMemoryEnabled": "yes", "env": "nonsense"},
+    ],
+)
+def test_the_flag_settings_turn_auto_memory_off_whatever_the_line_gives(
+    given: dict[str, object] | None,
+) -> None:
+    # The flag settings' env block comes after the global configuration's, and a
+    # value read as false there would force the memory on before the setting is read.
+    merged = engine_module.flag_settings(given)
+    assert merged["autoMemoryEnabled"] is False
+    block = cast(dict[str, object], merged["env"])
+    assert str(block["CLAUDE_CODE_DISABLE_AUTO_MEMORY"]).lower() in TRUE_VALUES
+    assert block["ENABLE_TOOL_SEARCH"] == "true"
+
+
+def test_every_claude_line_starts_with_auto_memory_off() -> None:
+    session = Scripted([init(), result()])
+    run(configured(DEFAULT_CONFIG, session))
+    options = session.options[0]
+    settings = json.loads(str(options.settings))
+    assert settings["autoMemoryEnabled"] is False
+    assert settings["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+    assert dict(options.env)["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+
+
 @pytest.mark.parametrize("tools", [(), ("Read",), ("Read", "ViewImage")])
 def test_no_other_line_asks_before_a_read(tools: tuple[str, ...]) -> None:
     offered = ["Read"] if tools else []
@@ -1252,3 +1315,184 @@ def test_sdk_explicit_transport_preserves_permission_control_channel() -> None:
     assert isinstance(transport, engine_module._SubprocessTransport)  # pyright: ignore[reportPrivateUsage]
     assert transport._options.permission_prompt_tool_name == "stdio"  # pyright: ignore[reportPrivateUsage]
     assert original.permission_prompt_tool_name is None
+
+
+# Round 18 follow-up of 2026-11-18. The tail of the engine's standard error.
+
+CLAUDE_REFUSAL = "Error: Invalid settings: permissions.allow is not a list"
+
+
+class EndsWithStandardError:
+    """A session whose engine writes ``said`` to its standard error, through the
+    callback the SDK would call, and then ends as ``error`` says, at start or after
+    the prompt."""
+
+    def __init__(
+        self, error: BaseException, *, said: str = "", at_start: bool = True
+    ) -> None:
+        self.error = error
+        self.said = said
+        self.at_start = at_start
+        self.options: list[ClaudeAgentOptions] = []
+
+    async def query(self, prompt: str) -> None:
+        del prompt
+
+    async def receive_response(self) -> AsyncIterator[Message]:
+        self._speak(self.options[-1])
+        raise self.error
+        yield  # pragma: no cover, makes this a generator
+
+    async def receive_messages(self) -> AsyncIterator[Message]:
+        async for message in self.receive_response():
+            yield message
+
+    async def interrupt(self) -> None:
+        return None
+
+    async def set_permission_mode(self, mode: PermissionMode) -> None:
+        del mode
+
+    def _speak(self, options: ClaudeAgentOptions) -> None:
+        assert options.stderr is not None
+        for text in self.said.splitlines():
+            options.stderr(text)
+
+    def factory(
+        self, options: ClaudeAgentOptions
+    ) -> AbstractAsyncContextManager["EndsWithStandardError"]:
+        self.options.append(options)
+
+        @asynccontextmanager
+        async def opened() -> AsyncGenerator["EndsWithStandardError"]:
+            if self.at_start:
+                self._speak(options)
+                raise self.error
+            yield self
+
+        return opened()
+
+
+def ended(session: EndsWithStandardError, keep: bool) -> ClaudeCodeLine:
+    return ClaudeCodeLine(
+        Driver.for_model(MODEL, Strategy.SUBSCRIPTION),
+        Path("/work"),
+        config=LineConfig(keep_session=keep),
+        environment={"SHELL": "/bin/bash"},
+        session_factory=session.factory,
+        kept_factory=session.factory,
+    )
+
+
+def exited() -> ProcessError:
+    return ProcessError(
+        "Command failed with exit code 1",
+        exit_code=1,
+        stderr="Check stderr output for details",
+    )
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_a_claude_start_refusal_reaches_the_closing_reason_masked(
+    keep: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    session = EndsWithStandardError(
+        exited(), said=f"{CLAUDE_REFUSAL}\nAuthorization: Bearer abc123secret"
+    )
+    with pytest.raises(EngineClosed) as raised:
+        run(ended(session, keep))
+    reason = evidence.with_tail(str(raised.value), raised.value.stderr)
+    assert reason.startswith(f"{ENGINE_CLOSED_PREFIX}: Command failed with exit code 1")
+    assert CLAUDE_REFUSAL in reason
+    assert "abc123secret" not in reason and "***" in reason
+    assert len(reason) <= evidence.CLOSING_REASON_CHARACTERS
+    assert isinstance(raised.value.__cause__, ProcessError)
+    # The tail travels apart from the message, which no other reader then sees.
+    assert CLAUDE_REFUSAL not in str(raised.value)
+    # Without a callback of its own the engine's lines still reach the daemon's
+    # standard error, as when the SDK left them to it, through the writer thread.
+    assert evidence.ENGINE_LINES.join(5)
+    assert CLAUDE_REFUSAL in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_a_claude_process_that_ends_during_the_turn_names_what_it_said(
+    keep: bool,
+) -> None:
+    session = EndsWithStandardError(
+        exited(), said="Error: the engine ran out of memory", at_start=False
+    )
+    with pytest.raises(EngineRefused) as raised:
+        run(ended(session, keep))
+    reason = evidence.with_tail(str(raised.value), raised.value.stderr)
+    assert "Error: the engine ran out of memory" in reason
+    assert len(reason) <= evidence.CLOSING_REASON_CHARACTERS
+
+
+def test_a_blocked_daemon_standard_error_never_holds_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 18 audit of ababdcd, finding 1. A standard error that blocks two seconds
+    on each write once held the loop four seconds for one engine line."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Blocked:
+        def write(self, text: str) -> int:
+            entered.set()
+            release.wait(10)
+            return len(text)
+
+    forwarder = evidence.LineForwarder(pending=2)
+    monkeypatch.setattr(evidence, "ENGINE_LINES", forwarder)
+    monkeypatch.setattr(sys, "stderr", Blocked())
+    tail = evidence.StderrTail()
+    keep = engine_module.keeping_tail(ClaudeAgentOptions(), tail).stderr
+    assert keep is not None
+
+    async def go() -> float:
+        began = asyncio.get_running_loop().time()
+        keep("Error: first")
+        assert await asyncio.to_thread(entered.wait, 5)
+        for number in range(5):
+            keep(f"Error: line {number}")
+        return asyncio.get_running_loop().time() - began
+
+    try:
+        assert asyncio.run(go()) < 1.0
+        assert tail.text() == "Error: first " + " ".join(
+            f"Error: line {number}" for number in range(5)
+        )
+        assert forwarder.dropped == 3
+    finally:
+        release.set()
+        assert forwarder.join(5)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ResultError("Claude Code returned an error result: refused", exit_code=1),
+        CLINotFoundError("Claude Code not found"),
+        RuntimeError("something else"),
+    ],
+)
+def test_other_claude_errors_are_left_as_they_were(error: BaseException) -> None:
+    """A result the engine reported, an engine that was not found, and any other
+    error keep their own type and text."""
+    session = EndsWithStandardError(error, said="Error: noise")
+    with pytest.raises(type(error)) as raised:
+        run(ended(session, False))
+    assert raised.value is error
+
+
+def test_the_probe_recording_still_reaches_the_tail() -> None:
+    """A recording's own callback calls the one Dromon set, so a probe that records
+    standard error still names the cause."""
+    seen: list[str] = []
+    options = ClaudeAgentOptions(stderr=seen.append)
+    tail = evidence.StderrTail()
+    kept = engine_module.keeping_tail(options, tail)
+    assert kept.stderr is not None
+    kept.stderr("Error: one")
+    assert seen == ["Error: one"] and tail.text() == "Error: one"

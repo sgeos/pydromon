@@ -217,7 +217,7 @@ only the common entries and pinned `ENABLE_TOOL_SEARCH`.
 
 | Adapter | Additional inherited entries | Scope |
 |---|---|---|
-| Claude Code | `SHELL`, `CLAUDE_CODE_SHELL`, `USER`, `LOGNAME`, `ENABLE_TOOL_SEARCH`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_AGENT_SDK_VERSION`, `CLAUDE_CODE_SDK_READS_SESSION_STATE`, `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING`, `PWD`, `TRACEPARENT`, `TRACESTATE`, `BAGGAGE`, `DROMON_LINE_MARK` | Claude Code uses the account names to find its macOS Keychain sign-in, confirmed by the operator's live check. Tool search is pinned on. The Agent SDK sets the entry point, its version and session-state behavior. Checkpointing and trace values are present only when the SDK sets them. The process mark is for tracking. Launcher target, parent, report, stop-policy and filter entries do not reach Claude Code. |
+| Claude Code | `SHELL`, `CLAUDE_CODE_SHELL`, `USER`, `LOGNAME`, `ENABLE_TOOL_SEARCH`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_AGENT_SDK_VERSION`, `CLAUDE_CODE_SDK_READS_SESSION_STATE`, `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING`, `PWD`, `TRACEPARENT`, `TRACESTATE`, `BAGGAGE`, `DROMON_LINE_MARK` | Claude Code uses the account names to find its macOS Keychain sign-in, confirmed by the operator's live check. Tool search is pinned on. Auto memory is pinned off, as [`SETTINGS.md`](SETTINGS.md) explains. The Agent SDK sets the entry point, its version and session-state behavior. Checkpointing and trace values are present only when the SDK sets them. The process mark is for tracking. Launcher target, parent, report, stop-policy and filter entries do not reach Claude Code. |
 | Codex | `SHELL`, `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `XDG_CACHE_HOME` | Credentials are allowed only for `api` and `flexible` strategies. Subscription lines omit them. Dromon uses a supplied cache path or sets its private cache directory. |
 | Pi | `OPENAI_API_KEY` | Only for `pi:openai/...` lines with `api` or `flexible` strategy. Subscription lines omit it. Other provider variables and endpoint selectors are not inherited. Dromon's Pi directory, bridge and tool values are set separately. |
 | Cursor Agent | `CURSOR_API_KEY`, `CURSOR_AUTH_TOKEN`, `CURSOR_AUTH_TOKEN_EXPIRES_AT` | Only for metered strategies. Subscription lines omit them. Dromon sets the config and data directories separately. |
@@ -472,6 +472,72 @@ and a daemon line's engine run alike, and only what is kept differs. **Failure m
 A descendant left running that holds standard error open delays the end of a
 connection by at most 10 seconds, the bound on that read, where the null device once
 cost nothing.
+
+**The tail in a closing reason.** Round 18 follow-up of 2026-11-18, revised after the
+audit of ababdcd. A Codex line whose app-server refused its configuration at start saw
+only that the engine closed its connection, because standard error was kept only while
+a probe recorded, as the round 18 diagnosis found. Codex, Claude Code and Grok now keep
+the last 4 KiB of their engine's standard error in memory for the life of the process,
+in `dromon.evidence.StderrTail`, which the drain fills for Codex and Grok and the Agent
+SDK's callback fills for Claude Code. A turn that ends with `EngineClosed`, and a Grok
+start that times out, carry a snapshot of the tail on the error as `stderr`, apart from
+its message. The scheduler alone renders it, with `evidence.with_tail`, after the
+error's own first line and into as much of the 240 characters of
+`line_turn_ended.closing_reason` as that line leaves, so the error's first words still
+select the fixed stop wording and no other reader of the message sees the tail. Fact,
+shown by tests. The refusal of Codex 0.166.0 reaches the reason through the real
+process wrapper, a credential the engine wrote is masked, and a Grok refusal at start,
+through its real wrapper, does the same. The Claude Code test drives a substitute
+session that calls the SDK's callback and raises the SDK's error, so the SDK's own
+reading of standard error is not under test.
+
+- **Masking.** The whole tail is first scrubbed by the event log's exact match of
+  configured secrets, on its raw text, since a secret holding a line break or a run of
+  spaces did not match once the text was on one line, which the audit found. The home
+  directory is then written `~`, and only then is a kept engine's tail divided at its
+  turn mark, since a secret written across the mark matched in neither part when each
+  was scrubbed alone, which the second audit found. The home is masked wherever its
+  path is not run on by a name before it or after it, so a home followed by a colon, a
+  quotation mark or a full stop is masked and `/mnt/home/x` is left whole, in any case
+  of its letters, and both as the home is given and as its links resolve. The first
+  line of the error is home masked as well. The launcher's notes are set aside as below,
+  and the rest is masked by `dromon.redact` before it is put on one line and cut to the
+  room. A part cut at its front drops everything before its first line break, or its
+  first word when it has none, since the cut can part a credential from the name
+  masking keys on or a configured secret from its start. The scheduler then screens
+  the whole reason against the disclosure list and withholds it on a match, as
+  `EVENT_LOG.md` says. A secret in a form no pattern names and no one configured
+  passes the masking, as for a recording, and a configured secret that spans a line
+  break and is cut within its first line can leave its later lines. A home inside a
+  longer path, as `/mnt/home/x`, keeps its name, and on a file system that tells
+  case apart a directory that differs from the home only in case is also written `~`.
+- **A kept engine's turns.** A Codex or Claude Code kept session's tail lives as long
+  as its process, so each reused turn marks where it began. What the engine wrote
+  before that mark is given only when it has written nothing since, and then after
+  `before this turn: `, so an old complaint is not read as a later turn's cause.
+- **The launcher's notes.** The launcher shares the stream and writes its notes, which
+  begin with `launcher.DIAGNOSTIC_PREFIX`, after the engine ends, which crowded the
+  engine's refusal out of the reason in the first test. They are shown only when the
+  engine wrote nothing, as when the launcher could not start it.
+- **Claude Code.** The Agent SDK pipes standard error only when given a callback, so
+  every Claude Code line now gives one, which also hands each line to
+  `evidence.ENGINE_LINES` for the daemon's standard error, where the engine's own went
+  before. The SDK calls the callback on the event loop, and the audit found that a
+  blocking standard error held the loop and stopped the SDK reading the engine's pipe,
+  so the line is written by one writer thread of its own, as `spawn._say` does. When
+  256 lines wait, a further line is dropped and counted, and the writer says how many
+  once it catches up. A `ProcessError` or `CLIConnectionError` from the SDK, other than
+  a `ResultError` or a `CLINotFoundError`, is now raised as `EngineClosed`, whose
+  definition it meets, so it is recorded with the cause `engine_closed` and the class
+  `EngineClosed` rather than as an engine error, and the line receives the fixed stop
+  note for a closed connection. A kept connection whose process ended carries the tail
+  on the refusal it always gave.
+- **Failure modes.** The SDK cancels its standard error reader when it disconnects,
+  so a line the engine wrote in the instant before it ended may be missing.
+  Inference, not observed. A Claude Code start that times out at initialize, and
+  Cursor, Antigravity and Pi, whose drain also fills a tail when one is set, do not
+  yet carry it. A daemon start check prints its own startup diagnostics and the
+  error's message, which no longer holds the tail.
 
 **A failed write.** Review of 2026-10-27, finding R3. A write to the recording that
 fails, such as on a full disk, ends the recording and is noted, and the turn goes on.

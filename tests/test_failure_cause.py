@@ -15,6 +15,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import evidence
 from dromon.codec import DecodeError, decode, encode
 from dromon.driver import Strategy
 from dromon.engine import (
@@ -519,6 +520,79 @@ def test_closing_reason_does_not_use_scratch_screening(
     world.actions["alpha"] = raising(EngineClosed("transport vanished"))
     world.turn()
     assert last_end(world).closing_reason == "transport vanished"
+
+
+def stderr_of(text: str) -> evidence.StderrTail:
+    tail = evidence.StderrTail()
+    tail.append(text.encode())
+    return tail
+
+
+def test_the_tail_follows_the_message_in_the_closing_reason(world: World) -> None:
+    error = EngineClosed("transport vanished", stderr=stderr_of("Error: refused\n"))
+    world.actions["alpha"] = raising(error)
+    world.turn()
+    assert last_end(world).closing_reason == (
+        f"transport vanished{evidence.STDERR_JOINER}Error: refused"
+    )
+
+
+@pytest.mark.parametrize("secret", ["alpha-line1\nbravo-line2", "pass  with  gaps"])
+def test_a_configured_secret_with_whitespace_in_the_tail_is_masked(
+    world: World, secret: str
+) -> None:
+    """Round 18 audit of ababdcd, finding 2, through the scheduler itself."""
+    world.log.secrets = lambda: (secret,)
+    tail = stderr_of(f"Error: refused with {secret} as given\n")
+    world.actions["alpha"] = raising(EngineClosed("transport vanished", stderr=tail))
+    world.turn()
+    end = last_end(world)
+    assert end.closing_reason == (
+        f"transport vanished{evidence.STDERR_JOINER}Error: refused with *** as given"
+    )
+    assert secret not in encode(end)
+    assert " ".join(secret.split()) not in encode(end)
+    assert secret.split()[0] not in encode(end)
+
+
+def test_a_secret_across_a_kept_turns_mark_is_masked(world: World) -> None:
+    """Round 18 audit of 5afb120, its own case, through the scheduler itself."""
+    literal = "secret-value"
+    world.log.secrets = lambda: (literal,)
+    tail = stderr_of("old secret-")
+    tail.mark_turn()
+    tail.append(b"value tail\n")
+    world.actions["alpha"] = raising(EngineClosed("transport vanished", stderr=tail))
+    world.turn()
+    end = last_end(world)
+    assert end.closing_reason == f"transport vanished{evidence.STDERR_JOINER}*** tail"
+    assert "ret-value" not in encode(end) and "secret-" not in encode(end)
+
+
+def test_the_first_line_of_the_reason_is_home_masked(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 18 audit of 5afb120. Only the tail was home masked."""
+    monkeypatch.setenv("HOME", "/home/alex")
+    tail = stderr_of("Error: cannot open /home/alex/.codex: denied\n")
+    error = EngineClosed("cannot open '/home/alex': denied", stderr=tail)
+    world.actions["alpha"] = raising(error)
+    world.turn()
+    end = last_end(world)
+    assert end.closing_reason == (
+        f"cannot open '~': denied{evidence.STDERR_JOINER}"
+        "Error: cannot open ~/.codex: denied"
+    )
+    assert "alex" not in encode(end)
+
+
+def test_a_disclosure_term_in_the_tail_withholds_the_reason(world: World) -> None:
+    world.scheduler.set_disclosure_terms(("private diagnostic",))
+    tail = stderr_of("Error: private diagnostic\n")
+    world.actions["alpha"] = raising(EngineClosed("transport vanished", stderr=tail))
+    world.turn()
+    assert last_end(world).closing_reason is None
+    assert "private diagnostic" not in encode(last_end(world))
 
 
 def test_literal_credential_crossing_reason_cut_is_masked(world: World) -> None:

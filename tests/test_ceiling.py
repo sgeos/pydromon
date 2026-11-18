@@ -280,6 +280,16 @@ def test_a_line_may_not_set_the_pinned_tool_search() -> None:
     assert reserved_variable("ENABLE_TOOL_SEARCH")
 
 
+def test_a_line_may_not_set_the_pinned_auto_memory_switch() -> None:
+    """Round 18, item 2. A value Claude Code reads as false would force auto memory
+    on, so no value is accepted, and the refusal gives the reason."""
+    for value in ("0", "false", "1", ""):
+        with pytest.raises(SettingsError, match="auto-memory index") as refused:
+            parse_settings({"env": {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": value}})
+        assert refused.value.key == "env.CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+    assert reserved_variable("CLAUDE_CODE_DISABLE_AUTO_MEMORY")
+
+
 def test_a_line_may_not_set_a_variable_dromon_sets() -> None:
     for name in ("DROMON_STOP_POLICY", "DROMON_LAUNCH_TARGET", "DROMON_ANYTHING"):
         with pytest.raises(SettingsError, match="Dromon sets itself"):

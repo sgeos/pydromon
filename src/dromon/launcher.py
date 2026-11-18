@@ -208,6 +208,11 @@ SCRIPT_NAME: Final = "dromon-launch"
 """The launcher's command, installed beside the Python interpreter, which the Agent
 SDK runs in place of Claude Code."""
 
+DIAGNOSTIC_PREFIX: Final = f"{SCRIPT_NAME}:"
+"""What begins every line the launcher writes to standard error, which it shares
+with the engine, so a closing reason can tell the launcher's notes from what the
+engine said, as ``dromon.evidence.StderrTail`` does."""
+
 VERSION_ARGUMENTS: Final = (("-v",), ("--version",))
 """The arguments of the Agent SDK's version check. **Fact, read from Agent SDK 0.2.174
 on 2026-10-26.** The SDK runs ``cli_path -v`` before each connection, with a 2 second
@@ -1258,7 +1263,9 @@ def _write_private(target: Path, document: Mapping[str, object]) -> Path | None:
             json.dump(document, handle)
         partial.replace(target)
     except OSError as error:
-        print(f"dromon-launch: cannot write {target.name}: {error}", file=sys.stderr)
+        print(
+            f"{DIAGNOSTIC_PREFIX} cannot write {target.name}: {error}", file=sys.stderr
+        )
         return None
     return target
 
@@ -1434,7 +1441,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not target:
         version = version_target(arguments)
         if version is None:
-            print(f"dromon-launch: {TARGET_VARIABLE} is not set", file=sys.stderr)
+            print(f"{DIAGNOSTIC_PREFIX} {TARGET_VARIABLE} is not set", file=sys.stderr)
             return 127
         # A version query starts nothing that lasts, so it needs no watcher.
         try:
@@ -1444,7 +1451,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 version_environment(os.environ),
             )
         except OSError as error:
-            print(f"dromon-launch: cannot start {version}: {error}", file=sys.stderr)
+            print(
+                f"{DIAGNOSTIC_PREFIX} cannot start {version}: {error}", file=sys.stderr
+            )
             return 127
     if os.environ.get(FILTER_ENVIRONMENT_VARIABLE) == "1":
         # The Agent SDK merges its host environment into options.env. Replace this
@@ -1470,7 +1479,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         except OSError as error:
             print(
-                f"dromon-launch: cannot re-exec with the filtered environment: {error}",
+                f"{DIAGNOSTIC_PREFIX} cannot re-exec with the filtered environment:"
+                f" {error}",
                 file=sys.stderr,
             )
             return 127
@@ -1485,7 +1495,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # started it with a session of its own, which serves as well.
         os.setsid()
     if sys.platform == "linux" and not become_subreaper():
-        print("dromon-launch: cannot become a child subreaper", file=sys.stderr)
+        print(f"{DIAGNOSTIC_PREFIX} cannot become a child subreaper", file=sys.stderr)
     me = os.getpid()
     wakeup, notify = os.pipe()
     os.set_blocking(wakeup, False)
@@ -1513,7 +1523,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             preexec_fn=arm_death_signal(policy),  # noqa: PLW1509
         )
     except OSError as error:
-        print(f"dromon-launch: cannot start {target}: {error}", file=sys.stderr)
+        print(f"{DIAGNOSTIC_PREFIX} cannot start {target}: {error}", file=sys.stderr)
         return 127
     if relay is not None:
         relay.start()
@@ -1543,7 +1553,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         stop_verified = end_tree(me, child.pid, exits)
         if not stop_verified:
             print(
-                "dromon-launch: the process table could not be read, so stopping"
+                f"{DIAGNOSTIC_PREFIX} the process table could not be read, so stopping"
                 " the harness tree is unverified",
                 file=sys.stderr,
             )
@@ -1571,7 +1581,7 @@ def _report_left(
     daemon's report directory, and whether the walk could be made."""
     if not listed:
         print(
-            "dromon-launch: the process table could not be read, so what the"
+            f"{DIAGNOSTIC_PREFIX} the process table could not be read, so what the"
             " harness left running may not all be listed",
             file=sys.stderr,
         )
@@ -1581,7 +1591,7 @@ def _report_left(
     if left:
         pids = ", ".join(str(row.pid) for row in left[:MAX_LEFT])
         print(
-            f"dromon-launch: left {len(left)} processes running by the stop policy"
+            f"{DIAGNOSTIC_PREFIX} left {len(left)} processes running by the stop policy"
             f" ({pids}), reported to {where or 'no report file'}",
             file=sys.stderr,
         )

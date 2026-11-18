@@ -108,7 +108,9 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    CLIConnectionError,
     CLIJSONDecodeError,
+    CLINotFoundError,
     HookContext,
     HookInput,
     HookJSONOutput,
@@ -119,8 +121,10 @@ from claude_agent_sdk import (
     PermissionMode,
     PermissionResultAllow,
     PermissionResultDeny,
+    ProcessError,
     RateLimitEvent,
     RateLimitInfo,
+    ResultError,
     ResultMessage,
     SdkMcpTool,
     StreamEvent,
@@ -167,6 +171,8 @@ from dromon.ceiling import (
 )
 from dromon.driver import TOOL_RESULT, ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine_environment import (
+    AUTO_MEMORY_DISABLED,
+    AUTO_MEMORY_VARIABLE,
     CLAUDE_SHELL_VARIABLE,
     SHELL_VARIABLE,
     TOOL_SEARCH_PINNED,
@@ -305,7 +311,20 @@ NON_SUBSCRIPTION_ENVIRONMENT: Final = API_ENVIRONMENT + PROVIDER_ENVIRONMENT
 
 
 class EngineRefused(Exception):
-    """The credential policy or the driver refused to run the turn."""
+    """The credential policy or the driver refused to run the turn.
+
+    ``stderr`` is the tail of the engine's standard error, when the refusal is a
+    closed connection or a failed start, which the scheduler alone renders into
+    the closing reason. **Round 18 audit of ababdcd, finding 2.** It travels apart
+    from the message, so that the event log's exact-value scrub reaches its raw
+    text before anything puts it on one line, and so that no other reader of the
+    message sees it."""
+
+    def __init__(
+        self, *args: object, stderr: evidence.StderrTail | None = None
+    ) -> None:
+        super().__init__(*args)
+        self.stderr = stderr
 
 
 class EngineClosed(EngineRefused):
@@ -313,6 +332,54 @@ class EngineClosed(EngineRefused):
     follow-up of 2026-11-05.** A type of its own, so the scheduler records the cause
     ``engine_closed`` from the type and never from the message. It stays an
     ``EngineRefused``, so every handler that caught the plain refusal still does."""
+
+
+ENGINE_CLOSED_PREFIX: Final = "the engine closed its connection"
+"""How a Claude Code process that ended under the Agent SDK is reported, which the
+scheduler maps to its fixed wording for a closed connection."""
+
+
+def process_ended(error: BaseException) -> bool:
+    """Whether ``error`` is the Agent SDK saying the engine's process ended or its
+    transport closed. A result the engine reported as an error, and an engine that
+    could not be found, are not, since the first carries its own text and the
+    second never started a process."""
+    return isinstance(error, ProcessError | CLIConnectionError) and not isinstance(
+        error, ResultError | CLINotFoundError
+    )
+
+
+def closed_by_process(error: BaseException, tail: evidence.StderrTail) -> EngineClosed:
+    """The ``EngineClosed`` a Claude Code turn raises for an SDK error that
+    ``process_ended`` accepts, naming the SDK's first line and the tail of the
+    engine's standard error. **Round 18 follow-up of 2026-11-18.** The SDK's own
+    error says only "Command failed with exit code 1" and points at a standard
+    error Dromon did not keep, and it was recorded as an engine error. It is now a
+    closed engine, as the type's own definition says it is."""
+    first = str(error).split("\n", 1)[0]
+    return EngineClosed(f"{ENGINE_CLOSED_PREFIX}: {first}", stderr=tail.snapshot())
+
+
+def keeping_tail(
+    options: ClaudeAgentOptions, tail: evidence.StderrTail
+) -> ClaudeAgentOptions:
+    """``options`` whose standard error callback also keeps the engine's lines in
+    ``tail``. A callback already set is still called. Without one the SDK would have
+    left the engine's standard error to the daemon's, so each line is written there
+    too, which keeps the daemon log as it was. **Round 18 audit of ababdcd, finding
+    1.** The SDK calls the callback on the event loop, so the line is handed to
+    ``evidence.ENGINE_LINES``, whose thread writes it, and a standard error that
+    blocks costs a dropped and counted line and never the loop."""
+    previous = options.stderr
+
+    def keep(line: str) -> None:
+        tail.append((line + "\n").encode())
+        if previous is not None:
+            previous(line)
+        else:
+            evidence.ENGINE_LINES.say(line)
+
+    return replace(options, stderr=keep)
 
 
 class ConfinementBreach(EngineRefused):
@@ -721,9 +788,13 @@ def _recorded(
     ``can_use_tool`` callback is set, as ``_configure_can_use_tool`` does in Agent SDK
     0.2.174, since a transport given to the client is used as it is."""
     if recording.wants_stderr:
+        previous = options.stderr
 
         def keep(line: str) -> None:
             recording.stderr((line + "\n").encode())
+            if previous is not None:
+                # The tail ``keeping_tail`` set, so a probe still names its cause.
+                previous(line)
 
         options = replace(options, stderr=keep)
     return options, RecordedTransport(_subprocess_transport(options), recording)
@@ -861,14 +932,21 @@ def flag_settings(
     file, ``~/.claude.json``, which no setting source governs. The flag settings.
     The managed policy settings. The process environment alone would lose to the
     first, so the pin is also set here, in the second, which comes after it. The
-    third is an administrator's, and Dromon does not override it."""
+    third is an administrator's, and Dromon does not override it.
+
+    **Round 18, item 2.** Auto memory is turned off for every line the same way, by
+    ``AUTO_MEMORY_VARIABLE`` in the env block and by the documented
+    ``autoMemoryEnabled`` setting, which replace whatever the line's own settings
+    give, as ``dromon.engine_environment.AUTO_MEMORY_VARIABLE`` explains."""
     merged = dict(settings or {})
     given = merged.get("env")
     block: dict[str, object] = (
         dict(cast(Mapping[str, object], given)) if isinstance(given, Mapping) else {}
     )
     block[TOOL_SEARCH_VARIABLE] = TOOL_SEARCH_PINNED
+    block[AUTO_MEMORY_VARIABLE] = AUTO_MEMORY_DISABLED
     merged["env"] = block
+    merged["autoMemoryEnabled"] = False
     if ask:
         merged["permissions"] = _with_ask_rules(merged.get("permissions"), ask)
     return merged
@@ -1678,6 +1756,9 @@ class _Connection:
     ended_by: str | None = None
     """Why the pump stopped reading, when Dromon can say more than that the engine's
     process ended, as ``MESSAGE_TOO_LONG`` does."""
+    stderr: evidence.StderrTail = field(default_factory=evidence.StderrTail)
+    """The tail of the engine's standard error, for the reason of a turn that ends
+    because its process ended."""
 
 
 def check_environment(environment: Mapping[str, str], strategy: Strategy) -> None:
@@ -2206,8 +2287,9 @@ def launch_environment(
     temp: LineTemp | None = None,
 ) -> dict[str, str]:
     """The variables a Claude Code line's engine starts with, beside the daemon's own:
-    the pinned tool search, the line's process mark, what its launcher needs, and the
-    variables of ``git_ssh`` under the names ``launcher.relayed`` gives them.
+    the pinned tool search, auto memory turned off, the line's process mark, what its
+    launcher needs, and the variables of ``git_ssh`` under the names
+    ``launcher.relayed`` gives them.
 
     Each relayed name is set, empty for a line without the option, so a value the
     daemon's own environment holds under that name, which the Agent SDK merges in
@@ -2218,7 +2300,10 @@ def launch_environment(
     need no workaround. ``TMPDIR`` is a base variable the launcher's filter keeps, and
     ``UV_CACHE_DIR`` travels as a relayed variable, so only this value reaches the
     engine and never the daemon's own."""
-    environment = {TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED}
+    environment = {
+        TOOL_SEARCH_VARIABLE: TOOL_SEARCH_PINNED,
+        AUTO_MEMORY_VARIABLE: AUTO_MEMORY_DISABLED,
+    }
     if shell is not None:
         environment[SHELL_VARIABLE] = shell
         environment[CLAUDE_SHELL_VARIABLE] = shell
@@ -2525,7 +2610,7 @@ class ClaudeCodeLine:
             self._kept_factory if self.config.keep_session else self._session_factory
         )
         async with AsyncExitStack() as stack:
-            await self._enter(stack, factory, options)
+            await self._enter(stack, factory, options, evidence.StderrTail())
 
     async def run_turn(self, prompt: str) -> TurnReport:
         """Run one turn for ``prompt`` and return what happened. A check that
@@ -2544,9 +2629,10 @@ class ClaudeCodeLine:
         turn = _Turn()
         result: ResultMessage | None = None
         self._turn = turn
+        tail = evidence.StderrTail()
         try:
             async with AsyncExitStack() as stack:
-                session = await self._enter(stack, self._session_factory, options)
+                session = await self._enter(stack, self._session_factory, options, tail)
                 if request is not None and self._compaction_allowed(turn):
                     await session.query(COMPACT_COMMAND)
                     note = await self._run_compaction(
@@ -2579,13 +2665,22 @@ class ClaudeCodeLine:
             if message_too_long(error):
                 raise EngineRefused(MESSAGE_TOO_LONG) from error
             raise
+        except Exception as error:
+            # The stack's exit has ended the process, so the tail holds what the
+            # engine wrote as it ended.
+            if process_ended(error):
+                raise closed_by_process(error, tail) from error
+            raise
         finally:
             self._turn = None
         cost = None if result is None else self._measure(result)
         if turn.refusal is not None:
             raise _refusal_error(turn)
         self._check_limit(result, turn)
-        return self._report(result, turn, cost)
+        try:
+            return self._report(result, turn, cost)
+        except EngineClosed as error:
+            raise EngineClosed(str(error), stderr=tail.snapshot()) from error
 
     def _check_limit(self, result: ResultMessage | None, turn: _Turn) -> None:
         """Raise ``EnginePlanLimit`` when the turn shows the provider's budget
@@ -2610,21 +2705,31 @@ class ClaudeCodeLine:
         stack: AsyncExitStack,
         factory: Callable[[ClaudeAgentOptions], AbstractAsyncContextManager[S]],
         options: ClaudeAgentOptions,
+        tail: evidence.StderrTail,
     ) -> S:
-        """Start the engine. A start that times out at its initialize request is
-        tried once more, and the activity log says so, since on a loaded host the
-        engine can miss the SDK's wait while still starting. Any other failure, and
-        a second timeout, end the turn as before."""
+        """Start the engine, keeping the tail of its standard error in ``tail``. A
+        start that times out at its initialize request is tried once more, and the
+        activity log says so, since on a loaded host the engine can miss the SDK's
+        wait while still starting. Any other failure, and a second timeout, end the
+        turn as before, except that an engine process that ended is reported as
+        ``EngineClosed`` with what it wrote, as ``closed_by_process`` says."""
+        options = keeping_tail(options, tail)
         try:
+            try:
+                return await stack.enter_async_context(factory(options))
+            except Exception as error:
+                if not initialize_timed_out(error):
+                    raise
+            self._observe(
+                ActivityKind.NOTICE,
+                "the engine's start timed out at initialize, so Dromon starts it"
+                " once more",
+            )
             return await stack.enter_async_context(factory(options))
         except Exception as error:
-            if not initialize_timed_out(error):
-                raise
-        self._observe(
-            ActivityKind.NOTICE,
-            "the engine's start timed out at initialize, so Dromon starts it once more",
-        )
-        return await stack.enter_async_context(factory(options))
+            if process_ended(error):
+                raise closed_by_process(error, tail) from error
+            raise
 
     def request_compaction(
         self,
@@ -3155,12 +3260,14 @@ class ClaudeCodeLine:
         # Digested before the engine starts, so a refusal leaves nothing open.
         files = self.loaded_files_digest()
         stack = AsyncExitStack()
+        tail = evidence.StderrTail()
         try:
-            session = await self._enter(stack, self._kept_factory, options)
+            session = await self._enter(stack, self._kept_factory, options, tail)
         except BaseException:
             await stack.aclose()
             raise
         connection = _Connection(stack, session, fingerprint, self._clock(), files)
+        connection.stderr = tail
         loop = asyncio.get_running_loop()
         connection.pump = loop.create_task(self._pump(connection))
         connection.watch = loop.create_task(self._watch(connection))
@@ -3603,6 +3710,8 @@ class ClaudeCodeLine:
         reused = self._kept is not None
         self.driver.step(Event("turn_start"))
         connection = self._kept or await self._connect(options, fingerprint)
+        if reused:
+            connection.stderr.mark_turn()
         turn = _Turn()
         if self._notes:
             prompt = "\n\n".join([*self._notes, prompt])
@@ -3668,6 +3777,9 @@ class ClaudeCodeLine:
                 # fail on the dead connection, which would hide the cause.
                 self._notes.append(DIED_NOTE)
                 raise EngineRefused(connection.ended_by) from error
+            if process_ended(error):
+                # The close has ended the process, so the tail is complete.
+                raise closed_by_process(error, connection.stderr) from error
             raise
         finally:
             self._turn = None
@@ -3681,8 +3793,11 @@ class ClaudeCodeLine:
             self._notes.append(DIED_NOTE)
             if turn.refusal is not None:
                 raise _refusal_error(turn)
+            if connection.ended_by:
+                raise EngineRefused(connection.ended_by)
             raise EngineRefused(
-                connection.ended_by or "the engine's process ended during the turn"
+                "the engine's process ended during the turn",
+                stderr=connection.stderr.snapshot(),
             )
         cost = self._measure(result)
         if turn.refusal is not None:

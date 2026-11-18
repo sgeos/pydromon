@@ -6,8 +6,11 @@ import asyncio
 import dataclasses
 import gc
 import json
+import os
 import stat
 import sys
+import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
@@ -15,7 +18,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk._internal.transport import Transport
 
-from dromon import acp, cli, codex, evidence, exits, grok
+from dromon import acp, cli, codex, credentials, evidence, exits, grok, launcher
 from dromon.capabilities import (
     CAPABILITY_NAMES,
     CLAUDE_CODE,
@@ -57,6 +60,7 @@ from dromon.evidence import (
 )
 from dromon.jsonlines import json_lines_factory
 from dromon.lineconfig import LineConfig
+from dromon.model import FailureCause, InvalidField, LineTurnEnded
 from dromon.paths import PathError, project_paths
 
 HAIKU = "claude-haiku-5-5"
@@ -1478,3 +1482,366 @@ def test_startup_diagnostics_are_bounded_masked_and_drained_without_a_recording(
     assert "sk-invented-value" not in text
     assert "Authorization: ***" in text
     assert "\n" not in text
+
+
+# The tail of an engine's standard error, round 18 follow-up of 2026-11-18.
+
+
+def test_the_tail_keeps_only_its_last_bytes() -> None:
+    tail = evidence.StderrTail()
+    tail.append(b"a" * evidence.STDERR_TAIL_BYTES)
+    assert not tail.cut
+    tail.append(b"bc")
+    assert len(tail.raw) == evidence.STDERR_TAIL_BYTES
+    assert tail.cut
+    assert bytes(tail.raw).endswith(b"bc")
+
+
+def test_the_tail_masks_a_credential_and_shows_one_printable_line() -> None:
+    tail = evidence.StderrTail()
+    tail.append(b"Error: refused\x1b[0m\nAuthorization: Bearer abc123secret\n")
+    tail.append(b"retry with api_token=def456secret\r\n")
+    shown = tail.text()
+    assert "abc123secret" not in shown and "def456secret" not in shown
+    assert shown.count("***") >= 2 and "api_token=***" in shown
+    assert shown.isprintable() and "\n" not in shown
+
+
+def test_a_cut_that_parts_a_credential_from_its_name_drops_the_value() -> None:
+    """The cut falls right after ``api_token=``, so the value starts the tail with
+    no name for masking to key on. The partial first word is dropped."""
+    secret = b"S3CRETVALUE"
+    name = b"api_token="
+    tail = evidence.StderrTail()
+    tail.append(name)
+    tail.append(secret + b" " + b"z" * (evidence.STDERR_TAIL_BYTES - len(secret) - 1))
+    assert bytes(tail.raw).startswith(secret)
+    assert secret.decode() not in tail.text()
+
+
+def test_a_shorter_text_starts_at_a_whole_word() -> None:
+    tail = evidence.StderrTail()
+    tail.append(b"alpha bravo charlie delta")
+    assert tail.text(len("charlie delta")) == "charlie delta"
+    assert tail.text(len("harlie delta")) == "delta"
+    assert tail.text(0) == ""
+
+
+def test_with_tail_fits_the_closing_reason_and_keeps_the_message_first() -> None:
+    tail = evidence.StderrTail()
+    tail.append(("word " * 200 + "Error: the last words").encode())
+    message = "the engine closed its connection during the turn"
+    explained = evidence.with_tail(message, tail)
+    assert explained.startswith(message + evidence.STDERR_JOINER)
+    assert explained.endswith("Error: the last words")
+    assert len(explained) <= evidence.CLOSING_REASON_CHARACTERS
+
+
+def test_with_tail_leaves_a_message_alone_without_a_tail_or_room() -> None:
+    message = "the engine closed its connection during the turn"
+    assert evidence.with_tail(message, None) == message
+    assert evidence.with_tail(message, evidence.StderrTail()) == message
+    tail = evidence.StderrTail()
+    tail.append(b"Error: something")
+    crowded = "x" * (
+        evidence.CLOSING_REASON_CHARACTERS
+        - len(evidence.STDERR_JOINER)
+        - evidence.MIN_TAIL_CHARACTERS
+        + 1
+    )
+    assert evidence.with_tail(crowded, tail) == crowded
+    roomy = crowded[:-1]
+    assert evidence.with_tail(roomy, tail).startswith(roomy + evidence.STDERR_JOINER)
+
+
+# Round 18 audit of ababdcd, finding 2. The exact-value scrub runs on the raw text.
+
+WHITESPACE_SECRETS = ("alpha-line1\nbravo-line2", "pass  with  gaps")
+
+
+@pytest.mark.parametrize("secret", WHITESPACE_SECRETS)
+def test_a_configured_secret_holding_whitespace_is_scrubbed_before_one_line(
+    secret: str,
+) -> None:
+    def scrub(text: str) -> str:
+        return credentials.scrub_text(text, [secret])
+
+    tail = evidence.StderrTail()
+    tail.append(f"Error: refused with {secret} as given\n".encode())
+    shown = tail.text(scrub=scrub)
+    assert shown == "Error: refused with *** as given"
+    # The order is what matters. The same scrub after the text is on one line
+    # finds nothing, which is how the secret reached the reason before.
+    flattened = " ".join(f"Error: refused with {secret} as given".split())
+    assert scrub(flattened) == flattened
+
+
+def test_the_scrub_reaches_the_reason_through_with_tail() -> None:
+    secret = WHITESPACE_SECRETS[0]
+    tail = evidence.StderrTail()
+    tail.append(f"Error: {secret}\n".encode())
+    reason = evidence.with_tail(
+        "head", tail, lambda text: credentials.scrub_text(text, [secret])
+    )
+    assert reason == f"head{evidence.STDERR_JOINER}Error: ***"
+    for word in secret.split():
+        assert word not in reason
+
+
+def test_a_cut_part_drops_through_its_first_line_break() -> None:
+    """The cut leaves the end of a secret with a double space at the front, with no
+    start for the exact scrub to match. Its whole partial line goes."""
+    tail = evidence.StderrTail()
+    tail.append(b"pass  with  gaps\nError: refused\n")
+    tail.cut = True
+    assert tail.text() == "Error: refused"
+
+
+# Round 18 audit of ababdcd, finding 3. The home directory and a kept engine's turns.
+
+
+def test_the_home_directory_is_written_as_a_tilde() -> None:
+    home = "/home/x"
+    assert evidence.home_masked("/home/x/.codex/config.toml", home) == (
+        "~/.codex/config.toml"
+    )
+    assert evidence.home_masked("in /home/x and /home/x2/a", home) == (
+        "in ~ and /home/x2/a"
+    )
+    assert evidence.home_masked("/home/x/a", "") == "/home/x/a"
+    assert evidence.home_masked("/home/x/a", "~") == "/home/x/a"
+
+
+# Round 18 audit of 5afb120. The shapes of its table, and the over-mask it found.
+
+AUDIT_HOME = "/home/alex"
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("cannot open /home/alex: denied", "cannot open ~: denied"),
+        ("path '/home/alex'", "path '~'"),
+        ('path "/home/alex"', 'path "~"'),
+        ("(/home/alex)", "(~)"),
+        ("in /home/alex.", "in ~."),
+        ("/home/alex, then", "~, then"),
+        ("/home/alex; then", "~; then"),
+        ("/home/alex/.codex/config.toml", "~/.codex/config.toml"),
+        ("HOME=/home/alex", "HOME=~"),
+        ("ends at /home/alex", "ends at ~"),
+        ("/HOME/Alex/x", "~/x"),
+    ],
+)
+def test_a_home_path_followed_by_what_ends_a_name_is_masked(
+    text: str, expected: str
+) -> None:
+    assert evidence.home_masked(text, AUDIT_HOME) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/private/home/alex/x",
+        "/mnt/home/alex/x",
+        "./home/alex/x",
+        "/home/alex2/a",
+        "/home/alex.old/a",
+        "/home/alex-b",
+        "/home/alex_b",
+    ],
+)
+def test_a_home_path_inside_a_longer_name_or_path_is_left(text: str) -> None:
+    assert evidence.home_masked(text, AUDIT_HOME) == text
+
+
+def test_the_home_the_links_resolve_to_is_masked_as_well(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    monkeypatch.setenv("HOME", str(link))
+    resolved = os.path.realpath(link)
+    assert resolved != str(link)
+    shown = evidence.home_masked(f"at {link}/a and {resolved}/b")
+    assert shown == "at ~/a and ~/b"
+
+
+def test_the_tail_masks_the_home_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", "/home/x")
+    tail = evidence.StderrTail()
+    tail.append(b"Error: cannot parse /home/x/.codex/config.toml\n")
+    assert tail.text() == "Error: cannot parse ~/.codex/config.toml"
+
+
+def test_a_kept_engines_earlier_output_is_not_given_as_this_turns() -> None:
+    tail = evidence.StderrTail()
+    tail.append(b"warning: an old complaint\n")
+    tail.mark_turn()
+    assert tail.text() == evidence.EARLIER_LABEL + "warning: an old complaint"
+    tail.append(b"Error: the cause\n")
+    assert tail.text() == "Error: the cause"
+    snapshot = tail.snapshot()
+    tail.mark_turn()
+    tail.append(b"Error: later\n")
+    assert snapshot.text() == "Error: the cause"
+
+
+def test_a_secret_across_the_turn_mark_is_scrubbed_whole() -> None:
+    """Round 18 audit of 5afb120. Each part was scrubbed alone, so a literal written
+    partly before the mark and partly after matched in neither."""
+    literal = "secret-value"
+    half = len(literal) // 2
+
+    def scrub(text: str) -> str:
+        return credentials.scrub_text(text, [literal])
+
+    tail = evidence.StderrTail()
+    tail.append(f"old {literal[:half]}".encode())
+    tail.mark_turn()
+    tail.append(f"{literal[half:]} tail\n".encode())
+    shown = tail.text(scrub=scrub)
+    assert shown == "*** tail"
+    assert literal[half:] not in shown and literal[:half] not in shown
+
+
+def test_a_home_path_across_the_turn_mark_is_masked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", AUDIT_HOME)
+    tail = evidence.StderrTail()
+    tail.append(b"cannot open /home/al")
+    tail.mark_turn()
+    tail.append(b"ex: denied\n")
+    assert tail.text() == "~: denied"
+
+
+def test_a_turn_mark_inside_a_character_moves_to_its_start() -> None:
+    tail = evidence.StderrTail()
+    tail.append("café".encode()[:-1])
+    tail.mark_turn()
+    tail.append("é".encode()[-1:] + b" ok\n")
+    assert tail.text() == "é ok"
+
+
+def test_a_turn_mark_the_cut_passes_leaves_all_of_the_tail_current() -> None:
+    tail = evidence.StderrTail()
+    tail.append(b"old\n")
+    tail.mark_turn()
+    tail.append(b"x" * evidence.STDERR_TAIL_BYTES + b"\nError: now\n")
+    assert tail.turn_from == 0 and tail.cut
+    assert tail.text() == "Error: now"
+
+
+def test_the_earlier_label_counts_against_the_limit() -> None:
+    tail = evidence.StderrTail()
+    tail.append(b"alpha bravo charlie\n")
+    tail.mark_turn()
+    limit = len(evidence.EARLIER_LABEL) + len("charlie")
+    assert tail.text(limit) == evidence.EARLIER_LABEL + "charlie"
+    assert tail.text(len(evidence.EARLIER_LABEL)) == ""
+
+
+# Round 18 audit of ababdcd, finding 1. Forwarded lines never wait on the write.
+
+
+def test_the_forwarder_never_waits_on_a_blocked_standard_error() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    written: list[str] = []
+
+    def blocked(text: str) -> None:
+        entered.set()
+        release.wait(10)
+        written.append(text)
+
+    forwarder = evidence.LineForwarder(blocked, pending=4)
+    began = time.monotonic()
+    forwarder.say("line 0")
+    assert entered.wait(5)
+    for number in range(1, 10):
+        forwarder.say(f"line {number}")
+    assert time.monotonic() - began < 1.0
+    # The writer holds the first line in its write and four wait, so five drop.
+    assert forwarder.dropped == 5
+    assert not forwarder.join(0.1)
+    release.set()
+    assert forwarder.join(5)
+    assert written[:5] == [f"line {number}" for number in range(5)]
+    assert written[5:] == [
+        "dromond: 5 lines of an engine's standard error were dropped, because"
+        " standard error did not accept them"
+    ]
+
+
+def test_the_forwarder_writes_every_line_in_order_when_not_blocked() -> None:
+    written: list[str] = []
+    forwarder = evidence.LineForwarder(written.append, pending=4)
+    for number in range(3):
+        forwarder.say(f"line {number}")
+        assert forwarder.join(5)
+    assert written == ["line 0", "line 1", "line 2"]
+    assert forwarder.dropped == 0
+
+
+def test_a_failing_write_is_suppressed(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Broken:
+        def write(self, text: str) -> int:
+            raise OSError("gone")
+
+    monkeypatch.setattr(sys, "stderr", Broken())
+    forwarder = evidence.LineForwarder()
+    forwarder.say("line")
+    assert forwarder.join(5)
+
+
+def test_the_closing_reason_bound_is_the_events_own() -> None:
+    """Derived from ``LineTurnEnded``'s own check, so the two cannot drift."""
+    bound = evidence.CLOSING_REASON_CHARACTERS
+    LineTurnEnded(
+        "alpha", None, True, True, FailureCause.ENGINE_CLOSED, None, "x" * bound
+    )
+    with pytest.raises(InvalidField):
+        LineTurnEnded(
+            "alpha",
+            None,
+            True,
+            True,
+            FailureCause.ENGINE_CLOSED,
+            None,
+            "x" * (bound + 1),
+        )
+
+
+def test_the_drain_keeps_the_tail_its_context_names(tmp_path: Path) -> None:
+    async def go() -> evidence.StderrTail:
+        tail = evidence.StderrTail()
+        token = evidence.ENGINE_STDERR.set(tail)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import sys; sys.stderr.write('Error: refused token=abc123secret')",
+                stderr=asyncio.subprocess.PIPE,
+            )
+            draining = evidence.start_draining(process, None)
+        finally:
+            evidence.ENGINE_STDERR.reset(token)
+        await process.wait()
+        await evidence.stop_draining(draining)
+        return tail
+
+    shown = asyncio.run(go()).text()
+    assert shown == "Error: refused token=***"
+
+
+def test_the_launchers_notes_give_way_to_what_the_engine_said() -> None:
+    note = f"{launcher.DIAGNOSTIC_PREFIX} the process table could not be read"
+    tail = evidence.StderrTail()
+    tail.append(f"Error: refused at start\n{note}\n".encode())
+    assert tail.text() == "Error: refused at start"
+    alone = evidence.StderrTail()
+    alone.append(f"{launcher.DIAGNOSTIC_PREFIX} cannot start codex: denied\n".encode())
+    assert alone.text() == f"{launcher.DIAGNOSTIC_PREFIX} cannot start codex: denied"
