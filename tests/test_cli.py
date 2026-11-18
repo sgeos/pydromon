@@ -452,6 +452,64 @@ def test_send_names_a_sender_only_when_given_one(
     assert ("sent as @keeper" in out) is not named and "login" not in out
 
 
+@pytest.mark.parametrize("since", [None, "m-0123456789ab", "2026-11-18T07:00:00Z"])
+def test_mail_sends_since_only_when_given(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    since: str | None,
+) -> None:
+    """Round 18, item 2. ``--since`` is passed as given for the daemon to resolve."""
+    sent: list[tuple[Operation, dict[str, object] | None]] = []
+    answer: dict[str, object] = {"total": 0, "messages": []}
+    monkeypatch.setattr(cli, "call", answering(sent, answer))
+    argv = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "mail"]
+    extra = [] if since is None else ["--since", since]
+    assert cli.main([*argv, *extra]) == exits.OK
+    ((operation, args),) = sent
+    assert operation is Operation.MAIL and args is not None
+    assert args.get("since") == since and ("since" in args) is (since is not None)
+
+
+def test_mail_refuses_since_beside_replies_to(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sent: list[tuple[Operation, dict[str, object] | None]] = []
+    monkeypatch.setattr(cli, "call", answering(sent, {}))
+    argv = ["--project", str(tmp_path), "--runtime-dir", str(short_runtime), "mail"]
+    rest = ["--replies-to", "m-0123456789ab", "--since", "m-0123456789ab"]
+    assert cli.main([*argv, *rest]) == exits.USAGE
+    assert sent == [] and "--since" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("waits", [None, "line beta is a seat of role core"])
+def test_send_says_why_a_recipient_waits_on_its_role_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    short_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    waits: str | None,
+) -> None:
+    """Round 18, item 4. The daemon's ``waits`` sentence is printed on a line of its
+    own after the identifier, and nothing is printed without one."""
+    sent: list[tuple[Operation, dict[str, object] | None]] = []
+    answer: dict[str, object] = {"message_id": "m-1", "priority": False}
+    if waits is not None:
+        answer["waits"] = waits
+    monkeypatch.setattr(cli, "call", answering(sent, answer))
+    runtime = ["--runtime-dir", str(short_runtime)]
+    argv = ["--project", str(tmp_path), *runtime, "send", "beta", "hello"]
+    assert cli.main([*argv, "--operator", "ana"]) == exits.OK
+    out = capsys.readouterr().out
+    assert out.startswith("message_id m-1\n")
+    assert ("waits: " in out) is (waits is not None)
+    if waits is not None:
+        assert f"waits: {waits}\n" in out
+
+
 def test_send_refuses_both_reply_flags(
     tmp_path: Path, short_runtime: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

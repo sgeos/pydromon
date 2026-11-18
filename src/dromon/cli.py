@@ -120,6 +120,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "renew": "start a line's next turn in a fresh engine session, keeping its mail,"
     " brief and files",
     "retire": "retire a line the project file does not declare, for good",
+    "upgrade-check": "open a copy of an event log and project file under the installed"
+    " code, with no daemon and no engine, and report what an upgrade would meet",
 }
 """Planned subcommands and their one-line help, in display order."""
 
@@ -1199,6 +1201,10 @@ def _send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     sender = answer.get("operator")
     if arguments.operator is None and isinstance(sender, str):
         print(f"sent as @{sender}")
+    # Round 18, item 4. A recipient that waits on its role's owner says so.
+    waits = answer.get("waits")
+    if isinstance(waits, str):
+        print(f"waits: {waits}")
     return exits.OK
 
 
@@ -1248,6 +1254,10 @@ def _mail(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         args["sender"] = arguments.sender
     if arguments.issues:
         args["issues_only"] = True
+    # Round 18, item 2. The daemon resolves a message or a time, and refuses
+    # anything else, so an operator can wait for new mail without a baseline.
+    if arguments.since is not None:
+        args["since"] = arguments.since
     response = _call(paths, "mail", Operation.MAIL, args)
     if isinstance(response, int):
         return response
@@ -1314,6 +1324,11 @@ def _replies(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     **Round 9, item 5.** A wait loop can count and read them in one query."""
     if arguments.sender is not None:
         print("dromon mail: --from does not combine with --replies-to", file=sys.stderr)
+        return exits.USAGE
+    if getattr(arguments, "since", None) is not None:
+        print(
+            "dromon mail: --since does not combine with --replies-to", file=sys.stderr
+        )
         return exits.USAGE
     args: dict[str, object] = {
         "operator": arguments.operator,
@@ -3384,6 +3399,7 @@ IMPLEMENTED: Final[dict[str, Callable[[ProjectPaths, argparse.Namespace], int]]]
     "sync-worktrees": _sync_worktrees,
     "renew": _renew,
     "retire": _retire,
+    "upgrade-check": lambda _paths, arguments: _upgrade_check(arguments),
 }
 
 
@@ -3651,6 +3667,73 @@ def _add_fleet_commands(command: argparse.ArgumentParser) -> None:
             sub.add_argument("--end-tasks", action="store_true")
 
 
+def _upgrade_check_arguments(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--from-log",
+        type=Path,
+        required=True,
+        metavar="FILE",
+        help="a copy of the project's event log, with its snapshot and sealed store"
+        " beside it where they exist. It is copied again and never written",
+    )
+    command.add_argument(
+        "--project-file",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="a copy of the project file, .dromon/dromon.toml, default none",
+    )
+    command.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="the project root its working directories are resolved in, such as a"
+        " copy holding its worktrees, default an empty directory",
+    )
+    command.add_argument(
+        "--from-commit",
+        default=None,
+        metavar="COMMIT",
+        help="the revision the project runs now, whose rollback floor is compared",
+    )
+    command.add_argument(
+        "--repository",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="the installed code's repository, for the floor table, default the"
+        " checkout this code runs from",
+    )
+    command.add_argument("--json", action="store_true", help="print the checks as JSON")
+
+
+def _upgrade_check(arguments: argparse.Namespace) -> int:
+    """**Round 18, item 1.** ``dromon.upgrade`` describes the checks."""
+    from dromon import upgrade
+
+    report = upgrade.run_checks(
+        arguments.from_log,
+        project_file=arguments.project_file,
+        root=arguments.root,
+        from_commit=arguments.from_commit,
+        repository=arguments.repository,
+    )
+    as_json: bool = arguments.json
+    if as_json:
+        document = {
+            "passed": report.passed,
+            "checks": [
+                {"name": c.name, "outcome": c.outcome.value, "detail": c.detail}
+                for c in report.checks
+            ],
+        }
+        print(json.dumps(document, indent=2))
+    else:
+        print(upgrade.render(report), end="")
+    return exits.OK if report.passed else exits.FAILURE
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Return the argument parser for ``dromon``."""
     parser = argparse.ArgumentParser(
@@ -3743,6 +3826,8 @@ def build_parser() -> argparse.ArgumentParser:
                 help="sync every worktree whose build inputs differ from"
                 f" {buildinputs.BASE} without asking, after showing each",
             )
+        if name == "upgrade-check":
+            _upgrade_check_arguments(command)
         if name == "renew":
             command.add_argument("line_id", help="the line to renew")
         if name == "retire":
@@ -4156,6 +4241,15 @@ def build_parser() -> argparse.ArgumentParser:
                 help="the replies to one message, with their bodies, marking none read",
             )
             command.add_argument(
+                "--since",
+                default=None,
+                metavar="MESSAGE_OR_TIME",
+                help=(
+                    "only mail recorded after a message, or at or after a time in"
+                    " ISO 8601 with its offset"
+                ),
+            )
+            command.add_argument(
                 "--offset", type=int, default=0, help="matches to skip"
             )
             command.add_argument(
@@ -4233,6 +4327,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "fleet":
         # The fleet needs no project of its own, so a client run outside one works.
         return _fleet(arguments)
+    if command == "upgrade-check":
+        # It reads copies the operator names, never the project's own state.
+        return _upgrade_check(arguments)
     project: Path = arguments.project
     runtime_dir: Path | None = arguments.runtime_dir
     try:

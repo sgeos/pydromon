@@ -24,7 +24,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import commitruns, runs, spawn
+from dromon import commitruns, evidence, runs, spawn
 from dromon.codec import decode, encode
 from dromon.driver import Strategy
 from dromon.eventlog import EventLog
@@ -448,7 +448,7 @@ def test_a_checkout_holds_the_commit_and_nothing_uncommitted(
     before = git(repository, "worktree", "list", "--porcelain")
     made = commitruns.make_checkout(base, "r-1", repository, main, git_env(tmp_path))
     checkout = made.tree
-    assert made == commitruns.Checkout(base / "r-1" / "tree", base / "r-1" / "home")
+    assert made == commitruns.Checkout(base / "r-1" / "tree", base / "r-1" / "run-home")
     assert (checkout / "gate.txt").read_text() == "committed gate\n"
     assert not (checkout / "loose.txt").exists()
     assert not (checkout / "side.txt").exists()
@@ -1116,6 +1116,67 @@ def test_a_commit_run_names_the_daemon_interpreter_and_no_downloads(
         check(scheduler)
         output = (Path(run.workdir) / run.output_file).read_text()
         assert output == f"{commitruns.daemon_interpreter()} never\n"
+
+
+# Round 18, item 2. The audit's review-gate runs r-6d12763e52a8 and, earlier,
+# r-c704cb3c0e07 exited 2 at collection, since uv chose a Python without Tk. Both ran
+# under daemons that predate the fix of 2026-11-05, 3ba663e, which reached main only in
+# aa45ba3 on 2026-11-16. These pin what the gate needs of the environment the fix gives,
+# the interpreter's Tk and caches it can write in the fresh home, so a later change of
+# the environment that loses either fails here and not in a review.
+
+TK_AND_CACHE_SOURCE = (
+    "import os, subprocess, sys;"
+    " python = os.environ['UV_PYTHON'];"
+    " tk = subprocess.run([python, '-c', 'import tkinter'], check=False).returncode;"
+    " cache = os.path.join(os.environ['HOME'], '.cache', 'uv');"
+    " os.makedirs(cache);"
+    " probe = os.path.join(cache, 'probe');"
+    " open(probe, 'w').write('x');"
+    " print(tk, open(probe).read(), oct(os.stat(os.environ['HOME']).st_mode & 0o777))"
+)
+
+
+def test_a_commit_run_s_interpreter_has_tk_where_the_gate_s_does(
+    repo: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    """The interpreter a commit run names imports Tk whenever the interpreter this
+    gate runs on does, since the gate's tests of the window client import it."""
+    gate_tk = subprocess.run(
+        [sys.executable, "-c", "import tkinter"], check=False, capture_output=True
+    ).returncode
+    repository, main, _ = repo
+    with EventLog(tmp_path / "events.sqlite") as log:
+        scheduler = commit_scheduler(log, repository, tmp_path)
+        scheduler.set_runs(
+            {}, {"review": (sys.executable, "-c", TK_AND_CACHE_SOURCE)}, MAIN
+        )
+        run = asyncio.run(scheduler.start_run("alpha", "review", "none", main))
+        wait_for_supervisor(scheduler, run.run_id)
+        check(scheduler)
+        output = (Path(run.workdir) / run.output_file).read_text()
+        ended = log.state.runs[run.run_id].ended
+        assert ended is not None and ended.exit_code == 0, output
+        tk, written, mode = output.split()
+        assert int(tk) == gate_tk, output
+        assert (written, mode) == ("x", "0o700"), output
+
+
+def test_a_commit_run_s_home_is_not_read_as_a_scrubbed_user_name(
+    repo: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    """Round 18, item 2. Review gate ``r-47d1a0b867ce`` failed the scrubber's fixture
+    test, which takes the user name from the last part of ``HOME``, because the fresh
+    home was called ``home`` and every scrubbed recording names
+    ``evidence.SCRUBBED_HOME``. The second assertion shows the check finds the old
+    name, so it would fail were the name put back."""
+    repository, main, _ = repo
+    base = tmp_path / "state" / "commit-runs"
+    base.parent.mkdir()
+    made = commitruns.make_checkout(base, "r-1", repository, main, git_env(tmp_path))
+    scrubbed = f"{evidence.SCRUBBED_HOME}/.claude/settings.json"
+    assert evidence.leaks(scrubbed, str(made.home)) == []
+    assert evidence.leaks(scrubbed, str(made.home.parent / "home")) == ["the user name"]
 
 
 def test_an_ordinary_run_is_not_given_the_interpreter(tmp_path: Path) -> None:

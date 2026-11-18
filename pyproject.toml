@@ -56,6 +56,7 @@ markers = [
     "live: calls the real engine on the operator's subscription",
     "real_processes: gives a test's scheduler the operating system's process table",
     "real_git_status: lets dromon.readiness start git status rather than answer clean",
+    "task_note_quiet: keeps the scheduler's quiet period for waking task notes",
 ]
 # Collection skips the state directory, which a line's sandbox denies outright, so a
 # line running the gate in its own project would otherwise fail to collect. -rfEs adds
@@ -91,6 +92,7 @@ include = [
     "scripts/assemble_changelog.py",
     "scripts/assemble_floors.py",
     "scripts/ci_pythons.py",
+    "scripts/state_pin.py",
 ]
 # Naming extraPaths drops pyright's automatic src entry, after which dromon resolves as
 # the installed library and every test import of a private name fails, so src is listed.

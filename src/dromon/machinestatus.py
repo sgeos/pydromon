@@ -16,7 +16,8 @@ nothing. The reader is a pure function of the file's text and the time, which a 
 carries over unchanged. **Porting note.** The file's path comes from the project file,
 and the port reads the same text.
 
-**Decisions.** At ``critical`` nothing starts, neither a run nor a turn. At
+**Decisions.** ``POLICY`` below states them in the words every notice uses. At
+``critical`` no turn starts, and no run unless only disk raised it. At
 ``elevated`` a run is deferred, and a turn proceeds with a warning in its prompt. A
 status that is stale, missing or unreadable counts as ``elevated``, and says why. A
 level raised only by free disk space does not defer a run, because a gate uses
@@ -145,6 +146,51 @@ class Decision:
 
 
 NO_DECISION: Final = Decision()
+
+# **Round 18, item 4.** The policy was worded in four places, the module's text, the
+# warning a turn proceeds with, the refusal of a run and the documents, and they
+# disagreed. A turn at ``elevated`` raised only by free disk space was told to start
+# nothing heavy, such as a full gate, while ``decide`` let the gate start, so a line
+# that obeyed the notice waited for nothing. Every sentence a line or the operator
+# reads about what the status holds back now comes from here, derived from the
+# ``Decision``, so a change of ``decide`` changes the words with it.
+
+RUNS_HELD_WHEN: Final = (
+    "A run, supervised or on a commit, waits while the machine status is elevated or"
+    " critical or cannot be relied on, unless only free disk space raised it, since a"
+    " gate uses processor and memory and not disk."
+)
+"""When a run is held back, in one sentence, as ``decide`` sets it."""
+
+TURNS_HELD_WHEN: Final = (
+    "A turn waits while the status is critical, whatever raised it, and otherwise"
+    " proceeds, with a warning when the status is not ok."
+)
+"""When a turn is held back, in one sentence, as ``decide`` sets it."""
+
+POLICY: Final = f"{RUNS_HELD_WHEN} {TURNS_HELD_WHEN}"
+"""The whole policy, as ``line_status`` and the run tools give it."""
+
+RUNS_HELD_ADVICE: Final = (
+    "Runs are held back, so start nothing heavy, such as a full gate, until they are"
+    " allowed. A start_run now waits in the queue and begins by itself once they are."
+    " Say in your report that you waited."
+)
+RUNS_ALLOWED_ADVICE: Final = (
+    "Runs are not held back, since only free disk space raised the level and a gate"
+    " uses processor and memory and not disk, so a full gate may start. Write little"
+    " to disk, and say in your report that the level was raised by disk alone."
+)
+
+
+def advice(decision: Decision) -> str:
+    """What a line should do about heavy work under ``decision``, or nothing at
+    ``ok``. A turn's warning and a run's refusal both end with it."""
+    if decision.defer_runs:
+        return RUNS_HELD_ADVICE
+    if decision.warn or decision.defer_turns:
+        return RUNS_ALLOWED_ADVICE
+    return ""
 
 
 def kind_of(reason: str) -> Kind:
