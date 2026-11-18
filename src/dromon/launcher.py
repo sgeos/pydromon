@@ -122,7 +122,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Final, cast
@@ -135,6 +135,7 @@ from dromon.processes import (
     TreeReadFailure,
     TreeRow,
     descendants,
+    process_gone,
     row_is_same_process,
     same_start,
     signal_group_if_started,
@@ -311,6 +312,11 @@ LAUNCH_SUFFIX: Final = ".launch"
 MAX_LAUNCHES: Final = 256
 """The most launch records one sweep reads. The rest wait for the next sweep."""
 MAX_LAUNCH_BYTES: Final = 4096
+MAX_START_RETRIES: Final = 10
+"""How many sweeps keep a launch record whose harness's start time cannot be read,
+before the record is removed. **Round 19, item 1.** The count is of sweeps and not of
+time, and is written into the record, so it survives a restart of the daemon."""
+RETRY_FIELD: Final = "start_retries"
 
 EXITED: Final = "exited"
 STOPPED: Final = "stopped"
@@ -733,6 +739,11 @@ class LaunchRecord:
     """The same for the harness. It stays the harness's identity through a change of
     its command, as a script engine that replaces itself with a native program makes,
     which the executable's name does not."""
+    start_retries: int = 0
+    """How many sweeps have kept this record because the harness's start time could not
+    be read, as the daemon wrote it into the record. **Round 19, item 1.** A value that
+    is not a whole number from 0 to ``MAX_START_RETRIES`` is read as the most, so a
+    damaged count can shorten the retries and never lengthen them."""
 
 
 def launched_at(path: Path) -> int | None:
@@ -745,11 +756,21 @@ def launched_at(path: Path) -> int | None:
 def _started_of(value: object) -> float | None:
     """A start time a record carries, or ``None`` when it carries none or one that is
     not a positive finite number, which is then treated as absent and never trusted,
-    so a sweep falls back to the executable's name for that record."""
+    so a sweep signals nothing for that record, as for one that has none."""
     if type(value) not in (int, float):
         return None
     number = float(cast(float, value))
     return number if 0 < number < float("inf") else None
+
+
+def _retries_of(value: object) -> int:
+    """The retry count a record carries, ``0`` when it carries none, and
+    ``MAX_START_RETRIES`` for anything that is not a whole number in range."""
+    if value is None:
+        return 0
+    if type(value) is not int or not 0 <= value <= MAX_START_RETRIES:
+        return MAX_START_RETRIES
+    return value
 
 
 def parse_launch(path: Path, raw: bytes) -> LaunchRecord | None:
@@ -786,6 +807,7 @@ def parse_launch(path: Path, raw: bytes) -> LaunchRecord | None:
         launched_at(path),
         _started_of(fields.get("launcher_started")),
         _started_of(fields.get("harness_started")),
+        _retries_of(fields.get(RETRY_FIELD)),
     )
 
 
@@ -984,10 +1006,75 @@ async def sweep_launches(
     for record in records:
         if record in running:
             continue
-        swept.append(await _sweep_one(record, rows, record.harness in claimed))
-        with contextlib.suppress(OSError):
-            record.path.unlink()
+        result = await _sweep_one(record, rows, record.harness in claimed)
+        if result.skipped == UNREADABLE_START:
+            result = _retain_or_drop(record, result)
+        else:
+            with contextlib.suppress(OSError):
+                record.path.unlink()
+        swept.append(result)
     return swept
+
+
+UNREADABLE_START: Final = (
+    "the harness's start time cannot be read, so nothing is signalled"
+)
+"""Why a sweep touched nothing when the process at the harness's pid is there and its
+start time did not read. **Round 19, item 1.** That can be a moment's failure, and the
+harness may be the live one whose launcher has gone, so the record is kept for the next
+sweeps, up to ``MAX_START_RETRIES``. A start time that reads and disagrees is another
+process, and a record without one never can be read, and neither is kept."""
+
+
+def _write_retries(record: LaunchRecord, count: int) -> bool:
+    """Write ``count`` into the record's file, whole or not at all, and say whether it
+    was written. The file is read again and replaced through a temporary file of
+    another suffix in the same directory, so a sweep never reads half a record. A
+    launcher that wrote the record has exited, so the daemon is its only writer."""
+    temporary = record.path.with_name(record.path.name + ".tmp")
+    try:
+        with record.path.open("rb") as handle:
+            raw = handle.read(MAX_LAUNCH_BYTES + 1)
+        document: object = json.loads(raw)
+        if len(raw) > MAX_LAUNCH_BYTES or not isinstance(document, dict):
+            return False
+        fields = cast(dict[str, object], document)
+        fields[RETRY_FIELD] = count
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(fields))
+        os.replace(temporary, record.path)
+    except (OSError, ValueError):
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        return False
+    return True
+
+
+def _retain_or_drop(record: LaunchRecord, result: Swept) -> Swept:
+    """Keep the record of a harness whose start time did not read, with the count of
+    sweeps written into it, or remove it once the count is spent or cannot be written.
+    **Round 19, item 1.** A count that cannot be written would otherwise never advance,
+    so failing to write it removes the record, which keeps the retries bounded. Nothing
+    is signalled in either case."""
+    attempt = record.start_retries + 1
+    if attempt <= MAX_START_RETRIES and _write_retries(record, attempt):
+        return replace(
+            result,
+            skipped=(
+                f"{UNREADABLE_START}, and the record is kept for the next sweep,"
+                f" attempt {attempt} of {MAX_START_RETRIES}"
+            ),
+        )
+    with contextlib.suppress(OSError):
+        record.path.unlink()
+    return replace(
+        result,
+        skipped=(
+            f"{UNREADABLE_START}, and the record is removed after"
+            f" {record.start_retries} kept sweeps"
+        ),
+    )
 
 
 NO_START_TIME: Final = (
@@ -1020,7 +1107,10 @@ def _held_by_another(
     if known is False:
         return "another process now holds the harness's pid"
     if known is None:
-        return "the harness's start time cannot be read, so nothing is signalled"
+        # A table that lists a process the system no longer has is a table read a
+        # moment ago, and a start time cannot be read from nothing. That is not a
+        # time that failed to read, so there is nothing to wait for.
+        return None if process_gone(record.harness) else UNREADABLE_START
     return None
 
 

@@ -1260,6 +1260,13 @@ def _exists(pid: int) -> bool | None:
     return True
 
 
+def process_gone(pid: int) -> bool:
+    """Whether no process holds ``pid``, which is certain only when the system says so.
+    A zombie and another user's process are not gone, and a number that cannot be told
+    is not gone either. **Round 19, item 1.**"""
+    return _exists(pid) is False
+
+
 def signal_group_if_started(
     group: int, number: int, started: float, *, leader_defunct: bool = False
 ) -> bool:
