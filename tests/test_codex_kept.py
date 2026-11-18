@@ -11,6 +11,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import evidence
 from dromon.codex import (
     CODEX_SELF_STARTED_NOTE,
     LIST_TERMINALS,
@@ -223,6 +224,24 @@ def test_a_kept_codex_line_reuses_its_app_server_and_checks_again(
         assert methods.count(check) == 2
     assert methods.count("thread/start") == 1 and methods.count("thread/resume") == 1
     assert world.servers[0].closed
+
+
+def test_a_reused_codex_connection_marks_where_its_turn_began(tmp_path: Path) -> None:
+    """Round 18 audit of ababdcd, finding 3. What the kept engine wrote before a turn
+    is not given as that turn's end."""
+    world = World([[said("one"), done()], [said("two"), done()]])
+    engine = world.line(tmp_path)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        kept_of(engine).stderr.append(b"warning: an old complaint\n")
+        await engine.run_turn("second")
+        tail = kept_of(engine).stderr
+        assert tail.turn_from == len(tail.raw)
+        assert tail.text() == evidence.EARLIER_LABEL + "warning: an old complaint"
+        await engine.close()
+
+    asyncio.run(go())
 
 
 def test_a_reused_codex_connection_refuses_a_changed_profile(tmp_path: Path) -> None:

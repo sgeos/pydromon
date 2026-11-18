@@ -311,7 +311,20 @@ NON_SUBSCRIPTION_ENVIRONMENT: Final = API_ENVIRONMENT + PROVIDER_ENVIRONMENT
 
 
 class EngineRefused(Exception):
-    """The credential policy or the driver refused to run the turn."""
+    """The credential policy or the driver refused to run the turn.
+
+    ``stderr`` is the tail of the engine's standard error, when the refusal is a
+    closed connection or a failed start, which the scheduler alone renders into
+    the closing reason. **Round 18 audit of ababdcd, finding 2.** It travels apart
+    from the message, so that the event log's exact-value scrub reaches its raw
+    text before anything puts it on one line, and so that no other reader of the
+    message sees it."""
+
+    def __init__(
+        self, *args: object, stderr: evidence.StderrTail | None = None
+    ) -> None:
+        super().__init__(*args)
+        self.stderr = stderr
 
 
 class EngineClosed(EngineRefused):
@@ -344,7 +357,7 @@ def closed_by_process(error: BaseException, tail: evidence.StderrTail) -> Engine
     error Dromon did not keep, and it was recorded as an engine error. It is now a
     closed engine, as the type's own definition says it is."""
     first = str(error).split("\n", 1)[0]
-    return EngineClosed(tail.explain(f"{ENGINE_CLOSED_PREFIX}: {first}"))
+    return EngineClosed(f"{ENGINE_CLOSED_PREFIX}: {first}", stderr=tail.snapshot())
 
 
 def keeping_tail(
@@ -353,7 +366,10 @@ def keeping_tail(
     """``options`` whose standard error callback also keeps the engine's lines in
     ``tail``. A callback already set is still called. Without one the SDK would have
     left the engine's standard error to the daemon's, so each line is written there
-    too, which keeps the daemon log as it was."""
+    too, which keeps the daemon log as it was. **Round 18 audit of ababdcd, finding
+    1.** The SDK calls the callback on the event loop, so the line is handed to
+    ``evidence.ENGINE_LINES``, whose thread writes it, and a standard error that
+    blocks costs a dropped and counted line and never the loop."""
     previous = options.stderr
 
     def keep(line: str) -> None:
@@ -361,7 +377,7 @@ def keeping_tail(
         if previous is not None:
             previous(line)
         else:
-            print(line, file=sys.stderr)
+            evidence.ENGINE_LINES.say(line)
 
     return replace(options, stderr=keep)
 
@@ -2664,7 +2680,7 @@ class ClaudeCodeLine:
         try:
             return self._report(result, turn, cost)
         except EngineClosed as error:
-            raise EngineClosed(tail.explain(str(error))) from error
+            raise EngineClosed(str(error), stderr=tail.snapshot()) from error
 
     def _check_limit(self, result: ResultMessage | None, turn: _Turn) -> None:
         """Raise ``EnginePlanLimit`` when the turn shows the provider's budget
@@ -3694,6 +3710,8 @@ class ClaudeCodeLine:
         reused = self._kept is not None
         self.driver.step(Event("turn_start"))
         connection = self._kept or await self._connect(options, fingerprint)
+        if reused:
+            connection.stderr.mark_turn()
         turn = _Turn()
         if self._notes:
             prompt = "\n\n".join([*self._notes, prompt])
@@ -3775,11 +3793,11 @@ class ClaudeCodeLine:
             self._notes.append(DIED_NOTE)
             if turn.refusal is not None:
                 raise _refusal_error(turn)
+            if connection.ended_by:
+                raise EngineRefused(connection.ended_by)
             raise EngineRefused(
-                connection.ended_by
-                or connection.stderr.explain(
-                    "the engine's process ended during the turn"
-                )
+                "the engine's process ended during the turn",
+                stderr=connection.stderr.snapshot(),
             )
         cost = self._measure(result)
         if turn.refusal is not None:

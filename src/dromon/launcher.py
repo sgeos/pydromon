@@ -205,13 +205,13 @@ def unrelayed(environment: dict[str, str]) -> None:
 
 
 SCRIPT_NAME: Final = "dromon-launch"
+"""The launcher's command, installed beside the Python interpreter, which the Agent
+SDK runs in place of Claude Code."""
 
 DIAGNOSTIC_PREFIX: Final = f"{SCRIPT_NAME}:"
 """What begins every line the launcher writes to standard error, which it shares
 with the engine, so a closing reason can tell the launcher's notes from what the
 engine said, as ``dromon.evidence.StderrTail`` does."""
-"""The launcher's command, installed beside the Python interpreter, which the Agent
-SDK runs in place of Claude Code."""
 
 VERSION_ARGUMENTS: Final = (("-v",), ("--version",))
 """The arguments of the Agent SDK's version check. **Fact, read from Agent SDK 0.2.174

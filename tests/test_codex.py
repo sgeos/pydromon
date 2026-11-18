@@ -2300,9 +2300,10 @@ def test_a_start_refusal_reaches_the_closing_reason_with_its_credential_masked(
 
     with pytest.raises(EngineClosed) as raised:
         asyncio.run(go())
-    reason = str(raised.value)
+    reason = evidence.with_tail(str(raised.value), raised.value.stderr)
     assert reason.startswith("the engine closed its connection during the turn")
     assert START_REFUSAL in reason
+    assert START_REFUSAL not in str(raised.value)
     assert "token=***" in reason and "abc123secret" not in reason
     assert len(reason) <= evidence.CLOSING_REASON_CHARACTERS
 

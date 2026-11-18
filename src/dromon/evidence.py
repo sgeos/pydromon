@@ -91,8 +91,11 @@ import contextlib
 import json
 import os
 import re
+import sys
+import threading
+import time
 import unicodedata
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -273,6 +276,27 @@ MIN_TAIL_CHARACTERS: Final = 24
 
 STDERR_JOINER: Final = ". Its standard error ended with: "
 
+EARLIER_LABEL: Final = "before this turn: "
+"""What leads a kept engine's tail when nothing was written since its turn began."""
+
+type Scrub = Callable[[str], str]
+"""A function that masks secrets in text, as the event log's ``scrub_text``."""
+
+
+def _unscrubbed(text: str) -> str:
+    return text
+
+
+def home_masked(text: str, home: str | None = None) -> str:
+    """``text`` with the home directory written ``~`` wherever it stands as a whole
+    path component. **Round 18 audit of ababdcd, finding 3.** An engine's refusal
+    names its configuration file by its full path, which holds the user's name. An
+    unknown home, or one that is the root, masks nothing."""
+    root = (os.path.expanduser("~") if home is None else home).rstrip("/")
+    if not root or root == "~":
+        return text
+    return re.sub(rf"{re.escape(root)}(?![^/\s])", "~", text)
+
 
 @dataclass(slots=True)
 class StderrTail:
@@ -283,20 +307,35 @@ class StderrTail:
     refused its configuration at start saw only that the connection closed.
 
     It is held in memory only, for the life of its process, and never written as
-    it is. ``text`` masks it, so only masked text leaves it. **Failure modes.**
-    Masking is by the patterns of ``dromon.redact``, so a secret in another form
-    passes as it is, which is why the scheduler also screens the closing reason
-    against the disclosure list and withholds it on a match. The bytes are cut from
-    the front, which can leave a credential's value without the name that masking
-    keys on, so a cut tail drops its first word before it is shown. An engine that
-    writes after it closes its output, or a reader the engine's transport cancels
-    first, can leave the last words out. The launcher shares the stream and writes
-    its notes after the engine ends, so its lines are shown only when the engine
-    wrote none. An engine that writes a line beginning as the launcher's hides that
-    line from the reason and from nothing else."""
+    it is. An adapter hands a ``snapshot`` to the scheduler on the error it raises,
+    and the scheduler renders it with ``with_tail`` into the closing reason alone.
+
+    **Round 18 audit of ababdcd.** ``text`` applies the scrub it is given, the event
+    log's exact match of configured secrets, to the raw text of each part before
+    anything else, since a secret holding a line break or a run of spaces no longer
+    matched once the text was put on one line. It then writes the home directory as
+    ``~``. ``mark_turn`` divides a kept engine's earlier output from its current
+    turn's, so an old line is not given as the end of a later turn.
+
+    **Failure modes.** Masking past the scrub is by the patterns of
+    ``dromon.redact``, so a secret in another form that no one configured passes as
+    it is, which is why the scheduler also screens the closing reason against the
+    disclosure list and withholds it on a match. The bytes are cut from the front,
+    which can leave a credential's value without the name that masking keys on, or
+    the end of a configured secret without its start, so a cut part drops everything
+    before its first line break, or its first word when it has no line break. A
+    configured secret that spans a line break and is cut in its first line can
+    still leave its later lines. An engine that writes after it closes its output,
+    or a reader the engine's transport cancels first, can leave the last words out.
+    The launcher shares the stream and writes its notes after the engine ends, so
+    its lines are shown only when the engine wrote none. An engine that writes a
+    line beginning as the launcher's hides that line from the reason and from
+    nothing else."""
 
     raw: bytearray = field(default_factory=bytearray)
     cut: bool = False
+    turn_from: int = 0
+    """Where in ``raw`` the current turn began, or 0 when all of it is current."""
 
     def append(self, chunk: bytes) -> None:
         self.raw.extend(chunk)
@@ -304,46 +343,177 @@ class StderrTail:
         if excess > 0:
             del self.raw[:excess]
             self.cut = True
+            self.turn_from = max(0, self.turn_from - excess)
 
-    def text(self, limit: int = STDERR_TAIL_BYTES) -> str:
-        """The tail masked, on one line of printable characters, and at most
-        ``limit`` characters from its end. Masking runs on everything kept before
-        any cut, and a cut drops the partial first word."""
-        lines = self.raw.decode("utf-8", "replace").splitlines()
-        own = [line for line in lines if not line.startswith(DIAGNOSTIC_PREFIX)]
+    def mark_turn(self) -> None:
+        """Note that a kept engine's new turn begins here. **Round 18 audit of
+        ababdcd, finding 3.** What came before is given only when the engine has
+        written nothing since, and then under ``EARLIER_LABEL``."""
+        self.turn_from = len(self.raw)
+
+    def snapshot(self) -> "StderrTail":
+        """A copy that later output of a kept engine does not change."""
+        return StderrTail(bytearray(self.raw), self.cut, self.turn_from)
+
+    def _lines(self, part: bytes, scrub: Scrub, cut: bool) -> list[str]:
+        text = home_masked(scrub(part.decode("utf-8", "replace")))
+        if cut:
+            head, newline, rest = text.partition("\n")
+            text = rest if newline else head.partition(" ")[2]
+        return text.splitlines()
+
+    def text(self, limit: int = STDERR_TAIL_BYTES, scrub: Scrub = _unscrubbed) -> str:
+        """The tail scrubbed and masked, on one line of printable characters, and at
+        most ``limit`` characters from its end. The scrub and the masking run on
+        everything kept before it is put on one line or cut to ``limit``."""
+        if limit <= 0:
+            return ""
+        earlier = self._lines(bytes(self.raw[: self.turn_from]), scrub, self.cut)
+        current = self._lines(
+            bytes(self.raw[self.turn_from :]), scrub, self.cut and not self.turn_from
+        )
+
+        def own(lines: list[str]) -> list[str]:
+            return [line for line in lines if not line.startswith(DIAGNOSTIC_PREFIX)]
+
         # The launcher writes its notes after the engine has ended, which would
         # crowd out what the engine said. They are shown only when the engine said
         # nothing, as when the launcher could not start it.
-        kept = own if any(line.strip() for line in own) else lines
+        label = ""
+        if any(line.strip() for line in own(current)):
+            kept = own(current)
+        elif any(line.strip() for line in own(earlier)):
+            kept, label = own(earlier), EARLIER_LABEL
+        else:
+            kept = earlier + current
         masked = redact.mask("\n".join(kept))
-        words = "".join(c if c.isprintable() else " " for c in masked).split()
-        if self.cut and words:
-            words = words[1:]
-        shown = " ".join(words)
-        if limit <= 0:
+        shown = " ".join("".join(c if c.isprintable() else " " for c in masked).split())
+        room = limit - len(label)
+        if not shown or room <= 0:
             return ""
-        if len(shown) <= limit:
-            return shown
-        start = len(shown) - limit
-        rest = shown[start:]
-        if shown[start - 1] == " ":
-            return rest
-        _, _, whole = rest.partition(" ")
-        return whole
+        if len(shown) > room:
+            start = len(shown) - room
+            rest = shown[start:]
+            shown = rest if shown[start - 1] == " " else rest.partition(" ")[2]
+        return f"{label}{shown}" if shown else ""
 
-    def explain(self, message: str) -> str:
-        """``message`` with as much of the tail as the closing reason has room for,
-        or ``message`` unchanged when the tail is empty or the room is too small.
-        ``message`` keeps its own first words, by which the scheduler maps a stop
-        to its fixed wording."""
-        first = message.split("\n", 1)[0]
-        room = CLOSING_REASON_CHARACTERS - len(first) - len(STDERR_JOINER)
-        if room < MIN_TAIL_CHARACTERS:
-            return message
-        shown = self.text(room)
-        if not shown:
-            return message
-        return f"{first}{STDERR_JOINER}{shown}"
+
+def with_tail(head: str, tail: StderrTail | None, scrub: Scrub = _unscrubbed) -> str:
+    """``head``, the first line of a turn's error already masked, with as much of
+    ``tail`` as the closing reason has room for, or ``head`` alone when there is no
+    tail or too little room. ``head`` keeps its own first words, by which the
+    scheduler maps a stop to its fixed wording."""
+    room = CLOSING_REASON_CHARACTERS - len(head) - len(STDERR_JOINER)
+    if tail is None or room < MIN_TAIL_CHARACTERS:
+        return head
+    shown = tail.text(room, scrub)
+    return f"{head}{STDERR_JOINER}{shown}" if shown else head
+
+
+FORWARD_PENDING: Final = 256
+"""The most engine lines queued for a daemon standard error that has not accepted the
+one before. A bound, so that a standard error that never accepts a line costs a few
+tens of kilobytes and not the daemon's memory."""
+FORWARD_DRAIN_LIMIT: Final = 1000
+"""The most lines one writer thread writes before it ends, a bound on its loop. A
+later line starts another."""
+
+
+def _write_stderr(text: str) -> None:
+    # A forwarded line must not disturb the engine whose line it is.
+    with contextlib.suppress(Exception):
+        sys.stderr.write(f"{text}\n")
+
+
+class LineForwarder:
+    """Writes lines to the daemon's standard error from a thread of its own, so the
+    caller never waits on the write. **Round 18 audit of ababdcd, finding 1.** The
+    Agent SDK calls a Claude Code line's standard error callback on the event loop,
+    and a standard error that blocked, as a pipe whose reader stopped does, held the
+    whole daemon and stopped the SDK reading the engine's pipe. The pattern is
+    ``spawn._say``'s, without its wait, since the caller is the event loop.
+
+    At most one writer thread exists, so a standard error that never accepts a line
+    holds one thread. A line that finds ``FORWARD_PENDING`` queued is dropped and
+    counted, and the writer says how many once the queue is empty. ``say`` never
+    raises and holds the lock only to queue. **Porting note.** A port gives the
+    writer a bounded channel and a task of its own."""
+
+    def __init__(
+        self,
+        write: Callable[[str], None] = _write_stderr,
+        pending: int = FORWARD_PENDING,
+    ) -> None:
+        self._write = write
+        self._bound = pending
+        self._lock = threading.Lock()
+        self._pending: list[str] = []
+        self._writer: threading.Thread | None = None
+        self._unreported = 0
+        self.dropped = 0
+
+    def say(self, text: str) -> None:
+        with self._lock:
+            if len(self._pending) >= self._bound:
+                self.dropped += 1
+                self._unreported += 1
+                return
+            self._pending.append(text)
+            writer = self._writer
+            if writer is not None:
+                return
+            writer = threading.Thread(
+                target=self._drain, name="dromon-engine-stderr", daemon=True
+            )
+            self._writer = writer
+        try:
+            writer.start()
+        except RuntimeError:
+            # No thread could be made. The line stays queued for the next writer.
+            with self._lock:
+                if self._writer is writer:
+                    self._writer = None
+
+    def _drain(self) -> None:
+        for _ in range(FORWARD_DRAIN_LIMIT):
+            with self._lock:
+                if self._pending:
+                    text = self._pending.pop(0)
+                elif self._unreported:
+                    text = (
+                        f"dromond: {self._unreported} lines of an engine's standard"
+                        " error were dropped, because standard error did not accept"
+                        " them"
+                    )
+                    self._unreported = 0
+                else:
+                    self._writer = None
+                    return
+            self._write(text)
+        with self._lock:
+            self._writer = None
+
+    def join(self, seconds: float) -> bool:
+        """Wait at most ``seconds`` for the queue to be written, and say whether it
+        was. For tests and an orderly stop."""
+        deadline = time.monotonic() + seconds
+        while True:
+            with self._lock:
+                writer = self._writer
+                idle = writer is None and not self._pending and not self._unreported
+            if idle:
+                return True
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            if writer is not None:
+                writer.join(min(left, 0.05))
+            else:
+                time.sleep(min(left, 0.01))
+
+
+ENGINE_LINES: Final = LineForwarder()
+"""The forwarder every Claude Code line's standard error callback writes through."""
 
 
 ENGINE_STDERR: ContextVar[StderrTail | None] = ContextVar(

@@ -1467,7 +1467,7 @@ class CodexLine:
         except EngineClosed as error:
             # The connection's exit has ended the process and drained its standard
             # error, so the tail holds what the engine said as it closed.
-            raise EngineClosed(tail.explain(str(error))) from error
+            raise EngineClosed(str(error), stderr=tail.snapshot()) from error
         finally:
             evidence.ENGINE_STDERR.reset(token)
         if turn.refusal is not None:
@@ -2546,7 +2546,10 @@ class CodexLine:
                 await self.close(
                     "its configuration, instructions, tools or environment changed"
                 )
+        reused = self._kept is not None
         kept = self._kept or await self._open_kept(arguments, environment, fingerprint)
+        if reused:
+            kept.stderr.mark_turn()
         if self._notes:
             prompt = "\n\n".join([*self._notes, prompt])
             self._notes.clear()
@@ -2582,7 +2585,7 @@ class CodexLine:
                 self._notes.append(DIED_NOTE)
             if isinstance(error, EngineClosed):
                 # The close has ended the process and drained its standard error.
-                raise EngineClosed(kept.stderr.explain(str(error))) from error
+                raise EngineClosed(str(error), stderr=kept.stderr.snapshot()) from error
             raise
         finally:
             self._in_turn = False

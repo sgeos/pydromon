@@ -10,6 +10,8 @@ import asyncio
 import json
 import re
 import os
+import sys
+import threading
 from collections.abc import (
     AsyncGenerator,
     AsyncIterator,
@@ -1399,14 +1401,17 @@ def test_a_claude_start_refusal_reaches_the_closing_reason_masked(
     )
     with pytest.raises(EngineClosed) as raised:
         run(ended(session, keep))
-    reason = str(raised.value)
+    reason = evidence.with_tail(str(raised.value), raised.value.stderr)
     assert reason.startswith(f"{ENGINE_CLOSED_PREFIX}: Command failed with exit code 1")
     assert CLAUDE_REFUSAL in reason
     assert "abc123secret" not in reason and "***" in reason
     assert len(reason) <= evidence.CLOSING_REASON_CHARACTERS
     assert isinstance(raised.value.__cause__, ProcessError)
+    # The tail travels apart from the message, which no other reader then sees.
+    assert CLAUDE_REFUSAL not in str(raised.value)
     # Without a callback of its own the engine's lines still reach the daemon's
-    # standard error, as when the SDK left them to it.
+    # standard error, as when the SDK left them to it, through the writer thread.
+    assert evidence.ENGINE_LINES.join(5)
     assert CLAUDE_REFUSAL in capsys.readouterr().err
 
 
@@ -1419,8 +1424,49 @@ def test_a_claude_process_that_ends_during_the_turn_names_what_it_said(
     )
     with pytest.raises(EngineRefused) as raised:
         run(ended(session, keep))
-    assert "Error: the engine ran out of memory" in str(raised.value)
-    assert len(str(raised.value)) <= evidence.CLOSING_REASON_CHARACTERS
+    reason = evidence.with_tail(str(raised.value), raised.value.stderr)
+    assert "Error: the engine ran out of memory" in reason
+    assert len(reason) <= evidence.CLOSING_REASON_CHARACTERS
+
+
+def test_a_blocked_daemon_standard_error_never_holds_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 18 audit of ababdcd, finding 1. A standard error that blocks two seconds
+    on each write once held the loop four seconds for one engine line."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Blocked:
+        def write(self, text: str) -> int:
+            entered.set()
+            release.wait(10)
+            return len(text)
+
+    forwarder = evidence.LineForwarder(pending=2)
+    monkeypatch.setattr(evidence, "ENGINE_LINES", forwarder)
+    monkeypatch.setattr(sys, "stderr", Blocked())
+    tail = evidence.StderrTail()
+    keep = engine_module.keeping_tail(ClaudeAgentOptions(), tail).stderr
+    assert keep is not None
+
+    async def go() -> float:
+        began = asyncio.get_running_loop().time()
+        keep("Error: first")
+        assert await asyncio.to_thread(entered.wait, 5)
+        for number in range(5):
+            keep(f"Error: line {number}")
+        return asyncio.get_running_loop().time() - began
+
+    try:
+        assert asyncio.run(go()) < 1.0
+        assert tail.text() == "Error: first " + " ".join(
+            f"Error: line {number}" for number in range(5)
+        )
+        assert forwarder.dropped == 3
+    finally:
+        release.set()
+        assert forwarder.join(5)
 
 
 @pytest.mark.parametrize(

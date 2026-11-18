@@ -4785,7 +4785,7 @@ def test_a_grok_start_refusal_reaches_the_closing_reason_masked(
 ) -> None:
     with pytest.raises(EngineClosed) as raised:
         run(real_agent_line(project, monkeypatch, tmp_path, REFUSING_GROK))
-    reason = str(raised.value)
+    reason = evidence.with_tail(str(raised.value), raised.value.stderr)
     assert reason.startswith("the engine closed its connection")
     assert SPOKEN_REFUSAL in reason
     assert "api_key=***" in reason and "abc123secret" not in reason
@@ -4798,7 +4798,7 @@ def test_a_grok_start_that_times_out_names_what_the_agent_said(
     monkeypatch.setattr(grok_module, "START_SECONDS", 0.5)
     with pytest.raises(EngineRefused) as raised:
         run(real_agent_line(project, monkeypatch, tmp_path, STALLED_GROK))
-    reason = str(raised.value)
+    reason = evidence.with_tail(str(raised.value), raised.value.stderr)
     assert reason.startswith("Grok start timed out during initialize")
     assert SPOKEN_REFUSAL in reason
     assert "api_key=***" in reason and "abc123secret" not in reason

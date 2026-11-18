@@ -932,10 +932,13 @@ and values supplied to the event log. Other private text requires the disclosure
 list. No later exception line is persisted in this field. Historical events and
 separate engine evidence files are unchanged.
 
-Round 18 follow-up of 2026-11-18. The first line of a closed connection or a failed
-start may now end with the tail of the engine's standard error, fitted to the same
-240 characters, as `ENGINES.md` describes. The field, its bound and its screening are
-unchanged, so the event's format and its meaning are too.
+Round 18 follow-up of 2026-11-18. The reason of a closed connection or a failed start
+may now end with the tail of the engine's standard error, which the error carries apart
+from its message, fitted after the error's own first line to the same 240 characters,
+as `ENGINES.md` describes. The tail's raw text is scrubbed of the literal values
+before it is put on one line, and the whole reason is then screened as before. The
+field, its bound and its screening are unchanged, so the event's format and its
+meaning are too.
 
 Rollback hazard. Older daemons refuse events carrying `closing_reason`. The floor
 table above records the first compatible commit and its pending main floor. Ports

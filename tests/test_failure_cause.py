@@ -15,6 +15,7 @@ from typing import Any, cast
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
+from dromon import evidence
 from dromon.codec import DecodeError, decode, encode
 from dromon.driver import Strategy
 from dromon.engine import (
@@ -519,6 +520,48 @@ def test_closing_reason_does_not_use_scratch_screening(
     world.actions["alpha"] = raising(EngineClosed("transport vanished"))
     world.turn()
     assert last_end(world).closing_reason == "transport vanished"
+
+
+def stderr_of(text: str) -> evidence.StderrTail:
+    tail = evidence.StderrTail()
+    tail.append(text.encode())
+    return tail
+
+
+def test_the_tail_follows_the_message_in_the_closing_reason(world: World) -> None:
+    error = EngineClosed("transport vanished", stderr=stderr_of("Error: refused\n"))
+    world.actions["alpha"] = raising(error)
+    world.turn()
+    assert last_end(world).closing_reason == (
+        f"transport vanished{evidence.STDERR_JOINER}Error: refused"
+    )
+
+
+@pytest.mark.parametrize("secret", ["alpha-line1\nbravo-line2", "pass  with  gaps"])
+def test_a_configured_secret_with_whitespace_in_the_tail_is_masked(
+    world: World, secret: str
+) -> None:
+    """Round 18 audit of ababdcd, finding 2, through the scheduler itself."""
+    world.log.secrets = lambda: (secret,)
+    tail = stderr_of(f"Error: refused with {secret} as given\n")
+    world.actions["alpha"] = raising(EngineClosed("transport vanished", stderr=tail))
+    world.turn()
+    end = last_end(world)
+    assert end.closing_reason == (
+        f"transport vanished{evidence.STDERR_JOINER}Error: refused with *** as given"
+    )
+    assert secret not in encode(end)
+    assert " ".join(secret.split()) not in encode(end)
+    assert secret.split()[0] not in encode(end)
+
+
+def test_a_disclosure_term_in_the_tail_withholds_the_reason(world: World) -> None:
+    world.scheduler.set_disclosure_terms(("private diagnostic",))
+    tail = stderr_of("Error: private diagnostic\n")
+    world.actions["alpha"] = raising(EngineClosed("transport vanished", stderr=tail))
+    world.turn()
+    assert last_end(world).closing_reason is None
+    assert "private diagnostic" not in encode(last_end(world))
 
 
 def test_literal_credential_crossing_reason_cut_is_masked(world: World) -> None:

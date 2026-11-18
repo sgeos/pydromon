@@ -166,6 +166,7 @@ from dromon.agents import LineTokens
 from dromon import (
     capabilities,
     credentials,
+    evidence,
     launcher,
     linetemp,
     redact,
@@ -13497,6 +13498,12 @@ class Scheduler:
         try:
             text = redact.mask(self._log.scrub_text(str(error).split("\n", 1)[0]))
             text = "".join(char if char.isprintable() else " " for char in text)
+            # Round 18 follow-up. A closed connection or a failed start carries the
+            # raw tail of its engine's standard error, which ``with_tail`` scrubs
+            # with the log's exact values before it puts it on one line, and which
+            # the screen below sees whole with the message.
+            if isinstance(error, EngineRefused):
+                text = evidence.with_tail(text, error.stderr, self._log.scrub_text)
             if self.discloses(type(error).__name__, text):
                 return None
         except Exception:  # noqa: BLE001

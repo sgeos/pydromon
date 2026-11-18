@@ -33,7 +33,7 @@ from claude_agent_sdk import (
 )
 
 from dromon.driver import Action, Driver, Event, Strategy, driver_resource
-from dromon import launcher, redact
+from dromon import evidence, launcher, redact
 from dromon.activity import ActivityKind, ActivityLog
 from dromon.ceiling import HARD_REASON, STOP_REASON, Choice
 from dromon.engine import (
@@ -283,6 +283,27 @@ def test_a_kept_line_sends_its_next_prompt_on_the_same_connection(
     # The reused connection was asked to report its init again, in its own mode.
     assert connection.modes == ["default"]
     assert connection.closed
+
+
+def test_a_reused_claude_connection_marks_where_its_turn_began(
+    tmp_path: Path,
+) -> None:
+    """Round 18 audit of ababdcd, finding 3. What the kept engine wrote before a turn
+    is not given as that turn's end."""
+    factory = Factory([[say("one"), result()], [say("two"), result("session-1")]])
+    engine = line(factory, tmp_path)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        kept = engine._kept  # pyright: ignore[reportPrivateUsage]
+        assert kept is not None
+        kept.stderr.append(b"warning: an old complaint\n")
+        await engine.run_turn("second")
+        assert kept.stderr.turn_from == len(kept.stderr.raw)
+        assert kept.stderr.text().startswith(evidence.EARLIER_LABEL)
+        await engine.close()
+
+    asyncio.run(go())
 
 
 def test_a_line_without_keep_session_does_not_use_a_kept_connection(

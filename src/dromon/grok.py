@@ -1786,11 +1786,11 @@ class GrokLine:
         except EngineClosed as error:
             # The connection's exit has ended the process and drained its standard
             # error, so the tail holds what the engine said as it closed.
-            raise EngineClosed(tail.explain(str(error))) from error
+            raise EngineClosed(str(error), stderr=tail.snapshot()) from error
         except EngineRefused as error:
             if error is not start_failure:
                 raise
-            raise EngineRefused(tail.explain(str(error))) from error
+            raise EngineRefused(str(error), stderr=tail.snapshot()) from error
         finally:
             evidence.ENGINE_STDERR.reset(token)
         if turn.refusal is not None:
