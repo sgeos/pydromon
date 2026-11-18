@@ -1237,20 +1237,12 @@ def _questions(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         )
         for text_line in str(entry.get("text", "")).splitlines() or [""]:
             print(f"    {text_line}")
-        if entry.get("text_truncated") is True:
-            print("    [the text is cut to fit one answer, and the rest is in the log]")
         choices = entry.get("choices")
         if isinstance(choices, list) and choices:
             print(
                 "    choices: "
                 + " | ".join(str(c) for c in cast(list[object], choices))
             )
-    left_out = response.result.get("left_out")
-    if type(left_out) is int and left_out > 0:
-        print(
-            f"{left_out} more open questions did not fit this answer. Answer the"
-            " ones shown, and ask again."
-        )
     return exits.OK
 
 
@@ -2386,7 +2378,9 @@ def _run_status(
     left_out = result.get("left_out")
     if type(left_out) is int and left_out > 0:
         print(
-            f"{left_out} more runs are not shown, the oldest and those past the limit."
+            f"{left_out} more runs are not shown. The page takes the runs that block"
+            " their scope first, then the newest, up to the limit and the answer's"
+            " size, and leaves out older finished runs, and past the limit any run."
             " dromon run status RUN_ID shows one run whole, and --limit N asks for"
             f" more, to at most {RUNS_LIMIT_MAX}."
         )
@@ -2593,11 +2587,6 @@ def _role(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
                 f" {result['daemon_commit'] or 'unknown'}"
             )
             print(result["body"])
-            if result.get("body_truncated") is True:
-                print(
-                    f"[the body is cut to fit one answer. It is {result['chars']}"
-                    " characters, and the whole is in the log]"
-                )
         case "take" | "vacate":
             owner = result["owner"] or "no seat"
             print(

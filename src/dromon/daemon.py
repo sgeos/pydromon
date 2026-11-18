@@ -2472,6 +2472,24 @@ def _cut_to_written(text: str, limit: int) -> str:
     return text[:low]
 
 
+def _cut_mark(chars: int) -> str:
+    """The words that end a text cut to fit one answer, in the text itself.
+    **Round 19, review.** A client that predates the ``text_truncated`` and
+    ``body_truncated`` markers prints the text and ignores a key it does not know, so
+    the cut was silent to it. The mark is part of the text, so every client shows it."""
+    return f"\n[cut by the daemon, {chars} characters in all, the whole is in the log]"
+
+
+QUESTIONS_NOTICE_BYTES: Final = 256
+"""Room, in written bytes, that ``_bounded_questions`` keeps for the notice that ends
+the last text when it leaves questions out. It holds the notice with a count of ten
+digits, the most a count of this log can have, and a margin for escaping."""
+
+
+def _left_out_notice(count: int) -> str:
+    return f"\n[{count} more open questions did not fit this answer, ask again]"
+
+
 def _bounded_questions(
     entries: list[dict[str, object]], budget: int = ANSWER_BUDGET_BYTES
 ) -> dict[str, object]:
@@ -2480,43 +2498,56 @@ def _bounded_questions(
     every open question, so it could pass the protocol's line. Entries are kept oldest
     first until the next does not fit, and the rest are counted in ``left_out``. A first
     entry that alone does not fit has its text cut, marked with ``text_truncated``,
-    so the answer is never empty for want of room. The full text stays in the log."""
+    so the answer is never empty for want of room. The full text stays in the log.
+    **Review.** Each cut is also marked in the text, which an older client prints, and
+    when entries are left out the last text ends with a notice of how many, for the
+    same reason."""
+    kept, left_out = _keep_questions(entries, budget)
+    if left_out > 0:
+        kept, left_out = _keep_questions(entries, budget - QUESTIONS_NOTICE_BYTES)
+        if left_out > 0 and kept:
+            last = kept[-1]
+            kept[-1] = {**last, "text": str(last["text"]) + _left_out_notice(left_out)}
+    return {"questions": kept, "total": len(entries), "left_out": left_out}
+
+
+def _keep_questions(
+    entries: list[dict[str, object]], budget: int
+) -> tuple[list[dict[str, object]], int]:
+    """The leading entries that fit ``budget``, each as written plus a comma, and how
+    many it left out. A first entry that does not fit has its text cut and marked."""
     kept: list[dict[str, object]] = []
     room = budget
     for entry in entries:
         size = _written(entry) + 1
         if size > room and not kept:
             text = str(entry.get("text", ""))
+            mark = _cut_mark(len(text))
             others = _written({**entry, "text": "", "text_truncated": True}) + 1
-            entry = {
-                **entry,
-                "text": _cut_to_written(text, max(0, room - others)),
-                "text_truncated": True,
-            }
+            cut = _cut_to_written(text, max(0, room - others - _written(mark)))
+            entry = {**entry, "text": cut + mark, "text_truncated": True}
             size = _written(entry) + 1
         if size > room:
             break
         room -= size
         kept.append(entry)
-    return {
-        "questions": kept,
-        "total": len(entries),
-        "left_out": len(entries) - len(kept),
-    }
+    return kept, len(entries) - len(kept)
 
 
 def _bounded_entry(view: dict[str, object]) -> dict[str, object]:
     """A journal entry's view with its body kept within ``ANSWER_BUDGET_BYTES``, cut
     and marked with ``body_truncated`` when it is longer. **Round 19.** A body may be
     64 KiB, which with its fields is over one protocol line. ``chars`` keeps the whole
-    length."""
+    length. **Review.** A cut body also ends with ``_cut_mark``, in the text, so a
+    client that predates ``body_truncated`` still shows that it was cut."""
     body = view.get("body")
     if not isinstance(body, str):
         return view
-    cut = _cut_to_written(body, ANSWER_BUDGET_BYTES)
-    if cut == body:
+    if _written(body) <= ANSWER_BUDGET_BYTES:
         return view
-    return {**view, "body": cut, "body_truncated": True}
+    mark = _cut_mark(len(body))
+    cut = _cut_to_written(body, ANSWER_BUDGET_BYTES - _written(mark))
+    return {**view, "body": cut + mark, "body_truncated": True}
 
 
 def _question_summary(message_id: str, message: Message) -> dict[str, object]:

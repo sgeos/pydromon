@@ -760,27 +760,50 @@ envelope, the override with a reason of the most the model allows, eight queued 
 with the longest reason a view keeps, and the counts, using the characters that cost the
 most to write, and asserts that the sum is under two thirds of the reserve. That test
 found that a first guess of 16 KiB was too small, which is why the reserve is derived and
-checked. A second test asserts that the worst run the model allows takes at most half the
-budget as a list entry, so the budget never leaves an answer with no run for want of room,
-and that one run's whole view with the reserve is under the line. The count is a limit on
+checked. A second test asserts that the worst run the model allows, of either shape, fits the
+budget as a list entry, so the budget never leaves an answer with no run for want of
+room, and that one run's whole view with the reserve is under the line. **Review.** The
+first version of that test left out `checkout`, the daemon-made path of a commit run,
+which the model allows to be as long as the other two paths, up to 6 KiB as written.
+It is in the proof now and the worst shape is a commit run. A list entry of it is 20,310
+bytes and its whole view 30,314, so a page of such runs holds one, and `left_out` says
+so, with 2,454 bytes to spare under the line. Ordinary runs are a few hundred bytes, so
+the cost of the bound is for runs that take the most the model allows. The count is a limit on
 work and on output, and it is the budget, not the count, that guarantees the fit.
 
 **Which runs.** Each scope offers its latest ten, as before. Of those, the runs that
 block their scope, open or lost, come first, since an operator looks for them, then the
 rest newest first by the order the log holds them. The page is cut at `limit` or at the
-first run that does not fit the budget, and is then grouped by scope as before. `total`
+first run that does not fit the budget, and is then grouped by scope as before. **Review.**
+The window of ten cannot hide a blocking run, because a blocking run is always the newest
+of its scope. The log refuses a start behind an open run and behind a lost run that is not
+cleared, and two tests pin that rule and then check that every blocking run is shown when
+the limit is their number. A change that let a scope start behind a blocking run would
+fail them. The run that a limit or a budget leaves out can be a blocking one, which the
+page then counts in `left_out`, and the client's wording says what it takes first and what
+it leaves out. `total`
 is every run the log holds and `left_out` how many this page does not show. The client
 prints a line saying how many were left out, that `dromon run status RUN_ID` shows one
 run whole, and that `--limit` asks for more.
 
-**Smaller views.** A run in a list carries no note and no output tail, which are null
-there, since the list shows neither. One run's view carries both. `corrects`, which
+**Smaller views.** A run in a list carries no note and no output tail, since the list
+shows neither, and gives in their place the words "[not in a list, N bytes, dromon run
+status RUN_ID gives it]", so a client that predates the bound, which could not tell
+`null` from a run with no note, sees that the text exists and where it is. An empty note,
+an absent tail and a run that has not ended stay as they were. One run's view carries
+both. `corrects`, which
 named every failed run a passing run corrected, and so was as long as the log, names the
 newest eight, with `corrects_left_out` for the rest. The client says "and N older".
 
 **Queued runs.** The answer gives `queued`, the runs that wait, in order, at most the
 queue's own bound of eight, each with its place, its command, the commit for a commit run
-and what holds it back now, cut to 512 bytes. The client prints them after the runs.
+and what holds it back now, cut to 512 bytes as written in JSON, quotes included. **Review.**
+It was cut to 512 bytes of UTF-8, and a control character is one byte there and six
+written, so a reason of them could write 3 KiB against a reserve derived from 512. The
+sentence is built from identifiers, so it is unlikely, and a test now cuts by the
+written length for control characters, quotes, newlines and accented letters, and
+derives the reserve from the cut of the worst reason. The client prints them after the
+runs.
 
 **Failure modes.** A limit outside 1 to 100, a limit that is not a whole number, a limit
 with a run, and an unknown argument are refused as `bad_request`, and the client refuses

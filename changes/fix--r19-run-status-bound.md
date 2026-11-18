@@ -14,3 +14,14 @@ Type: Fixed
   cuts a body past 48 KiB, and `status` and `roles` give the newest hundred retired lines
   and roles with a total. `docs/protocol/CLIENT.md` lists every request with its bound,
   and the four that stay unbounded with the reason.
+- A text the daemon cuts to fit one answer now says so in the text itself, since a
+  client written before the cut reads only the text. A `questions` text and a
+  `role_entry` body end with "[cut by the daemon, ...]", the last question ends with how
+  many were left out, and a run in a list has the words "[not in a list, ...]" where its
+  note and tail were `null`. The protocol version stays 1, and `docs/protocol/CLIENT.md`
+  records the change as one-way for the port, what an older client still cannot see, and
+  that a version bump is the operator's decision.
+- A queued run's reason is cut by its written length and not its UTF-8 length, the proof
+  of the bound now includes the `checkout` path of a commit run, a test pins that a
+  blocking run is always the newest of its scope and so is never hidden by the window,
+  and the line that says what a list left out names what it takes first.

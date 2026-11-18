@@ -25,6 +25,7 @@ from dromon.model import (
     MAX_RUN_NOTE_BYTES,
     MAX_RUN_TAIL_BYTES,
     MAX_TASK_PATH_BYTES,
+    EventRejected,
     OperatorAddress,
     Run,
     RunAdmitted,
@@ -173,16 +174,35 @@ def test_the_largest_limit_still_fits_the_line(project: Path) -> None:
         assert len(response.result["runs"]) <= RUNS_LIMIT_MAX  # type: ignore[arg-type]
 
 
-def test_a_list_gives_no_note_and_no_tail_and_one_run_gives_both(
+def test_a_list_says_where_the_note_and_tail_are_and_one_run_gives_both(
     project: Path,
 ) -> None:
+    """**Review.** The list gave ``null``, which a client that predates the cut cannot
+    tell from a run with no note. It now gives words that name the size and the request
+    that gives the text, an empty text stays empty, and a run that has not ended has
+    none, so it stays ``null``."""
     with EventLog(project / "events.sqlite") as log:
         scheduler = scheduler_on(log, project)
+        scheduler.create_line("zed", HAIKU, Strategy.SUBSCRIPTION)
+        log.append(started("r-quiet", line_id="zed"))
+        log.append(RunEnded("r-quiet", RunStatus.EXITED, 0, None, None, "", LATER))
+        log.append(started("r-open", line_id="zed", previous="r-quiet"))
         many_runs(log, scheduler, lines=2)
-        listed = scheduler.runs_view(None)
-        assert listed and all(
-            view["note"] is None and view["output_tail"] is None for view in listed
-        )
+        page = scheduler.runs_page(None, RUNS_LIMIT_MAX, RUNS_BUDGET_BYTES)
+        listed = cast(list[dict[str, Any]], page["runs"])
+        by_id = {str(view["run_id"]): view for view in listed}
+        talking = [v for v in listed if str(v["run_id"]).startswith("r-0")]
+        assert talking
+        for view in talking:
+            note = str(view["note"])
+            assert note.startswith("[not in a list, ")
+            assert f"dromon run status {view['run_id']} gives it]" in note
+            assert f"{MAX_RUN_NOTE_BYTES - 1} bytes" in note
+            assert str(view["output_tail"]).startswith("[not in a list, ")
+        assert by_id["r-quiet"]["note"] == ""
+        assert by_id["r-quiet"]["output_tail"] is None
+        assert by_id["r-open"]["note"] is None
+        assert by_id["r-open"]["output_tail"] is None
         (one,) = scheduler.runs_view("r-000-05")
         assert one["output_tail"] == failed_tail()
         assert one["note"] == "n" * (MAX_RUN_NOTE_BYTES - 1)
@@ -203,6 +223,59 @@ def test_a_run_that_blocks_its_scope_is_listed_before_newer_finished_runs(
         assert len(shown) == 3
         assert "r-open" in [view["run_id"] for view in shown]
         assert page["left_out"] == int(str(page["total"])) - 3
+
+
+def test_the_log_refuses_a_start_behind_a_blocking_run(project: Path) -> None:
+    """The per-scope window of ``MAX_RUNS_SHOWN`` cannot hide a blocking run only
+    because a blocking run is always the newest of its scope, which this rule gives.
+    The review of round 19 found no test pinned it, so a change that let a scope
+    start behind an open or an uncleared lost run would break the window silently."""
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        scheduler.create_line("alpha", HAIKU, Strategy.SUBSCRIPTION)
+        log.append(started("r-open", line_id="alpha"))
+        with pytest.raises(EventRejected, match="run r-open has not ended"):
+            log.append(started("r-next", line_id="alpha", previous="r-open"))
+        log.append(RunEnded("r-open", RunStatus.LOST, None, None, None, "", LATER))
+        assert log.state.runs["r-open"].blocks
+        with pytest.raises(EventRejected, match="run r-open is lost and not cleared"):
+            log.append(started("r-next", line_id="alpha", previous="r-open"))
+
+
+def test_a_blocking_run_is_never_hidden_by_the_window_or_the_limit(
+    project: Path,
+) -> None:
+    """Built through the log, which refuses a start behind a blocking run, so the
+    runs are ones a daemon can hold. In every scope the blocking run, open or lost,
+    is the newest of the scope, whatever came before it, and the page shows every
+    blocking run when the limit is their number, with newer runs of other scopes
+    around."""
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        blocking: list[str] = []
+        for number, status in enumerate((None, RunStatus.LOST)):
+            line_id = f"stuck-{number}"
+            scheduler.create_line(line_id, HAIKU, Strategy.SUBSCRIPTION)
+            previous = None
+            for step in range(MAX_RUNS_SHOWN + 5):
+                run_id = f"r-s{number}-{step:02d}"
+                log.append(started(run_id, line_id=line_id, previous=previous))
+                log.append(RunEnded(run_id, RunStatus.EXITED, 0, None, None, "", LATER))
+                previous = run_id
+            last = f"r-s{number}-last"
+            log.append(started(last, line_id=line_id, previous=previous))
+            if status is not None:
+                log.append(RunEnded(last, status, None, None, None, "", LATER))
+            blocking.append(last)
+        many_runs(log, scheduler, lines=6)
+        state = log.state
+        for scope_runs in _by_line(state.runs.values()).values():
+            for run in scope_runs[:-1]:
+                assert not run.blocks, "a blocking run is the newest of its scope"
+        page = scheduler.runs_page(None, len(blocking), RUNS_BUDGET_BYTES)
+        shown: list[dict[str, Any]] = page["runs"]  # type: ignore[assignment]
+        assert sorted(view["run_id"] for view in shown) == sorted(blocking)
+        assert all(view["blocks"] for view in shown)
 
 
 def test_the_page_is_grouped_by_scope_with_each_scopes_runs_newest_first(
@@ -278,23 +351,28 @@ def test_one_run_is_not_cut_by_the_list_bound(project: Path) -> None:
 # The bound is derived, and checked.
 
 
-def worst_started(run_id: str) -> RunStarted:
+def worst_started(run_id: str, commit_run: bool = True) -> RunStarted:
     """A run whose every text field is as long and as costly to write as the model
     allows. A control character is written as six bytes in JSON, the most any
-    character takes, and a path must start with a slash."""
+    character takes, and a path must start with a slash. **Round 19, review.** A commit
+    run gives a ``checkout`` path in place of the tree, the dirty count and the
+    worktree's commit, so it is the larger shape, which this gives by default. A run in
+    a worktree is ``commit_run=False``."""
     long_path = "/" + "\x01" * (MAX_TASK_PATH_BYTES - 1)
     base = started(run_id, line_id="l" * 64)
-    return replace(
+    common = replace(
         base,
         role_id="r" * 64,
         previous="p" * 64,
         command="c" * 64,
         workdir=long_path,
         output_file=long_path,
-        workdir_commit="a" * 40,
-        tree="b" * 64,
-        dirty_paths=2**31 - 1,
         admitted_by="o" * 64,
+    )
+    if commit_run:
+        return replace(common, commit="c" * 40, checkout=long_path)
+    return replace(
+        common, workdir_commit="a" * 40, tree="b" * 64, dirty_paths=2**31 - 1
     )
 
 
@@ -314,23 +392,28 @@ def worst_ended(run_id: str) -> RunEnded:
 def test_the_worst_run_the_model_allows_fits_the_budget_and_the_line(
     project: Path,
 ) -> None:
-    """A list view of the worst run leaves room for several in the budget, so the
-    budget never leaves an answer with no run for want of room, and one run's whole
-    view with the envelope and the override fits the line."""
-    run = Run(worst_started("r-" + "9" * 60), worst_ended("r-" + "9" * 60))
+    """A list view of the worst run, of either shape, fits the budget, so the budget
+    never leaves an answer with no run for want of room, and one run's whole view with
+    the envelope and the override fits the line. **Round 19, review.** The worst shape
+    is a commit run, whose ``checkout`` path adds up to 6 KiB. Of those a page holds
+    one before the budget stops it, and ``left_out`` says so, which is the cost of the
+    bound for runs that take the most the model allows, and not for ordinary runs."""
     many = tuple("r-" + str(n) * 60 for n in range(1, 10)) * 100
-    listed = scheduler_module._written_size(  # pyright: ignore[reportPrivateUsage]
-        scheduler_module._run_view(  # pyright: ignore[reportPrivateUsage]
-            run, ("line", "l" * 64), many, "r-" + "7" * 60, False
+    for commit_run in (True, False):
+        run_id = "r-" + "9" * 60
+        run = Run(worst_started(run_id, commit_run), worst_ended(run_id))
+        listed = scheduler_module._written_size(  # pyright: ignore[reportPrivateUsage]
+            scheduler_module._run_view(  # pyright: ignore[reportPrivateUsage]
+                run, ("line", "l" * 64), many, "r-" + "7" * 60, False
+            )
         )
-    )
-    whole = scheduler_module._written_size(  # pyright: ignore[reportPrivateUsage]
-        scheduler_module._run_view(  # pyright: ignore[reportPrivateUsage]
-            run, ("line", "l" * 64), many, "r-" + "7" * 60, True
+        whole = scheduler_module._written_size(  # pyright: ignore[reportPrivateUsage]
+            scheduler_module._run_view(  # pyright: ignore[reportPrivateUsage]
+                run, ("line", "l" * 64), many, "r-" + "7" * 60, True
+            )
         )
-    )
-    assert listed * 2 <= RUNS_BUDGET_BYTES, f"a list view is {listed} bytes"
-    assert whole + RUNS_RESERVE_BYTES <= MAX_LINE_BYTES, f"a whole view is {whole}"
+        assert listed <= RUNS_BUDGET_BYTES, f"a list view is {listed} bytes"
+        assert whole + RUNS_RESERVE_BYTES <= MAX_LINE_BYTES, f"a whole view is {whole}"
 
 
 def test_a_run_that_corrected_many_names_the_newest_and_counts_the_rest(
@@ -395,7 +478,9 @@ def test_the_reserve_covers_the_worst_of_everything_but_the_runs() -> None:
                 "queued_at": AT,
                 "position": MAX_QUEUED_RUNS,
                 "of": MAX_QUEUED_RUNS,
-                "waits": '"' * MAX_QUEUED_WAIT_BYTES,
+                "waits": scheduler_module._clip_text(  # pyright: ignore[reportPrivateUsage]
+                    "\x01" * 4000, MAX_QUEUED_WAIT_BYTES
+                ),
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -472,11 +557,32 @@ def test_nothing_queued_gives_an_empty_list(rig: Rig) -> None:
     assert page["queued"] == []
 
 
-def test_a_queued_reason_over_the_bound_is_cut_with_a_mark() -> None:
-    cut = scheduler_module._clip_text("é" * 2000, MAX_QUEUED_WAIT_BYTES)  # pyright: ignore[reportPrivateUsage]
-    assert len(cut.encode("utf-8")) <= MAX_QUEUED_WAIT_BYTES and cut.endswith("...")
+def written(value: str) -> int:
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+@pytest.mark.parametrize("unit", ["\x01", '"', "\n", "é", "\u2028", "a"])
+def test_a_queued_reason_over_the_bound_is_cut_by_its_written_length(
+    unit: str,
+) -> None:
+    """Confirmed before the change, which cut by UTF-8 bytes. A control character is
+    one byte there and six written, so a cut of 512 bytes of them wrote 3 KiB. The cut
+    is now by the bytes written in JSON, whatever the character."""
+    cut = scheduler_module._clip_text(unit * 2000, MAX_QUEUED_WAIT_BYTES)  # pyright: ignore[reportPrivateUsage]
+    assert written(cut) <= MAX_QUEUED_WAIT_BYTES and cut.endswith("...")
+    assert len(cut) > len("...")
+    longer = scheduler_module._clip_text(unit * 2000 + "x", MAX_QUEUED_WAIT_BYTES)  # pyright: ignore[reportPrivateUsage]
+    assert longer == cut, "the cut is of the start, so it does not depend on the end"
+    one_more = cut[: -len("...")] + unit + "..."
+    assert written(one_more) > MAX_QUEUED_WAIT_BYTES, "it keeps as much as fits"
+
+
+def test_a_queued_reason_that_fits_is_not_cut_and_the_byte_cut_is_what_failed() -> None:
     same = scheduler_module._clip_text("short", MAX_QUEUED_WAIT_BYTES)  # pyright: ignore[reportPrivateUsage]
     assert same == "short"
+    exact = "a" * (MAX_QUEUED_WAIT_BYTES - 2)
+    assert scheduler_module._clip_text(exact, MAX_QUEUED_WAIT_BYTES) == exact  # pyright: ignore[reportPrivateUsage]
+    assert written("\x01" * MAX_QUEUED_WAIT_BYTES) > 5 * MAX_QUEUED_WAIT_BYTES
 
 
 # The client.
@@ -592,7 +698,14 @@ def test_many_open_questions_are_bounded_and_counted(project: Path) -> None:
         assert 0 < len(shown) < len(ids)
         assert [entry["question_id"] for entry in shown] == ids[: len(shown)]
         assert response.result["total"] == len(ids)
-        assert response.result["left_out"] == len(ids) - len(shown)
+        left_out = len(ids) - len(shown)
+        assert response.result["left_out"] == left_out
+        # An older client prints the text and ignores the counts, so the last text
+        # says how many were left out.
+        assert str(shown[-1]["text"]).endswith(
+            f"\n[{left_out} more open questions did not fit this answer, ask again]"
+        )
+        assert all("more open questions" not in str(e["text"]) for e in shown[:-1])
         assert sum(len(json.dumps(entry)) for entry in shown) <= ANSWER_BUDGET_BYTES
 
 
@@ -610,7 +723,11 @@ def test_one_question_longer_than_the_budget_is_cut_and_marked(
         (entry,) = cast(list[dict[str, object]], response.result["questions"])
         assert entry["question_id"] == question and entry["text_truncated"] is True
         text = str(entry["text"])
-        assert 0 < len(text) < 200_000 and set(text) == {"w"}
+        cut, _, mark = text.partition("\n")
+        assert 0 < len(cut) < 200_000 and set(cut) == {"w"}
+        assert mark == (
+            "[cut by the daemon, 200000 characters in all, the whole is in the log]"
+        )
         assert response.result["left_out"] == 0
 
 
@@ -663,10 +780,71 @@ def test_a_journal_entry_of_the_largest_size_is_cut_to_fit_one_line(
     assert len(json.dumps(view)) > MAX_LINE_BYTES - 200
     cut = _bounded_entry(view)
     assert cut["body_truncated"] is True and cut["chars"] == MAX_ROLE_NOTE_BYTES
+    # An older client ignores body_truncated, so the body says it was cut.
+    assert str(cut["body"]).endswith(
+        f"\n[cut by the daemon, {MAX_ROLE_NOTE_BYTES} characters in all,"
+        " the whole is in the log]"
+    )
+    assert set(str(cut["body"]).partition("\n")[0]) == {"b"}
     assert len(encode_response(Response("r", ok=True, result=cut))) <= MAX_LINE_BYTES
     small: dict[str, object] = {"body": "short", "chars": 5}
     assert _bounded_entry(small) == small
     assert _bounded_entry({"chars": 0}) == {"chars": 0}
+
+
+@pytest.mark.parametrize("unit", ["w", '"', "\x01", "é", "\n"])
+def test_a_cut_text_with_its_mark_fits_for_any_character(unit: str) -> None:
+    """The mark is part of the text, so it counts against the budget. For the
+    characters that cost the most as written, a cut body and a cut question both
+    leave the answer within its budget, and the mark is the last thing in the text."""
+    from dromon import daemon as daemon_module
+
+    written = daemon_module._written  # pyright: ignore[reportPrivateUsage]
+    body = unit * 90_000
+    entry = daemon_module._bounded_entry(  # pyright: ignore[reportPrivateUsage]
+        {"body": body, "chars": len(body)}
+    )
+    assert written(entry["body"]) <= daemon_module.ANSWER_BUDGET_BYTES
+    assert str(entry["body"]).endswith("the whole is in the log]")
+    answer_cut = daemon_module._bounded_questions(  # pyright: ignore[reportPrivateUsage]
+        [{"question_id": "m-1", "text": body, "choices": []}]
+    )
+    (question,) = cast(list[dict[str, object]], answer_cut["questions"])
+    assert written(answer_cut) <= daemon_module.ANSWER_BUDGET_BYTES + 200
+    assert str(question["text"]).endswith("the whole is in the log]")
+    many = daemon_module._bounded_questions(  # pyright: ignore[reportPrivateUsage]
+        [
+            {"question_id": f"m-{n}", "text": unit * 9_000, "choices": []}
+            for n in range(30)
+        ]
+    )
+    shown = cast(list[dict[str, object]], many["questions"])
+    assert 0 < len(shown) < 30 and many["left_out"] == 30 - len(shown)
+    assert written(many) <= daemon_module.ANSWER_BUDGET_BYTES + 200
+    assert str(shown[-1]["text"]).endswith("did not fit this answer, ask again]")
+
+
+def test_an_older_client_that_prints_only_the_text_still_shows_every_cut(
+    project: Path,
+) -> None:
+    """**Review.** A client written before round 19 prints ``text`` and ``body`` and
+    ignores any key it does not know, so ``text_truncated``, ``body_truncated`` and
+    ``left_out`` do not reach it. Built here by reading only the old keys of the
+    answers, as it would. The cut is visible in the text it prints. The list of runs
+    has no text to carry it, which ``docs/protocol/CLIENT.md`` records as a residual."""
+    with EventLog(project / "events.sqlite") as log:
+        scheduler = scheduler_on(log, project)
+        seed_questions(scheduler, 12, "q" * 12_000)
+        daemon = daemon_for(project, log, scheduler)
+        line = {"id": "r", "op": "questions", "v": 1, "args": {"operator": "ana"}}
+        response = daemon.respond((json.dumps(line) + "\n").encode())
+        assert response.result is not None
+        old_keys = {"question_id", "line", "operator", "text", "choices"}
+        printed = [
+            {key: value for key, value in entry.items() if key in old_keys}
+            for entry in cast(list[dict[str, object]], response.result["questions"])
+        ]
+        assert "did not fit this answer" in str(printed[-1]["text"])
 
 
 def test_retired_lines_and_roles_are_the_newest_few_with_their_totals(

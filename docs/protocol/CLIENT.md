@@ -134,8 +134,8 @@ reproduces.
 | Request | What grows | Bound before this round | Now |
 |---|---|---|---|
 | `runs` | runs, with notes and tails, over every scope | ten per scope, none across scopes. Over the line with forty lines | At most 100, 20 by default, and a 48 KiB budget, with `left_out`. Fixed |
-| `questions` | open questions, each text up to 1 MiB | none | 48 KiB of them, `total`, `left_out` and a cut first text. Fixed |
-| `role_entry` | one body, up to 64 KiB | none. A largest body with its fields is over the line | Body cut to 48 KiB as written, with `body_truncated`. Fixed |
+| `questions` | open questions, each text up to 1 MiB | none | 48 KiB of them, `total`, `left_out` and a cut first text, each cut marked in the text as well. Fixed |
+| `role_entry` | one body, up to 64 KiB | none. A largest body with its fields is over the line | Body cut to 48 KiB as written, with `body_truncated`, and marked in the text. Fixed |
 | `line_view` | messages, and open questions with whole texts | messages 40,000 bytes and fifty. Questions none | Questions within what the messages leave, with a count. Fixed |
 | `status` | `retired_lines`, one hundred bytes each | none | Newest 100 and a total. Fixed |
 | `roles` | `retired`, one hundred bytes each | none | Newest 100 and a total. Fixed |
@@ -154,6 +154,51 @@ soon they bite. `read` and a long journal body are bounded by the people and lin
 write them, `status` by the number of lines, and `agent_list` by the number of agents the
 operator adds. **Porting note.** Each bound is a count, a byte budget or a cut, all
 computed from the written form, so a port keeps them by measuring as the protocol writes.
+
+### How the cuts reach an older client
+
+**Round 19, review, finding 1. Facts from the code, and a decision left to the operator.**
+The protocol has one signal for a change of shape, the version `v`, which is checked for
+equality. A request with any other value is refused as `unsupported_version`, so a bump
+refuses every older client outright, including every one that would have worked. There is
+no negotiation and no list of capabilities. Every addition to the answers so far, which
+the tables date, added keys under version 1, and a client ignores a key it does not know.
+This round changed three things that way, and one that is not an added key.
+
+- **Added keys.** `total`, `left_out`, `queued`, `text_truncated`, `body_truncated`,
+  `corrects_left_out`, `open_questions_left_out`, `retired_lines_total` and
+  `retired_total`. A client written before the round never reads them, so the counts and
+  the flags do not reach it.
+- **A default that changed.** A `runs` request with no `limit`, which is every older
+  client's, now gets at most 20 runs in all, the runs that block their scope first, and
+  not the latest ten of each scope. It is a different set, though it is the same request.
+- **Fields that changed meaning.** `note` and `output_tail` of a run in a list were the
+  text, and are now the words that say where it is. `corrects` holds the newest eight.
+
+The version stays 1, because the protocol is a draft, the daemon and the client are built
+from one tree, and a bump is a decision about every client that the operator has not
+made. **Open decision for the operator, not made here.** Whether a bump is wanted before
+the cut is relied on, for the port in particular.
+
+What the change does for a client that predates it, where the protocol allows. A cut text
+carries its own mark, as part of the text, which such a client prints. A `questions` text
+or a `role_entry` body that is cut ends with "[cut by the daemon, N characters in all,
+the whole is in the log]", and when questions are left out the last question's text ends
+with how many and that the reader should ask again. A run's `note` and `output_tail` in a
+list are the words "[not in a list, N bytes, dromon run status RUN_ID gives it]", where
+they were the text, and stay empty or `null` where there was none. The flags and counts
+stay, since a current client and a port read those, and they are the authority.
+
+**Residuals, which no field can fix.** A list has no text to carry a mark, and adding a
+pseudo entry would break a client that reads every entry as a run, a question or a
+retired line. So an older client is **silent** about a run, a retired line or a retired
+role the page left out, and about the new default of the `runs` list. Facts, since the
+code has no such field. The reader of an older client sees the newest runs, which is the
+case that matters, and `dromon run status` of a current client says what it left out.
+**Porting note.** One-way. A port keeps the marks in the text, since the text is what a
+client that does not know the counts prints, and it must not add a mark to a field a
+machine compares. It need not keep `_listed_text` words byte for byte, since nothing parses
+them, and its tests should not.
 
 ## Responses
 

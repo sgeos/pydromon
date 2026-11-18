@@ -689,9 +689,10 @@ last pass, which is as many as the log holds, so the view cut it, and gives how 
 it left out in ``corrects_left_out``."""
 
 MAX_QUEUED_WAIT_BYTES: Final = 512
-"""The most bytes of what holds a queued run back that the ``runs`` answer gives for it,
-cut with a mark. **Round 19.** The sentence is built by the daemon and is shorter in
-practice. The bound is what lets the answer's reserve be derived."""
+"""The most bytes, as written in JSON with the quotes, of what holds a queued run
+back that the ``runs`` answer gives for it, cut with a mark. **Round 19.** The
+sentence is built by the daemon and is shorter in practice. The bound is what lets the
+answer's reserve be derived."""
 
 START_RUN_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
@@ -6708,7 +6709,8 @@ class Scheduler:
     def _queued_views(self) -> list[dict[str, object]]:
         """The runs that wait in the queue, in their order, at most ``MAX_QUEUED_RUNS``
         by the queue's own bound, each with what holds it back now, cut to
-        ``MAX_QUEUED_WAIT_BYTES``. **Round 19.** The operator could not see them."""
+        ``MAX_QUEUED_WAIT_BYTES`` as written in JSON. **Round 19.** The operator could
+        not see them."""
         views: list[dict[str, object]] = []
         entries = list(self._state().queued_runs.values())
         for position, entry in enumerate(entries[:MAX_QUEUED_RUNS], start=1):
@@ -17131,13 +17133,41 @@ def _written_size(value: object) -> int:
 
 
 def _clip_text(text: str, limit: int) -> str:
-    """``text`` cut to at most ``limit`` bytes of UTF-8 at a character boundary, with
-    a mark that it was cut. **Round 19.**"""
-    if len(text.encode("utf-8")) <= limit:
+    """``text`` cut so that it takes at most ``limit`` bytes as written in JSON, its
+    quotes included, with a mark that it was cut. **Round 19, review.** The budget of
+    a page is in written bytes, and a character takes up to six of them, a control
+    character as ``\\u0001``, so a cut by UTF-8 bytes could write six times its limit.
+    Found by halving, so the loop runs at most as many times as ``text`` has bits in
+    its length."""
+
+    def written(value: str) -> int:
+        return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+    if written(text) <= limit:
         return text
     mark = "..."
-    kept = text.encode("utf-8")[: limit - len(mark)].decode("utf-8", "ignore")
-    return kept + mark
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if written(text[:middle] + mark) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low] + mark
+
+
+def _listed_text(text: str | None, run_id: str, detail: bool) -> str | None:
+    """``text`` in one run's view, or in a list the words that say it is not there.
+    **Round 19, review.** The list gave ``null``, which a client that predates the
+    cut cannot tell from a run with no note, so a run's own words were silently
+    missing. The words name the size and the request that gives the text, and an empty
+    or absent text stays as it is, since nothing is missing."""
+    if detail or not text:
+        return text
+    return (
+        f"[not in a list, {len(text.encode('utf-8'))} bytes, dromon run status"
+        f" {run_id} gives it]"
+    )
 
 
 def _run_view(
@@ -17151,9 +17181,10 @@ def _run_view(
     ``running`` until ``run_ended``, then the end's status. Every field is plain
     data the log holds, so a port gives the same view. **Round 19.** ``detail`` is
     false for a run in a list, which gives no note and no output tail, the two
-    fields that are long, so a list stays small. They are null there and one run's
-    view gives them."""
+    fields that are long, so a list stays small. A list gives the words
+    ``_listed_text`` says for a text that exists, and one run's view gives the text."""
     started, ended, cleared = run.started, run.ended, run.cleared
+    run_id = started.run_id
     return {
         "run_id": started.run_id,
         "scope": f"{scope[0]} {scope[1]}",
@@ -17176,8 +17207,10 @@ def _run_view(
         "exit_code": None if ended is None else ended.exit_code,
         "output_bytes": None if ended is None else ended.output_bytes,
         "output_digest": None if ended is None else ended.output_digest,
-        "note": None if ended is None or not detail else ended.note,
-        "output_tail": None if ended is None or not detail else ended.output_tail,
+        "note": None if ended is None else _listed_text(ended.note, run_id, detail),
+        "output_tail": (
+            None if ended is None else _listed_text(ended.output_tail, run_id, detail)
+        ),
         "coverage": (
             None
             if ended is None or ended.coverage is None
