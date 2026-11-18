@@ -310,3 +310,92 @@ def test_two_records_are_counted_apart(tmp_path: Path, clock: Clock) -> None:
     sweep(tmp_path)
     assert counted(first) == 1
     assert counted(second) == 5
+
+
+def planted_name(path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Fix the random part of the temporary name, so a test can plant the name."""
+
+    def fixed(size: int) -> str:
+        return "ab" * size
+
+    monkeypatch.setattr(launcher.secrets, "token_hex", fixed)
+    return path.with_name(f"{path.name}.{launcher.os.getpid()}.{'ab' * 8}.tmp")
+
+
+def test_a_planted_link_at_the_temporary_name_is_not_followed(
+    tmp_path: Path, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 19, audit. The temporary file is opened with ``O_EXCL`` and ``O_NOFOLLOW``,
+    so a link in its place is refused and the file it points to is not written. The
+    link is not ours, since this call did not create it, so it is left."""
+    path = write(tmp_path)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious")
+    link = planted_name(path, monkeypatch)
+    link.symlink_to(victim)
+    [record] = launcher.read_launches(tmp_path)
+    assert launcher._write_retries(record, 1) is False  # pyright: ignore[reportPrivateUsage]
+    assert victim.read_text() == "precious"
+    assert link.is_symlink()
+    assert counted(path) is None
+    [found] = sweep(tmp_path)
+    assert found.skipped is not None and "removed after" in found.skipped
+    assert victim.read_text() == "precious"
+    assert clock.sent == []
+
+
+def test_a_file_already_at_the_temporary_name_is_not_truncated_or_removed(
+    tmp_path: Path, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del clock
+    path = write(tmp_path)
+    planted = planted_name(path, monkeypatch)
+    planted.write_text("someone else's")
+    [record] = launcher.read_launches(tmp_path)
+    assert launcher._write_retries(record, 1) is False  # pyright: ignore[reportPrivateUsage]
+    assert planted.read_text() == "someone else's"
+
+
+def test_the_temporary_names_differ_and_the_data_is_flushed_before_the_replace(
+    tmp_path: Path, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del clock
+    order: list[str] = []
+    names: list[str] = []
+    real_replace = launcher.os.replace
+    real_fsync = launcher.os.fsync
+
+    def fsync(descriptor: int) -> None:
+        order.append("fsync")
+        real_fsync(descriptor)
+
+    def replace(source: object, target: object) -> None:
+        order.append("replace")
+        names.append(Path(str(source)).name)
+        real_replace(str(source), str(target))
+
+    monkeypatch.setattr(launcher.os, "fsync", fsync)
+    monkeypatch.setattr(launcher.os, "replace", replace)
+    path = write(tmp_path)
+    sweep(tmp_path)
+    sweep(tmp_path)
+    assert order == ["fsync", "replace", "fsync", "replace"]
+    assert len(set(names)) == 2 and all(name.endswith(".tmp") for name in names)
+    assert counted(path) == 2
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_a_temporary_file_that_was_created_is_removed_when_the_flush_fails(
+    tmp_path: Path, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del clock
+
+    def refuse(descriptor: int) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(launcher.os, "fsync", refuse)
+    path = write(tmp_path)
+    [found] = sweep(tmp_path)
+    assert found.skipped is not None and "removed after" in found.skipped
+    assert not path.exists()
+    assert not list(tmp_path.glob("*.tmp"))

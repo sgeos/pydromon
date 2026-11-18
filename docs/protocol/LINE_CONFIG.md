@@ -2544,7 +2544,11 @@ daemon stops it, when the daemon stops or dies, and when the line's engine is st
   the failure can be a moment's and the harness can be the live one whose launcher has gone.
   The record is kept for the next sweeps, and the number of sweeps that kept it,
   `start_retries`, is written into it whole, through a temporary file and a rename, so it
-  survives a restart of the daemon. It is removed when the start time reads and differs, which
+  survives a restart of the daemon. The temporary file has a unique random name, is created
+  with exclusive creation, no following of links and mode 0600, and is flushed to disk before
+  the rename, so a file or link planted at a name is refused and never followed or truncated,
+  a crash leaves the old record or the new, and the file is removed on a failure once this
+  call has created it. A port must keep all four. It is removed when the start time reads and differs, which
   is another process, when no process holds the pid any more, when the count passes
   `MAX_START_RETRIES`, 10, or when the count cannot be written, so the retries are bounded in
   every case. A count that is not a whole number from 0 to the bound is read as the bound, so

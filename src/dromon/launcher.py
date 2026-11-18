@@ -114,6 +114,7 @@ import contextlib
 import ctypes
 import json
 import os
+import secrets
 import select
 import signal
 import stat
@@ -1028,10 +1029,19 @@ process, and a record without one never can be read, and neither is kept."""
 
 def _write_retries(record: LaunchRecord, count: int) -> bool:
     """Write ``count`` into the record's file, whole or not at all, and say whether it
-    was written. The file is read again and replaced through a temporary file of
-    another suffix in the same directory, so a sweep never reads half a record. A
-    launcher that wrote the record has exited, so the daemon is its only writer."""
-    temporary = record.path.with_name(record.path.name + ".tmp")
+    was written. The file is read again and replaced through a temporary file in the
+    same directory, so a sweep never reads half a record. **Round 19, audit.** The
+    temporary file has a unique random name and is created with ``O_EXCL`` and
+    ``O_NOFOLLOW`` at mode 0600, so a name planted beforehand, as a file or as a link,
+    is refused and never followed or truncated. It is flushed to disk before the
+    replace, so a crash leaves the old record or the new one. It is removed on any
+    failure, but only once this call has created it, since a file that already existed
+    is not ours to remove. A launcher that wrote the record has exited, so the daemon is
+    its only writer."""
+    temporary = record.path.with_name(
+        f"{record.path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    )
+    created = False
     try:
         with record.path.open("rb") as handle:
             raw = handle.read(MAX_LAUNCH_BYTES + 1)
@@ -1040,13 +1050,21 @@ def _write_retries(record: LaunchRecord, count: int) -> bool:
             return False
         fields = cast(dict[str, object], document)
         fields[RETRY_FIELD] = count
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        created = True
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(fields))
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, record.path)
     except (OSError, ValueError):
-        with contextlib.suppress(OSError):
-            temporary.unlink()
+        if created:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
         return False
     return True
 

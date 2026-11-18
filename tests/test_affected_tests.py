@@ -6,6 +6,8 @@ tree and asks the script what the change reaches. The script is also run as the
 documentation says, with ``python3 -I`` and no dependencies, once.
 """
 
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -309,3 +311,172 @@ def test_the_script_imports_only_the_standard_library() -> None:
         if isinstance(node, ast.ImportFrom) and node.module
     }
     assert imported <= set(sys.stdlib_module_names), imported
+
+
+NESTED = """\
+import sys
+
+if sys.platform == "linux":
+
+    class Watch:
+        def close(self) -> None:
+            return None
+
+    LIMIT_IF = 1
+else:
+
+    class Watch:
+        def close(self) -> None:
+            return None
+
+try:
+    import missing
+except ImportError:
+    def fallback() -> None:
+        return None
+
+with open(__file__) as handle:
+    HELD = handle
+
+for index in range(2):
+    LOOPED = index
+
+while False:
+    def never() -> None:
+        return None
+
+match sys.platform:
+    case "linux":
+        MATCHED = 1
+
+
+def outer() -> None:
+    if True:
+        def inner() -> None:
+            return None
+        inside = 1
+"""
+
+
+def test_definitions_inside_module_level_compound_statements_are_found() -> None:
+    """Round 19, audit. A class chosen by an ``if``, as ``ExitWatch`` is in the
+    launcher, or a function defined in a ``try``, ``with``, loop or ``match``, is a
+    definition at the depth of the statement that holds it. A name bound inside a
+    function is still not one."""
+    found = {name: depth for name, _, _, depth in affected_tests.definitions(NESTED)}
+    for name in ("Watch", "LIMIT_IF", "fallback", "HELD", "LOOPED", "never", "MATCHED"):
+        assert found[name] == 0, name
+    assert found["close"] == 1 and found["outer"] == 0 and found["inner"] == 1
+    assert "inside" not in found
+    watches = [d for d in affected_tests.definitions(NESTED) if d[0] == "Watch"]
+    assert len(watches) == 2, "both branches define it"
+
+
+def test_exitwatch_in_the_launcher_is_a_definition() -> None:
+    launcher = Path(affected_tests.__file__).resolve().parent.parent
+    source = (launcher / "src" / "dromon" / "launcher.py").read_text()
+    watches = [d for d in affected_tests.definitions(source) if d[0] == "ExitWatch"]
+    assert len(watches) == 2 and {d[3] for d in watches} == {0}
+
+
+def test_a_change_inside_a_conditional_class_names_it_and_the_tests_naming_it(
+    repository: Path,
+) -> None:
+    library = repository / "src" / "dromon" / "library.py"
+    library.write_text(
+        library.read_text()
+        + "\nif True:\n\n    class Watch:\n        def close(self) -> int:\n"
+        "            return 1\n"
+    )
+    (repository / "tests" / "test_watch.py").write_text("def test_w():\n    Watch\n")
+    git(repository, "add", "-A")
+    git(repository, "commit", "--quiet", "-m", "watch")
+    change(
+        repository,
+        "def close(self) -> int:\n            return 1",
+        "def close(self) -> int:\n            return 2",
+    )
+    assert found(repository) == {"tests/test_watch.py": ["Watch"]}
+
+
+def test_a_base_that_begins_with_a_dash_is_a_revision_and_never_an_option(
+    repository: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--output`` would make ``git diff`` write a file. After ``--end-of-options``
+    it is a name to look up, which is not found."""
+    change(repository, "return 1", "return 10")
+    target = repository / "planted.txt"
+    with pytest.raises(SystemExit) as refused:
+        affected_tests.main([f"--output={target}", "--root", str(repository)])
+    assert refused.value.code == 2, "argparse takes it for an option and refuses"
+    status = affected_tests.main(
+        ["--root", str(repository), "--", f"--output={target}"]
+    )
+    assert status == 1
+    assert not target.exists()
+    assert "affected_tests: git" in capsys.readouterr().err
+    with pytest.raises(Failure):
+        found(repository, base=f"--output={target}")
+    assert not target.exists()
+
+
+def test_no_external_diff_or_text_conversion_program_runs(repository: Path) -> None:
+    """A repository's configuration can name a program for ``git diff``, and a listing
+    of changed names has no use for one."""
+    marker = repository.parent / "ran.txt"
+    program = repository.parent / "program.sh"
+    program.write_text(f"#!/bin/sh\necho ran >> {marker}\nexit 0\n")
+    program.chmod(0o700)
+    git(repository, "config", "diff.external", str(program))
+    git(repository, "config", "diff.conv.textconv", str(program))
+    (repository / ".gitattributes").write_text("*.py diff=conv\n")
+    change(repository, "return 1", "return 10")
+    assert found(repository) == {"tests/test_alpha.py": ["alpha"]}
+    assert not marker.exists()
+
+
+def test_a_test_file_that_is_not_a_regular_file_is_skipped_without_following(
+    repository: Path,
+) -> None:
+    """A link to a file that names the function, a link to a directory of such files,
+    and a pipe that would block a reader, none of which a checkout holds."""
+    change(repository, "return 1", "return 10")
+    outside = repository.parent / "outside"
+    outside.mkdir()
+    (outside / "test_outside.py").write_text("alpha\n")
+    (repository / "tests" / "test_link.py").symlink_to(outside / "test_outside.py")
+    (repository / "tests" / "linked").symlink_to(outside, target_is_directory=True)
+    pipe = repository / "tests" / "test_pipe.py"
+    os.mkfifo(pipe)
+    assert stat.S_ISFIFO(pipe.lstat().st_mode)
+    assert found(repository) == {"tests/test_alpha.py": ["alpha"]}
+
+
+def test_a_source_that_is_not_utf8_is_a_clear_error_and_not_a_traceback(
+    repository: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = repository / "src" / "dromon" / "library.py"
+    library.write_bytes(b"def alpha():\n    return '\xff'\n")
+    assert affected_tests.main(["HEAD", "--root", str(repository)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "library.py is not valid UTF-8 source" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_an_old_side_that_is_not_utf8_is_a_clear_error_too(
+    repository: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = repository / "src" / "dromon" / "library.py"
+    library.write_bytes(b"def alpha():\n    return '\xff'\n")
+    git(repository, "commit", "--quiet", "-am", "latin")
+    library.write_bytes(b"def alpha():\n    return 'a'\n")
+    assert affected_tests.main(["HEAD", "--root", str(repository)]) == 1
+    assert "at HEAD is not valid UTF-8 source" in capsys.readouterr().err
+
+
+def test_a_test_file_that_is_not_utf8_is_still_searched(repository: Path) -> None:
+    """Only names matter in a test file, so a bad byte is replaced and not fatal."""
+    change(repository, "return 1", "return 10")
+    (repository / "tests" / "test_bytes.py").write_bytes(b"# \xff\nalpha\n")
+    assert found(repository)["tests/test_bytes.py"] == ["alpha"]
