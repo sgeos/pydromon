@@ -53,6 +53,7 @@ ALLOWED: dict[str, str] = {
         "test_a_start_that_executes_in_time_leaves_no_entry_and_no_sample",
         "test_forks_past_the_watch_limit_are_not_queued",
         "test_the_report_is_made_while_the_start_is_still_waiting",
+        "_stuck_start",
     ),
     **named(
         "test_spawn.py",

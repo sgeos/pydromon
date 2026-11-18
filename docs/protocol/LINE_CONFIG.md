@@ -2477,8 +2477,21 @@ daemon stops it, when the daemon stops or dies, and when the line's engine is st
   started, as the kernel gives it, from `/proc` on Linux and `libproc` on macOS, and the
   sweep tells the harness by that start time and not by the executable's name, so a pid given
   to another process is not taken for the harness, and a harness that replaced itself with a
-  program of another name is not taken for another process. A record with no start time, as
-  an older launcher writes, is judged by the name as before. Immediately before each signal the
+  program of another name is not taken for another process. **Audit's finding,
+  2026-11-18.** Not knowing is never knowing. A record with no start time for the harness, as
+  a launcher that started before round 18 wrote, signals nothing, whatever its executable's
+  name is, and a harness whose start time cannot be read is not signalled, since the name is
+  what a reused pid shares. The sweep says so in the record's `skipped` text and removes the
+  record, and what the harness left running is left to the operator. A zombie harness that
+  `ps` shows `<defunct>` is the exception, since it keeps its pid until it is reaped, and a
+  leader that has gone leaves its group signalled, since a group number is not given to a new
+  group while a member runs, but a leader that is there with a start time that cannot be read
+  is refused. A launcher or a harness whose start time cannot be told is taken as still
+  running and held, so no sweep follows. **At the first restart onto this version** each
+  record that an older launcher wrote and whose launcher is still in the table is left
+  alone, so its engine goes on, and each such record whose launcher has exited is removed
+  with that text, so an orphan of the old version is not ended by the sweep. Elsewhere than
+  Linux and macOS no start time is read, so a sweep signals nothing. Immediately before each signal the
   sweep reads the start time again, so a pid reused after the table was read is not signalled.
   On Linux the harness is held by a `pidfd` for the signal, which closes the window, and on
   macOS no handle names a process, so the window is only made small. It reads the

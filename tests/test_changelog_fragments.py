@@ -1106,8 +1106,8 @@ def test_two_gates_at_once_have_two_roots_and_neither_touches_the_other(
     gates: list[tuple[subprocess.Popen[str], Path, Path]] = []
     for name in ("first", "second"):
         log, hold = tmp_path / f"{name}.log", tmp_path / f"{name}.hold"
-        started = subprocess.Popen(  # noqa: S603
-            ["bash", "scripts/check.sh"],  # noqa: S607
+        started = spawn.start(
+            ["bash", "scripts/check.sh"],
             cwd=root,
             env={
                 **os.environ,

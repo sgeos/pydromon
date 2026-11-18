@@ -15,7 +15,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -241,10 +241,11 @@ def test_a_group_with_no_leader_and_no_members_is_not_signalled() -> None:
     assert not processes.signal_group_if_started(1, signal.SIGTERM, 1.0)
 
 
-def test_a_group_whose_leader_has_gone_is_still_signalled_while_it_has_members(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A group outlives its leader, so no leader is no reason to refuse."""
+def unread_leader(
+    monkeypatch: pytest.MonkeyPatch, exists: bool | None
+) -> list[tuple[int, int]]:
+    """Make the leader's start time unreadable, say whether its pid answers, and
+    return what ``killpg`` is sent."""
     sent: list[tuple[int, int]] = []
 
     def unread(pid: int) -> None:
@@ -254,8 +255,47 @@ def test_a_group_whose_leader_has_gone_is_still_signalled_while_it_has_members(
         sent.append((group, number))
 
     monkeypatch.setattr(processes, "start_time", unread)
+
+    def present(pid: int) -> bool | None:
+        del pid
+        return exists
+
+    monkeypatch.setattr(processes, "_exists", present)
     monkeypatch.setattr(os, "killpg", record)
+    return sent
+
+
+def test_a_group_whose_leader_has_gone_is_still_signalled_while_it_has_members(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A group outlives its leader, so no leader is no reason to refuse."""
+    sent = unread_leader(monkeypatch, False)
     assert processes.signal_group_if_started(4242, signal.SIGTERM, 1.0)
+    assert sent == [(4242, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize("exists", [True, None])
+def test_a_group_whose_leader_is_there_and_cannot_be_read_is_not_signalled(
+    monkeypatch: pytest.MonkeyPatch, exists: bool | None
+) -> None:
+    """Audit's finding, 2026-11-18. The pid answers, so it may be a process that took
+    the number, and a start time that cannot be read cannot say it is not. A zombie
+    that the caller has seen in the table is the exception, below."""
+    sent = unread_leader(monkeypatch, exists)
+    for number in (signal.SIGTERM, signal.SIGKILL, 0):
+        assert not processes.signal_group_if_started(4242, number, 1.0)
+    assert sent == []
+
+
+def test_a_group_whose_leader_is_a_zombie_is_signalled_when_the_caller_saw_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zombie keeps its number until it is reaped, so the group is the one meant,
+    and macOS gives a zombie no start time."""
+    sent = unread_leader(monkeypatch, True)
+    assert processes.signal_group_if_started(
+        4242, signal.SIGTERM, 1.0, leader_defunct=True
+    )
     assert sent == [(4242, signal.SIGTERM)]
 
 
@@ -329,9 +369,10 @@ def test_a_listed_process_is_taken_for_the_same_one_only_by_its_start_time(
         listed(child.pid, "sleep", started - 60), started
     )
     assert not processes.row_is_same_process(listed(child.pid, "sleep", started), None)
-    # A row listed without a start time is taken as it was before the check existed.
-    assert processes.row_is_same_process(listed(child.pid, "sleep"), started)
-    assert processes.row_is_same_process(listed(child.pid, "sleep"), None)
+    # Audit's finding, 2026-11-18. Not knowing is not knowing the same, so a row listed
+    # without a start time is refused, whether or not the process's own can be read.
+    assert not processes.row_is_same_process(listed(child.pid, "sleep"), started)
+    assert not processes.row_is_same_process(listed(child.pid, "sleep"), None)
 
 
 @needs_start_time
@@ -472,9 +513,10 @@ def swept(directory: Path, rows: Sequence[TreeRow]) -> list[launcher.Swept]:
 def test_a_process_with_the_recorded_name_and_another_start_is_not_the_harness(
     tmp_path: Path, children: list[subprocess.Popen[bytes]]
 ) -> None:
-    """Confirmed first as the name-only path, which is the sweep before round 18 and
-    what a record without a start time still gets: the name matches, so the process is
-    ended. With the start time the sweep leaves it alone."""
+    """A start time that differs, and then no start time at all. Before round 18 the
+    name alone decided, and a record without a start time was ended by it. **Audit's
+    finding, 2026-11-18.** A record without one signals nothing, whatever the name
+    says, since the name is what a reused pid shares."""
     child = make(children, group=True)
     started = start_time(child.pid)
     assert started is not None
@@ -487,11 +529,14 @@ def test_a_process_with_the_recorded_name_and_another_start_is_not_the_harness(
     assert skipped.ended == ()
     assert still_running(child)
 
-    record_file(tmp_path, dead, child.pid, "sleep")
-    [fooled] = swept(tmp_path, rows)
-    assert fooled.skipped is None
-    assert fooled.ended == (child.pid,)
-    assert gone(child)
+    old = record_file(tmp_path, dead, child.pid, "sleep")
+    [legacy] = swept(tmp_path, rows)
+    assert legacy.skipped == launcher.NO_START_TIME
+    assert legacy.ended == ()
+    assert still_running(child)
+    assert not old.exists(), (
+        "the record is removed, and what ran is left to the operator"
+    )
 
 
 @needs_start_time
@@ -507,7 +552,7 @@ def test_a_harness_that_changed_its_name_is_swept_when_its_launcher_is_gone(
 
     record_file(tmp_path, dead, child.pid, "/bin/sh", policy=policy)
     [kept] = swept(tmp_path, rows)
-    assert kept.skipped == "another process now holds the harness's pid"
+    assert kept.skipped == launcher.NO_START_TIME
     assert still_running(child)
 
     record_file(
@@ -562,3 +607,131 @@ def test_the_daemons_table_is_read_with_start_times(
     monkeypatch.setattr(launcher, "tree_or_reason", read)
     assert launcher.read_rows() == []
     assert seen == [{"with_start": True}]
+
+
+# Audit's finding, 2026-11-18. A time that is missing or cannot be read fails closed.
+
+
+def unreadable(pid: int) -> float | None:
+    """A reader of start times for which no process can be read."""
+    del pid
+    return None
+
+
+def recording(sent: list[object], kind: str) -> Callable[..., None]:
+    """A stand-in for a function that signals, which records that it was called."""
+
+    def record(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        sent.append(kind)
+
+    return record
+
+
+def test_a_launcher_or_harness_whose_start_time_cannot_be_read_keeps_its_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No reading is no sweep. The launcher is taken as running, which signals nothing,
+    and not as gone on the name's evidence, which a reused pid shares."""
+    monkeypatch.setattr(launcher, "start_time", unreadable)
+    rows = [
+        TreeRow(4242, 1, 4242, "python -I -m dromon.launcher"),
+        TreeRow(4343, 1, 4343, "sleep 60"),
+    ]
+    assert launcher.launcher_running(
+        rows, 4242, 4343, "sleep", launcher_started=5.0, harness_started=5.0
+    )
+    assert launcher.launcher_running(rows, 4242, 4343, "sleep")
+    assert launcher._is_harness(rows[1], 5.0) is None  # pyright: ignore[reportPrivateUsage]
+    assert launcher._is_harness(rows[1], None) is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("policy", list(StopPolicy))
+def test_a_harness_whose_start_time_cannot_be_read_is_not_signalled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: StopPolicy
+) -> None:
+    sent: list[object] = []
+    monkeypatch.setattr(launcher, "start_time", unreadable)
+    monkeypatch.setattr(launcher, "_send", recording(sent, "pid"))
+    monkeypatch.setattr(launcher, "signal_group_if_started", recording(sent, "group"))
+    monkeypatch.setattr(launcher, "signal_if_started", recording(sent, "one"))
+    rows = [
+        TreeRow(4343, 1, 4343, "sleep 60"),
+        TreeRow(4344, 4343, 4343, "sleep 60"),
+    ]
+    record_file(tmp_path, 4242, 4343, "sleep", policy=policy, harness_started=5.0)
+    [kept] = swept(tmp_path, rows)
+    assert kept.skipped is not None and "cannot be read" in kept.skipped
+    assert kept.ended == ()
+    assert sent == []
+
+
+def test_a_zombie_harness_whose_start_time_cannot_be_read_is_still_swept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """macOS gives a zombie no start time, and ``ps`` shows it ``<defunct>``, which a
+    pid that was given away cannot be, so its group is signalled, with the table's word
+    for it."""
+    sent: list[tuple[int, int, bool]] = []
+    monkeypatch.setattr(launcher, "start_time", unreadable)
+
+    def record(
+        group: int, number: int, started: float, *, leader_defunct: bool
+    ) -> bool:
+        del started
+        sent.append((group, number, leader_defunct))
+        return False
+
+    monkeypatch.setattr(launcher, "signal_group_if_started", record)
+    rows = [
+        TreeRow(4343, 1, 4343, launcher.DEFUNCT),
+        TreeRow(4344, 4343, 4343, "sleep 60"),
+    ]
+    record_file(tmp_path, 4242, 4343, "sleep", harness_started=5.0)
+    [done] = swept(tmp_path, rows)
+    assert done.skipped is None
+    assert sent and all(group == 4343 and defunct for group, _, defunct in sent)
+
+
+def test_a_record_written_before_round_18_signals_nothing_whatever_it_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first restart onto this version reads the records of launchers that started
+    before it. They have no start times. Nothing they name is signalled, however the
+    name matches, and the record is removed with the reason, which the daemon logs."""
+    sent: list[object] = []
+    monkeypatch.setattr(launcher, "_send", recording(sent, "pid"))
+    monkeypatch.setattr(launcher, "signal_group_if_started", recording(sent, "group"))
+    monkeypatch.setattr(launcher, "signal_if_started", recording(sent, "one"))
+    rows = [
+        TreeRow(4343, 1, 4343, "sleep 60"),
+        TreeRow(4344, 4343, 4343, "sleep 60"),
+    ]
+    for policy in StopPolicy:
+        path = record_file(tmp_path, 4242, 4343, "sleep", policy=policy)
+        [kept] = swept(tmp_path, rows)
+        assert kept.skipped == launcher.NO_START_TIME
+        assert kept.ended == () and not path.exists()
+    assert sent == []
+    for name in ("_signal_group", "_signal_harness"):
+        path = record_file(tmp_path, 4242, 4343, "sleep")
+        [record] = launcher.read_launches(tmp_path)
+        assert record.harness_started is None
+        getattr(launcher, name)(record, signal.SIGTERM)
+        path.unlink()
+    assert sent == []
+
+
+def test_a_legacy_record_whose_launcher_still_runs_is_left_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the first restart. A launcher of the old version that is still
+    in the table is not swept, so its engine goes on, and its record stays."""
+    monkeypatch.setattr(launcher, "start_time", unreadable)
+    rows = [
+        TreeRow(4242, 1, 4242, "python -I -m dromon.launcher"),
+        TreeRow(4343, 4242, 4343, "sleep 60"),
+    ]
+    path = record_file(tmp_path, 4242, 4343, "sleep")
+    assert swept(tmp_path, rows) == []
+    assert path.exists()

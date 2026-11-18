@@ -857,13 +857,15 @@ def _started_as(pid: int, recorded: float | None) -> bool | None:
     return None if now is None else same_start(recorded, now)
 
 
-def _is_harness(record_command: str, harness: TreeRow, started: float | None) -> bool:
-    """Whether the process listed as ``harness`` is the harness the record names. By its
-    recorded start time when there is one and it can be read, which survives a harness
-    that replaced itself with another program, and else by the recorded executable's
-    name, as before."""
-    known = _started_as(harness.pid, started)
-    return record_command in harness.command if known is None else known
+def _is_harness(harness: TreeRow, started: float | None) -> bool | None:
+    """Whether the process listed as ``harness`` is the harness that started at
+    ``started``, or ``None`` when that cannot be told, which is when no start time was
+    recorded or the process's cannot be read. **Audit's finding, 2026-11-18.** It no
+    longer falls back to the executable's name, so a caller that gets ``None`` has to
+    fail closed, which is to signal nothing. A zombie's start time is unreadable on
+    macOS, and a caller that knows from the table that the row is ``<defunct>`` says
+    so itself."""
+    return _started_as(harness.pid, started)
 
 
 def launcher_running(
@@ -887,8 +889,12 @@ def launcher_running(
     with a program of another name was never held to its parent. With the start times
     the launcher recorded, ``launcher_started`` and ``harness_started``, a process that
     started at another time is another process, whatever it is called, and the
-    harness is recognised by when it started and not by its name. A start time that
-    was not recorded or cannot be read leaves the earlier behaviour."""
+    harness is recognised by when it started and not by its name. **Audit's finding,
+    2026-11-18.** A start time that was not recorded or cannot be read is not a reason
+    to go by the name, which a reused pid shares. A launcher whose time cannot be
+    checked is taken as the launcher, and a harness that cannot be recognised is taken
+    as still held, so that no sweep follows and nothing is signalled. ``command`` is
+    kept for the callers that pass it and no longer decides anything."""
     row = next((row for row in rows if row.pid == pid), None)
     if row is None or row.has_marker("<defunct>"):
         return False
@@ -897,7 +903,7 @@ def launcher_running(
     if _started_as(pid, launcher_started) is False:
         return False
     held = next((row for row in rows if row.pid == harness), None)
-    if held is None or not _is_harness(command, held, harness_started):
+    if held is None or _is_harness(held, harness_started) is not True:
         return True
     return held.ppid == pid
 
@@ -978,22 +984,51 @@ async def sweep_launches(
     return swept
 
 
+NO_START_TIME: Final = (
+    "the record has no start time for the harness, as one written before round 18"
+    " has, so nothing is signalled"
+)
+"""Why a sweep touched nothing. A record written by a launcher that started before the
+upgrade carries no start times, and a pid cannot be told from one given to another
+process without them. At the first restart onto the upgrade such a record is read, its
+launcher is taken as running when it still is, and when it has exited the record is
+removed with this said and what the harness left running is left to the operator."""
+
+
+def _held_by_another(
+    record: LaunchRecord, leader: TreeRow | None, claimed: bool
+) -> str | None:
+    """Why the sweep of ``record`` must signal nothing, or ``None`` when the harness is
+    shown to be the harness. **Audit's finding, 2026-11-18.** Not knowing is never
+    knowing, so a record without the harness's start time, or a harness whose start
+    time cannot be read, is refused, and not matched by the executable's name."""
+    if claimed:
+        return "another launch's harness now holds its pid"
+    if record.harness_started is None:
+        return NO_START_TIME
+    if leader is None:
+        return None
+    known = _is_harness(leader, record.harness_started)
+    if known is None and leader.has_marker(DEFUNCT):
+        return None
+    if known is False:
+        return "another process now holds the harness's pid"
+    if known is None:
+        return "the harness's start time cannot be read, so nothing is signalled"
+    return None
+
+
 async def _sweep_one(
     record: LaunchRecord, rows: Sequence[TreeRow], claimed: bool
 ) -> Swept:
     harness = record.harness
     leader = next((row for row in rows if row.pid == harness), None)
-    skipped = None
-    if claimed:
-        skipped = "another launch's harness now holds its pid"
-    elif leader is not None and not _is_harness(
-        record.command, leader, record.harness_started
-    ):
-        skipped = "another process now holds the harness's pid"
+    defunct = leader is not None and leader.has_marker(DEFUNCT)
     found = {row.pid: row for row in rows if row.pgid == harness}
     if leader is not None:
         found.update({row.pid: row for row in descendants(rows, harness)})
         found[harness] = leader
+    skipped = _held_by_another(record, leader, claimed) if found else None
     if skipped is not None or not found:
         return Swept(
             record.line_id,
@@ -1005,12 +1040,12 @@ async def _sweep_one(
             record.launched_ns,
         )
     if record.policy is StopPolicy.KILL_ALL:
-        return await _end_found(record, found)
+        return await _end_found(record, found, defunct)
     ended: tuple[int, ...] = ()
     if not record.done and leader is not None:
         _signal_harness(record, signal.SIGKILL)
         ended = (harness,)
-    _signal_group(record, signal.SIGCONT)
+    _signal_group(record, signal.SIGCONT, defunct)
     left = (
         ()
         if record.done
@@ -1028,21 +1063,27 @@ async def _sweep_one(
     )
 
 
-def _signal_group(record: LaunchRecord, number: int) -> bool:
+def _signal_group(
+    record: LaunchRecord, number: int, leader_defunct: bool = False
+) -> bool:
     """``launcher.signal_group`` for the record's harness group, unless the harness's
     pid now belongs to another process, as ``processes.signal_group_if_started``
-    checks, when the record has the harness's start time. **Round 18, item 4.**"""
+    checks. **Round 18, item 4.** **Audit's finding, 2026-11-18.** A record without the
+    harness's start time signals nothing, as ``_held_by_another`` has already said."""
     if record.harness_started is None:
-        return signal_group(record.harness, number)
-    return signal_group_if_started(record.harness, number, record.harness_started)
+        return False
+    return signal_group_if_started(
+        record.harness,
+        number,
+        record.harness_started,
+        leader_defunct=leader_defunct,
+    )
 
 
 def _signal_harness(record: LaunchRecord, number: int) -> None:
     """Signal the record's harness, if its pid is still the harness's, which is told
-    from its start time when the record has one, and from nothing otherwise."""
-    if record.harness_started is None:
-        _send(record.harness, number)
-    else:
+    from its start time. A record without one signals nothing."""
+    if record.harness_started is not None:
         signal_if_started(record.harness, number, record.harness_started)
 
 
@@ -1050,26 +1091,31 @@ def _signal_found(row: TreeRow, number: int) -> None:
     """Signal a process the sweep listed, unless its pid now belongs to another
     process. The process is checked now, against the start time its row carried, so a
     process that ended and was replaced since the table was read, which in a sweep of
-    several records can be seconds, is not signalled. A row without a start time is
-    signalled as before. **Round 18, item 4.**"""
+    several records can be seconds, is not signalled. A row without a start time, or a
+    process whose start time cannot be read, is not signalled, since it cannot be told
+    from another that took the number. **Round 18, item 4, and audit's finding.**"""
     if row_is_same_process(row, start_time(row.pid)):
         _send(row.pid, number)
 
 
-async def _end_found(record: LaunchRecord, found: Mapping[int, TreeRow]) -> Swept:
+async def _end_found(
+    record: LaunchRecord, found: Mapping[int, TreeRow], defunct: bool = False
+) -> Swept:
     """``KILL_ALL``: end the group and what else was found, within a bound."""
     harness = record.harness
     others = sorted(pid for pid, row in found.items() if row.pgid != harness)
-    _signal_group(record, signal.SIGTERM)
-    _signal_group(record, signal.SIGCONT)
+    _signal_group(record, signal.SIGTERM, defunct)
+    _signal_group(record, signal.SIGCONT, defunct)
     for pid in others:
         _signal_found(found[pid], signal.SIGTERM)
         _signal_found(found[pid], signal.SIGCONT)
     for _ in range(int(EXIT_SECONDS / CHECK_SECONDS)):
-        if not _signal_group(record, 0) and not any(_alive(pid) for pid in others):
+        if not _signal_group(record, 0, defunct) and not any(
+            _alive(pid) for pid in others
+        ):
             break
         await asyncio.sleep(CHECK_SECONDS)
-    _signal_group(record, signal.SIGKILL)
+    _signal_group(record, signal.SIGKILL, defunct)
     for pid in others:
         if _alive(pid):
             _signal_found(found[pid], signal.SIGKILL)

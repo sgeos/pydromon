@@ -283,6 +283,18 @@ checkable and skipped without refusing restart before adapter construction.
 Their launch arguments and configuration remain unverified by preflight. Any failure refuses
 restart before the client sends its restart request.
 
+**Round 18, audit's finding, 2026-11-18. Records written before the upgrade.** The
+sweep signals a harness only when its record carries the harness's start time and the
+process now holding the pid started then. A launch record written by a launcher that started
+before round 18 has no start times, so the first restart onto this version reads it as
+follows. If its launcher is still in the process table the record is left, its engine goes
+on, and the launcher is taken as running. If its launcher has exited the sweep signals nothing,
+says in the record's `skipped` text that it has no start time, and removes the record, so an
+orphan of the old version is left to the operator to end. This ends as those engines end, and
+no record written by this version lacks the times, except where the harness had already
+exited when the launcher read them. The smoke check's verdict asks `launcher_running` with the
+record's start times, as the sweep does.
+
 **Round 18, item 1. The launch smoke check.** After the engine startup checks the
 preflight runs `dromon.launchsmoke`. For each of the six engine kinds, and under both stop
 policies, it starts a stand-in harness through the function that the engine's adapter

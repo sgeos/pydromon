@@ -1247,19 +1247,41 @@ def signal_if_started(pid: int, number: int, started: float) -> bool:
     return True
 
 
-def signal_group_if_started(group: int, number: int, started: float) -> bool:
+def _exists(pid: int) -> bool | None:
+    """Whether ``pid`` names a process, which a zombie does, or ``None`` when that
+    cannot be told, as for another user's process, which answers ``PermissionError``
+    and still exists."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    return True
+
+
+def signal_group_if_started(
+    group: int, number: int, started: float, *, leader_defunct: bool = False
+) -> bool:
     """Signal process group ``group`` unless its leader's pid now belongs to another
     process, and say whether any process of the group remained, as
     ``launcher.signal_group`` does, so ``0`` asks. **Round 18, item 4.** A group
     outlives its leader, and while any member runs the number cannot be given to a new
-    group, so a leader that is gone is no reason to refuse. A leader that is there with
-    another start time is a new process that took the number after the group ended,
-    and its group is not the one meant, so nothing is sent. **Residual.** The check
-    and ``killpg`` are two calls, and no handle names a group on either platform."""
+    group, so a leader that is gone is no reason to refuse, nor one that is a zombie,
+    which keeps its number until it is reaped, and the caller says so with
+    ``leader_defunct`` from the table it read. **Audit's finding, 2026-11-18.** A
+    leader that is there and whose start time cannot be read is refused, since it may
+    be a process that took the number, and nothing is sent. A leader that is there with
+    another start time is likewise a new process, and its group is not the one meant.
+    **Residual.** The check and ``killpg`` are two calls, and no handle names a group
+    on either platform."""
     if type(group) is not int or group <= 1:
         return False
     leader = start_time(group)
-    if leader is not None and not same_start(started, leader):
+    if leader is None:
+        if not leader_defunct and _exists(group) is not False:
+            return False
+    elif not same_start(started, leader):
         return False
     try:
         os.killpg(group, number)
@@ -1270,14 +1292,12 @@ def signal_group_if_started(group: int, number: int, started: float) -> bool:
 
 def row_is_same_process(row: TreeRow, now: float | None) -> bool:
     """Whether ``now``, a direct reading of the start time of ``row.pid``, is that of
-    the process ``row`` listed. A row that was listed without a start time cannot be
-    checked, and is taken as it was before this check existed. A process that cannot
-    be read is gone."""
-    if row.started == "":
-        return True
-    if now is None:
-        # A platform with no reading cannot tell, and is taken as it was before.
-        return sys.platform not in START_TIME_PLATFORMS
+    the process ``row`` listed. **Audit's finding, 2026-11-18.** A row that was listed
+    without a start time cannot be checked, and a process whose start time cannot be
+    read cannot be told from another that took its number, so neither is taken as the
+    same, and the signal that depends on it is not sent."""
+    if row.started == "" or now is None:
+        return False
     listed = lstart_epoch(row.started)
     return listed is not None and abs(listed - now) <= ROW_START_TOLERANCE_SECONDS
 

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -165,3 +166,110 @@ def test_the_wrapper_keeps_the_original_fork_call_reachable() -> None:
     wrapped: Any = getattr(subprocess, "_fork_exec")  # noqa: B009
     inner = getattr(wrapped, "__wrapped__")  # noqa: B009
     assert hasattr(inner, "__wrapped__"), "the fork lock is still inside the watch"
+
+
+# Audit's finding of 2026-11-18. The monitor could die silently and for good.
+
+
+class Slots:
+    """Sets the one item of a list for a test and puts it back, as
+    ``monkeypatch.setitem`` does for a mapping, which a list is not."""
+
+    def __init__(self) -> None:
+        self.saved: list[tuple[list[Any], Any]] = []
+
+    def set(self, slot: list[Any], value: object) -> None:
+        self.saved.append((slot, slot[0]))
+        slot[0] = value
+
+
+@pytest.fixture
+def slots() -> Iterator[Slots]:
+    held = Slots()
+    try:
+        yield held
+    finally:
+        for slot, before in reversed(held.saved):
+            slot[0] = before
+
+
+def _stuck_start() -> subprocess.Popen[bytes]:
+    """A start whose child is stuck between its fork and its exec for 1.5 seconds."""
+    child = subprocess.Popen(  # noqa: S603  # direct on purpose, the start under test
+        [sys.executable, "-I", "-c", "pass"], preexec_fn=_slow_exec
+    )
+    assert child.wait(30) == 0
+    return child
+
+
+def _failure_entries() -> list[str]:
+    return [
+        line for line in spawn.slow_starts() if line.startswith("exec watch failed")
+    ]
+
+
+def test_a_look_that_fails_is_recorded_once_and_the_watch_goes_on(
+    sampled: list[int], monkeypatch: pytest.MonkeyPatch, slots: Slots
+) -> None:
+    real = spawn._in_exec_wait  # pyright: ignore[reportPrivateUsage]
+    calls: list[int] = []
+
+    def flaky(ident: int, token: int) -> bool:
+        calls.append(token)
+        if len(calls) <= 2:
+            raise RuntimeError("the frames cannot be read")
+        return real(ident, token)
+
+    monkeypatch.setattr(spawn, "_in_exec_wait", flaky)
+    slots.set(spawn._exec_failures, 0)  # pyright: ignore[reportPrivateUsage]
+    first, second, third = _stuck_start(), _stuck_start(), _stuck_start()
+    assert _wait_for(lambda: bool(_exec_entries()))
+    assert len(calls) >= 3
+    [failure] = _failure_entries()
+    assert "RuntimeError" in failure and "the frames cannot be read" in failure
+    assert spawn._exec_failures[0] == 2  # pyright: ignore[reportPrivateUsage]
+    assert sampled == [third.pid], "the third start was still watched and sampled"
+    assert first.pid != second.pid
+    monitor = spawn._exec_monitor[0]  # pyright: ignore[reportPrivateUsage]
+    assert monitor is not None and monitor.is_alive()
+
+
+def test_a_pass_of_the_monitor_that_fails_is_recorded_and_the_monitor_continues(
+    sampled: list[int], monkeypatch: pytest.MonkeyPatch, slots: Slots
+) -> None:
+    real = spawn._watch_once  # pyright: ignore[reportPrivateUsage]
+    failed: list[int] = []
+
+    def once() -> None:
+        if not failed:
+            failed.append(1)
+            raise RuntimeError("a pass failed")
+        real()
+
+    monkeypatch.setattr(spawn, "_watch_once", once)
+    monkeypatch.setattr(spawn, "EXEC_WATCH_RETRY_SECONDS", 0.05)
+    slots.set(spawn._exec_failures, 0)  # pyright: ignore[reportPrivateUsage]
+    child = _stuck_start()
+    assert _wait_for(lambda: bool(_exec_entries()))
+    assert failed
+    [failure] = _failure_entries()
+    assert "a pass failed" in failure
+    assert sampled == [child.pid]
+
+
+def test_a_monitor_that_has_ended_is_started_again_by_the_next_fork(
+    sampled: list[int], slots: Slots
+) -> None:
+    """Only an exception that is not an ``Exception`` can end it now, and the next
+    start must not queue forks for a thread that is gone."""
+    ended = threading.Thread(target=lambda: None)
+    ended.start()
+    ended.join()
+    assert not ended.is_alive()
+    slots.set(spawn._exec_monitor, ended)  # pyright: ignore[reportPrivateUsage]
+    child = _stuck_start()
+    replacement = spawn._exec_monitor[0]  # pyright: ignore[reportPrivateUsage]
+    assert replacement is not ended
+    assert replacement is not None and replacement.is_alive()
+    assert _wait_for(lambda: bool(_exec_entries()))
+    assert sampled == [child.pid]

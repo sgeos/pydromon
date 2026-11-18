@@ -320,3 +320,141 @@ def test_the_pipe_to_a_child_that_exited_is_closed_though_a_descendant_holds_it(
         return process.stdin.transport.is_closing(), code
 
     assert asyncio.run(scenario()) == (True, 0)
+
+
+# Audit's finding of 2026-11-18. The starts had shared the loop's default executor.
+
+
+async def timed_to_thread() -> float:
+    """How long an unrelated call through ``asyncio.to_thread`` takes."""
+    began = time.monotonic()
+    assert await asyncio.to_thread(lambda: 7) == 7
+    return time.monotonic() - began
+
+
+def test_the_default_executor_is_starved_by_blocking_calls_which_is_the_control() -> (
+    None
+):
+    async def scenario() -> float:
+        loop = asyncio.get_running_loop()
+        held = [loop.run_in_executor(None, time.sleep, 0.8) for _ in range(40)]
+        await asyncio.sleep(0.1)
+        delay = await timed_to_thread()
+        await asyncio.gather(*held)
+        return delay
+
+    assert asyncio.run(scenario()) >= 0.4
+
+
+def test_forty_slow_starts_do_not_delay_an_unrelated_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocking_popen(monkeypatch, 0.8)
+
+    async def scenario() -> tuple[float, list[int | None]]:
+        starts = [
+            asyncio.ensure_future(spawn.subprocess_exec(*TRUE)) for _ in range(40)
+        ]
+        await asyncio.sleep(0.1)
+        delay = await timed_to_thread()
+        processes = await asyncio.gather(*starts)
+        return delay, [await process.wait() for process in processes]
+
+    delay, codes = asyncio.run(scenario())
+    assert delay < 0.3, "the unrelated call waited for the starts"
+    assert codes == [0] * 40
+
+
+def test_the_starts_run_on_threads_of_their_own() -> None:
+    names: list[str] = []
+    real = spawn._start_claimed  # pyright: ignore[reportPrivateUsage]
+
+    def recording(
+        claim: object, argv: list[str], options: dict[str, Any]
+    ) -> subprocess.Popen[bytes] | None:
+        names.append(threading.current_thread().name)
+        return real(claim, argv, options)  # type: ignore[arg-type]
+
+    async def scenario() -> None:
+        process = await spawn.subprocess_exec(*TRUE)
+        assert await process.wait() == 0
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(spawn, "_start_claimed", recording)
+        asyncio.run(scenario())
+    assert names and all(name.startswith("dromon-start") for name in names)
+    assert spawn.START_WORKERS > 0
+
+
+def test_starts_past_the_limit_are_refused_and_the_count_returns_to_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocking_popen(monkeypatch, 0.6)
+    monkeypatch.setattr(spawn, "MAX_ASYNC_STARTS", 2)
+
+    async def scenario() -> list[int]:
+        first = asyncio.ensure_future(spawn.subprocess_exec(*TRUE))
+        second = asyncio.ensure_future(spawn.subprocess_exec(*TRUE))
+        await asyncio.sleep(0.1)
+        with pytest.raises(spawn.StartStalled, match="already running or waiting"):
+            await spawn.subprocess_exec(*TRUE)
+        return [await (await first).wait(), await (await second).wait()]
+
+    assert asyncio.run(scenario()) == [0, 0]
+    assert spawn._async_starts[0] == 0  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_start_that_fails_gives_its_place_back() -> None:
+    async def scenario() -> None:
+        with pytest.raises(OSError, match="No such file"):
+            await spawn.subprocess_exec("/no/such/program")
+
+    before = spawn._async_starts[0]  # pyright: ignore[reportPrivateUsage]
+    asyncio.run(scenario())
+    assert spawn._async_starts[0] == before  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_caller_cancelled_as_the_loop_ends_does_not_leave_the_child_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The loop is gone when the child is made, so no callback of the loop can end it.
+    The thread that made it does, because the claim says the caller is gone."""
+    made = blocking_popen(monkeypatch, 0.6)
+
+    async def scenario() -> None:
+        task = asyncio.ensure_future(spawn.subprocess_exec(*SLEEP))
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not made:
+        time.sleep(0.05)
+    assert made
+    assert made[0].wait(timeout=10) is not None
+
+
+def test_a_child_made_before_the_caller_is_cancelled_is_ended_by_the_claim() -> None:
+    claim = spawn._Claim()  # pyright: ignore[reportPrivateUsage]
+    popen = spawn.start(SLEEP)
+    assert claim.offer(popen)
+    claim.abandon()
+    assert popen.wait(timeout=10) is not None
+    late = spawn.start(SLEEP)
+    assert not claim.offer(late), "a child offered after the cancellation is refused"
+    assert late.wait(timeout=10) is not None
+
+
+def test_a_child_the_caller_has_taken_is_not_ended_by_a_later_cancellation() -> None:
+    claim = spawn._Claim()  # pyright: ignore[reportPrivateUsage]
+    popen = spawn.start(SLEEP)
+    try:
+        assert claim.offer(popen)
+        claim.take()
+        claim.abandon()
+        assert popen.poll() is None
+    finally:
+        popen.kill()
+        popen.wait(timeout=10)

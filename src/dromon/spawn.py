@@ -196,6 +196,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Generator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Final, Literal, Protocol, cast, overload
@@ -724,33 +725,82 @@ def _report_exec_wait(entry: _ExecWait, waited: float) -> None:
         pass
 
 
-def _exec_watch_loop() -> None:
-    """The monitor thread. It sleeps until the earliest fork is due, drops what is no
-    longer waiting, and reports the rest. It holds the lock only to read and edit the
-    list, never while it samples. Ends only with the process."""
-    while True:
+_exec_failures = [0]
+"""How many passes of the monitor failed, of which only the first is recorded."""
+
+EXEC_WATCH_RETRY_SECONDS: Final = 0.2
+"""The pause after a failed pass, so that a failure that repeats does not spin."""
+
+
+def _exec_watch_failed(error: Exception) -> None:
+    """Record the first failure of the monitor, once, in the ledger and the log, and
+    count the rest. **Audit's finding, 2026-11-18.** A monitor that raised ended
+    silently, nothing started another, and no later fork was ever looked at. Never
+    raises."""
+    try:
+        _exec_failures[0] += 1
+        if _exec_failures[0] > 1:
+            return
+        text = _clean(
+            f"exec watch failed, {type(error).__name__}: {error}, and it goes on"
+            " watching, with this reported once",
+            MAX_SAMPLE_CHARS,
+        )
+        _keep_slow(text, reserved=True)
+        _say(f"dromond: {text}", limited=False, wait=SAMPLE_LOG_WAIT_SECONDS)
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
+def _look_at(entry: _ExecWait) -> None:
+    """Look at one fork that is due, and report it if its thread is still waiting."""
+    try:
+        if _in_exec_wait(entry.ident, entry.token):
+            _report_exec_wait(entry, EXEC_WAIT_SECONDS)
+    finally:
         with _exec_lock:
-            while not _exec_pending:
-                _exec_lock.wait()
-            soonest = min(entry.due for entry in _exec_pending)
-            delay = soonest - time.monotonic()
-            if delay > 0.0:
-                _exec_lock.wait(delay)
-                continue
-            now = time.monotonic()
-            due = [entry for entry in _exec_pending if entry.due <= now]
-            _exec_pending[:] = [entry for entry in _exec_pending if entry.due > now]
-        for entry in due:
-            if _in_exec_wait(entry.ident, entry.token):
-                _report_exec_wait(entry, EXEC_WAIT_SECONDS)
-            with _exec_lock:
-                if _exec_tokens.get(entry.ident) == entry.token:
-                    del _exec_tokens[entry.ident]
+            if _exec_tokens.get(entry.ident) == entry.token:
+                del _exec_tokens[entry.ident]
+
+
+def _watch_once() -> None:
+    """One pass of the monitor, which waits until a fork is due and looks at every one
+    that is. It holds the lock only to read and edit the list, never while it
+    samples. Each fork is looked at on its own, so one that cannot be does not hide
+    the rest."""
+    with _exec_lock:
+        while not _exec_pending:
+            _exec_lock.wait()
+        soonest = min(entry.due for entry in _exec_pending)
+        delay = soonest - time.monotonic()
+        if delay > 0.0:
+            _exec_lock.wait(delay)
+            return
+        now = time.monotonic()
+        due = [entry for entry in _exec_pending if entry.due <= now]
+        _exec_pending[:] = [entry for entry in _exec_pending if entry.due > now]
+    for entry in due:
+        try:
+            _look_at(entry)
+        except Exception as error:  # noqa: BLE001
+            _exec_watch_failed(error)
+
+
+def _exec_watch_loop() -> None:
+    """The monitor thread. A pass that fails is recorded once and the watch goes on,
+    after a short pause, so that it ends only with the process."""
+    while True:
+        try:
+            _watch_once()
+        except Exception as error:  # noqa: BLE001
+            _exec_watch_failed(error)
+            time.sleep(EXEC_WATCH_RETRY_SECONDS)
 
 
 def _watch_exec(ident: int, token: int, pid: int, program: str) -> None:
     """Queue a fork that returned for a look after ``EXEC_WAIT_SECONDS``, and start the
-    monitor thread on first use. Does not wait, and does not raise."""
+    monitor thread on first use, or again if it has ended, which only an exception that
+    is not an ``Exception`` can make it do. Does not wait, and does not raise."""
     try:
         with _exec_lock:
             if len(_exec_pending) >= MAX_EXEC_WATCHED:
@@ -761,7 +811,8 @@ def _watch_exec(ident: int, token: int, pid: int, program: str) -> None:
                     ident, token, pid, time.monotonic() + EXEC_WAIT_SECONDS, program
                 )
             )
-            if _exec_monitor[0] is None:
+            current = _exec_monitor[0]
+            if current is None or not current.is_alive():
                 monitor = threading.Thread(
                     target=_exec_watch_loop, name="dromon-exec-watch", daemon=True
                 )
@@ -2245,12 +2296,38 @@ async def _read_all(reader: asyncio.StreamReader | None) -> bytes:
     return b"" if reader is None else await reader.read()
 
 
-def _dispose_late(future: asyncio.Future[subprocess.Popen[bytes]]) -> None:
-    """For a start whose caller was cancelled, end the child it made, if it made one,
-    so that nothing is left running that no caller will wait for."""
-    if future.cancelled() or future.exception() is not None:
-        return
-    popen = future.result()
+START_WORKERS: Final = 16
+"""The threads of the pool that makes the children of ``subprocess_exec``. **Audit's
+finding, 2026-11-18.** Starts shared the loop's default executor with every
+``asyncio.to_thread`` and ``run_in_executor`` caller, and 40 starts held for three
+seconds each delayed an unrelated call 5.79 seconds. A pool of its own keeps a burst of
+slow starts from delaying them. The fork lock serializes the forks themselves, so more
+threads would only wait for it."""
+
+MAX_ASYNC_STARTS: Final = 64
+"""How many starts of ``subprocess_exec`` may be running or waiting for a worker at
+once. Past it a start is refused with ``StartStalled``, so the queue of the pool is
+bounded too, as the stuck starts are by ``MAX_STRANDED``."""
+
+_start_pool: list[ThreadPoolExecutor | None] = [None]
+_start_pool_lock = threading.Lock()
+_async_starts = [0]
+
+
+def _starts() -> ThreadPoolExecutor:
+    """The pool of the starts of ``subprocess_exec``, made on first use."""
+    with _start_pool_lock:
+        pool = _start_pool[0]
+        if pool is None:
+            pool = ThreadPoolExecutor(
+                max_workers=START_WORKERS, thread_name_prefix="dromon-start"
+            )
+            _start_pool[0] = pool
+        return pool
+
+
+def _end_child(popen: subprocess.Popen[bytes]) -> None:
+    """End a child that no caller will wait for, and reap it."""
     for stream in (popen.stdin, popen.stdout, popen.stderr):
         if stream is not None:
             with contextlib.suppress(OSError, ValueError):
@@ -2260,9 +2337,57 @@ def _dispose_late(future: asyncio.Future[subprocess.Popen[bytes]]) -> None:
     threading.Thread(target=popen.wait, name="dromon-child-reap", daemon=True).start()
 
 
-def _start_bytes(argv: list[str], options: dict[str, Any]) -> subprocess.Popen[bytes]:
-    """``start`` for a binary child, as the executor calls it."""
-    return cast("subprocess.Popen[bytes]", start(argv, **options))
+class _Claim:
+    """Who owns the child of one start of ``subprocess_exec``, the caller or the pool's
+    thread. The thread that made it gives it to the caller, unless the caller was
+    cancelled first, in which case the thread ends it. A caller cancelled after the
+    thread gave it up ends it from here. Either way no child is left running, and none
+    depends on the event loop being alive to run a callback, which the loop's default
+    executor had to be waited for to give."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._taken = False
+        self._made: subprocess.Popen[bytes] | None = None
+
+    def offer(self, popen: subprocess.Popen[bytes]) -> bool:
+        """Called by the thread that made the child. Whether the caller still wants it,
+        and when not the child has been ended."""
+        with self._lock:
+            if not self._abandoned:
+                self._made = popen
+                return True
+        _end_child(popen)
+        return False
+
+    def take(self) -> None:
+        """The caller has the child, and a later cancellation is not about it."""
+        with self._lock:
+            self._taken = True
+            self._made = None
+
+    def abandon(self) -> None:
+        """The caller was cancelled. End the child if it was made and not taken."""
+        with self._lock:
+            self._abandoned = True
+            made = None if self._taken else self._made
+            self._made = None
+        if made is not None:
+            _end_child(made)
+
+
+def _start_claimed(
+    claim: _Claim, argv: list[str], options: dict[str, Any]
+) -> subprocess.Popen[bytes] | None:
+    """``start`` for a binary child, as the pool calls it, offering the child to the
+    caller."""
+    try:
+        popen = cast("subprocess.Popen[bytes]", start(argv, **options))
+        return popen if claim.offer(popen) else None
+    finally:
+        with _start_pool_lock:
+            _async_starts[0] -= 1
 
 
 async def subprocess_exec(
@@ -2289,19 +2414,39 @@ async def subprocess_exec(
 
     **Cancellation.** A caller cancelled while the child is being made does not receive
     it, and it is ended with ``SIGTERM`` and reaped as it returns, so none is left
-    running. **Cost.** An executor thread is held for the length of the start, at most
-    its bound, so a burst of stalled starts holds that many of the executor's threads
-    until the bound. The pool is not enlarged, and ``MAX_STRANDED`` refuses further
+    running, whether or not the loop is still alive to run a callback. **Cost.** A
+    thread of the pool of ``START_WORKERS`` is held for the length of the start, at
+    most its bound, so a burst of stalled starts holds that many threads until the
+    bound, and the rest wait for one. **Audit's finding, 2026-11-18.** The pool is this
+    module's own and not the loop's default executor, which every ``asyncio.to_thread``
+    caller shares, so a burst of starts no longer delays an unrelated call.
+    ``MAX_ASYNC_STARTS`` bounds the starts waiting, and ``MAX_STRANDED`` refuses further
     starts while that many are stuck. **Porting hazard.** The Rust port has a bounded
     spawn of its own and needs no adapter."""
     loop = asyncio.get_running_loop()
     argv = [os.fspath(program), *(os.fspath(argument) for argument in args)]
-    pending = loop.run_in_executor(None, _start_bytes, argv, kwargs)
+    with _start_pool_lock:
+        if _async_starts[0] >= MAX_ASYNC_STARTS:
+            raise StartStalled(
+                f"{Path(argv[0]).name} was not started: {MAX_ASYNC_STARTS} starts are"
+                " already running or waiting for a thread"
+            )
+        _async_starts[0] += 1
+    claim = _Claim()
+    try:
+        pending = loop.run_in_executor(_starts(), _start_claimed, claim, argv, kwargs)
+    except BaseException:
+        with _start_pool_lock:
+            _async_starts[0] -= 1
+        raise
     try:
         popen = await asyncio.shield(pending)
     except asyncio.CancelledError:
-        pending.add_done_callback(_dispose_late)
+        claim.abandon()
         raise
+    if popen is None:
+        raise asyncio.CancelledError
+    claim.take()
     process = BoundedProcess(popen, loop)
     try:
         await process.connect(limit)

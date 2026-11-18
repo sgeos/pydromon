@@ -12,6 +12,7 @@ choices, and not ``ps``. The ``full-gate`` run reads the real table.
 
 import asyncio
 import os
+import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -230,3 +231,174 @@ def test_the_main_exit_status_tells_a_pass_a_failure_and_an_unverified_table(
         monkeypatch.setattr(launchsmoke, "check_launches", fake)
         assert launchsmoke.main() == status
     assert "UNVERIFIED" in capsys.readouterr().out
+
+
+# Audit's review of 2026-11-18. Three single-line mutations of the verdict survived the
+# tests above, since only a launch that really failed ever reached them. Each branch of
+# ``_verdict`` is now reached with hand-built records and rows, and each test fails when
+# its branch is ignored, as the mutation shows.
+
+LAUNCHER_PID, HARNESS_PID, LAUNCHER_AT, HARNESS_AT = 7, 40, 100.0, 200.0
+
+
+class Verdict:
+    """A launch that is whole, which a test then breaks in one way."""
+
+    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.path = tmp_path / "7-1.launch"
+        self.path.write_text("{}")
+        self.living = {LAUNCHER_PID, HARNESS_PID}
+        self.clock = {LAUNCHER_PID: LAUNCHER_AT, HARNESS_PID: HARNESS_AT}
+        monkeypatch.setattr(launchsmoke, "_alive", self.alive)
+        monkeypatch.setattr(launcher, "start_time", self.started)
+        self.record = LaunchRecord(
+            self.path,
+            "alpha",
+            LAUNCHER_PID,
+            HARNESS_PID,
+            "/x/claude",
+            launcher.StopPolicy.KILL_ALL,
+            False,
+            None,
+            LAUNCHER_AT,
+            HARNESS_AT,
+        )
+        self.rows = parse_tree(
+            f"{LAUNCHER_PID} 1 {LAUNCHER_PID}"
+            f" {' '.join(module_command('dromon.launcher', '--stand-in'))}\n"
+            f"{HARNESS_PID} {LAUNCHER_PID} {HARNESS_PID} /bin/sh /x/claude\n"
+        )
+
+    def alive(self, pid: int) -> bool:
+        return pid in self.living
+
+    def started(self, pid: int) -> float | None:
+        return self.clock.get(pid)
+
+    def verdict(self, swept: Sequence[launcher.Swept] = ()) -> launchsmoke.SmokeResult:
+        return launchsmoke._verdict(  # pyright: ignore[reportPrivateUsage]
+            "claude-code",
+            launcher.StopPolicy.KILL_ALL,
+            self.record,
+            self.rows,
+            swept,
+        )
+
+
+@pytest.fixture
+def whole(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Verdict:
+    return Verdict(tmp_path, monkeypatch)
+
+
+def test_a_launch_that_is_whole_survives(whole: Verdict) -> None:
+    assert whole.verdict().survived
+
+
+def test_a_sweep_that_ended_something_is_a_failure_though_all_else_is_whole(
+    whole: Verdict,
+) -> None:
+    ended = launcher.Swept("alpha", launcher.StopPolicy.KILL_ALL, False, (40,), ())
+    found = whole.verdict([ended])
+    assert not found.survived
+    assert "a sweep ended (40,)" in found.detail
+
+
+def test_a_sweep_that_ended_nothing_is_not_a_failure(whole: Verdict) -> None:
+    quiet = launcher.Swept("alpha", launcher.StopPolicy.KILL_ALL, False, (), ())
+    assert whole.verdict([quiet]).survived
+
+
+def test_a_launcher_that_no_longer_runs_is_a_failure(whole: Verdict) -> None:
+    whole.living.discard(LAUNCHER_PID)
+    found = whole.verdict()
+    assert not found.survived and "launcher no longer ran" in found.detail
+
+
+def test_a_harness_that_no_longer_runs_is_a_failure(whole: Verdict) -> None:
+    whole.living.discard(HARNESS_PID)
+    found = whole.verdict()
+    assert not found.survived and "harness no longer ran" in found.detail
+
+
+def test_a_launcher_the_table_does_not_show_running_is_a_failure(
+    whole: Verdict,
+) -> None:
+    """Both processes answer a signal and the record is there, but the table that the
+    next sweep reads would end the harness, so the launch does not survive."""
+    whole.rows = [row for row in whole.rows if row.pid != LAUNCHER_PID]
+    found = whole.verdict()
+    assert not found.survived and "launcher_running" in found.detail
+
+
+def test_the_question_to_launcher_running_carries_the_records_start_times(
+    whole: Verdict,
+) -> None:
+    """The sweep asks with the start times, so the verdict does. A launcher whose pid
+    went to a process that started at another time is not the launcher, though the
+    table shows a launcher's name there."""
+    whole.clock[LAUNCHER_PID] = LAUNCHER_AT + 50
+    found = whole.verdict()
+    assert not found.survived and "launcher_running" in found.detail
+
+
+def test_a_record_the_sweep_removed_is_a_failure(whole: Verdict) -> None:
+    whole.path.unlink()
+    found = whole.verdict()
+    assert not found.survived and "removed its launch record" in found.detail
+
+
+def test_a_table_that_cannot_be_read_after_the_sweeps_is_unverified() -> None:
+    """The sweeps read well and the last reading fails. That is not a pass and not a
+    failure of any launch, so it is reported as the table's."""
+    calls: list[int] = []
+
+    def read(records: Sequence[LaunchRecord]) -> list[TreeRow] | TreeReadFailure | str:
+        calls.append(len(calls))
+        if len(calls) > launchsmoke.SWEEPS:
+            return TreeReadFailure("ps stopped answering")
+        return table(records)
+
+    report = asyncio.run(REAL(kinds=(launchsmoke.KINDS[2],), read=read))
+    assert len(calls) == launchsmoke.SWEEPS + 1
+    assert report.unverified == "ps stopped answering"
+    assert not report.passed and report.results == ()
+
+
+def test_alive_tells_a_live_process_from_one_that_has_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The verdict's own test of a pid, which the tests above replace, so it is tested
+    here with real processes. The mutation that makes it always true survived without
+    this."""
+    alive_here = launchsmoke._alive  # pyright: ignore[reportPrivateUsage]
+    assert alive_here(os.getpid())
+    child = spawn.start([sys.executable, "-I", "-c", "pass"])
+    child.wait()
+    assert not alive_here(child.pid)
+
+    def refused(pid: int, number: int) -> None:
+        raise PermissionError(pid)
+
+    # Another user's process answers with a refusal, and is there.
+    monkeypatch.setattr(os, "kill", refused)
+    assert alive_here(4242)
+
+
+def test_a_launch_whose_processes_have_really_gone_is_a_failure() -> None:
+    """With the real ``_alive``, a record naming pids that do not run is a failure that
+    says which of the two ended."""
+    child = spawn.start([sys.executable, "-I", "-c", "pass"])
+    child.wait()
+    record = LaunchRecord(
+        Path(__file__),
+        "alpha",
+        os.getpid(),
+        child.pid,
+        "/x/claude",
+        launcher.StopPolicy.KILL_ALL,
+        False,
+    )
+    found = launchsmoke._verdict(  # pyright: ignore[reportPrivateUsage]
+        "claude-code", launcher.StopPolicy.KILL_ALL, record, [], []
+    )
+    assert not found.survived and "harness no longer ran" in found.detail

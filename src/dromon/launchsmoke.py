@@ -273,8 +273,9 @@ def judge(
     """One result per kind and policy, from the launch records read before the sweeps,
     the rows of the table after them, and what the sweeps did. A launch survives when
     its record is still there, its launcher and harness still run and the launcher is
-    recognised as running by ``launcher_running``, which is what the sweep asks, and
-    the sweeps ended nothing."""
+    recognised as running by ``launcher_running``, asked with the start times the
+    record carries, as the sweep asks it, and the sweeps ended nothing. **Audit's
+    finding, 2026-11-18.** Without the start times the question was the weaker one."""
     results: list[SmokeResult] = []
     for kind in kinds:
         for policy in POLICIES:
@@ -316,7 +317,12 @@ def _verdict(
     if not _alive(record.harness):
         return SmokeResult(kind, policy, False, "its harness no longer ran")
     if not launcher.launcher_running(
-        rows, record.launcher, record.harness, record.command
+        rows,
+        record.launcher,
+        record.harness,
+        record.command,
+        launcher_started=record.launcher_started,
+        harness_started=record.harness_started,
     ):
         return SmokeResult(
             kind,
