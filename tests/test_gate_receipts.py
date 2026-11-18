@@ -2,6 +2,7 @@
 and one deferral that every surface words alike. **Round 18, items 1, 2 and 3.**
 ``docs/architecture/RUNS.md`` is normative."""
 
+import ast
 import asyncio
 import sys
 from collections.abc import Generator
@@ -745,3 +746,225 @@ def test_the_run_view_of_the_operator_shows_the_receipt(rig: OverrideRig) -> Non
     assert "admitted by the override of operator ana" in details
     assert any(line.startswith("tested: worktree commit") for line in details)
     assert any(line.startswith("tree digest: ") for line in details)
+
+
+# The review of a44ae0e, findings 1, 3 and 5.
+
+
+def test_a_lost_run_counts_as_open_for_the_override_and_fails_closed(
+    rig: OverrideRig,
+) -> None:
+    """Review finding 1. A lost run blocks its scope, and its command may still run,
+    so the override must not admit a second run beside it. Confirmed before the fix,
+    which skipped any run with an end recorded, a lost one included."""
+    rig.set_level("elevated")
+    rig.scheduler.admit_runs(ANA, 600, "")
+    first = rig.start("alpha", "hold")
+    rig.log.append(RunEnded(first.run_id, RunStatus.LOST, None, None, None, "", AT))
+    assert rig.log.state.runs[first.run_id].blocks
+    with pytest.raises(runs.RunRefused) as refused:
+        rig.start("beta")
+    text = str(refused.value)
+    assert f"run {first.run_id} of line alpha is lost" in text
+    assert "its command may still run" in text
+    assert "admits one run at a time" in text
+    assert "deferred" not in text or "override" in text
+    shown = rig.scheduler.run_status("beta")
+    assert "A start now would be deferred" in shown and "is lost" in shown
+    # The operator clears it, and the next start is admitted under the override.
+    rig.scheduler.clear_run(ANA, first.run_id)
+    second = rig.start("beta")
+    assert second.admitted_by == "ana"
+    rig.finish(second.run_id)
+
+
+def test_a_lost_run_that_was_cleared_no_longer_holds_the_override(
+    rig: OverrideRig,
+) -> None:
+    rig.set_level("elevated")
+    rig.scheduler.admit_runs(ANA, 600, "")
+    first = rig.start("alpha", "hold")
+    rig.log.append(RunEnded(first.run_id, RunStatus.LOST, None, None, None, "", AT))
+    rig.scheduler.clear_run(ANA, first.run_id)
+    assert not rig.log.state.runs[first.run_id].blocks
+    assert rig.scheduler._open_run_besides("beta") is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_run_that_ended_normally_does_not_hold_the_override(
+    rig: OverrideRig,
+) -> None:
+    rig.set_level("elevated")
+    rig.scheduler.admit_runs(ANA, 600, "")
+    first = rig.start("alpha")
+    rig.finish(first.run_id)
+    assert rig.log.state.runs[first.run_id].ended is not None
+    assert rig.scheduler._open_run_besides("beta") is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_an_override_made_while_nothing_is_deferred_stands_by_and_is_not_active(
+    rig: OverrideRig,
+) -> None:
+    """Review finding 3. Confirmed before the change, which showed it as admitting
+    runs now while the status read ok."""
+    rig.set_level("ok")
+    rig.scheduler.admit_runs(ANA, 600, "")
+    view = rig.scheduler.admission_view()
+    assert view is not None
+    assert view["active"] is False and view["standing_by"] is True
+    assert view["expired"] is False and view["critical"] is False
+    shown = rig.scheduler.run_status("alpha")
+    assert "It is standing by, since no run is deferred now." in shown
+    assert "It admits runs now" not in shown
+    assert "Nothing holds a start back now." in shown
+    started = rig.start("alpha")
+    assert started.admitted_by is None, "the status allowed it, so no override applied"
+    rig.finish(started.run_id)
+    # When the status defers runs, the same override admits one.
+    rig.set_level("elevated")
+    view = rig.scheduler.admission_view()
+    assert view is not None
+    assert view["active"] is True and view["standing_by"] is False
+    assert "It admits runs now." in rig.scheduler.run_status("alpha")
+    second = rig.start("alpha")
+    assert second.admitted_by == "ana"
+    rig.finish(second.run_id)
+
+
+def test_a_standing_by_override_is_not_shown_as_expired_or_critical_when_it_is_neither(
+    rig: OverrideRig,
+) -> None:
+    rig.set_level("elevated")
+    rig.scheduler.admit_runs(ANA, 60, "")
+    rig.clock.now += timedelta(seconds=120)
+    view = rig.scheduler.admission_view()
+    assert view is not None
+    assert view["expired"] is True
+    assert view["active"] is False and view["standing_by"] is False
+    rig.set_level("critical")
+    view = rig.scheduler.admission_view()
+    assert view is not None
+    assert view["expired"] is True and view["standing_by"] is False
+
+
+def test_the_client_row_says_standing_by_for_an_override_at_ok(
+    rig: OverrideRig,
+) -> None:
+    from dromon import cli
+
+    rig.set_level("ok")
+    rig.scheduler.admit_runs(ANA, 600, "")
+    view = rig.scheduler.admission_view()
+    assert view is not None
+    row = cli._admission_row(view)  # pyright: ignore[reportPrivateUsage]
+    assert row.endswith("and it is standing by, since no run is deferred now")
+    assert "it admits runs now" not in row
+    rig.set_level("elevated")
+    view = rig.scheduler.admission_view()
+    assert view is not None
+    assert cli._admission_row(view).endswith("and it admits runs now")  # pyright: ignore[reportPrivateUsage]
+
+
+def _scheduler_method(name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    """The last definition of ``Scheduler.name``, which is the implementation when the
+    method has ``overload`` stubs before it."""
+    tree = ast.parse(Path(scheduler_module.__file__).read_text(encoding="utf-8"))
+    found: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "Scheduler":
+            found.extend(
+                item
+                for item in node.body
+                if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef)
+                and item.name == name
+            )
+    assert found, f"no Scheduler.{name}"
+    return found[-1]
+
+
+def test_the_check_and_the_claim_of_the_one_run_rule_have_no_await_between_them() -> (
+    None
+):
+    """Review finding 5. The rule is race free only because no other task can run
+    between the check that finds no other run open and the claim that counts this one.
+    This reads the source and fails for an ``await``, an async loop or context, or a
+    ``yield`` added to the function that makes both, and for one added between its
+    call and the ``try`` that releases the claim."""
+    gate = _scheduler_method("_gate_start")
+    assert isinstance(gate, ast.FunctionDef), "_gate_start must be a plain function"
+    suspending = (ast.Await, ast.AsyncFor, ast.AsyncWith, ast.Yield, ast.YieldFrom)
+    for node in ast.walk(gate):
+        assert not isinstance(node, suspending), (
+            f"line {node.lineno} of the scheduler can suspend between the check and"
+            " the claim of the one run at a time"
+        )
+    claimed = [
+        node
+        for node in ast.walk(gate)
+        if isinstance(node, ast.Attribute) and node.attr == "_admission_starting"
+    ]
+    assert claimed, "the claim is not made in _gate_start"
+    start = _scheduler_method("start_run")
+    body = start.body
+    calls = [
+        index
+        for index, statement in enumerate(body)
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(node, ast.Attribute) and node.attr == "_gate_start"
+            for node in ast.walk(statement.value)
+        )
+    ]
+    assert len(calls) == 1, "start_run must call _gate_start exactly once"
+    index = calls[0]
+    assert not any(isinstance(node, ast.Await) for node in ast.walk(body[index])), (
+        "the call of _gate_start must not itself await"
+    )
+    follow = body[index + 1 : index + 3]
+    assert isinstance(follow[0], ast.If), "the early return follows the claim"
+    assert not any(isinstance(node, ast.Await) for node in ast.walk(follow[0].test))
+    assert isinstance(follow[1], ast.Try), "the release is the next statement"
+    discards = [
+        node
+        for node in ast.walk(ast.Module(body=follow[1].finalbody, type_ignores=[]))
+        if isinstance(node, ast.Attribute) and node.attr == "discard"
+    ]
+    assert discards, "the try must release the claim in its finally"
+
+
+def test_the_start_check_refuses_a_second_claim_by_the_same_line(
+    rig: OverrideRig,
+) -> None:
+    rig.set_level("elevated")
+    rig.scheduler.admit_runs(ANA, 600, "")
+    gate = rig.scheduler._gate_start  # pyright: ignore[reportPrivateUsage]
+    claims = rig.scheduler._admission_starting  # pyright: ignore[reportPrivateUsage]
+    assert gate("alpha") == "ana"
+    assert claims == {"alpha"}
+    with pytest.raises(runs.RunRefused, match="in progress"):
+        gate("alpha")
+    with pytest.raises(runs.RunRefused, match="is starting a run"):
+        gate("beta")
+    claims.discard("alpha")
+    assert gate("beta") == "ana"
+    claims.discard("beta")
+
+
+def test_a_start_that_fails_after_the_claim_releases_it(rig: OverrideRig) -> None:
+    rig.set_level("elevated")
+    rig.scheduler.admit_runs(ANA, 600, "")
+    claims = rig.scheduler._admission_starting  # pyright: ignore[reportPrivateUsage]
+
+    async def refuse(*_: object, **__: object) -> None:
+        raise runs.RunRefused("simulated")
+
+    original = rig.scheduler._start_checked  # pyright: ignore[reportPrivateUsage]
+    rig.scheduler._start_checked = refuse  # type: ignore[method-assign]  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    try:
+        with pytest.raises(runs.RunRefused, match="simulated"):
+            rig.start("alpha")
+        assert claims == set()
+    finally:
+        rig.scheduler._start_checked = original  # type: ignore[method-assign]  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    started = rig.start("beta")
+    assert started.admitted_by == "ana"
+    rig.finish(started.run_id)

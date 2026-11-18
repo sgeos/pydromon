@@ -1192,6 +1192,78 @@ def test_a_root_holding_an_unreadable_directory_is_still_removed(
     assert list(shared.iterdir()) == []
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_a_gate_removes_its_root_and_nothing_outside_it(
+    tmp_path: Path, fail: bool
+) -> None:
+    """Review of a44ae0e, finding 4. The trap runs ``chmod -R`` and ``rm -rf`` on the
+    root. The shared directory beside it holds a file, a directory with a nested file
+    and a closed directory, and the root holds links to a directory and a file outside
+    it, as a pytest that made them would. Every one outside survives with its content
+    and its mode, the links are removed and not followed, and the root is gone."""
+    root, stand_in = gate_repository(tmp_path)
+    shared = tmp_path / "shared-tmp"
+    shared.mkdir()
+    keep_file = shared / "keep.txt"
+    keep_file.write_text("a neighbour's file", encoding="utf-8")
+    keep_dir = shared / "pytest-of-someone"
+    (keep_dir / "pytest-0").mkdir(parents=True)
+    (keep_dir / "pytest-0" / "result").write_text("kept", encoding="utf-8")
+    closed = shared / "closed-by-another"
+    closed.mkdir()
+    (closed / "inside").write_text("kept too", encoding="utf-8")
+    closed.chmod(0o500)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file").write_text("outside file", encoding="utf-8")
+    outside.chmod(0o500)
+    target = tmp_path / "target.txt"
+    target.write_text("target", encoding="utf-8")
+    target.chmod(0o400)
+    (stand_in / "uv").write_text(
+        UV_STAND_IN.replace(
+            'mkdir -p "$base/pytest-made-this"',
+            'mkdir -p "$base/own"; touch "$base/own/f";'
+            ' ln -s "$UV_OUTSIDE" "$base/dir-link";'
+            ' ln -s "$UV_TARGET" "$base/file-link"',
+        ),
+        encoding="utf-8",
+    )
+    before = {
+        path: path.stat().st_mode & 0o777
+        for path in (keep_file, keep_dir, closed, outside, target)
+    }
+    extra = {"UV_FAIL": "pytest"} if fail else {}
+    try:
+        done = run_gate(
+            root,
+            stand_in,
+            UV_LOG=str(tmp_path / "uv.log"),
+            UV_PYTEST_LOG=str(tmp_path / "pytest.log"),
+            UV_OUTSIDE=str(outside),
+            UV_TARGET=str(target),
+            TMPDIR=str(shared),
+            **extra,
+        )
+        assert (done.returncode != 0) is fail, done.stdout + done.stderr
+        assert sorted(entry.name for entry in shared.iterdir()) == sorted(
+            [keep_file.name, keep_dir.name, closed.name]
+        ), "the gate left its root, or removed what is not its own"
+        assert keep_file.read_text(encoding="utf-8") == "a neighbour's file"
+        assert (keep_dir / "pytest-0" / "result").read_text(encoding="utf-8") == "kept"
+        assert (closed / "inside").read_text(encoding="utf-8") == "kept too"
+        assert (outside / "file").read_text(encoding="utf-8") == "outside file"
+        assert target.read_text(encoding="utf-8") == "target"
+        after = {
+            path: path.stat().st_mode & 0o777
+            for path in (keep_file, keep_dir, closed, outside, target)
+        }
+        assert after == before, "a mode outside the root was changed"
+    finally:
+        closed.chmod(0o700)
+        outside.chmod(0o700)
+
+
 def test_a_gate_that_cannot_make_its_root_fails_and_says_so(tmp_path: Path) -> None:
     root, stand_in = gate_repository(tmp_path)
     done = run_gate(

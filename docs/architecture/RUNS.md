@@ -557,9 +557,20 @@ operator, the time and the expiry, and the reason the operator gave.
   machine is pressed and a second gate would press it more. A start that waits is
   refused with the open run named, or kept by the queue, which begins it when that run
   ends. Two starts that reach the check at the same moment cannot both pass, since the
-  first holds its place until its run is recorded. A lost run that is not cleared is not
-  counted, since the daemon cannot tell whether it runs. **Inference.** The operator's
-  wording of one run at a time is read as one run on the machine, not one in each scope.
+  first holds its place until its run is recorded. A lost run that is not cleared counts
+  as open and blocks the override, which fails closed, since the daemon cannot tell
+  whether its command still runs and that is the case the rule exists for. The refusal
+  names it as lost. The review of a44ae0e found the opposite choice, which admitted a
+  second run beside a lost one. The check and the claim that makes a start count are one
+  plain function, `_gate_start`, with no `await` in it, so that no other task runs
+  between them. That holds only while no `await` is added, and a test reads the source
+  and fails if one is. **Inference.** The operator's wording of one run at a time is read
+  as one run on the machine, not one in each scope.
+- **Standing by.** An override made while nothing is deferred, at `ok` or raised by disk
+  alone, is recorded and admits nothing yet. It is shown as standing by, never as
+  admitting runs, and it admits one when the status next defers runs, within its expiry.
+  It is not refused at `ok`, since an operator who expects pressure may make it first.
+  Review finding 3.
 - **What it leaves.** Every other refusal stands, and so does the project's slot. A
   holder of the slot is not admitted past another line's lease.
 - **Expiry.** The span is 60 seconds to four hours, an hour by default. It ends by
@@ -575,6 +586,13 @@ operator, the time and the expiry, and the reason the operator gave.
   reason. The operator's `dromon run status` shows the same.
 - **Trust.** Only the operator can make it. The request is not offered to lines or to
   external agents. The reason is free text and is scrubbed as other recorded text is.
+  **The authority rests on the socket.** The daemon does not authenticate the operator
+  named in the request. It trusts the operator socket and its access control, as
+  `CLIENT.md` states for every operator request, such as clearing a run, placing a
+  scratch file or setting a budget. A process that can write to that socket can name any
+  operator and make the override, so the claim that only the operator can make it holds
+  exactly as far as access to the socket does. This adds no new authority path. Review
+  finding 2, a statement and no code change.
 
 **Failure modes.** A daemon with no machine status file refuses the request, since no
 run is deferred by a status there. The override is state in the log, so a restart keeps
@@ -638,7 +656,14 @@ made readable before it is removed. **Failure modes.** A gate that cannot make i
 directory fails at once and says where. A directory that cannot be removed is reported
 as a warning and does not fail a gate that passed. **Residual.** A gate killed with
 `SIGKILL` runs no exit handler and leaves its directory, which the operator removes. It
-is small, and no later gate reads it. **Inference.** The declared run `full-gate` runs this script, so it has the same
+is small, and no later gate reads it. **Tests.** Review finding 4. One test runs the real
+script with a stand-in `uv`, for a passing and a failing gate, over a shared directory
+that holds a neighbour's file, a directory of results, and a directory closed to its
+owner, with links inside the root to a directory and a file outside it. It asserts that
+the root is gone, that every neighbour and link target is intact with its mode, and that
+the links are removed and never followed. A mutation that made the trap also remove a
+neighbour fails it. A `SIGKILL` is not tested, since it leaves the root by design.
+**Inference.** The declared run `full-gate` runs this script, so it has the same
 isolation, which this line could not check since the project file that declares it is
 closed to lines. A test that makes its own directory outside the base, as the
 socket tests do with a short one, is isolated by its own name and not by this.

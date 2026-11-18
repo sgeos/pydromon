@@ -24,3 +24,7 @@ Type: Added
 - Each gate has a temporary test root of its own. `scripts/check.sh` makes a directory
   with `mktemp -d`, gives pytest a base inside it, and removes it when the gate ends, so
   two gates at once cannot prune or repair each other's directories.
+- The override counts a lost run, which is not cleared, as open, so it cannot admit a
+  second run beside a command that may still run. An override made while nothing is
+  deferred is shown as standing by and not as admitting runs, and the choice of the one
+  run at a time is made by one plain function that a test keeps free of `await`.

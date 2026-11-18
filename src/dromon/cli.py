@@ -2339,6 +2339,8 @@ def _admission_row(view: dict[str, object]) -> str:
             "it has expired"
             if view.get("expired") is True
             else "it does not apply while the status is critical"
+            if view.get("critical") is True
+            else "it is standing by, since no run is deferred now"
         )
     )
     reason = view.get("reason")

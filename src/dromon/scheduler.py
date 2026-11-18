@@ -3810,13 +3810,19 @@ class Scheduler:
         """A sentence naming a run that is open, or being started, under another line,
         or ``None``, for the override's one run at a time. Any scope's run counts, since
         the override exists because the machine is pressed and a second gate would press
-        it more. A lost run that is not cleared is not counted, since the daemon cannot
-        tell whether its command runs, and the line's own open run is refused by
-        another check. **Round 18, item 1.**"""
+        it more. A lost run that is not cleared counts as open, failing closed, since
+        the daemon cannot tell whether its command still runs, which is the case the
+        one run rule exists for. The line's own run is refused by another check.
+        **Round 18, item 1, and its review, finding 1.**"""
         for run in self._state().runs.values():
             started = run.started
-            if run.ended is None and started.line_id != line_id:
-                return f"run {started.run_id} of line {started.line_id} is open"
+            if run.blocks and started.line_id != line_id:
+                if run.ended is None:
+                    return f"run {started.run_id} of line {started.line_id} is open"
+                return (
+                    f"run {started.run_id} of line {started.line_id} is lost and its"
+                    " command may still run"
+                )
         for other in sorted(self._admission_starting):
             if other != line_id:
                 return f"line {other} is starting a run"
@@ -5776,6 +5782,29 @@ class Scheduler:
                 return self._enqueue_run(
                     line_id, command, previous, commit, arguments, waits
                 )
+        admitted_by = self._gate_start(line_id)
+        if admitted_by is None:
+            return await self._start_checked(line_id, command, latest_id, argv, commit)
+        try:
+            return await self._start_checked(
+                line_id, command, latest_id, argv, commit, admitted_by
+            )
+        finally:
+            self._admission_starting.discard(line_id)
+
+    def _gate_start(self, line_id: str) -> str | None:
+        """The last checks before a run starts, and for a start the operator's override
+        admits, the claim that makes it the one run at a time. Returns the operator
+        whose override admits the start, or ``None`` for one the status allows, and
+        raises ``RunRefused`` for a deferral, a held slot, or a start of this line
+        already claimed. **Round 18, item 1, and its review, finding 5.**
+
+        This is deliberately a plain function. The one run rule holds only because
+        nothing can run between the check that finds no other run open and the claim
+        that makes this one count, and a plain function cannot be interrupted by
+        another task. Adding an ``await`` here would let two starts both pass the check.
+        A test reads this source and fails if one is added. The caller releases the
+        claim in a ``finally`` once ``run_started`` is recorded or the start fails."""
         deferred = self._machine_run_refusal(line_id)
         if deferred is not None:
             raise runs.RunRefused(deferred)
@@ -5784,16 +5813,11 @@ class Scheduler:
             raise runs.RunRefused(slot_held)
         admitted_by = self._admitted_by(line_id)
         if admitted_by is None:
-            return await self._start_checked(line_id, command, latest_id, argv, commit)
-        # Round 18, item 1. Held from the check that admitted the start to its record,
-        # so a second start that reaches the check meanwhile sees this one.
+            return None
+        if line_id in self._admission_starting:
+            raise runs.RunRefused("a start of yours under the override is in progress")
         self._admission_starting.add(line_id)
-        try:
-            return await self._start_checked(
-                line_id, command, latest_id, argv, commit, admitted_by
-            )
-        finally:
-            self._admission_starting.discard(line_id)
+        return admitted_by
 
     async def _start_checked(
         self,
@@ -6468,6 +6492,8 @@ class Scheduler:
                     "It has expired."
                     if view["expired"]
                     else "It does not apply while the status is critical."
+                    if view["critical"]
+                    else "It is standing by, since no run is deferred now."
                 )
             )
             reason = view["reason"]
@@ -6741,19 +6767,25 @@ class Scheduler:
         """The recorded override as plain data for an operator or ``run_status``, or
         ``None`` when none is recorded. ``active`` is whether it admits runs now, which
         is false past its expiry and at a critical status, so a reader never takes a
-        recorded override for a live one. **Round 18, item 1.**"""
+        recorded override for a live one. ``standing_by`` is a live override while no
+        run is deferred, which admits nothing until the status defers runs again.
+        **Round 18, item 1, and its review, finding 3.**"""
         admitted = self._state().run_admission
         if admitted is None:
             return None
         status = self.machine_status()
         live = self._active_admission() is not None
         critical = status is not None and status.effective == "critical"
+        # Review finding 3. An override made while nothing is deferred admits nothing
+        # yet, so it stands by and is never shown as admitting runs.
+        deferring = status is not None and self.machine_decision().defer_runs
         return {
             "operator": admitted.operator_id,
             "admitted_at": admitted.admitted_at,
             "expires_at": admitted.expires_at,
             "reason": admitted.reason,
-            "active": live and not critical,
+            "active": live and not critical and deferring,
+            "standing_by": live and not critical and not deferring,
             "expired": not live,
             "critical": critical,
         }
