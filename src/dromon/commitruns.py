@@ -71,9 +71,17 @@ writing them, and the files backend keeps them under ``refs/remotes`` and in
 the operator's own fetch."""
 
 TREE: Final = "tree"
-HOME: Final = "home"
+HOME: Final = "run-home"
 """The two directories of a run's private directory, the checkout and the home the
-command is given."""
+command is given.
+
+**Round 18, item 2.** The home was named ``home``, and review gate
+``r-47d1a0b867ce`` failed a test of the scrubber with it. Code that takes the user
+name from the last part of ``HOME``, as ``evidence.leaks`` does, then read the user
+name as ``home``, a word every scrubbed recording holds in ``evidence.SCRUBBED_HOME``.
+The name is now one that is no common word. ``tests/test_commitruns.py`` checks that
+a scrubbed home is not read as naming it. A run's whole directory is removed by its
+run identifier, so a checkout made under the old name is removed as before."""
 
 MAX_REF_PATTERNS: Final = 16
 MAX_REF_PATTERN_BYTES: Final = 256
@@ -128,7 +136,7 @@ exist then."""
 @dataclass(frozen=True, slots=True)
 class Checkout:
     """A commit run's checkout, ``tree``, and the empty private home its command is
-    given, ``home``, both in the run's own private directory."""
+    given, ``run-home``, both in the run's own private directory."""
 
     tree: Path
     home: Path
@@ -490,7 +498,7 @@ def make_checkout(
 ) -> Checkout:
     """A detached checkout of ``commit`` at ``base/run_id/tree``, made with a clone
     that writes nothing into ``repository``, and an empty home at
-    ``base/run_id/home``, each with mode 0700. Raises ``CommitRefused``, leaving
+    ``base/run_id/run-home``, each with mode 0700. Raises ``CommitRefused``, leaving
     nothing behind, when any step fails, or when the checkout's ``HEAD`` is not the
     commit. ``environment`` is given to git as it is, so the caller passes
     ``git_environment``'s."""

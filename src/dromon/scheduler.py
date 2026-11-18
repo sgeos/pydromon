@@ -3641,6 +3641,9 @@ class Scheduler:
             "monitor": self._monitor_trouble(status),
             "defers_runs": decision.defer_runs,
             "defers_turns": decision.defer_turns,
+            # **Round 18, item 4.** The same words the notices use, from one source.
+            "advice": machinestatus.advice(decision) or None,
+            "policy": machinestatus.POLICY,
         }
 
     def machine_decision(self) -> machinestatus.Decision:
@@ -3767,8 +3770,7 @@ class Scheduler:
             )
         return (
             f"the run is deferred, since {words}. Nothing was started. This machine"
-            " is shared, so wait with wake_after and start it again once"
-            f" machine-status says ok, and say in your report that you waited.{cause}"
+            f" is shared. {machinestatus.advice(self.machine_decision())}{cause}"
         )
 
     def _note_turn_deferral(self, line_id: str) -> None:
@@ -3808,12 +3810,15 @@ class Scheduler:
         if deferred is not None:
             waited = int((self._wall_clock() - deferred).total_seconds())
             parts.append(f"Your turn was deferred for {waited} seconds by the status.")
-        if status is not None and machinestatus.decide(status).warn:
+        decision = None if status is None else machinestatus.decide(status)
+        if status is not None and decision is not None and decision.warn:
+            # **Round 18, item 4.** The advice is the module's, from the decision,
+            # so a level raised only by disk no longer tells a line to hold a gate
+            # that ``decide`` lets start.
             words = self._machine_words(status)
             parts.append(
-                f"{words[:1].upper()}{words[1:]}. This machine is shared,"
-                " so start nothing heavy, such as a full gate, until it is ok, and"
-                " say so in your report if you wait. Your turn proceeds."
+                f"{words[:1].upper()}{words[1:]}. This machine is shared."
+                f" {machinestatus.advice(decision)} Your turn proceeds."
                 f"{self._machine_cause(status)}"
             )
         return "Dromon note: " + " ".join(parts) if parts else None
@@ -6714,7 +6719,8 @@ class Scheduler:
                     " A command with parameters, which run_status lists with their"
                     " patterns, takes a value for each in arguments. A start that"
                     " waits only for the machine status or the project's slot is"
-                    " queued, in order, and begins by itself."
+                    " queued, in order, and begins by itself. "
+                    + machinestatus.RUNS_HELD_WHEN
                 ),
                 input_schema=START_RUN_SCHEMA,
                 handler=start,
