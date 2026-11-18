@@ -279,6 +279,7 @@ def test_every_event_class_is_classified_as_scrubbed_or_without_free_text() -> N
         "RoleDeclared": "operator configuration",
         "RoleHeld": "an identifier and a time",
         "RoleRetired": "an identifier and a time",
+        "RunAdmissionEnded": "an identifier and a time",
         "RunCleared": "identifiers and a time",
         "SeatBound": "identifiers",
         "SeatUnbound": "identifiers",

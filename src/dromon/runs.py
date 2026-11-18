@@ -67,6 +67,7 @@ from dromon import spawn
 from dromon.modulecommand import module_command
 from dromon.processes import TreeRow, attached, deepest_first, signal_if_same
 from dromon.model import (
+    MAX_COVERAGE_COUNT,
     MAX_EXIT_CODE,
     MAX_RUN_NOTE_BYTES,
     MAX_RUN_TAIL_BYTES,
@@ -148,6 +149,9 @@ class Finding:
     tail: str | None = None
     """The last lines of a failed run's output, as ``failure_tail`` cuts them, or
     ``None`` for a run that passed or was lost. Task of 2026-11-05, item 2."""
+    coverage: tuple[tuple[str, int], ...] | None = None
+    """The counts the output's final line gives, as ``gate_counts`` reads them, or
+    ``None`` when it gives none or the run was lost. **Round 18, item 2.**"""
 
 
 @dataclass(slots=True)
@@ -297,25 +301,18 @@ def _skip_reason(line: str) -> str:
     return f"{place}: {cut}{'...' if len(reason) > MAX_REASON_CHARS else ''}"
 
 
-def gate_summary(tail: bytes) -> str | None:
-    """pytest's final line in ``tail`` and the skip reasons of the short summary
-    before it, or ``None`` when ``tail`` holds no final line. **Round 14, item 2.**
-    The daemon reads this from the output, which a writing line can edit, so it is
-    what the output says, never what the daemon saw run. pytest does not name
-    deselected tests, so only their count is given, in the final line.
-
-    **Audit of round 14.** Only the last short summary block is read. Where the
-    tail holds pytest's ``short test summary info`` mark, the summary is the first
-    final line after the last mark, with the skip lines between, and is ``None``
-    when no final line follows it. Without a mark, the last final line is taken,
-    with no reasons, as pytest prints the mark whenever it has a reason to name. A
-    command can still print a forged block last, which is why the note labels the
-    summary unverified."""
+def _final_line(tail: bytes) -> tuple[str | None, list[str]]:
+    """The counts text of pytest's final line in ``tail``, as ``gate_summary``
+    chooses it, with the skip reasons of the short summary before it. Where the tail
+    holds pytest's ``short test summary info`` mark, the line is the first final
+    line after the last mark, with the skip lines between, and is ``None`` when no
+    final line follows it. Without a mark, it is the last final line, with no
+    reasons."""
     lines = [_printable(raw) for raw in tail.decode("utf-8", "replace").splitlines()]
     marks = [index for index, line in enumerate(lines) if SECTION_MARK in line]
     if not marks:
         finals = [found for line in lines if (found := SUMMARY_PATTERN.match(line))]
-        return finals[-1].group(1).rstrip(", ") if finals else None
+        return (finals[-1].group(1).rstrip(", ") if finals else None), []
     summary: str | None = None
     reasons: list[str] = []
     for line in lines[marks[-1] + 1 :]:
@@ -326,6 +323,20 @@ def gate_summary(tail: bytes) -> str | None:
         if found is not None:
             summary = found.group(1).rstrip(", ")
             break
+    return summary, reasons
+
+
+def gate_summary(tail: bytes) -> str | None:
+    """pytest's final line in ``tail`` and the skip reasons of the short summary
+    before it, or ``None`` when ``tail`` holds no final line. **Round 14, item 2.**
+    The daemon reads this from the output, which a writing line can edit, so it is
+    what the output says, never what the daemon saw run. pytest does not name
+    deselected tests, so only their count is given, in the final line.
+
+    **Audit of round 14.** Only the last short summary block is read, as
+    ``_final_line`` chooses it. A command can still print a forged block last, which
+    is why the note labels the summary unverified."""
+    summary, reasons = _final_line(tail)
     if summary is None:
         return None
     if not reasons:
@@ -334,6 +345,39 @@ def gate_summary(tail: bytes) -> str | None:
     more = len(reasons) - MAX_SKIP_REASONS
     rest = f"; and {more} more" if more > 0 else ""
     return f"{summary}, skipped {shown}{rest}"
+
+
+COUNT_PATTERN: Final = re.compile(
+    r"(\d+) (passed|failed|skipped|deselected|xfailed|xpassed|errors?|warnings?)"
+)
+SINGULAR_NAMES: Final = {"error": "errors", "warning": "warnings"}
+"""pytest writes ``1 error`` and ``1 warning`` for one, and a receipt keeps one name."""
+
+
+def gate_counts(tail: bytes) -> tuple[tuple[str, int], ...] | None:
+    """The counts of pytest's final line in ``tail``, as ``model.COVERAGE_NAMES``
+    names them, in the order the line gives them, or ``None`` when ``tail`` holds no
+    final line. **Round 18, item 2.** The same line ``gate_summary`` reads, so the
+    receipt's numbers and its quoted summary cannot disagree. ``error`` and
+    ``warning`` are the names ``errors`` and ``warnings``, and a name the line gives
+    twice keeps its first count. A count over ``MAX_COVERAGE_COUNT`` makes the whole
+    line unreadable and gives ``None``, since a clipped number would be false. Like
+    the summary these are the output's own claim, which a writing line can shape."""
+    text, _ = _final_line(tail)
+    if text is None:
+        return None
+    pairs: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for found in COUNT_PATTERN.finditer(text):
+        count, word = int(found.group(1)), found.group(2)
+        name = SINGULAR_NAMES.get(word, word)
+        if name in seen:
+            continue
+        if count > MAX_COVERAGE_COUNT:
+            return None
+        seen.add(name)
+        pairs.append((name, count))
+    return tuple(pairs) or None
 
 
 SUMMARY_LABEL: Final = "Unverified, the run's own output ends with the test summary"
@@ -844,13 +888,20 @@ def _digest(run: RunStarted) -> tuple[str | None, int | None]:
     return output_digest(Path(run.workdir), run.output_file)
 
 
-def _results(run: RunStarted, passed: bool) -> tuple[str | None, str | None]:
+def _results(
+    run: RunStarted, passed: bool
+) -> tuple[str | None, str | None, tuple[tuple[str, int], ...] | None]:
     """The test summary the run's output ends with, and, for a run that did not
-    pass, its output's tail, from one read of the output's end."""
+    pass, its output's tail, and the counts of the summary's line, from one read of
+    the output's end."""
     tail = output_tail(Path(run.workdir), run.output_file)
     if tail is None:
-        return None, None
-    return gate_summary(tail), None if passed else failure_tail(tail)
+        return None, None, None
+    return (
+        gate_summary(tail),
+        None if passed else failure_tail(tail),
+        gate_counts(tail),
+    )
 
 
 def signal_run(

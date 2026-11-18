@@ -232,6 +232,7 @@ COVERED: Final[dict[type, tuple[str, ...]]] = {
     model.RunStarted: ("argv",),
     model.RunQueued: ("reason",),
     model.RunDequeued: ("reason",),
+    model.RunAdmitted: ("reason",),
 }
 """The events with free text, and the fields of each that are scrubbed. **Round 15,
 review of 3344ca6.** ``RunStarted.argv`` is added. It is the project file's argument
