@@ -1088,11 +1088,39 @@ class Signals:
     def is_alive(self, pid: int) -> bool:
         return pid in self.alive
 
+    def group_if_started(
+        self, group: int, number: int, started: float, *, leader_defunct: bool = False
+    ) -> bool:
+        """``signal_group_if_started``, which a record's start time lets act."""
+        assert started == HARNESS_STARTED
+        return self.group(group, number)
+
+    def pid_if_started(self, pid: int, number: int, started: float) -> bool:
+        assert started == HARNESS_STARTED
+        self.send(pid, number)
+        return True
+
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """**Audit's finding, 2026-11-18.** A sweep signals only a harness it can show
+        to be the harness, from the start time its record holds. The tests give every
+        process the start time ``write_launch`` records, as a live system gives the
+        process the record names, and record the signals instead of sending them."""
         monkeypatch.setattr(launcher, "signal_group", self.group)
+        monkeypatch.setattr(launcher, "signal_group_if_started", self.group_if_started)
+        monkeypatch.setattr(launcher, "signal_if_started", self.pid_if_started)
+        monkeypatch.setattr(launcher, "start_time", read_start)
         monkeypatch.setattr(launcher, "_send", self.send)
         monkeypatch.setattr(launcher, "_alive", self.is_alive)
         monkeypatch.setattr(launcher, "CHECK_SECONDS", 0.001)
+
+
+HARNESS_STARTED = 1_700_000_000.0
+"""The start time of every process of these tests, as the table and the record hold."""
+
+
+def read_start(pid: int) -> float | None:
+    """``start_time`` for the processes of these tests, which are not real ones."""
+    return HARNESS_STARTED
 
 
 HARNESS_ROWS = [
@@ -1108,21 +1136,23 @@ def write_launch(
     *,
     launcher_pid: int = 9,
     launched_ns: int = 1,
+    started: float | None = HARNESS_STARTED,
 ) -> Path:
+    """A launch record as this version writes it, with the harness's start time. A
+    record written before it has none, which ``started=None`` gives."""
     path = directory / f"{launcher_pid}-{launched_ns}{launcher.LAUNCH_SUFFIX}"
-    path.write_text(
-        json.dumps(
-            {
-                "v": 1,
-                "mark": "alpha.0123",
-                "launcher": launcher_pid,
-                "harness": 4242,
-                "command": "/opt/claude",
-                "policy": policy.value,
-                "done": done,
-            }
-        )
-    )
+    document: dict[str, object] = {
+        "v": 1,
+        "mark": "alpha.0123",
+        "launcher": launcher_pid,
+        "harness": 4242,
+        "command": "/opt/claude",
+        "policy": policy.value,
+        "done": done,
+    }
+    if started is not None:
+        document["harness_started"] = started
+    path.write_text(json.dumps(document))
     return path
 
 
@@ -1168,6 +1198,25 @@ def test_a_swept_launch_under_kill_all_is_ended_and_recorded(
         "alpha", UNFINISHED_KILL_NOTE.format(count=2)
     )
     assert line.left is not None and line.left.pids == (4243,)
+
+
+def test_a_launch_record_without_a_start_time_signals_nothing_and_is_removed(
+    tmp_path: Path, worlds: Callable[..., World], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**Audit's finding, 2026-11-18.** A record written before the start times were
+    recorded cannot show that the process at its harness's pid is the harness, so the
+    sweep signals nothing, however well the table's row fits, and removes the record,
+    with the reason in its result and no unfinished stop recorded."""
+    reports = tmp_path / "left"
+    reports.mkdir()
+    signals = Signals({4242, 4243})
+    signals.install(monkeypatch)
+    world = worlds(Engine(), reports=reports, sweep_read=lambda: HARNESS_ROWS)
+    record = write_launch(reports, StopPolicy.KILL_ALL, started=None)
+    asyncio.run(world.scheduler.sweep())
+    assert signals.sent == []
+    assert not record.exists()
+    assert world.log.state.lines["alpha"].unverified is None
 
 
 def test_the_scheduler_sweeps_at_rest_and_as_it_stops(

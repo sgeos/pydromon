@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from conftest import reopen_directories
+from dromon import spawn
 
 pytestmark = pytest.mark.skipif(os.geteuid() == 0, reason="root reads every directory")
 
@@ -103,10 +104,9 @@ def base_with_lock(root: Path, name: str, lock: str | None) -> Path:
 
 def dead_pid() -> int:
     """A process identifier of a child that has ended and been waited for."""
-    import subprocess
     import sys
 
-    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child = spawn.start([sys.executable, "-c", "pass"])
     child.wait()
     return child.pid
 

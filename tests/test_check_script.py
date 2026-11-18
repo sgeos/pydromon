@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from dromon import spawn
 
 
 def executable(name: str) -> str:
@@ -24,12 +25,13 @@ def bash() -> str:
 
 
 def check_project(root: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: S603
+    return spawn.run(
         [bash(), "scripts/check.sh", "--hygiene-only"],
         cwd=root,
         capture_output=True,
         text=True,
         check=False,
+        timeout=300,
     )
 
 
@@ -55,23 +57,16 @@ def test_disclosure_exceptions_match_the_exact_path_number_and_line(
     )
 
     git = executable("git")
-    subprocess.run(  # noqa: S603
-        [git, "init", "-q"], cwd=root, check=True
-    )
-    subprocess.run(  # noqa: S603
-        [git, "config", "user.name", "Test"], cwd=root, check=True
-    )
-    subprocess.run(  # noqa: S603
+    spawn.run([git, "init", "-q"], cwd=root, check=True, timeout=300)
+    spawn.run([git, "config", "user.name", "Test"], cwd=root, check=True, timeout=300)
+    spawn.run(
         [git, "config", "user.email", "test@example.invalid"],
         cwd=root,
         check=True,
+        timeout=300,
     )
-    subprocess.run(  # noqa: S603
-        [git, "add", "."], cwd=root, check=True
-    )
-    subprocess.run(  # noqa: S603
-        [git, "commit", "-qm", "fixture"], cwd=root, check=True
-    )
+    spawn.run([git, "add", "."], cwd=root, check=True, timeout=300)
+    spawn.run([git, "commit", "-qm", "fixture"], cwd=root, check=True, timeout=300)
 
     accepted = check_project(root)
     assert accepted.returncode == 0, accepted.stderr
@@ -97,9 +92,7 @@ def test_disclosure_exceptions_match_the_exact_path_number_and_line(
     # Batch files permit CRLF under repository hygiene. The digest excludes CR.
     batch = root / "src/example.bat"
     batch.write_bytes((changed_text + "\r\n").encode())
-    subprocess.run(  # noqa: S603
-        [git, "add", "src/example.bat"], cwd=root, check=True
-    )
+    spawn.run([git, "add", "src/example.bat"], cwd=root, check=True, timeout=300)
     with project_file.open("a", encoding="utf-8") as handle:
         handle.write(f'"src/example.bat" = ["{digest}"]\n')
     assert check_project(root).returncode == 0
@@ -120,8 +113,12 @@ LINE = f'private = "{TERM}"'
 
 
 def git_in(root: Path, *arguments: str) -> None:
-    subprocess.run(  # noqa: S603
-        [executable("git"), *arguments], cwd=root, check=True, capture_output=True
+    spawn.run(
+        [executable("git"), *arguments],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        timeout=300,
     )
 
 
@@ -187,13 +184,14 @@ def decoy(tmp_path: Path) -> Path:
 def check_with(
     root: Path, environment: dict[str, str]
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: S603
+    return spawn.run(
         [bash(), "scripts/check.sh", "--hygiene-only"],
         cwd=root,
         capture_output=True,
         text=True,
         check=False,
         env={**os.environ, **environment},
+        timeout=300,
     )
 
 

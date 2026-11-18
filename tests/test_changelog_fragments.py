@@ -419,7 +419,7 @@ def git(root: Path, *arguments: str) -> str:
 
 
 def script(root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: S603
+    return spawn.run(
         [
             sys.executable,
             "-I",
@@ -430,6 +430,7 @@ def script(root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         check=False,
+        timeout=300,
     )
 
 
@@ -869,13 +870,14 @@ def run_gate(
     root: Path, stand_in: Path, **extra: str
 ) -> subprocess.CompletedProcess[str]:
     environment = {**os.environ, "PATH": f"{stand_in}:{os.environ['PATH']}", **extra}
-    return subprocess.run(  # noqa: S603
+    return spawn.run(
         ["bash", "scripts/check.sh"],  # noqa: S607
         cwd=root,
         capture_output=True,
         text=True,
         check=False,
         env=environment,
+        timeout=300,
     )
 
 
@@ -883,25 +885,27 @@ def test_the_gate_shows_a_skip_as_a_skip(tmp_path: Path) -> None:
     """Run the real check.sh with a stand-in `uv`, so the gate's own lines are read."""
     root, stand_in = gate_repository(tmp_path)
     environment = {**os.environ, "PATH": f"{stand_in}:{os.environ['PATH']}"}
-    skipped = subprocess.run(  # noqa: S603
+    skipped = spawn.run(
         ["bash", "scripts/check.sh"],  # noqa: S607
         cwd=root,
         capture_output=True,
         text=True,
         check=False,
         env=environment,
+        timeout=300,
     )
     assert skipped.returncode == 0, skipped.stderr
     assert "SKIPPED: the changelog rule had no base branch" in skipped.stdout
     assert "ok: changelog fragments" not in skipped.stdout
     git(root, "branch", "main")
-    based = subprocess.run(  # noqa: S603
+    based = spawn.run(
         ["bash", "scripts/check.sh"],  # noqa: S607
         cwd=root,
         capture_output=True,
         text=True,
         check=False,
         env=environment,
+        timeout=300,
     )
     assert based.returncode == 0, based.stderr
     assert "ok: changelog fragments are valid" in based.stdout
@@ -912,13 +916,14 @@ def test_the_gate_shows_a_skip_as_a_skip(tmp_path: Path) -> None:
         .replace("- First added.", "- Edited."),
         encoding="utf-8",
     )
-    refused = subprocess.run(  # noqa: S603
+    refused = spawn.run(
         ["bash", "scripts/check.sh"],  # noqa: S607
         cwd=root,
         capture_output=True,
         text=True,
         check=False,
         env=environment,
+        timeout=300,
     )
     assert refused.returncode == 1
     assert "only a release or a lossless regrouping" in refused.stderr
@@ -1101,8 +1106,8 @@ def test_two_gates_at_once_have_two_roots_and_neither_touches_the_other(
     gates: list[tuple[subprocess.Popen[str], Path, Path]] = []
     for name in ("first", "second"):
         log, hold = tmp_path / f"{name}.log", tmp_path / f"{name}.hold"
-        started = subprocess.Popen(  # noqa: S603
-            ["bash", "scripts/check.sh"],  # noqa: S607
+        started = spawn.start(
+            ["bash", "scripts/check.sh"],
             cwd=root,
             env={
                 **os.environ,

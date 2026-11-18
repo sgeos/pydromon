@@ -8,7 +8,6 @@ could not find it at all."""
 
 import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -16,6 +15,7 @@ import pytest
 
 from dromon import modulecommand
 from dromon.modulecommand import module_command
+from dromon import spawn
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 
@@ -52,7 +52,7 @@ def test_a_child_runs_the_tree_under_test(extracted: Path, tmp_path: Path) -> No
     planted.mkdir()
     (planted / "planted.py").write_text("", encoding="utf-8")
     environment = {**os.environ, "PYTHONPATH": f"{extracted}{os.pathsep}{planted}"}
-    found = subprocess.run(  # noqa: S603
+    found = spawn.run(
         [sys.executable, "-c", PARENT],
         cwd=planted,
         env=environment,
@@ -73,7 +73,7 @@ def test_the_plain_isolated_form_reaches_the_installed_package(
 ) -> None:
     """The defect this replaces. ``-I -m`` ignores ``PYTHONPATH``, so the child
     looks in the installed package, which holds no probe."""
-    found = subprocess.run(  # noqa: S603
+    found = spawn.run(
         [sys.executable, "-I", "-m", "dromon._probe"],
         env={**os.environ, "PYTHONPATH": str(extracted)},
         capture_output=True,

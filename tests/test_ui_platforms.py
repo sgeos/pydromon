@@ -2,7 +2,6 @@
 
 import ast
 import curses
-import subprocess
 import sys
 from pathlib import Path
 
@@ -18,6 +17,7 @@ from dromon.ui.keys import Char, Named
 from dromon.ui.link import SocketDaemon
 from dromon.ui.render import Style, text_of
 from dromon.ui.runtime import MAX_STEPS, Runtime, Unreachable, request_of
+from dromon import spawn
 
 LINE: dict[str, object] = {
     "line_id": "alpha",
@@ -87,8 +87,12 @@ def test_importing_the_core_loads_no_platform() -> None:
         + "".join(f"import dromon.ui.{name}\n" for name in CORE)
         + f"print(sorted(set({platforms!r}) & set(sys.modules)))\n"
     )
-    found = subprocess.run(  # noqa: S603
-        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    found = spawn.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=300,
     )
     assert found.stdout.strip() == "[]"
 

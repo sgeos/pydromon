@@ -11,7 +11,6 @@ import os
 import re
 import shutil
 import stat
-import subprocess
 import sys
 import tomllib
 from collections import deque
@@ -78,6 +77,7 @@ from dromon.model import (
 from dromon.paths import project_paths
 from dromon.sandbox import parse_sandbox
 from dromon.scheduler import LineEngine, LineSpec, Scheduler, engine_factory
+from dromon import spawn
 
 GROK = "grok-4.7"
 
@@ -3908,7 +3908,7 @@ def test_generated_hook_runs_a_fixed_system_program_without_shell_input(
     malicious = workspace / "printf"
     malicious.write_text("exit 99\n")
     malicious.chmod(0o700)
-    result = subprocess.run(  # noqa: S603, fixed generated command and arguments
+    result = spawn.run(
         [handler["command"], *handler["args"]],
         input='{"toolName":"$(touch injected)"}',
         text=True,

@@ -6,7 +6,6 @@ supervisor exits, ``run_status`` never shows a finished output as running,
 
 import asyncio
 import os
-import subprocess
 import sys
 import time
 from collections.abc import Generator, Sequence
@@ -42,6 +41,7 @@ from dromon.scheduler import (
     LineSpec,
     Scheduler,
 )
+from dromon import spawn
 
 HAIKU = "claude-haiku-5-5"
 AT = "2026-10-31T09:00:00Z"
@@ -613,7 +613,7 @@ def test_a_note_that_holds_no_term_is_recorded_as_it_was(project: Path) -> None:
 
 
 def git(directory: Path, *arguments: str) -> str:
-    done = subprocess.run(  # noqa: S603
+    done = spawn.run(
         ["git", "-C", str(directory), *arguments],  # noqa: S607
         check=True,
         capture_output=True,

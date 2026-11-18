@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk._internal.transport import Transport
 
-from dromon import acp, cli, codex, credentials, evidence, exits, grok, launcher
+from dromon import acp, cli, codex, credentials, evidence, exits, grok, launcher, spawn
 from dromon.capabilities import (
     CAPABILITY_NAMES,
     CLAUDE_CODE,
@@ -1820,7 +1820,7 @@ def test_the_drain_keeps_the_tail_its_context_names(tmp_path: Path) -> None:
         tail = evidence.StderrTail()
         token = evidence.ENGINE_STDERR.set(tail)
         try:
-            process = await asyncio.create_subprocess_exec(
+            process = await spawn.subprocess_exec(
                 sys.executable,
                 "-c",
                 "import sys; sys.stderr.write('Error: refused token=abc123secret')",

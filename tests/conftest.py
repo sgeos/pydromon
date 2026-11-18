@@ -14,7 +14,15 @@ from pathlib import Path
 import pytest
 from typing import Any, cast
 
-from dromon import hookpolicy, linetemp, priority, readiness, spawn
+from dromon import (
+    hookpolicy,
+    launcher,
+    launchsmoke,
+    linetemp,
+    priority,
+    readiness,
+    spawn,
+)
 from dromon import scheduler as scheduler_module
 from dromon.processes import ProcessInfo
 from dromon.fleet import HOSTS_FILE_ENV
@@ -891,6 +899,30 @@ def _no_real_git_status(
             return ""
 
         monkeypatch.setattr(readiness, "_run_git_status", clean)
+
+
+@pytest.fixture(autouse=True)
+def _no_launch_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer every test's launch smoke check with a passing report, without starting a
+    launcher. **Round 18, item 1.** The restart preflight runs the check, which starts a
+    stand-in of every engine kind under both stop policies, so a test of the preflight
+    that did not say otherwise would pay for twelve launches. The tests of
+    ``dromon.launchsmoke`` run the real check, which they take from the module before
+    this replaces it."""
+
+    async def passing() -> launchsmoke.SmokeReport:
+        return launchsmoke.SmokeReport(
+            (
+                launchsmoke.SmokeResult(
+                    launchsmoke.KINDS[0],
+                    launcher.StopPolicy.KILL_ALL,
+                    True,
+                    "replaced by the suite's fixture",
+                ),
+            )
+        )
+
+    monkeypatch.setattr(launchsmoke, "check_launches", passing)
 
 
 @pytest.fixture(autouse=True)

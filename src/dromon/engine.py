@@ -2285,6 +2285,7 @@ def launch_environment(
     shell: str | None,
     git_ssh: GitSshAccess | None = None,
     temp: LineTemp | None = None,
+    target: str | None = None,
 ) -> dict[str, str]:
     """The variables a Claude Code line's engine starts with, beside the daemon's own:
     the pinned tool search, auto memory turned off, the line's process mark, what its
@@ -2307,7 +2308,14 @@ def launch_environment(
     if shell is not None:
         environment[SHELL_VARIABLE] = shell
         environment[CLAUDE_SHELL_VARIABLE] = shell
-    environment.update(launcher.launch_environment(claude_cli(), stop_policy))
+    # ``target`` names the harness the launcher starts, which is Claude Code unless the
+    # launch smoke check of ``dromon.launchsmoke`` starts a stand-in through the same
+    # path, so that the check starts what an engine start starts, and no model.
+    environment.update(
+        launcher.launch_environment(
+            claude_cli() if target is None else target, stop_policy
+        )
+    )
     environment[launcher.FILTER_ENVIRONMENT_VARIABLE] = "1"
     given = gitssh.environment(git_ssh)
     if temp is not None:

@@ -166,12 +166,15 @@ bound. It is also the call the first hypothesis names as the possible cause of t
 stall, and it stays outside this module, so that candidate is neither bounded nor
 excluded. A traceback of every thread at the next hang is what would settle it.
 
-**Not covered.** ``asyncio.create_subprocess_exec`` runs ``Popen`` on the event loop's
-own thread and cannot be moved to another, so its callers in the engine drivers are
-still unbounded, and a stall there stops the daemon's loop. **Round 17.** They now
-start through ``subprocess_exec``, which gives them the descriptor handling of
-``start`` and not its bound. The follow-up is an asynchronous process adapter built on
-``start``, which is a larger change than this one.
+**Starts on the event loop.** ``asyncio.create_subprocess_exec`` runs ``Popen`` on the
+event loop's own thread, so a stall there stops the daemon's loop and no timer on it
+can end the wait. **Round 17.** The engine drivers and the relay started through
+``subprocess_exec``, which gave them the descriptor handling of ``start`` and not its
+bound. **Round 18, item 3.** ``subprocess_exec`` now makes the child with ``start``, on
+a thread of its own and under the same bound, and wraps it as ``BoundedProcess``, which
+has the members of an ``asyncio`` process that those modules use. A test forbids any
+module from calling ``asyncio``'s own start, so a child cannot again be started on the
+loop without a bound.
 
 Porting note. A start is one external effect with a deadline, which maps onto
 ``std::process::Command`` spawned from a thread with a channel in the Rust port, and
@@ -193,9 +196,10 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Generator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any, Final, Literal, cast, overload
+from typing import IO, Any, Final, Literal, Protocol, cast, overload
 
 START_SECONDS: Final = 30.0
 """How long a child may take to start, before its program runs. A start takes
@@ -342,6 +346,20 @@ MAX_STALL_SAMPLES_KEPT: Final = 8
 """Room the ledger keeps beyond ``MAX_SLOW_STARTS_KEPT`` for stall samples, so a ledger
 full of slow starts, which a loaded machine makes, cannot drop the evidence of a
 stall."""
+
+EXEC_WAIT_SECONDS: Final = 3.0
+"""A child that has been forked and has not executed this long after the fork
+returned is sampled and recorded, whoever made the start. **Round 18, from a hang of
+2026-11-18.** A direct ``subprocess.Popen`` in a test sat for five minutes in the read
+of the exec status pipe, with the fork already returned, so neither the bound of
+``start`` nor the ledger of slow forks, which times the call that forks, saw it. A
+start that is bounded by ``START_SECONDS`` is sampled at the bound, and this reports
+the same state at three seconds, which is about a hundred times the usual and well
+under the bound."""
+MAX_EXEC_WATCHED: Final = 256
+"""The most forks watched for the exec wait at once. A fork past it is not watched,
+which only means it is not reported if it stalls. Every watched start leaves the list
+within ``EXEC_WAIT_SECONDS``."""
 
 _REAL_POPEN: Final = subprocess.Popen
 """``subprocess.Popen`` as it was when this module was loaded. The report of a stalled
@@ -648,6 +666,199 @@ def _serialized(call: Callable[..., Any]) -> Callable[..., Any]:
     return serialized
 
 
+@dataclass
+class _ExecWait:
+    """One fork whose exec wait is watched. ``ident`` is the starting thread, ``token``
+    is which of its calls of ``_fork_exec`` this is, ``pid`` is the child, and
+    ``due`` is when to look."""
+
+    ident: int
+    token: int
+    pid: int
+    due: float
+    program: str
+
+
+_exec_lock = threading.Condition()
+_exec_tokens: dict[int, int] = {}
+_exec_pending: list[_ExecWait] = []
+_exec_counter = [0]
+_exec_monitor: list[threading.Thread | None] = [None]
+
+
+def _in_exec_wait(ident: int, token: int) -> bool:
+    """Whether thread ``ident`` is still inside ``subprocess``'s ``_execute_child``
+    after the call of ``_fork_exec`` that ``token`` names, which means it is reading
+    the exec status pipe, or is about to. **Inference, with one known gap.** A thread
+    that left ``_execute_child`` and began another start, which has not reached its own
+    ``_fork_exec``, still carries the old token, so it is reported if it is in that gap
+    when the time comes, which takes microseconds. **Porting hazard.** It reads the
+    frames of another thread, which only Python gives."""
+    with _exec_lock:
+        if _exec_tokens.get(ident) != token:
+            return False
+    frame = sys._current_frames().get(ident)  # pyright: ignore[reportPrivateUsage]
+    depth = 0
+    while frame is not None and depth < 200:
+        code = frame.f_code
+        if code.co_name == "_execute_child" and code.co_filename == subprocess.__file__:
+            return True
+        frame = frame.f_back
+        depth += 1
+    return False
+
+
+def _report_exec_wait(entry: _ExecWait, waited: float) -> None:
+    """Sample the child that has not executed and keep one ledger entry and one log
+    line for it, as ``_sample_stalled`` does for a bounded start. Never raises."""
+    try:
+        sample = sample_process(entry.pid)
+        text = _clean(
+            f"exec wait, {Path(entry.program).name} forked as {entry.pid} and not"
+            f" executed within {waited:.1f}s, thread {entry.ident}, {_machine_text()},"
+            f" {sample}",
+            MAX_SAMPLE_CHARS + 300,
+        )
+        _keep_slow(text, reserved=True)
+        _say(f"dromond: {text}", limited=False, wait=SAMPLE_LOG_WAIT_SECONDS)
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
+_exec_failures = [0]
+"""How many passes of the monitor failed, of which only the first is recorded."""
+
+EXEC_WATCH_RETRY_SECONDS: Final = 0.2
+"""The pause after a failed pass, so that a failure that repeats does not spin."""
+
+
+def _exec_watch_failed(error: Exception) -> None:
+    """Record the first failure of the monitor, once, in the ledger and the log, and
+    count the rest. **Audit's finding, 2026-11-18.** A monitor that raised ended
+    silently, nothing started another, and no later fork was ever looked at. Never
+    raises."""
+    try:
+        _exec_failures[0] += 1
+        if _exec_failures[0] > 1:
+            return
+        text = _clean(
+            f"exec watch failed, {type(error).__name__}: {error}, and it goes on"
+            " watching, with this reported once",
+            MAX_SAMPLE_CHARS,
+        )
+        _keep_slow(text, reserved=True)
+        _say(f"dromond: {text}", limited=False, wait=SAMPLE_LOG_WAIT_SECONDS)
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
+def _look_at(entry: _ExecWait) -> None:
+    """Look at one fork that is due, and report it if its thread is still waiting."""
+    try:
+        if _in_exec_wait(entry.ident, entry.token):
+            _report_exec_wait(entry, EXEC_WAIT_SECONDS)
+    finally:
+        with _exec_lock:
+            if _exec_tokens.get(entry.ident) == entry.token:
+                del _exec_tokens[entry.ident]
+
+
+def _watch_once() -> None:
+    """One pass of the monitor, which waits until a fork is due and looks at every one
+    that is. It holds the lock only to read and edit the list, never while it
+    samples. Each fork is looked at on its own, so one that cannot be does not hide
+    the rest."""
+    with _exec_lock:
+        while not _exec_pending:
+            _exec_lock.wait()
+        soonest = min(entry.due for entry in _exec_pending)
+        delay = soonest - time.monotonic()
+        if delay > 0.0:
+            _exec_lock.wait(delay)
+            return
+        now = time.monotonic()
+        due = [entry for entry in _exec_pending if entry.due <= now]
+        _exec_pending[:] = [entry for entry in _exec_pending if entry.due > now]
+    for entry in due:
+        try:
+            _look_at(entry)
+        except Exception as error:  # noqa: BLE001
+            _exec_watch_failed(error)
+
+
+def _exec_watch_loop() -> None:
+    """The monitor thread. A pass that fails is recorded once and the watch goes on,
+    after a short pause, so that it ends only with the process."""
+    while True:
+        try:
+            _watch_once()
+        except Exception as error:  # noqa: BLE001
+            _exec_watch_failed(error)
+            time.sleep(EXEC_WATCH_RETRY_SECONDS)
+
+
+def _watch_exec(ident: int, token: int, pid: int, program: str) -> None:
+    """Queue a fork that returned for a look after ``EXEC_WAIT_SECONDS``, and start the
+    monitor thread on first use, or again if it has ended, which only an exception that
+    is not an ``Exception`` can make it do. Does not wait, and does not raise."""
+    try:
+        with _exec_lock:
+            if len(_exec_pending) >= MAX_EXEC_WATCHED:
+                _exec_tokens.pop(ident, None)
+                return
+            _exec_pending.append(
+                _ExecWait(
+                    ident, token, pid, time.monotonic() + EXEC_WAIT_SECONDS, program
+                )
+            )
+            current = _exec_monitor[0]
+            if current is None or not current.is_alive():
+                monitor = threading.Thread(
+                    target=_exec_watch_loop, name="dromon-exec-watch", daemon=True
+                )
+                _exec_monitor[0] = monitor
+                monitor.start()
+            _exec_lock.notify()
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
+def _exec_watched(call: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``subprocess._fork_exec`` so that the wait that follows it is timed.
+    **Round 18.** The call returns the child's pid once the fork has returned, and
+    ``Popen`` then reads the exec status pipe until the child executes, which is where
+    a child stuck before its program leaves the starting thread. The wrapper does not
+    sit in that read, so it queues the pid and the thread, and the monitor looks at
+    the thread's frames after ``EXEC_WAIT_SECONDS``. A thread that is still in
+    ``_execute_child`` is still waiting, and its child is sampled. The wrapper adds a
+    lock and a list append to a start, outside the fork lock. A call that raises is
+    not watched."""
+
+    def watched(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        ident = threading.get_ident()
+        with _exec_lock:
+            _exec_counter[0] += 1
+            token = _exec_counter[0]
+            _exec_tokens[ident] = token
+        try:
+            pid = call(*args, **kwargs)
+        except BaseException:
+            with _exec_lock:
+                if _exec_tokens.get(ident) == token:
+                    del _exec_tokens[ident]
+            raise
+        program = "(unknown)"
+        with contextlib.suppress(Exception):
+            first = args[0]
+            program = os.fsdecode(first[0]) if first else program
+        if isinstance(pid, int):
+            _watch_exec(ident, token, pid, program)
+        return pid
+
+    setattr(watched, "__wrapped__", call)  # noqa: B010
+    return watched
+
+
 def install_fork_lock() -> bool:
     """Put ``forking`` around ``subprocess``'s call that forks, ``_fork_exec``, and
     around ``os.posix_spawn`` and ``os.posix_spawnp``, which ``subprocess`` and
@@ -664,7 +875,7 @@ def install_fork_lock() -> bool:
     installed = False
     inner = getattr(subprocess, "_fork_exec", None)
     if callable(inner):
-        setattr(subprocess, "_fork_exec", _serialized(inner))  # noqa: B010
+        setattr(subprocess, "_fork_exec", _exec_watched(_serialized(inner)))  # noqa: B010
         installed = True
     for name in ("posix_spawn", "posix_spawnp"):
         spawner = getattr(os, name, None)
@@ -1928,52 +2139,320 @@ def _begin(
     return outcome
 
 
+class ChildProcess(Protocol):
+    """What the modules that start a child on the event loop use of it, which
+    ``asyncio.subprocess.Process`` and ``BoundedProcess`` both give. **Round 18,
+    item 3.**"""
+
+    @property
+    def pid(self) -> int: ...
+
+    @property
+    def returncode(self) -> int | None: ...
+
+    @property
+    def stdin(self) -> asyncio.StreamWriter | None: ...
+
+    @property
+    def stdout(self) -> asyncio.StreamReader | None: ...
+
+    @property
+    def stderr(self) -> asyncio.StreamReader | None: ...
+
+    async def wait(self) -> int: ...
+
+    async def communicate(
+        self,
+        input: bytes | None = None,  # noqa: A002
+    ) -> tuple[bytes, bytes]: ...
+
+    def send_signal(self, signal: int) -> None: ...
+
+    def terminate(self) -> None: ...
+
+    def kill(self) -> None: ...
+
+
+class BoundedProcess:
+    """A child that ``start`` made, given the interface of an ``asyncio`` process.
+    **Round 18, item 3.** ``asyncio`` makes its ``Popen`` on the loop's own thread, so a
+    start that stalls in the fork stops the whole loop and no timer on it can end the
+    wait. ``start`` makes the child on a thread of its own and gives up at its bound,
+    and this wraps what it made. The standard streams are connected to the loop by its
+    public ``connect_read_pipe`` and ``connect_write_pipe``, and the exit is waited for
+    on a thread of its own per child, which is what ``asyncio``'s own threaded child
+    watcher did, so the loop is not blocked by any of it. No private name of
+    ``asyncio`` is used.
+
+    **What differs from ``asyncio.subprocess.Process``.** ``returncode`` is set on the
+    loop, as ``wait`` resolves, and not when the process ends, so the two agree.
+    ``kill``, ``terminate`` and ``send_signal`` raise ``ProcessLookupError`` once the
+    exit is known, as ``asyncio``'s do. Nothing else is promised, since the five
+    modules that start children use only the members of ``ChildProcess``. **Cost.**
+    One thread per live child, blocked in ``waitpid``. **Porting hazard.** A Rust port
+    waits on the child with ``tokio::process``, which needs none of this."""
+
+    def __init__(
+        self, popen: subprocess.Popen[bytes], loop: asyncio.AbstractEventLoop
+    ) -> None:
+        self._popen = popen
+        self._loop = loop
+        self._exited: asyncio.Future[int] = loop.create_future()
+        self._code: int | None = None
+        self.pid: int = popen.pid
+        self.stdin: asyncio.StreamWriter | None = None
+        self.stdout: asyncio.StreamReader | None = None
+        self.stderr: asyncio.StreamReader | None = None
+        threading.Thread(
+            target=self._watch, name="dromon-child-wait", daemon=True
+        ).start()
+
+    @property
+    def returncode(self) -> int | None:
+        return self._code
+
+    def _watch(self) -> None:
+        code = self._popen.wait()
+        # The loop may have closed, in which case nobody waits for the result.
+        with contextlib.suppress(RuntimeError):
+            self._loop.call_soon_threadsafe(self._set, code)
+
+    def _set(self, code: int) -> None:
+        self._code = code
+        # ``asyncio``'s process closes the pipe to a child that has exited, and a
+        # writer that nobody closed is reported as a ``ResourceWarning`` when it is
+        # collected, which the gate of 2026-11-18 showed in the launch smoke check.
+        if self.stdin is not None and not self.stdin.transport.is_closing():
+            self.stdin.close()
+        if not self._exited.done():
+            self._exited.set_result(code)
+
+    async def connect(self, limit: int) -> None:
+        """Connect the child's piped standard streams to the running loop. A failure
+        leaves the child to ``abandon``."""
+        loop = self._loop
+        if self._popen.stdin is not None:
+            protocol = asyncio.StreamReaderProtocol(
+                asyncio.StreamReader(limit, loop), loop=loop
+            )
+            transport, _ = await loop.connect_write_pipe(
+                lambda: protocol, self._popen.stdin
+            )
+            self.stdin = asyncio.StreamWriter(transport, protocol, None, loop)
+        if self._popen.stdout is not None:
+            self.stdout = await self._reader(self._popen.stdout, limit)
+        if self._popen.stderr is not None:
+            self.stderr = await self._reader(self._popen.stderr, limit)
+
+    async def _reader(self, pipe: IO[bytes], limit: int) -> asyncio.StreamReader:
+        reader = asyncio.StreamReader(limit, self._loop)
+        await self._loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(reader, loop=self._loop), pipe
+        )
+        return reader
+
+    def abandon(self) -> None:
+        """End a child that no caller will receive, and reap it on its own thread, which
+        is already waiting. ``SIGTERM`` first, since a child started through the
+        launcher ends what it started on it, and ``SIGKILL`` would leave that."""
+        for stream in (self._popen.stdin, self._popen.stdout, self._popen.stderr):
+            if stream is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    stream.close()
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.kill(self.pid, signal.SIGTERM)
+
+    async def wait(self) -> int:
+        return await asyncio.shield(self._exited)
+
+    def send_signal(self, signal: int) -> None:  # noqa: PLW0621
+        if self._code is not None:
+            raise ProcessLookupError(self.pid)
+        os.kill(self.pid, signal)
+
+    def terminate(self) -> None:
+        self.send_signal(signal.SIGTERM)
+
+    def kill(self) -> None:
+        self.send_signal(signal.SIGKILL)
+
+    async def communicate(
+        self,
+        input: bytes | None = None,  # noqa: A002
+    ) -> tuple[bytes, bytes]:
+        if self.stdin is not None:
+            if input is not None:
+                self.stdin.write(input)
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                    await self.stdin.drain()
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                self.stdin.close()
+        out, err = await asyncio.gather(_read_all(self.stdout), _read_all(self.stderr))
+        await self.wait()
+        return out, err
+
+
+async def _read_all(reader: asyncio.StreamReader | None) -> bytes:
+    return b"" if reader is None else await reader.read()
+
+
+START_WORKERS: Final = 16
+"""The threads of the pool that makes the children of ``subprocess_exec``. **Audit's
+finding, 2026-11-18.** Starts shared the loop's default executor with every
+``asyncio.to_thread`` and ``run_in_executor`` caller, and 40 starts held for three
+seconds each delayed an unrelated call 5.79 seconds. A pool of its own keeps a burst of
+slow starts from delaying them. The fork lock serializes the forks themselves, so more
+threads would only wait for it."""
+
+MAX_ASYNC_STARTS: Final = 64
+"""How many starts of ``subprocess_exec`` may be running or waiting for a worker at
+once. Past it a start is refused with ``StartStalled``, so the queue of the pool is
+bounded too, as the stuck starts are by ``MAX_STRANDED``."""
+
+_start_pool: list[ThreadPoolExecutor | None] = [None]
+_start_pool_lock = threading.Lock()
+_async_starts = [0]
+
+
+def _starts() -> ThreadPoolExecutor:
+    """The pool of the starts of ``subprocess_exec``, made on first use."""
+    with _start_pool_lock:
+        pool = _start_pool[0]
+        if pool is None:
+            pool = ThreadPoolExecutor(
+                max_workers=START_WORKERS, thread_name_prefix="dromon-start"
+            )
+            _start_pool[0] = pool
+        return pool
+
+
+def _end_child(popen: subprocess.Popen[bytes]) -> None:
+    """End a child that no caller will wait for, and reap it."""
+    for stream in (popen.stdin, popen.stdout, popen.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError, ValueError):
+                stream.close()
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.kill(popen.pid, signal.SIGTERM)
+    threading.Thread(target=popen.wait, name="dromon-child-reap", daemon=True).start()
+
+
+class _Claim:
+    """Who owns the child of one start of ``subprocess_exec``, the caller or the pool's
+    thread. The thread that made it gives it to the caller, unless the caller was
+    cancelled first, in which case the thread ends it. A caller cancelled after the
+    thread gave it up ends it from here. Either way no child is left running, and none
+    depends on the event loop being alive to run a callback, which the loop's default
+    executor had to be waited for to give."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._taken = False
+        self._made: subprocess.Popen[bytes] | None = None
+
+    def offer(self, popen: subprocess.Popen[bytes]) -> bool:
+        """Called by the thread that made the child. Whether the caller still wants it,
+        and when not the child has been ended."""
+        with self._lock:
+            if not self._abandoned:
+                self._made = popen
+                return True
+        _end_child(popen)
+        return False
+
+    def take(self) -> None:
+        """The caller has the child, and a later cancellation is not about it."""
+        with self._lock:
+            self._taken = True
+            self._made = None
+
+    def abandon(self) -> None:
+        """The caller was cancelled. End the child if it was made and not taken."""
+        with self._lock:
+            self._abandoned = True
+            made = None if self._taken else self._made
+            self._made = None
+        if made is not None:
+            _end_child(made)
+
+
+def _start_claimed(
+    claim: _Claim, argv: list[str], options: dict[str, Any]
+) -> subprocess.Popen[bytes] | None:
+    """``start`` for a binary child, as the pool calls it, offering the child to the
+    caller."""
+    try:
+        popen = cast("subprocess.Popen[bytes]", start(argv, **options))
+        return popen if claim.offer(popen) else None
+    finally:
+        with _start_pool_lock:
+            _async_starts[0] -= 1
+
+
 async def subprocess_exec(
     program: str | os.PathLike[str],
     *args: str | os.PathLike[str],
+    limit: int = 2**16,
     **kwargs: Any,  # noqa: ANN401
-) -> asyncio.subprocess.Process:
-    """``asyncio.create_subprocess_exec`` with the descriptor handling of ``start``.
-    **Round 17, item 2.** The engine drivers and the relay start children on the event
-    loop, where ``Popen`` runs on the loop's own thread, so they cannot use ``start``,
-    whose thread is the bound. What they can share is the rest. Where ``start`` leaves
-    the closing of descriptors to the parent, this does too, by the same sweep inside
-    the same fork lock, so no child of the daemon enumerates ``/dev/fd`` after its fork
-    on macOS and none inherits a stray descriptor. ``pass_fds`` is honoured as it is by
-    ``start``. A failed sweep raises ``OSError`` and starts no child.
+) -> BoundedProcess:
+    """Start a child for the event loop as ``asyncio.create_subprocess_exec`` does, with
+    the start bounded as ``start`` bounds it, and the descriptor handling of ``start``.
+    **Round 18, item 3, which finishes round 17, item 2.** The engine drivers and the
+    relay start children on the event loop. They used ``asyncio``'s own function, whose
+    ``Popen`` runs on the loop's thread, so a start that stalled before its program ran
+    stopped the daemon's loop, and the five-second lock bound, the watchdog and the
+    ledger reported it and did not end it. The child is now made by ``start`` on a
+    thread of its own, from an executor thread so that the loop stays free, and is
+    wrapped as ``BoundedProcess`` gives. A start that passes ``start``'s bound raises
+    ``StartStalled`` at that bound, with the report and the sample that ``start``
+    gives, and a child that starts late is ended by ``start`` and reaped. The sweep, the
+    fork lock and ``pass_fds`` are ``start``'s own, and a failed sweep raises
+    ``OSError`` and starts no child. ``kwargs`` are those of ``start``, and ``limit`` is
+    the stream limit of ``asyncio``. ``stdin``, ``stdout`` and ``stderr`` may be
+    ``asyncio.subprocess.PIPE`` for a piped stream, or any value ``start`` takes.
 
-    **Not bounded, and why.** ``asyncio`` makes the ``Popen`` inside the loop's own
-    ``subprocess_exec``, before its first suspension, so moving it to another thread
-    needs ``asyncio``'s private transport, or an adapter that gives ``Process`` over a
-    ``Popen`` that ``start`` made. The second is the follow-up, since five modules use
-    ``stdin``, ``stdout``, ``wait`` and ``communicate`` of a ``Process``. Until then a
-    stall in one of these starts stops the daemon's loop, which the fork lock's
-    five-second bound on a loop, the faulthandler watchdog and the slow-fork ledger
-    report and do not end. **Porting hazard.** It sets a
-    thread-local that the fork lock reads, which only a language with thread-locals and
-    a fork hook allows."""
-    chosen: dict[str, Any] = kwargs
-    sweep: _Sweep | None = None
-    if (
-        not children_close_descriptors()
-        and _FORK_INSTALLED[0]
-        and _open_descriptors() is not None
-    ):
-        sweep = _Sweep(kwargs.get("pass_fds", ()))
-        chosen = {**kwargs, "close_fds": False, "pass_fds": ()}
-        _fork_slot.sweep = sweep
+    **Cancellation.** A caller cancelled while the child is being made does not receive
+    it, and it is ended with ``SIGTERM`` and reaped as it returns, so none is left
+    running, whether or not the loop is still alive to run a callback. **Cost.** A
+    thread of the pool of ``START_WORKERS`` is held for the length of the start, at
+    most its bound, so a burst of stalled starts holds that many threads until the
+    bound, and the rest wait for one. **Audit's finding, 2026-11-18.** The pool is this
+    module's own and not the loop's default executor, which every ``asyncio.to_thread``
+    caller shares, so a burst of starts no longer delays an unrelated call.
+    ``MAX_ASYNC_STARTS`` bounds the starts waiting, and ``MAX_STRANDED`` refuses further
+    starts while that many are stuck. **Porting hazard.** The Rust port has a bounded
+    spawn of its own and needs no adapter."""
+    loop = asyncio.get_running_loop()
+    argv = [os.fspath(program), *(os.fspath(argument) for argument in args)]
+    with _start_pool_lock:
+        if _async_starts[0] >= MAX_ASYNC_STARTS:
+            raise StartStalled(
+                f"{Path(argv[0]).name} was not started: {MAX_ASYNC_STARTS} starts are"
+                " already running or waiting for a thread"
+            )
+        _async_starts[0] += 1
+    claim = _Claim()
     try:
-        process = await asyncio.create_subprocess_exec(program, *args, **chosen)
-    finally:
-        _fork_slot.sweep = None
-    if sweep is not None and sweep.cleared is None:
-        with contextlib.suppress(ProcessLookupError, OSError):
-            process.kill()
-        await process.wait()
-        raise OSError(
-            f"{Path(os.fspath(program)).name} was not started: the descriptor sweep did"
-            " not run before the fork"
-        )
+        pending = loop.run_in_executor(_starts(), _start_claimed, claim, argv, kwargs)
+    except BaseException:
+        with _start_pool_lock:
+            _async_starts[0] -= 1
+        raise
+    try:
+        popen = await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        claim.abandon()
+        raise
+    if popen is None:
+        raise asyncio.CancelledError
+    claim.take()
+    process = BoundedProcess(popen, loop)
+    try:
+        await process.connect(limit)
+    except BaseException:
+        process.abandon()
+        raise
     return process
 
 

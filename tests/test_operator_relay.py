@@ -12,7 +12,6 @@ import json
 import os
 import inspect
 import stat
-import subprocess
 import sys
 import time
 from collections.abc import Generator, Sequence
@@ -501,7 +500,7 @@ def test_ending_a_command_does_not_reach_a_process_it_did_not_start(
 ) -> None:
     """The walk finds descendants by ancestry alone, so a neighbour in a session of
     its own, which the test starts and the command does not, is left running."""
-    neighbour = subprocess.Popen(
+    neighbour = spawn.start(
         [sys.executable, "-c", "import time; time.sleep(30)"],
         start_new_session=True,
     )
@@ -528,7 +527,7 @@ def test_the_processes_a_walk_finds_are_killed_and_no_others(
         "start_new_session=True);"
         f"open({str(child)!r},'w').write(str(p.pid)); time.sleep(60)"
     )
-    neighbour = subprocess.Popen(
+    neighbour = spawn.start(
         [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
     )
 
@@ -571,7 +570,7 @@ def test_a_process_whose_identity_changed_since_the_walk_is_not_signalled(
     its pid go to a process that is not a descendant. The neighbour here stands for
     that process, and the walk names it. Its start time, its parent or its absence
     differs from the row, so it is left running, and the group is still ended."""
-    neighbour = subprocess.Popen(
+    neighbour = spawn.start(
         [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
     )
     command_child = tmp_path / "child.pid"
@@ -609,7 +608,7 @@ def test_a_process_whose_identity_changed_since_the_walk_is_not_signalled(
 def test_a_row_with_no_start_time_is_never_signalled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sleeping = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    sleeping = spawn.start([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
 
         def identity(pid: int) -> tuple[int, str]:
@@ -639,14 +638,17 @@ def test_a_cancellation_while_ending_the_group_closes_the_pipe(
     monkeypatch.setattr(relay_module, "attached", slow)
     relay = CommandRelay([sys.executable, "-c", "import time; time.sleep(30)"], 0.3)
     pids: list[int] = []
-    real_exec = asyncio.create_subprocess_exec
+    real_exec = spawn.subprocess_exec
 
-    async def recording(*arguments: object, **options: object) -> object:
-        process = await real_exec(*arguments, **options)  # pyright: ignore[reportArgumentType, reportUnknownVariableType]
-        pids.append(process.pid)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
-        return process  # pyright: ignore[reportUnknownVariableType]
+    async def recording(
+        *arguments: str,
+        **options: Any,  # noqa: ANN401
+    ) -> spawn.BoundedProcess:
+        process = await real_exec(*arguments, **options)
+        pids.append(process.pid)
+        return process
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", recording)
+    monkeypatch.setattr(spawn, "subprocess_exec", recording)
 
     async def scenario() -> None:
         task = asyncio.create_task(relay.deliver(notice()))

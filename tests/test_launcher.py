@@ -1560,22 +1560,32 @@ def write_record(
     launcher_pid: int = 2,
     command: str = sys.executable,
     name: str = "1-1",
+    started: float | None = None,
 ) -> Path:
+    """A launch record. ``started`` is the harness's start time, which a sweep needs to
+    signal anything since the audit's finding of 2026-11-18, and which a record written
+    before round 18 does not have."""
     path = directory / f"{name}{launcher.LAUNCH_SUFFIX}"
-    path.write_text(
-        json.dumps(
-            {
-                "v": 1,
-                "mark": MARK,
-                "launcher": launcher_pid,
-                "harness": harness,
-                "command": command,
-                "policy": policy.value,
-                "done": done,
-            }
-        )
-    )
+    document: dict[str, object] = {
+        "v": 1,
+        "mark": MARK,
+        "launcher": launcher_pid,
+        "harness": harness,
+        "command": command,
+        "policy": policy.value,
+        "done": done,
+    }
+    if started is not None:
+        document["harness_started"] = started
+    path.write_text(json.dumps(document))
     return path
+
+
+def began(pid: int) -> float:
+    """The start time of a live process, which every platform of the suite reads."""
+    found = processes.start_time(pid)
+    assert found is not None, "this platform gives no start time"
+    return found
 
 
 def group_rows(leader: int, member: int) -> list[TreeRow]:
@@ -1593,7 +1603,7 @@ def test_a_sweep_under_kill_all_ends_a_group_its_launcher_left_frozen(
     leader, member = orphan_group()
     orphans.extend([leader, member])
     os.killpg(leader, signal.SIGSTOP)
-    record = write_record(tmp_path, leader, StopPolicy.KILL_ALL)
+    record = write_record(tmp_path, leader, StopPolicy.KILL_ALL, started=began(leader))
     swept = asyncio.run(sweep_launches(tmp_path, lambda: group_rows(leader, member)))
     assert swept == [Swept("alpha", StopPolicy.KILL_ALL, False, (leader, member), ())]
     assert gone(leader) and gone(member)
@@ -1608,7 +1618,7 @@ def test_a_sweep_under_leave_background_kills_the_harness_and_records_the_rest(
     leader, member = orphan_group()
     orphans.extend([leader, member])
     os.kill(leader, signal.SIGSTOP)
-    write_record(tmp_path, leader, StopPolicy.LEAVE_BACKGROUND)
+    write_record(tmp_path, leader, StopPolicy.LEAVE_BACKGROUND, started=began(leader))
     rows = group_rows(leader, member)
     swept = asyncio.run(sweep_launches(tmp_path, lambda: rows))
     assert swept == [
@@ -1623,7 +1633,9 @@ def test_a_sweep_of_a_finished_launch_records_nothing_and_ends_nothing(
 ) -> None:
     leader, member = orphan_group()
     orphans.extend([leader, member])
-    write_record(tmp_path, leader, StopPolicy.LEAVE_BACKGROUND, done=True)
+    write_record(
+        tmp_path, leader, StopPolicy.LEAVE_BACKGROUND, done=True, started=began(leader)
+    )
     swept = asyncio.run(sweep_launches(tmp_path, lambda: group_rows(leader, member)))
     assert swept == [Swept("alpha", StopPolicy.LEAVE_BACKGROUND, True, (), ())]
     assert alive(leader) and alive(member)
@@ -1637,13 +1649,15 @@ def test_a_sweep_leaves_a_reused_pid_and_a_running_launcher_alone(
     leader, member = orphan_group()
     orphans.extend([leader, member])
     os.kill(leader, signal.SIGSTOP)
-    reused = write_record(tmp_path, leader, StopPolicy.KILL_ALL, command="/opt/other")
+    reused = write_record(
+        tmp_path, leader, StopPolicy.KILL_ALL, started=began(leader) - 100
+    )
     swept = asyncio.run(sweep_launches(tmp_path, lambda: group_rows(leader, member)))
     assert isinstance(swept, list)
     assert [s.skipped for s in swept] == ["another process now holds the harness's pid"]
     assert alive(leader) and alive(member) and not reused.exists()
     live = write_record(tmp_path, leader, StopPolicy.KILL_ALL, launcher_pid=7, name="2")
-    dead = write_record(tmp_path, leader, StopPolicy.KILL_ALL, name="1")
+    dead = write_record(tmp_path, leader, StopPolicy.KILL_ALL, name="1")  # no times
     # A running launcher is its harness's parent.
     rows = [
         TreeRow(leader, 7, leader, group_rows(leader, member)[0].command),
@@ -1664,19 +1678,34 @@ def test_a_sweep_that_cannot_read_the_table_touches_nothing(tmp_path: Path) -> N
     assert asyncio.run(sweep_launches(None)) == []
 
 
-def test_a_launcher_is_running_only_while_it_holds_its_harness() -> None:
+def clock_of(table: dict[int, float]) -> Callable[[int], float | None]:
+    """A reader of start times that knows the processes of ``table`` only."""
+
+    def read(pid: int) -> float | None:
+        return table.get(pid)
+
+    return read
+
+
+def test_a_launcher_is_running_only_while_it_holds_its_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Third live run of N1. A killed launcher the daemon has not reaped still
     answers a signal, so the table decides. It is gone when ``ps`` shows it
     ``<defunct>``, or when its harness has another parent. A harness that has exited,
-    or whose pid another command now holds, says nothing of its launcher."""
+    or whose pid another command now holds, says nothing of its launcher. Since the
+    audit's finding of 2026-11-18 the harness is told by its recorded start time, so
+    the readings are given."""
     me = f"{sys.executable} /venv/bin/dromon-launch"
     held = [TreeRow(7, 1, 7, me), TreeRow(40, 7, 40, "/opt/claude -p")]
-    assert launcher_running(held, 7, 40, "/opt/claude")
-    assert launcher_running(held[:1], 7, 40, "/opt/claude")
+    monkeypatch.setattr(launcher, "start_time", clock_of({40: 500.0}))
+    assert launcher_running(held, 7, 40, "/opt/claude", harness_started=500.0)
+    assert launcher_running(held[:1], 7, 40, "/opt/claude", harness_started=500.0)
     assert launcher_running(held, 7)
     orphaned = [held[0], TreeRow(40, 1, 40, "/opt/claude -p")]
-    assert not launcher_running(orphaned, 7, 40, "/opt/claude")
-    assert launcher_running(orphaned, 7, 40, "/opt/other")
+    assert not launcher_running(orphaned, 7, 40, "/opt/claude", harness_started=500.0)
+    # A harness that started at another time is another process, whatever it is called.
+    assert launcher_running(orphaned, 7, 40, "/opt/claude", harness_started=9.0)
     assert not launcher_running([TreeRow(7, 1, 7, launcher.DEFUNCT)], 7)
     assert not launcher_running([TreeRow(7, 1, 7, "[dromon-launch] <defunct>")], 7)
     assert not launcher_running([TreeRow(7, 1, 7, "/bin/sleep 60")], 7)

@@ -32,7 +32,6 @@ reached by the history either, so a change to one is not caught here."""
 import enum
 import os
 import shutil
-import subprocess
 import sys
 from collections.abc import Generator, Iterator, Mapping
 from contextlib import contextmanager
@@ -58,6 +57,7 @@ from state_pin import (
     replay,
     replay_digest,
 )
+from dromon import spawn
 
 
 def test_the_history_reaches_past_every_disclosure_cap(
@@ -285,11 +285,12 @@ def test_a_stray_file_does_not_stop_the_package_importing(tmp_path: Path) -> Non
         " from dromon import statesnapshot as s;"
         " print(s.STATE_VERSION, s.FOUND_STATE_CHANGES.ignored, s.__file__)"
     )
-    found = subprocess.run(  # noqa: S603
+    found = spawn.run(
         [sys.executable, "-I", "-c", probe, str(copy.parent)],
         capture_output=True,
         text=True,
         check=True,
+        timeout=300,
     ).stdout.split()
     assert found[0] == statesnapshot.STATE_VERSION
     assert found[1] == "('base.txt.orig',)"

@@ -48,7 +48,7 @@ def git(directory: Path, *arguments: str) -> str:
     environment = {
         name: value for name, value in os.environ.items() if not name.startswith("GIT_")
     }
-    done = subprocess.run(  # noqa: S603
+    done = spawn.run(
         [  # noqa: S607
             "git",
             "-C",
@@ -65,6 +65,7 @@ def git(directory: Path, *arguments: str) -> str:
         capture_output=True,
         text=True,
         env=environment,
+        timeout=300,
     )
     return done.stdout.strip()
 
