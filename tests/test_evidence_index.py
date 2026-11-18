@@ -217,25 +217,68 @@ def test_a_term_added_after_a_note_was_sent_withholds_its_entry(world: World) ->
     assert f"- {secret}, {evidence.WITHHELD}" in lead
 
 
+@pytest.mark.parametrize(
+    ("count", "closing"),
+    [
+        (
+            1,
+            "1 entry was withheld with its identifier, since its text now holds a"
+            " term of the disclosure list.",
+        ),
+        (
+            2,
+            "2 entries were withheld with their identifiers, since their text now"
+            " holds a term of the disclosure list.",
+        ),
+    ],
+)
 def test_an_index_whose_every_entry_is_withheld_says_only_how_many(
-    world: World,
+    world: World, count: int, closing: str
 ) -> None:
     """The line still learns that evidence exists, and none of it is shown, since
-    under this list even the identifier holds a term and is not named."""
-    sent = world.scheduler.send(ALPHA, ANA, "my report")
+    under this list even the identifier holds a term and is not named. Round 19,
+    item 1. The sentence agrees with its count, for one and for several."""
+    sent = [world.scheduler.send(ALPHA, ANA, "my report") for _ in range(count)]
 
     def discloses_all(text: str) -> bool:
         del text
         return True
 
     index = evidence_index(world.log.state, "alpha", discloses_all)
-    assert index is not None and sent not in index and "my report" not in index
-    assert index.splitlines()[-2:] == [
-        INDEX_END,
-        "1 entries were withheld with their identifiers, since their text now holds"
-        " a term of the disclosure list.",
-    ]
+    assert index is not None and "my report" not in index
+    assert not any(message_id in index for message_id in sent)
+    assert index.splitlines()[-2:] == [INDEX_END, closing]
     assert "Your last notes" not in index
+
+
+@pytest.mark.parametrize(
+    ("left_out", "closing"),
+    [
+        (1, "1 further entry was left out to keep this bounded."),
+        (2, "2 further entries were left out to keep this bounded."),
+    ],
+)
+def test_the_count_of_entries_left_out_agrees_in_number(
+    world: World, monkeypatch: pytest.MonkeyPatch, left_out: int, closing: str
+) -> None:
+    """Round 19, item 1. The bound is derived from the whole index, so exactly
+    ``left_out`` reports of equal size no longer fit, and the sentence agrees."""
+    sent = [
+        world.scheduler.send(ALPHA, ANA, "an equal report")
+        for _ in range(evidence.MAX_REPORTS)
+    ]
+    state = world.log.state
+    whole = evidence_index(state, "alpha", keeps_all)
+    assert whole is not None and "left out" not in whole
+    (entry,) = [line for line in whole.splitlines() if line.startswith(f"- {sent[0]}")]
+    entry_bytes = len(entry.encode("utf-8")) + 1
+    used = len(whole.encode("utf-8")) + 1
+    bound = used - left_out * entry_bytes + evidence._CLOSING_RESERVE  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(evidence, "MAX_EVIDENCE_BYTES", bound)
+    index = evidence_index(state, "alpha", keeps_all)
+    assert index is not None
+    assert sum(message_id in index for message_id in sent) == len(sent) - left_out
+    assert index.splitlines()[-2:] == [INDEX_END, closing]
 
 
 def test_a_quote_cannot_leave_its_fence_or_pass_as_the_daemons_words(
@@ -279,6 +322,27 @@ def test_an_address_or_command_dromon_writes_is_not_screened(world: World) -> No
     assert "r-new, full-gate, on commit" in index
 
 
+def test_the_premise_holds_the_engine_already_sees_what_the_index_leaves_unscreened(
+    world: World,
+) -> None:
+    """Round 19, item 2. The index leaves a run's command and commit out of the
+    screen on the premise that the line's engine, an external service, is already
+    given them unscreened by ``run_status``. This pins that
+    premise. Should ``run_status`` begin to screen them, this fails, and the index
+    must then screen the same parts. A report's address needs no such test, since it
+    is the recipient the line's engine itself named."""
+    started = run("r-0123456789ab", "alpha", 0).started
+    world.log.append(started)
+    world.scheduler.set_disclosure_terms(("full-gate", COMMIT[:12]))
+    status = world.scheduler.run_status("alpha")
+    assert "of full-gate in its worktree at commit" in status
+    assert COMMIT in status
+    index = world.scheduler._index_without_brief("alpha", False)  # pyright: ignore[reportPrivateUsage]
+    assert index is not None and "withheld" not in index
+    assert "r-0123456789ab, full-gate, on commit" in index
+    assert COMMIT[:12] in index
+
+
 @pytest.mark.parametrize(
     ("identifier", "named"),
     [
@@ -306,5 +370,5 @@ def test_a_withheld_entry_is_named_only_by_a_generated_identifier_clear_of_the_l
     assert index is not None and "hidden" not in index
     assert (f"- {identifier}, {evidence.WITHHELD}" in index) is named
     assert (identifier in index) is named
-    assert ("1 entries were withheld with their identifiers" in index) is not named
+    assert ("1 entry was withheld with its identifier" in index) is not named
     assert "cafe" not in index

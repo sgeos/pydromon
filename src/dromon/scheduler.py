@@ -4856,11 +4856,24 @@ class Scheduler:
         waiting = unanswered_from(self._state(), message.sender, message.recipient)
         if not waiting:
             return None
+        # Round 19, item 1. Each form agrees with its count, where one note read
+        # "the 1 notes" before.
+        if len(waiting) == 1:
+            unlinked = (
+                "This note names no reply_to, so it does not answer the 1 note from"
+                f" {message.recipient} you have not answered, {waiting[-1]}. If it"
+                " answers it, acknowledge_mail that note"
+            )
+        else:
+            unlinked = (
+                "This note names no reply_to, so it answers none of the"
+                f" {len(waiting)} notes from {message.recipient} you have not"
+                f" answered, the newest {waiting[-1]}. If it answers one,"
+                " acknowledge_mail that one"
+            )
         return (
-            f"This note names no reply_to, so it answers none of the {len(waiting)}"
-            f" notes from {message.recipient} you have not answered, the newest"
-            f" {waiting[-1]}. If it answers one, acknowledge_mail that one and name"
-            f" {message_id} as the reason. Later answers can carry reply_to."
+            f"{unlinked} and name {message_id} as the reason. Later answers can carry"
+            " reply_to."
         )
 
     def _sent_result(self, message_id: str) -> dict[str, Any]:
