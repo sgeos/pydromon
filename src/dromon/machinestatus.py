@@ -27,6 +27,11 @@ stricter reading is taken, since a machine whose disk is nearly full is better l
 alone by every session until the operator has seen the notice. It is one line to
 change, in ``decide``.
 
+**Round 18.** ``decide`` is unchanged and knows nothing of the operator's override,
+which admits one run at a time at ``elevated`` and never at ``critical``. The scheduler
+applies it after this decision, from the log, so the decision stays a pure function of
+the file's text and the time, and a port carries it across unchanged.
+
 **Failure modes.** A file that cannot be opened, is not a regular file, is larger than
 ``MAX_BYTES``, holds no ``level`` Dromon knows or no ``epoch`` it can read is
 ``unreadable`` and is handled as ``elevated``. A reason Dromon does not recognise is

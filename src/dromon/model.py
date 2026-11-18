@@ -2292,6 +2292,25 @@ MAX_RUN_TAIL_BYTES: Final = 2048
 and small enough that a run that fails often does not swell the log."""
 
 
+COVERAGE_NAMES: Final = (
+    "passed",
+    "failed",
+    "skipped",
+    "deselected",
+    "xfailed",
+    "xpassed",
+    "errors",
+    "warnings",
+)
+"""The counts of pytest's final line that a receipt keeps, in the order pytest and this
+project print them. **Round 18, item 2.** A fixed list, so that no text of the output
+reaches the log through a name, and ``error`` and ``errors`` are one name."""
+
+MAX_COVERAGE_COUNT: Final = 10**9
+"""The largest count kept. A suite that large is not this project's, and the bound
+keeps a forged line of digits from growing the event."""
+
+
 class RunStatus(StrEnum):
     """How a supervised run ended. ``exited`` and ``stopped`` come from the receipt
     its supervisor wrote, ``stopped`` when ``stop_run`` asked it to end. ``lost``
@@ -2364,6 +2383,19 @@ class RunStarted:
     move, and a reader who must know what ran starts a commit run, whose ``commit``
     the daemon checked out itself. It follows ``tree``, which main recorded first at
     ``STATE_VERSION`` 4, and raised the version to 5."""
+    dirty_paths: int | None = None
+    """**Round 18, item 2.** How many paths ``git status`` listed as changed or
+    untracked in the working directory as the run started, so ``0`` is a clean tree
+    and anything else is a run of uncommitted work, which ``workdir_commit`` alone
+    cannot say. ``None`` for a commit run, whose checkout is the commit and holds
+    nothing else, and where the status could not be read, which a receipt words as
+    unknown and never as clean. Counted by the daemon, and like ``workdir_commit`` it
+    describes what the daemon read and not what the line can change after."""
+    admitted_by: str | None = None
+    """**Round 18, item 1.** The operator whose override admitted this run while the
+    machine status deferred runs, or ``None`` for a run the status allowed. It says the
+    run started at a status the project defers runs at, by that operator's decision,
+    which ``run_admitted`` records with its time and expiry."""
 
     def __post_init__(self) -> None:
         check_id("run_id", self.run_id)
@@ -2371,6 +2403,15 @@ class RunStarted:
             raise InvalidField("tree must be null or a SHA-256 digest in hex")
         if self.tree is not None and self.commit is not None:
             raise InvalidField("a commit run records no tree")
+        if self.dirty_paths is not None and (
+            type(self.dirty_paths) is not int
+            or not 0 <= self.dirty_paths < 2**31
+            or self.commit is not None
+        ):
+            raise InvalidField(
+                "dirty_paths must be null or a whole number, and a commit run has none"
+            )
+        check_optional_id("admitted_by", self.admitted_by)
         check_id("line_id", self.line_id)
         check_optional_id("role_id", self.role_id)
         check_optional_id("previous", self.previous)
@@ -2427,9 +2468,27 @@ class RunEnded:
     note: str
     ended_at: str
     output_tail: str | None = None
+    coverage: tuple[tuple[str, int], ...] | None = None
+    """**Round 18, item 2.** The counts the run's output ends with, as
+    ``runs.gate_counts`` reads them from pytest's final line, each a name of
+    ``COVERAGE_NAMES`` and a whole number, in the order the line gives them. They are
+    the output's own claim, which a writing line can shape, as the note's summary is,
+    and they are the numbers alone, so they carry no text. ``None`` where the output
+    holds no final line or could not be read, and for a lost run, which has no
+    result."""
 
     def __post_init__(self) -> None:
         check_id("run_id", self.run_id)
+        if self.coverage is not None:
+            seen: set[str] = set()
+            for name, count in self.coverage:
+                if name not in COVERAGE_NAMES or name in seen:
+                    raise InvalidField(f"coverage names {name!r} twice or not at all")
+                seen.add(name)
+                if type(count) is not int or not 0 <= count <= MAX_COVERAGE_COUNT:
+                    raise InvalidField(f"coverage count for {name} is not a count")
+            if not self.coverage or self.status is RunStatus.LOST:
+                raise InvalidField("coverage is given for a run that has a result")
         if self.output_tail is not None:
             check_text("output_tail", self.output_tail, MAX_RUN_TAIL_BYTES)
             if any(
@@ -2628,6 +2687,67 @@ class RunDequeued:
         check_instant("at", self.at)
 
 
+MIN_ADMIT_SECONDS: Final = 60
+DEFAULT_ADMIT_SECONDS: Final = 3600
+MAX_ADMIT_SECONDS: Final = 14400
+"""How long the operator's override of the machine status may last. **Round 18, item
+1.** An hour by default, which holds several gates of a quarter of an hour each, and
+four hours at most, since an override is a decision about one shared machine at one
+time, and one that outlives the session in which it was made is a standing exemption
+that nobody has looked at. A longer one is made again, which is one command."""
+
+MAX_ADMIT_REASON_BYTES: Final = 512
+
+
+@dataclass(frozen=True, slots=True)
+class RunAdmitted:
+    """The operator admitted runs while the machine status defers them, one at a time,
+    until ``expires_at``. **Round 18, item 1.** On 2026-11-16 memory pressure from
+    applications outside Dromon held every line's gate for hours, and the operator ran
+    the gates by hand, which left no record and no limit. This is the operator's
+    decision as the daemon's own record, with its time and its expiry, so a run that
+    started under it says so and the override ends by itself.
+
+    The override lifts the deferral at ``elevated`` and at a status that cannot be read,
+    which counts as elevated. It never lifts ``critical``, where nothing starts. It
+    admits one run at a time, any scope's, so a pressured machine carries one gate, and
+    it leaves every other refusal and the project's slot as they are. A second
+    ``run_admitted`` replaces the first, so the operator extends or shortens it by
+    making another. **Porting note.** A single optional record in the state, replaced
+    whole, and expiry is read from the clock, never recorded as an event of its own."""
+
+    operator_id: str
+    admitted_at: str
+    expires_at: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        check_id("operator_id", self.operator_id)
+        check_instant("admitted_at", self.admitted_at)
+        check_instant("expires_at", self.expires_at)
+        seconds = (
+            parse_due(self.expires_at) - parse_due(self.admitted_at)
+        ).total_seconds()
+        if not MIN_ADMIT_SECONDS <= seconds <= MAX_ADMIT_SECONDS:
+            raise InvalidField(
+                f"an override lasts {MIN_ADMIT_SECONDS} to {MAX_ADMIT_SECONDS} seconds"
+            )
+        check_text("reason", self.reason, MAX_ADMIT_REASON_BYTES)
+
+
+@dataclass(frozen=True, slots=True)
+class RunAdmissionEnded:
+    """The operator ended the override before it expired. **Round 18, item 1.** A run
+    already admitted runs on, since only the operator decides to stop work."""
+
+    operator_id: str
+    ended_at: str
+
+    def __post_init__(self) -> None:
+        check_id("operator_id", self.operator_id)
+        check_instant("ended_at", self.ended_at)
+
+
 type Event = (
     LineCreated
     | LineStateChanged
@@ -2691,6 +2811,8 @@ type Event = (
     | CommitRunRefused
     | RunQueued
     | RunDequeued
+    | RunAdmitted
+    | RunAdmissionEnded
     | PeerDeclared
     | PeerRemoved
     | PeerKeyed
@@ -3193,6 +3315,10 @@ class State:
     queued_runs: dict[str, RunQueued] = field(default_factory=dict[str, RunQueued])
     """The runs that wait to start, by queue identifier, oldest first, which is the
     order they start in. Bounded by ``MAX_QUEUED_RUNS``. **Round 17, item 1.**"""
+    run_admission: RunAdmitted | None = None
+    """The operator's override of the machine status, while one is recorded and not
+    ended. It may be past its expiry, which the reader judges by the clock. At most one,
+    so the state is bounded. **Round 18, item 1.**"""
 
     def holder_of(self, role_id: str) -> RoleHolder:
         """What decides ``role_id``'s terms and seats now."""
@@ -3280,6 +3406,7 @@ class State:
             dict(self.commit_refusals),
             dict(self.line_costs),
             dict(self.queued_runs),
+            self.run_admission,
         )
 
     def line_mail(self, line_id: str) -> LineMail:
@@ -3554,6 +3681,14 @@ class State:
                     raise EventRejected(f"no queued run {event.queue_id}")
                 if event.run_id is not None and event.run_id not in self.runs:
                     raise EventRejected(f"no run {event.run_id}")
+            case RunAdmitted():
+                if event.operator_id not in self.operators:
+                    raise EventRejected(f"no operator {event.operator_id}")
+            case RunAdmissionEnded():
+                if event.operator_id not in self.operators:
+                    raise EventRejected(f"no operator {event.operator_id}")
+                if self.run_admission is None:
+                    raise EventRejected("no override of the machine status is recorded")
             case PeerDeclared():
                 peer = self.peers.get(event.peer_id)
                 if (
@@ -3976,6 +4111,10 @@ class State:
                 self.queued_runs[event.queue_id] = event
             case RunDequeued():
                 del self.queued_runs[event.queue_id]
+            case RunAdmitted():
+                self.run_admission = event
+            case RunAdmissionEnded():
+                self.run_admission = None
             case PeerDeclared():
                 peer = self.peers.get(event.peer_id)
                 # A declared table replaces an open peer of its name whole, so its
