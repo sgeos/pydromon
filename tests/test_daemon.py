@@ -22,7 +22,7 @@ from claude_agent_sdk import SdkMcpTool
 from dromon.activity import ActivityKind
 from dromon.daemon import AlreadyRunning, Daemon, acquire_lock
 from dromon.driver import Strategy
-from dromon.eventlog import EventLog
+from dromon.eventlog import EventLog, read_entries
 from dromon.model import (
     HoldCause,
     LineAddress,
@@ -460,6 +460,8 @@ def test_a_named_sender_is_kept_and_said(paths: ProjectPaths) -> None:
     )
     assert response.ok and response.result is not None
     assert response.result["operator"] == "ana"
+    # Round 18, item 4. A line that is no seat waits on no owner.
+    assert "waits" not in response.result
 
 
 def test_create_line_accepts_a_configuration(paths: ProjectPaths) -> None:
@@ -625,6 +627,66 @@ def test_mail_pages_and_filters(paths: ProjectPaths) -> None:
     assert nobody.result is not None and nobody.result["total"] == 0
 
 
+def test_mail_since_a_message_lists_only_what_came_after_it(
+    paths: ProjectPaths,
+) -> None:
+    """Round 18, item 2. A message identifier, which may be one the operator sent,
+    admits the mail recorded after it and not the message itself."""
+    ids = seed_mail(paths)
+    for since, expected in ((ids[0], ids[1:]), (ids[2], [])):
+        response = request(paths, "mail", {"operator": "ana", "since": since})
+        assert response.result is not None
+        entries = cast(list[dict[str, object]], response.result["messages"])
+        assert [e["message_id"] for e in entries] == expected
+        assert response.result["total"] == len(expected)
+
+
+def test_mail_since_a_time_lists_what_was_recorded_at_or_after_it(
+    paths: ProjectPaths,
+) -> None:
+    ids = seed_mail(paths)
+    recorded = {
+        entry.event.message_id: entry.recorded_at
+        for entry in read_entries(paths.event_log)
+        if isinstance(entry.event, MessageSent)
+    }
+    early = request(
+        paths, "mail", {"operator": "ana", "since": "2000-01-01T00:00:00+00:00"}
+    )
+    assert early.result is not None and early.result["total"] == len(ids)
+    late = request(
+        paths, "mail", {"operator": "ana", "since": "2999-01-01T00:00:00+00:00"}
+    )
+    assert late.result is not None and late.result["total"] == 0
+    # At the second note's own time, the second and every later note are admitted.
+    at = request(paths, "mail", {"operator": "ana", "since": recorded[ids[1]]})
+    assert at.result is not None
+    admitted = [
+        str(e["message_id"])
+        for e in cast(list[dict[str, object]], at.result["messages"])
+    ]
+    assert ids[1] in admitted and set(admitted) <= set(ids)
+    assert all(recorded[m] >= recorded[ids[1]] for m in admitted)
+
+
+@pytest.mark.parametrize(
+    ("since", "code"),
+    [
+        (3, ErrorCode.BAD_REQUEST),
+        ("", ErrorCode.BAD_REQUEST),
+        ("m-not-a-message", ErrorCode.REJECTED),
+        ("2026-11-18T07:00:00", ErrorCode.REJECTED),
+        ("yesterday", ErrorCode.REJECTED),
+    ],
+)
+def test_mail_refuses_a_since_that_is_neither_a_message_nor_a_dated_time(
+    paths: ProjectPaths, since: object, code: ErrorCode
+) -> None:
+    seed_mail(paths)
+    response = request(paths, "mail", {"operator": "ana", "since": since})
+    assert (response.ok, response.error_code) == (False, code)
+
+
 def test_read_returns_the_body_and_marks_it_read(paths: ProjectPaths) -> None:
     ids = seed_mail(paths)
     response = request(paths, "read", {"operator": "ana", "message_id": ids[1]})
@@ -668,7 +730,9 @@ def test_an_operator_acknowledges_and_lines_see_it_in_their_sent_mail(
     sent = request(paths, "sent", {"operator": "ana"})
     assert sent.result is not None
     (reply,) = cast(list[dict[str, object]], sent.result["messages"])
-    assert (reply["recipient"], reply["outcome"]) == ("alpha", "unanswered")
+    # Round 18, item 5. A reply asks none by default, so alpha's count does not
+    # count it, and the sender's view now says so rather than unanswered.
+    assert (reply["recipient"], reply["outcome"]) == ("alpha", "asks no reply")
 
 
 @pytest.mark.parametrize(
@@ -1085,7 +1149,8 @@ def test_an_operator_looks_through_mail_from_the_command_line(
             f"{ids[2]} from alpha, note, read, acknowledged" in capsys.readouterr().out
         )
         assert cli.main([*base, "sent", "--operator", "ana"]) == exits.OK
-        assert "to alpha, note, waiting, unanswered" in capsys.readouterr().out
+        # Her one sent note is a reply, which asks none, so it is not unanswered.
+        assert "to alpha, note, waiting, asks no reply" in capsys.readouterr().out
     finally:
         client.stop(paths)
         reap(pid)

@@ -322,6 +322,7 @@ from dromon.mailbox import (
     sent,
     summary,
 )
+from dromon.evidence_index import evidence_index
 from dromon.lineconfig import (
     DEFAULT_CONFIG,
     REPORT_RESERVED,
@@ -1181,6 +1182,16 @@ UNRELEASED_NOTE: Final = (
 )
 
 MAX_TASK_NOTES: Final = 3
+TASK_NOTE_QUIET_SECONDS: Final = 3.0
+"""How long a waking task note is held for another task end of the same line, so
+that ends arriving a moment apart share one turn. **Round 18, item 6.** Late task
+notices already queued shared a turn, but ends reported separately each started
+one. Each further end restarts the quiet period, up to ``TASK_NOTE_HOLD_SECONDS``
+from the first. A few seconds is short beside a turn and long beside the spread of
+ends a single command's tasks report."""
+TASK_NOTE_HOLD_SECONDS: Final = 15.0
+"""The longest a waking task note is held from the first of its line's held ends,
+however many more arrive, so the debounce is bounded. **Round 18, item 6.**"""
 TASK_NOTE_WINDOW_SECONDS: Final = 60.0
 """At most ``MAX_TASK_NOTES`` background task notes wake a line within this many
 seconds. A task named by the line's pending wake is exempt, so waiting cannot lose its
@@ -1769,7 +1780,11 @@ LIST_SENT_SCHEMA: Final[dict[str, object]] = {
     "properties": {
         "unanswered_only": {
             "type": "boolean",
-            "description": "Only messages neither replied to nor acknowledged",
+            "description": (
+                "Only messages counted as unanswered, by the rule the recipient's"
+                " list_mail counts by. A note that asks no reply shows as asks no"
+                " reply instead"
+            ),
         },
         "offset": {"type": "integer", "minimum": 0, "description": "Messages to skip"},
         "limit": {
@@ -3142,6 +3157,10 @@ class Scheduler:
         the session the line no longer resumes. Round 9 review, F1."""
         self._sent: list[str] = []
         """Messages sent during the current tick, moved to the post office after it."""
+        self._held_task_notes: dict[str, tuple[float, float, list[str]]] = {}
+        """Round 18, item 6. Waking task notes held for the quiet period, by line,
+        with the clock at the first and the latest end held. Each is in the log
+        already, so a restart finds it undelivered and posts it."""
         self._post_office: set[str] = {
             message_id
             for message_id, message in log.state.messages.items()
@@ -12981,7 +13000,8 @@ class Scheduler:
             raise EventRejected(f"no line {line_id}")
         spec = spec_of(Scope.LINE, key)
         checked = None if value is None else check(spec, value)
-        document = changed(self.line_overrides(line_id), key, checked)
+        before = self.line_overrides(line_id)
+        document = changed(before, key, checked)
         model = document.get("model", line.engine)
         if not isinstance(model, str) or model not in self.model_choices(line_id):
             raise OverrideError(
@@ -13002,7 +13022,17 @@ class Scheduler:
                 f"wake.every_ticks must be in [1, {MAX_WAKE_EVERY_TICKS}]"
             )
         self._log.append(LineOverridden(line_id, encode_override(document)))
-        self._drop_engine(line_id)
+        # Round 18, item 3. A change that leaves the engine's configuration and
+        # model as they were, as a limit or the wake cadence does, keeps the engine,
+        # so a kept session and its background tasks run on. Only a change the
+        # engine reads rebuilds it. The previous configuration is computed from the
+        # overrides as they stood, so a failure there rebuilds, the safe side.
+        try:
+            same = apply_config(self.baseline_config(line_id), before) == config
+        except (ConfigError, OverrideError, ValueError):
+            same = False
+        if not same or before.get("model", line.engine) != model:
+            self._drop_engine(line_id)
 
     def _skipped(self, line_id: str, reason: str) -> None:
         """Report, once, a stored override that no longer applies. It is skipped,
@@ -13124,6 +13154,40 @@ class Scheduler:
         engine = ENGINE_OF.get(self.model_of(line_id), "")
         return waits_unconfined(self._state(), line_id, engine, self._confining)
 
+    def role_wait_reason(self, line_id: str) -> str | None:
+        """Why mail to ``line_id`` waits on its role's owner, in a sentence that
+        names the owner, or ``None`` when it does not. **Round 18, item 4.** An
+        operator's note to a seat that ``waits_unconfined`` holds, or to a line that
+        ``beside_owner`` names, was recorded and then waited with no word, so the
+        operator could not tell a seat that will not run from one that is slow.
+
+        **Decided by core, for review.** The note is still recorded rather than
+        refused, since it is delivered once the seat may run, and a refused note
+        would be lost. The send's result carries this sentence instead, and
+        ``dromon send`` prints it. **Residual.** A seat that comes to wait after
+        the note was sent is not told to the sender again."""
+        state = self._state()
+        if line_id not in state.lines:
+            return None
+        seat = state.seats.get(line_id)
+        if seat is not None and self.waits_unconfined(line_id):
+            owner = state.roles[seat.role_id].owner
+            return (
+                f"line {line_id} is a seat of role {seat.role_id} that does not own"
+                f" it, since {owner} owns it, and its engine cannot be confined to"
+                " keep it from the owner's worktree, so this note waits until"
+                f" {line_id} owns the role or the role is vacant"
+            )
+        beside = self.beside_owner(line_id)
+        if beside is not None:
+            owner = state.roles[beside].owner
+            return (
+                f"line {line_id} is no seat of role {beside} but could write its"
+                f" worktree, which {owner} owns, so this note waits until the role"
+                " has no owner"
+            )
+        return None
+
     def _cooling(self, line_id: str) -> bool:
         ended = self._last_turn_end.get(line_id)
         if ended is None:
@@ -13141,6 +13205,10 @@ class Scheduler:
         for line_id in sorted(self._state().lines):
             self._ensure_context_compaction_wake(line_id)
         if self._running or self._sent or self._due_wakes():
+            return True
+        # Round 18, item 6. Held task notes whose quiet period has passed are work.
+        held = self.seconds_until_task_notes()
+        if held is not None and held <= 0:
             return True
         deferring = self.machine_decision().defer_turns
         return any(
@@ -13266,6 +13334,7 @@ class Scheduler:
         self._tick_refused = False
         self.expire_leases()
         self.fire_due_wakes()
+        self.release_task_notes()
         for line_id in sorted(self._state().lines):
             with self._refusing_on_secrets(f"the update of line {line_id}"):
                 self._update_line(line_id)
@@ -13299,6 +13368,7 @@ class Scheduler:
             while not stop.is_set():
                 self._work.clear()
                 self.kick_run_queue()
+                self.release_task_notes()
                 if self._work_waiting():
                     try:
                         self.step()
@@ -13338,6 +13408,9 @@ class Scheduler:
                     timeouts.append(MAX_REST_SECONDS)
                 if self._state().queued_runs:
                     timeouts.append(RUN_QUEUE_POLL_SECONDS)
+                held = self.seconds_until_task_notes()
+                if held is not None:
+                    timeouts.append(held)
                 # Mail already in the post office may need another tick to reach
                 # its wake cadence. Advance only while that mail can make progress.
                 for line_id in self._state().lines:
@@ -13612,13 +13685,17 @@ class Scheduler:
             roster = self._roster_lead(line_id, compaction is not None)
             if roster is not None:
                 prompt = f"{roster}\n\n{prompt}"
-            brief = (
+            fresh = self.effective_config(line_id).fresh_session_each_turn
+            alone = (
                 None
-                if self.effective_config(line_id).fresh_session_each_turn
-                else self._brief_lead(line_id, compaction is not None)
+                if fresh
+                else self._index_without_brief(line_id, compaction is not None)
             )
+            brief = None if fresh else self._brief_lead(line_id, compaction is not None)
             if brief is not None:
                 prompt = f"{brief}\n\n{prompt}"
+            if alone is not None:
+                prompt = f"{prompt}\n\n{alone}"
         except Exception as error:  # noqa: BLE001
             compaction, owed, refused = None, None, error
             prompt = f"the prompt could not be composed: {error}"
@@ -14150,6 +14227,17 @@ class Scheduler:
             + " Their ends are noted as they happen."
         )
 
+    def _index_without_brief(self, line_id: str, compacting: bool) -> str | None:
+        """The evidence index of ``line_id`` when its engine session is new and it
+        set no brief, or ``None``. **Round 18, item 1.** It is read before
+        ``_brief_lead`` clears the owed mark, and ends the prompt."""
+        owed = line_id in self._brief_owed
+        if not (owed or compacting or line_id not in self._engines):
+            return None
+        if line_id in self._state().briefs:
+            return None
+        return evidence_index(self._state(), line_id, self.discloses)
+
     def _brief_lead(self, line_id: str, compacting: bool) -> str | None:
         """What ``line_id``'s turn leads with when its engine session is new, its
         standing brief, or ``None``. **Task of 2026-10-29.** A session is new when
@@ -14172,11 +14260,18 @@ class Scheduler:
         if brief is None:
             self._brief_owed.discard(line_id)
             return None
+        # Round 18, item 1. The index of the line's own evidence follows the brief,
+        # as ``dromon.evidence_index`` says. A line with no brief is given it at the
+        # end of its prompt, by ``_index_without_brief``, so no notice loses its
+        # place at the head of the turn.
+        index = evidence_index(self._state(), line_id, self.discloses)
         lead = (
             f"{self._brief_standing(line_id, brief)}"
             f"{self._mail_since_brief(line_id, brief)}\n"
             f"{self._brief_block(brief)}"
         )
+        if index is not None:
+            lead += f"\n{index}"
         self._brief_owed.discard(line_id)
         return lead
 
@@ -15112,10 +15207,55 @@ class Scheduler:
             message = self._state().messages[message_id]
             self._notes([(message_id, message)])
         elif not defer_wake:
-            self._sent.append(message_id)
+            first, _, held = self._held_task_notes.get(line_id, (now, now, []))
+            held.append(message_id)
+            self._held_task_notes[line_id] = (first, now, held)
             self._failed.discard(line_id)
             self._work.set()
         return message_id
+
+    def release_task_notes(self) -> None:
+        """Move each line's held task notes to the sent queue once its quiet period
+        or its hold has passed, or at once when other mail of the line already waits,
+        so the notes share that mail's turn. **Round 18, item 6.**
+
+        **Failure mode.** A held note is recorded in the log but not yet in the sent
+        queue, so a daemon that stops while it is held delivers it as any undelivered
+        mail is delivered on the next start. **Residual.** A note that a hold or the
+        line's removal overtakes is moved all the same, and waits as any mail waits."""
+        if not self._held_task_notes:
+            return
+        now = self._clock()
+        for line_id in sorted(self._held_task_notes):
+            first, latest, held = self._held_task_notes[line_id]
+            waiting = bool(self.deliverable(line_id)) or any(
+                (message := self._state().messages.get(sent_id)) is not None
+                and message.recipient == LineAddress(line_id)
+                for sent_id in self._sent
+            )
+            if (
+                waiting
+                or now - latest >= TASK_NOTE_QUIET_SECONDS
+                or now - first >= TASK_NOTE_HOLD_SECONDS
+            ):
+                del self._held_task_notes[line_id]
+                self._sent.extend(held)
+                self._work.set()
+
+    def seconds_until_task_notes(self) -> float | None:
+        """How long until the next held task notes are released, or ``None`` when
+        none is held. **Round 18, item 6.**"""
+        if not self._held_task_notes:
+            return None
+        now = self._clock()
+        return max(
+            0.0,
+            min(
+                min(latest + TASK_NOTE_QUIET_SECONDS, first + TASK_NOTE_HOLD_SECONDS)
+                - now
+                for first, latest, _ in self._held_task_notes.values()
+            ),
+        )
 
     def begin_self_started(
         self, line_id: str, ends: tuple[BackgroundEnd, ...]
@@ -15132,6 +15272,8 @@ class Scheduler:
                 self._state().messages[message_id].recipient == LineAddress(line_id)
                 for message_id in self._sent
             )
+            # Round 18, item 6. Held notes are delivered by the daemon's own turn.
+            or line_id in self._held_task_notes
         ):
             return None
         engine = self._engines.get(line_id)
