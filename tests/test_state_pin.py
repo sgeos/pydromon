@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 import state_pin
-from dromon import statesnapshot
+from dromon import spawn, statesnapshot
 from dromon.model import Event
 from state_pin import Pin, current, decide, parse_pin, pin_path, pin_text
 
@@ -117,7 +117,7 @@ def test_the_loaded_scenario_is_the_test_suite_s(scenario: tuple[Event, ...]) ->
 
 
 def run(*arguments: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: S603, the test's own interpreter and script
+    return spawn.run(
         [sys.executable, str(SCRIPT), *arguments],
         capture_output=True,
         text=True,

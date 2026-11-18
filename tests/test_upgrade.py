@@ -17,7 +17,6 @@ import json
 import os
 import shutil
 import sqlite3
-import subprocess
 import tempfile
 import time
 from collections.abc import Generator
@@ -221,12 +220,13 @@ After the table.
 
 def git(repository: Path, *arguments: str) -> str:
     argv = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *arguments]
-    return subprocess.run(  # noqa: S603
-        argv,  # noqa: S607
+    return spawn.run(
+        argv,
         cwd=repository,
         capture_output=True,
         text=True,
         check=True,
+        timeout=60,
     ).stdout.strip()
 
 
@@ -432,8 +432,8 @@ def test_each_kind_the_codec_reads_anew_has_a_newer_floor_change() -> None:
     def source(revision: str | None, name: str) -> str:
         if revision is None:
             return (REPOSITORY / "src" / "dromon" / name).read_text(encoding="utf-8")
-        return subprocess.run(  # noqa: S603, a fixed git command of the test's own
-            ["git", "show", f"{revision}:src/dromon/{name}"],  # noqa: S607
+        return spawn.run(
+            ["git", "show", f"{revision}:src/dromon/{name}"],
             cwd=REPOSITORY,
             capture_output=True,
             text=True,

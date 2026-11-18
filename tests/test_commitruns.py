@@ -1142,8 +1142,11 @@ def test_a_commit_run_s_interpreter_has_tk_where_the_gate_s_does(
 ) -> None:
     """The interpreter a commit run names imports Tk whenever the interpreter this
     gate runs on does, since the gate's tests of the window client import it."""
-    gate_tk = subprocess.run(
-        [sys.executable, "-c", "import tkinter"], check=False, capture_output=True
+    gate_tk = spawn.run(
+        [sys.executable, "-c", "import tkinter"],
+        check=False,
+        capture_output=True,
+        timeout=60,
     ).returncode
     repository, main, _ = repo
     with EventLog(tmp_path / "events.sqlite") as log:
