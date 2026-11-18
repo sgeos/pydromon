@@ -99,7 +99,8 @@ SUBCOMMANDS: Final[dict[str, str]] = {
     "set": "change a project or line setting, or return it to the layers below",
     "role": "show, create, update or delete roles, read their journals, or give,"
     " vacate or ask to hand over one",
-    "run": "show supervised runs, or clear a lost one after inspecting what is left",
+    "run": "show supervised runs, clear a lost one after inspecting what is left,"
+    " or admit runs while the machine status defers them",
     "ci-log": "copy a GitHub Actions run's failed job log into a line's scratch",
     "budget": "list the providers' stated budgets, or state one",
     "reload": "read the project file again and apply its lines, limits and wake policy",
@@ -2180,6 +2181,8 @@ def _run(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     run_id: str | None = arguments.run_id
     if arguments.action == "status":
         return _run_status(paths, run_id)
+    if arguments.action in ("admit", "admit-end"):
+        return _run_admit(paths, arguments)
     if run_id is None:
         print("dromon run clear: name the run to clear", file=sys.stderr)
         return exits.USAGE
@@ -2190,6 +2193,40 @@ def _run(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     print(
         f"run {result['run_id']} cleared by {result['operator']} at"
         f" {result['cleared_at']}"
+    )
+    return exits.OK
+
+
+def _run_admit(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
+    """Record the operator's override of the machine status, or end it. **Round 18,
+    item 1.** The daemon refuses it at a critical status, and says so."""
+    if arguments.action == "admit-end":
+        ended = _call(
+            paths,
+            "run admit-end",
+            Operation.RUN_ADMIT_END,
+            {"operator": arguments.operator},
+        )
+        if isinstance(ended, int):
+            return ended
+        print(
+            f"the override was ended by {ended['operator']} at {ended['ended_at']}."
+            " A run it admitted runs on"
+        )
+        return exits.OK
+    args: dict[str, object] = {
+        "operator": arguments.operator,
+        "reason": arguments.reason,
+    }
+    if arguments.seconds is not None:
+        args["seconds"] = arguments.seconds
+    result = _call(paths, "run admit", Operation.RUN_ADMIT, args)
+    if isinstance(result, int):
+        return result
+    print(
+        f"{result['operator']} admits runs, one at a time, from {result['admitted_at']}"
+        f" until {result['expires_at']}, while the machine status defers them. It never"
+        " admits a run at a critical status"
     )
     return exits.OK
 
@@ -2270,6 +2307,9 @@ def _run_status(paths: ProjectPaths, run_id: str | None) -> int:
         for view in (cast(list[object], found) if isinstance(found, list) else [])
         if isinstance(view, dict)
     ]
+    admission = result.get("admission")
+    if isinstance(admission, dict):
+        print(_admission_row(cast(dict[str, object], admission)))
     if run_id is not None:
         for view in views:
             print(_run_row(view))
@@ -2286,6 +2326,29 @@ def _run_status(paths: ProjectPaths, run_id: str | None) -> int:
             print(scope)
         print(f"  {_run_row(view)}")
     return exits.OK
+
+
+def _admission_row(view: dict[str, object]) -> str:
+    """The operator's override on one line, for ``dromon run status``. **Round 18,
+    item 1.** Whether it admits runs now is the daemon's judgement, never re-derived
+    here from a clock."""
+    state = (
+        "it admits runs now"
+        if view.get("active") is True
+        else (
+            "it has expired"
+            if view.get("expired") is True
+            else "it does not apply while the status is critical"
+            if view.get("critical") is True
+            else "it is standing by, since no run is deferred now"
+        )
+    )
+    reason = view.get("reason")
+    why = f", saying {reason!r}" if isinstance(reason, str) and reason else ""
+    return (
+        f"override: {view.get('operator')} admitted runs, one at a time, at"
+        f" {view.get('admitted_at')}, until {view.get('expires_at')}{why}, and {state}"
+    )
 
 
 def _run_row(view: dict[str, object]) -> str:
@@ -2314,6 +2377,41 @@ def _run_row(view: dict[str, object]) -> str:
     return row
 
 
+def _receipt_details(view: dict[str, object]) -> list[str]:
+    """What a run's receipt says it tested, for ``dromon run status RUN``. **Round 18,
+    item 2.** The tested commit, whether the tree was clean as the run started and the
+    digest of it, who admitted the run while the status deferred runs, and the counts of
+    the output's final line, which are the output's own claim."""
+    details: list[str] = []
+    commit, worktree_commit = view.get("commit"), view.get("workdir_commit")
+    if commit is not None:
+        details.append(f"tested: commit {commit}, checked out by the daemon, clean")
+    else:
+        dirty = view.get("dirty_paths")
+        state = (
+            "uncommitted state unknown"
+            if dirty is None
+            else "clean tree"
+            if dirty == 0
+            else f"{dirty} changed or untracked paths"
+        )
+        at = "no commit recorded" if worktree_commit is None else f"{worktree_commit}"
+        details.append(f"tested: worktree commit {at}, {state} as it started")
+        tree = view.get("tree")
+        details.append(f"tree digest: {'none recorded' if tree is None else tree}")
+    admitted = view.get("admitted_by")
+    if admitted is not None:
+        details.append(f"admitted by the override of operator {admitted}")
+    coverage = view.get("coverage")
+    if isinstance(coverage, dict):
+        counts = ", ".join(
+            f"{count} {name}"
+            for name, count in cast(dict[str, object], coverage).items()
+        )
+        details.append(f"coverage counts, the output's own claim: {counts}")
+    return details
+
+
 def _run_details(view: dict[str, object]) -> list[str]:
     """What ``dromon run status RUN`` adds to a run's row, each field the log
     holds that the row leaves out."""
@@ -2327,6 +2425,7 @@ def _run_details(view: dict[str, object]) -> list[str]:
         digest = view.get("output_digest")
         of = "" if digest is None else f" of SHA-256 {digest}"
         details.append(f"output: {size} bytes{of}")
+    details.extend(_receipt_details(view))
     note = view.get("note")
     if note:
         details.append(f"note: {note}")
@@ -3908,7 +4007,9 @@ def build_parser() -> argparse.ArgumentParser:
                 help="who makes the change or the request, default %(default)s",
             )
         if name == "run":
-            command.add_argument("action", choices=["status", "clear"])
+            command.add_argument(
+                "action", choices=["status", "clear", "admit", "admit-end"]
+            )
             command.add_argument(
                 "run_id",
                 nargs="?",
@@ -3917,7 +4018,19 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument(
                 "--operator",
                 default=default_operator(),
-                help="who clears it, default %(default)s",
+                help="who clears it, admits runs or ends the override, default"
+                " %(default)s",
+            )
+            command.add_argument(
+                "--seconds",
+                type=int,
+                help="for admit, how long the override lasts, default 3600, from 60"
+                " to 14400",
+            )
+            command.add_argument(
+                "--reason",
+                default="",
+                help="for admit, why, recorded with the override",
             )
         if name == "ci-log":
             command.add_argument("line_id", help="the line whose scratch receives it")

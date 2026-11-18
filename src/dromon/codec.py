@@ -93,6 +93,8 @@ from dromon.model import (
     QueueEnd,
     RunCleared,
     RunClearance,
+    RunAdmissionEnded,
+    RunAdmitted,
     RunDequeued,
     RunQueued,
     RunEnded,
@@ -294,6 +296,8 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "checkout",
         "tree",
         "workdir_commit",
+        "dirty_paths",
+        "admitted_by",
     ),
     "run_ended": (
         "run_id",
@@ -304,6 +308,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "note",
         "ended_at",
         "output_tail",
+        "coverage",
     ),
     "run_cleared": ("run_id", "cause", "operator_id", "cleared_at"),
     "commit_run_refused": (
@@ -327,6 +332,8 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "reason",
     ),
     "run_dequeued": ("queue_id", "outcome", "run_id", "reason", "at"),
+    "run_admitted": ("operator_id", "admitted_at", "expires_at", "reason"),
+    "run_admission_ended": ("operator_id", "ended_at"),
     "peer_declared": ("peer_id", "transport", "policy"),
     "peer_removed": ("peer_id",),
     "peer_keyed": ("peer_id", "token_sha256"),
@@ -448,8 +455,15 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
     "lease_acquired": ("note",),
     "budget_stated": ("window",),
     "line_held": ("cause",),
-    "run_started": ("commit", "checkout", "tree", "workdir_commit"),
-    "run_ended": ("output_tail",),
+    "run_started": (
+        "commit",
+        "checkout",
+        "tree",
+        "workdir_commit",
+        "dirty_paths",
+        "admitted_by",
+    ),
+    "run_ended": ("output_tail", "coverage"),
     "line_configured": ("sealed",),
     "disclosure_checked": ("checked_bytes",),
     "line_cost_recorded": ("estimated", "between", "partial"),
@@ -483,7 +497,13 @@ commit run and every run whose tree could not be read, and refuses the log once 
 run in a working directory records its tree. ``workdir_commit`` was added to
 ``run_started`` in round 16, item 3, after ``tree``, so a daemon that predates it
 still reads every run whose worktree commit could not be read, and refuses the log
-once a run in a worktree is recorded with its commit."""
+once a run in a worktree is recorded with its commit. ``dirty_paths`` and
+``admitted_by`` were added to ``run_started``, and ``coverage`` to ``run_ended``, in
+round 18, item 1 and item 2, so a daemon that predates them still reads every run that
+records none of them, and refuses the log once a run records one. A run in a worktree
+whose status was read records ``dirty_paths``, so a daemon that predates it refuses the
+log of nearly every run of the next gate, which is the rollback hazard
+``docs/protocol/EVENT_LOG.md`` states."""
 
 
 def _without_nulls(kind: str, data: dict[str, object]) -> dict[str, object]:
@@ -855,6 +875,8 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "checkout": event.checkout,
                 "tree": event.tree,
                 "workdir_commit": event.workdir_commit,
+                "dirty_paths": event.dirty_paths,
+                "admitted_by": event.admitted_by,
             }
         case RunEnded():
             return "run_ended", {
@@ -866,6 +888,11 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "note": event.note,
                 "ended_at": event.ended_at,
                 "output_tail": event.output_tail,
+                "coverage": (
+                    None
+                    if event.coverage is None
+                    else [f"{name}={count}" for name, count in event.coverage]
+                ),
             }
         case RunCleared():
             return "run_cleared", {
@@ -895,6 +922,18 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "workdir_commit": event.workdir_commit,
                 "queued_at": event.queued_at,
                 "reason": event.reason,
+            }
+        case RunAdmitted():
+            return "run_admitted", {
+                "operator_id": event.operator_id,
+                "admitted_at": event.admitted_at,
+                "expires_at": event.expires_at,
+                "reason": event.reason,
+            }
+        case RunAdmissionEnded():
+            return "run_admission_ended", {
+                "operator_id": event.operator_id,
+                "ended_at": event.ended_at,
             }
         case RunDequeued():
             return "run_dequeued", {
@@ -1253,6 +1292,8 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _optional_str(data, "checkout"),
                 _optional_str(data, "tree"),
                 _optional_str(data, "workdir_commit"),
+                _optional_int(data, "dirty_paths"),
+                _optional_str(data, "admitted_by"),
             )
         case "run_ended":
             return RunEnded(
@@ -1264,6 +1305,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "note"),
                 _str(data, "ended_at"),
                 _optional_str(data, "output_tail"),
+                _coverage(data),
             )
         case "run_cleared":
             return RunCleared(
@@ -1294,6 +1336,15 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _str(data, "queued_at"),
                 _str(data, "reason"),
             )
+        case "run_admitted":
+            return RunAdmitted(
+                _str(data, "operator_id"),
+                _str(data, "admitted_at"),
+                _str(data, "expires_at"),
+                _str(data, "reason"),
+            )
+        case "run_admission_ended":
+            return RunAdmissionEnded(_str(data, "operator_id"), _str(data, "ended_at"))
         case "run_dequeued":
             return RunDequeued(
                 _str(data, "queue_id"),
@@ -1389,6 +1440,21 @@ def _arguments(data: dict[str, object]) -> tuple[tuple[str, str], ...]:
         if not separator:
             raise DecodeError("an argument has no =")
         pairs.append((name, value))
+    return tuple(pairs)
+
+
+def _coverage(data: dict[str, object]) -> tuple[tuple[str, int], ...] | None:
+    """The counts of a ``run_ended``, each written ``name=count``, or ``None`` when the
+    field is null. A name holds no ``=``, so the split is exact, and a count that is
+    not digits is refused, never read leniently."""
+    if data["coverage"] is None:
+        return None
+    pairs: list[tuple[str, int]] = []
+    for item in _list(data, "coverage", str):
+        name, separator, count = item.partition("=")
+        if not separator or not count.isascii() or not count.isdigit():
+            raise DecodeError("a coverage count is not name=digits")
+        pairs.append((name, int(count)))
     return tuple(pairs)
 
 

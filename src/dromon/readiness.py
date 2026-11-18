@@ -158,11 +158,26 @@ class Uncovered(StrEnum):
 class TreeUncovered(RuntimeError):
     """``tree_digest`` cannot give a digest that would move with every edit it
     covers. ``cause`` says why in a fixed word, apart from the message, which may
-    name a path."""
+    name a path. ``dirty`` is how many paths ``git status`` listed, which was read
+    before the digest failed, so a receipt can still say that the tree was not clean."""
 
-    def __init__(self, message: str, cause: Uncovered) -> None:
+    def __init__(
+        self, message: str, cause: Uncovered, dirty: int | None = None
+    ) -> None:
         super().__init__(message)
         self.cause = cause
+        self.dirty = dirty
+
+
+@dataclass(frozen=True, slots=True)
+class TreeSnapshot:
+    """What one read of ``git status`` gives of a working directory. **Round 18,
+    item 2.** ``digest`` is ``tree_digest``'s, and ``dirty`` counts every path the
+    status listed, changed or untracked, so ``0`` is a clean tree. Both come from the
+    same read, so a receipt's digest and its dirty count describe one moment."""
+
+    digest: str
+    dirty: int
 
 
 def tree_digest(worktree: Path) -> str:
@@ -189,23 +204,36 @@ def tree_digest(worktree: Path) -> str:
     does not follow, and a path deleted between the status and the stat. **A
     residual.** Where ``core.worktree`` is set and a file of the same name happens
     to lie beside the ``.git`` entry, that file is stated instead."""
+    return tree_snapshot(worktree).digest
+
+
+def tree_snapshot(worktree: Path) -> TreeSnapshot:
+    """``tree_digest``'s digest with the count of every path ``git status`` listed,
+    from one read of the status. **Round 18, item 2.** Raises what ``tree_digest``
+    does, and a ``TreeUncovered`` carries the count. Blocking."""
     output = _status(worktree)
     head = workdir.read_head_commit(worktree) or ""
     top = workdir.checkout_top(worktree)
     entries = _tracked_changes(output)
+    dirty = parse_porcelain(output).total
     if len(entries) > MAX_TREE_PATHS:
         raise TreeUncovered(
             f"{len(entries)} tracked paths are changed in {worktree}, more than"
             f" {MAX_TREE_PATHS}",
             Uncovered.TOO_MANY_PATHS,
+            dirty,
         )
     digest = hashlib.sha256()
     digest.update(head.encode("ascii", "replace") + b"\0")
     digest.update(f"{len(entries)}\0".encode("ascii"))
     for entry, path in entries:
         digest.update(entry.encode("utf-8", "surrogateescape") + b"\0")
-        digest.update(_path_stamp(top, entry[:2], path))
-    return digest.hexdigest()
+        try:
+            digest.update(_path_stamp(top, entry[:2], path))
+        except TreeUncovered as error:
+            error.dirty = dirty
+            raise
+    return TreeSnapshot(digest.hexdigest(), dirty)
 
 
 def _tracked_changes(output: str) -> list[tuple[str, str]]:
