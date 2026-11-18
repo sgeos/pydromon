@@ -125,7 +125,14 @@ Nothing here touches the running daemon or its checkout.
    client. FROM's client is used, since a client and a daemon of revisions far apart may
    not share every request.
 2. **Take the final copy.** Copy the state again, as above, now that nothing writes.
-   This copy is the rollback point. Run `upgrade-check` on it once more.
+   This copy is the rollback point. Run `upgrade-check` on it once more. Copy also the
+   launch records, the files `.dromon/left/*.launch`, into the same private directory,
+   since the step after the upgrade on processes FROM started reads them and the first
+   start under TO removes them. Each is a small JSON document naming the launcher's
+   pid, the harness's pid, which is also its process group, and the harness's command.
+   **Inference.** A clean stop sweeps the records of launchers that have exited, so
+   the directory is usually empty after one, and records remain after a crash, a kill,
+   or a launcher that outlived the stop.
 3. **Move the checkout to TO**, and run `uv sync --locked` in it.
 4. **Apply the project file changes** the `start` check needed.
 5. **Check and start.** Run `uv run dromond --project ROOT --check`, which runs the same
@@ -144,6 +151,42 @@ Nothing here touches the running daemon or its checkout.
   `dromon renew LINE`, which keeps its mail, brief and files.
 - **Roles.** A role the project file no longer names is left as it was, and the start
   says so. Read `dromon role` and retire or update what is no longer wanted.
+- **Processes FROM started.** **Fact, from the code of pull request 166.** From that
+  pull request the daemon's sweep of launch records fails closed. It tells a process
+  from another that was given the same pid only by the start times a launcher records,
+  and a record written by a revision before it carries none. At the first start under
+  TO, a launcher of FROM that still runs is taken as running and its record is kept.
+  Once a launcher has exited, its record is removed and nothing is signalled, so an
+  orphan of FROM's engines, such as a background process a tool started, is never
+  ended by TO and is left to the operator. The daemon's output,
+  `dromond.log` in the runtime directory, says so for each such record with
+  `a launch record of LINE was not swept: the record has no start time for the
+  harness`. A record kept for a running launcher is handled the same way at the
+  first sweep after that launcher exits. A TO before pull request 166 still
+  recognises a harness by its command, as FROM did.
+  1. **List them.** A line's `list_processes` does not show them, since the mark it
+     finds a line's processes by holds a token the daemon makes afresh in each run.
+     Use `ps` outside every line, as the daemon's user.
+
+     ```sh
+     ps -e -o pid,ppid,pgid,lstart,command
+     ```
+
+     For each launch record copied before the start, the rows whose `pgid` is the
+     record's `harness` are its harness's group. A descendant that left the group is
+     found by following `ppid` from them, or by a parent of 1 with the engine's or a
+     tool's command. A process is FROM's only if its `lstart` is earlier than FROM's
+     stop.
+  2. **End an orphan by hand.** A pid is reused, so read `ps` again just before
+     signalling, and signal only a process whose pid, start time and command all
+     still match. Send `kill -TERM PID`, then `kill -CONT PID`, which wakes a process
+     its launcher left stopped. After some seconds read `ps` again, and send
+     `kill -KILL PID` to what remains. A whole group is signalled with
+     `kill -TERM -- -PGID` only once every member is confirmed. A process of another
+     user, or one that started after FROM's stop, is not FROM's and is left alone.
+  3. **When nothing was recorded.** Where `.dromon/left` held no launch record, the
+     daemon has nothing to name, and a process FROM's engines left is found only by
+     its command and start time in the same listing.
 
 ## Rolling back
 

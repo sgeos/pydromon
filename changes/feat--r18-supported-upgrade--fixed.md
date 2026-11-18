@@ -23,3 +23,7 @@ Type: Fixed
   a check killed with `kill -9`, which holds a copy of the log, is removed by the
   next check. `UPGRADE.md` no longer advises `sqlite3 .backup` on a running daemon,
   and says what to copy after a crash.
+- `UPGRADE.md` keeps the launch records with the final copy and, after the upgrade,
+  lists the processes FROM started with `ps` and ends any orphan by hand, since from
+  pull request 166 a launch record written before start times were recorded is
+  removed with nothing signalled.
