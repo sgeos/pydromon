@@ -421,9 +421,20 @@ reader and the decision, and is a pure function of the file's text and the time.
 | `critical` | deferred, unless only disk raised it | deferred |
 | stale, missing or unreadable | deferred, as an unknown reason | starts, with a warning |
 
-**A deferral.** A run's start is refused with `RunRefused`, naming the status and saying
-that nothing was started and that the line should wait with `wake_after` and start it
-again, so the line is told by its own tool's answer. The operator is told once for the
+**One wording. Round 18, item 4.** The table is stated once in words, as
+`machinestatus.POLICY`, and the advice a line reads, `machinestatus.advice`, is derived
+from the decision. The warning a turn proceeds with, the refusal of a run, the
+`start_run` tool's description and `line_status`, as `advice` and `policy`, each give
+those sentences and no others. Before, the turn's warning told a line at `elevated`
+raised only by free disk space to start nothing heavy, such as a full gate, while the
+decision let the gate start, so a line that obeyed waited for nothing. That case is now
+told that runs are not held back and that a full gate may start. **Residual.** The
+project's own instructions to its lines are the operator's and are not derived from
+this source, so they can still word the rule differently.
+
+**A deferral.** A run's start is refused with `RunRefused`, naming the status, saying
+that nothing was started, and giving the advice, which says that a `start_run` now
+waits in the queue and begins by itself, so the line is told by its own tool's answer. The operator is told once for the
 deferral, by a note from the harness, and again only after a status that deferred nothing
 has intervened. A turn is not started and the line's mail waits. The line is told once by
 a harness note, which it reads with the mail that waited, and the operator once for the
@@ -1058,7 +1069,7 @@ commit run is stopped with the same access it was started with.
    against renaming a parent of a denied path remains the first barrier, as
    [`SANDBOX.md`](../protocol/SANDBOX.md) gives.
 2. It makes `commit-runs/RUN`, mode 0700, in the daemon's state directory, holding
-   `home`, empty and mode 0700, and `tree`, filled with `git clone --no-checkout
+   `run-home`, empty and mode 0700, and `tree`, filled with `git clone --no-checkout
    --shared` of the project's repository, then an `info/attributes` of `* -filter` in
    the clone, then `git checkout --detach COMMIT`, then a check that `HEAD` is the
    commit. A clone writes nothing into the project's own repository, as `git worktree
@@ -1067,7 +1078,7 @@ commit run is stopped with the same access it was started with.
    there, so it is in the state directory instead, which every line's sandbox denies.
    The start makes or checks `commit-runs` with the other private directories.
 3. The run then starts as any run does, with `tree` as its command's working
-   directory, `home` as its `HOME`, uv's `UV_PYTHON` and `UV_PYTHON_DOWNLOADS` as
+   directory, `run-home` as its `HOME`, uv's `UV_PYTHON` and `UV_PYTHON_DOWNLOADS` as
    "The interpreter" below gives, and its output file under `tmp/runs` in the
    reading line's working directory, which the daemon writes, not the line, as it
    writes the output of any run.
@@ -1134,11 +1145,11 @@ nothing.
   reading line's working directory. So a commit's code can print anything the
   operator's user can read, such as a credential, and a reading seat that could not
   read it itself can then read it in the output. This is the exposure an ordinary run
-  gives a writing line, now given to a reader too. The fresh `home` only keeps the
+  gives a writing line, now given to a reader too. The fresh home only keeps the
   operator's settings, credentials and caches from being found by `HOME`. It is not a
   confinement, since the command can still name any path.
 - **What is not shared.** The checkout has no virtual environment, so the command makes
-  its own, with `uv sync --locked` in its first step. Its `HOME` is the fresh `home`,
+  its own, with `uv sync --locked` in its first step. Its `HOME` is the fresh home,
   so uv starts with an empty cache and fetches the packages again, given the network.
   Nothing of a line's uncommitted work reaches it.
 - **The interpreter.** **Fact, observed on 2026-11-05.** A commit run with the fresh
@@ -1155,6 +1166,37 @@ nothing.
   **Assumption.** The daemon runs from the project's environment. One started from
   another interpreter gives commit runs that interpreter. Nothing makes the
   interpreter read-only, since the command runs outside every sandbox.
+- **Round 18, item 2. The review gate's environment.** **Fact, from the run outputs and
+  `git merge-base`.** The review gate runs that failed at collection for want of Tk,
+  `r-c704cb3c0e07` on 2026-11-05 and `r-6d12763e52a8` on 2026-11-16, both used
+  `/opt/local/bin/python3`, and both ran under daemons that did not hold the fix above,
+  `3ba663e`, which reached `main` only in `aa45ba3` on 2026-11-16. **Fact.** Run
+  `r-47d1a0b867ce` of `review-gate` on `4b1e2dd`, under daemon `3efb5bb`, which holds
+  the fix, chose the daemon's own Python 3.12.12, collected every test and ran them
+  all, and ended with 7 failed and 7848 passed. **Fact, confirmed by reproducing each.**
+  All 7 came from where the run's paths lie, not from the code under test. Six probes
+  in `tests/test_sign_in.py` took the project from the working directory, the checkout
+  deep in the state directory, so the default socket path was 105 bytes and each probe
+  stopped at that check. They now run in a short private directory of their own, and
+  from a working directory deep enough to fail before they pass. The seventh, the
+  scrubber's fixture test in `tests/test_evidence.py`, takes the user name from the
+  last part of `HOME`, and the fresh home was called `home`, a word every scrubbed
+  recording holds. It is now `run-home`, and a test checks that a scrubbed home is not
+  read as naming it. **Fact, observed on 2026-11-18.** With a fresh empty home, the
+  gate's git tests and its Tk tests pass, so the gate needs nothing else of the
+  operator's home. The caches the audit found unwritable were a reading seat's local
+  gate in its own worktree, which that seat may not write. A commit run writes its
+  caches in its fresh home and its checkout, both its own. `tests/test_commitruns.py`
+  now runs a commit command that checks the named interpreter imports Tk whenever the
+  gate's interpreter does, and that the fresh home, mode 0700, takes a cache file, so a
+  change that loses either fails the gate. **Not yet observed.** A review gate run on a
+  commit holding these fixes, which needs the operator to push one and restart the
+  daemon, since the run's home is named by the daemon's code. **Residual.** A test
+  that reads the working directory as its project, or the last part of `HOME` as the
+  user, can fail in a commit run alone, and neither the sandbox gate nor `full-gate`
+  shows it. **Residual.** A daemon started from an interpreter without Tk gives
+  commit runs that interpreter, and the gate then fails as before. The run fetches its
+  packages again each time, given the network, since the cache is not shared.
 
 **What a green commit run proves.** **Round 14, review of 1449c5c, C4.** Exit code 0
 means that the commit's own command, such as its own `scripts/check.sh`, exited 0 in

@@ -92,6 +92,7 @@ include = [
     "scripts/assemble_changelog.py",
     "scripts/assemble_floors.py",
     "scripts/ci_pythons.py",
+    "scripts/state_pin.py",
 ]
 # Naming extraPaths drops pyright's automatic src entry, after which dromon resolves as
 # the installed library and every test import of a private name fails, so src is listed.

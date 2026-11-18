@@ -302,7 +302,11 @@ without either may be missing. `failed` is written with every failed turn, so a 
 daemon built from `feat/mail-and-roles` has run for any while has most likely passed
 that floor. Most other changes appear only when a party uses the feature.
 `dromond` checks a log only forward, so a rollback past a floor is found when the
-older daemon refuses the log at its start, not before.
+older daemon refuses the log at its start, not before. **Round 18, item 1.**
+`dromon upgrade-check --from-commit FROM` reads this table and the fragments, and
+names each change whose floor FROM does not contain, before an upgrade, as
+[`UPGRADE.md`](../architecture/UPGRADE.md) gives. A row is parsed only in this
+table's form, with its floor the last commit in backticks in the third column.
 
 **Scheduled wakes.** **Decided by the operator on 2026-10-26.** A line schedules a wake
 for itself with the `wake_after` tool, as [`LINE_CONFIG.md`](LINE_CONFIG.md)

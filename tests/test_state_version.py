@@ -16,21 +16,21 @@ written once, before the pin reached ``main``.
 
 How to answer a failure. A branch that changed the codec's types or the replayed state
 adds ``src/dromon/statechanges/BRANCH.txt``, and then the pin file the failure names,
-with the content it gives. A merge of two such branches needs a pin for the set they
-make together, which the failure also names. A pin is never edited, since editing one
-would accept a change without a new version. The history replayed is ``SCENARIO``
-from ``conftest.py``, which the codec's tests keep covering every event kind, and then
-enough disclosure checks to pass each of their caps. A change of meaning for an event
-the history does not reach is left to ``dromond --check`` and to the check after each
-start from a snapshot. **Residual, inference from reading ``State.apply``.** Its other
-caps, ``MAX_TASK_RECORDS``, ``MAX_CORRELATIONS`` and
+with the content it gives, which ``scripts/state_pin.py`` writes. **Round 18, item
+3.** The pin's computation lives in that script, which this test imports, so the
+command and the test compute one pin. A merge of two such branches needs a pin for the
+set they make together, which the failure also names. A pin is never edited, since
+editing one would accept a change without a new version. The history replayed is
+``SCENARIO`` from ``conftest.py``, which the codec's tests keep covering every event
+kind, and then enough disclosure checks to pass each of their caps. A change of
+meaning for an event the history does not reach is left to ``dromond --check`` and to
+the check after each start from a snapshot. **Residual, inference from reading
+``State.apply``.** Its other caps, ``MAX_TASK_RECORDS``, ``MAX_CORRELATIONS`` and
 ``MAX_REQUEST_KEYS_PER_PARTY``, and the saturation at ``MAX_COST_MICRO_USD``, are not
 reached by the history either, so a change to one is not caught here."""
 
 import enum
-import hashlib
 import os
-import re
 import shutil
 import sys
 from collections.abc import Generator, Iterator, Mapping
@@ -42,108 +42,22 @@ from typing import Literal
 import pytest
 
 from dromon import model, statesnapshot
-from dromon.model import DisclosureChecked, Event, HoldCause, State
+from dromon.model import Event, HoldCause
+from state_pin import (
+    PIN_DIRECTORY,
+    RETAINED_FAILURES,
+    RETAINED_PASSES,
+    Pin,
+    current,
+    disclosure_history,
+    parse_pin,
+    pin_path,
+    pin_text,
+    pinned_history,
+    replay,
+    replay_digest,
+)
 from dromon import spawn
-
-PIN_DIRECTORY = Path(__file__).parent / "state_pins"
-
-DIGEST = re.compile(r"[0-9a-f]{64}")
-
-
-@dataclass(frozen=True)
-class Pin:
-    version: str
-    codec: str
-    replay: str
-    changes: tuple[str, ...]
-
-
-def pin_path(version: str) -> Path:
-    return PIN_DIRECTORY / f"{version[:16]}.txt"
-
-
-def pin_text(pin: Pin) -> str:
-    lines = [f"version {pin.version}", f"codec {pin.codec}", f"replay {pin.replay}"]
-    return "".join(
-        f"{line}\n" for line in (*lines, *(f"change {c}" for c in pin.changes))
-    )
-
-
-def parse_pin(text: str) -> Pin:
-    """A pin file, or ``ValueError`` for any other form."""
-    fields: dict[str, str] = {}
-    changes: list[str] = []
-    for line in text.splitlines():
-        key, _, value = line.partition(" ")
-        if key == "change":
-            changes.append(value)
-        elif key in ("version", "codec", "replay") and key not in fields:
-            if DIGEST.fullmatch(value) is None:
-                raise ValueError(f"{key} is not a SHA-256 digest")
-            fields[key] = value
-        else:
-            raise ValueError(f"unexpected line {line!r}")
-    if len(fields) != 3 or not changes:
-        raise ValueError("a pin needs version, codec, replay and at least one change")
-    pin = Pin(fields["version"], fields["codec"], fields["replay"], tuple(changes))
-    if pin_text(pin) != text:
-        raise ValueError("a pin is written in the form pin_text gives")
-    return pin
-
-
-RETAINED_FAILURES = 30
-RETAINED_PASSES = 150
-"""How many failing and passing disclosure checks the pinned history adds for one
-line. They are fixed numbers, not derived from the caps, so a change of a cap changes
-which checks the state keeps, and so the replay digest. A test fails if a cap is
-raised to or past them."""
-
-
-def disclosure_history() -> tuple[DisclosureChecked, ...]:
-    """**Review of 0db077c, informational, decided by the operator as item 6.** How
-    many disclosure checks the state keeps for a line is part of what applying an
-    event means, since a snapshot kept under one cap and restored under another
-    differs from a full replay. ``SCENARIO`` held two checks, which reach no cap, so a
-    changed cap left the pin unmoved. These reach past ``MAX_DISCLOSURE_CHECKS``,
-    ``MAX_DISCLOSURE_PASSES`` and ``MAX_DISCLOSURE_SIZES``, and every fourth pass
-    has no byte count, as a tool's refusal has none."""
-    events: list[DisclosureChecked] = []
-    for number in range(RETAINED_FAILURES + RETAINED_PASSES):
-        failed = number % 6 == 0
-        hour, rest = divmod(number, 3600)
-        at = f"2026-10-29T{hour:02d}:{rest // 60:02d}:{rest % 60:02d}Z"
-        size = None if not failed and number % 4 == 1 else 1000 + number
-        events.append(DisclosureChecked("alpha", at, 3 if failed else 0, size))
-    return tuple(events)
-
-
-def pinned_history(scenario: tuple[Event, ...]) -> tuple[Event, ...]:
-    """The history the pin replays, ``SCENARIO`` and then ``disclosure_history``."""
-    return (*scenario, *disclosure_history())
-
-
-def replay(history: tuple[Event, ...]) -> State:
-    state = State()
-    for event in history:
-        state.check(event)
-        state.apply(event)
-    return state
-
-
-def replay_digest(history: tuple[Event, ...]) -> str:
-    encoded = statesnapshot.canonical(
-        statesnapshot.encode_value(replay(history), State)
-    )
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def current(scenario: tuple[Event, ...]) -> Pin:
-    return Pin(
-        statesnapshot.STATE_VERSION,
-        statesnapshot.codec_digest(),
-        replay_digest(pinned_history(scenario)),
-        statesnapshot.STATE_CHANGES,
-    )
 
 
 def test_the_history_reaches_past_every_disclosure_cap(
@@ -184,7 +98,7 @@ def test_the_state_version_is_pinned_with_the_codec_and_a_replay(
     assert path.exists(), (
         "no pin names this set of state changes. If this is a merge of branches"
         " that each changed the state, or a branch that added its state change"
-        f" file, {added}"
+        f" file, run uv run python scripts/state_pin.py, which writes it, or {added}"
     )
     pinned = parse_pin(path.read_text(encoding="utf-8"))
     assert pinned == now, (

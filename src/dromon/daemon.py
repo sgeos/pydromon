@@ -4146,6 +4146,7 @@ def run(
     hold_wakes: bool = False,
     check_only: bool = False,
     launch_checks: bool = False,
+    observe: Callable[[EventLog], None] | None = None,
 ) -> int:
     """Run the daemon for ``paths`` in the foreground and return its exit status.
 
@@ -4164,6 +4165,11 @@ def run(
     made and none is removed, the process table is not probed, and recovery, which
     runs in ``serve``, does not run. ``docs/protocol/RESTART.md`` says what the
     check therefore cannot find.
+
+    **Round 18, item 1.** ``observe``, with ``check_only``, is given the copy of the
+    log once every check has passed, after the start applied the project file to it,
+    so ``dromon upgrade-check`` can say which lines the started daemon would hold. It
+    must only read.
     """
     os.umask(0o077)
     given = overrides or Overrides()
@@ -4365,6 +4371,8 @@ def run(
                     # checks, so it is as near the stop as the check comes.
                     since = snapshot_since_held(snapshot_path(paths.event_log), held)
                     print(f"dromond: {since}", file=sys.stderr)
+                    if observe is not None:
+                        observe(log)
                     print(CHECK_PASSED, file=sys.stderr)
                     return exits.OK
                 entry = open_registration(

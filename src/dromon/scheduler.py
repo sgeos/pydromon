@@ -3705,6 +3705,9 @@ class Scheduler:
             "monitor": self._monitor_trouble(status),
             "defers_runs": decision.defer_runs,
             "defers_turns": decision.defer_turns,
+            # **Round 18, item 4.** The same words the notices use, from one source.
+            "advice": machinestatus.advice(decision) or None,
+            "policy": machinestatus.POLICY,
         }
 
     def machine_decision(self) -> machinestatus.Decision:
@@ -3934,9 +3937,8 @@ class Scheduler:
             )
         return (
             f"the run is deferred, since {deferral.reason}. Nothing was started. It can"
-            f" start {deferral.resumes}. This machine is shared, so wait with"
-            " wake_after and start it again then, or start it with the queue, which"
-            " begins it by itself, and say in your report that you waited"
+            f" start {deferral.resumes}. This machine is shared."
+            f" {machinestatus.advice(self.machine_decision())}"
         )
 
     def _note_turn_deferral(self, line_id: str) -> None:
@@ -3976,7 +3978,11 @@ class Scheduler:
         if deferred is not None:
             waited = int((self._wall_clock() - deferred).total_seconds())
             parts.append(f"Your turn was deferred for {waited} seconds by the status.")
-        if status is not None and machinestatus.decide(status).warn:
+        decision = None if status is None else machinestatus.decide(status)
+        if status is not None and decision is not None and decision.warn:
+            # **Round 18, item 4.** The advice is the module's, from the decision,
+            # so a level raised only by disk no longer tells a line to hold a gate
+            # that ``decide`` lets start.
             words = self._machine_words(status)
             # Round 18, item 3. The condition is the run deferral's own, so this note
             # and a refused start say one thing. Where the status does not defer runs,
@@ -3988,9 +3994,11 @@ class Scheduler:
                 else f"a run can start, which is {deferral.resumes}"
             )
             parts.append(
-                f"{words[:1].upper()}{words[1:]}. This machine is shared,"
-                f" so start nothing heavy, such as a full gate, until {until}, and"
-                " say so in your report if you wait. Your turn proceeds."
+                f"{words[:1].upper()}{words[1:]}. This machine is shared."
+                f" {machinestatus.advice(decision)}"
+                + ("" if deferral is None else f" Runs wait until {until}.")
+                + " Your turn proceeds."
+                + self._machine_cause(status)
             )
         return "Dromon note: " + " ".join(parts) if parts else None
 
@@ -7069,7 +7077,8 @@ class Scheduler:
                     " A command with parameters, which run_status lists with their"
                     " patterns, takes a value for each in arguments. A start that"
                     " waits only for the machine status or the project's slot is"
-                    " queued, in order, and begins by itself."
+                    " queued, in order, and begins by itself. "
+                    + machinestatus.RUNS_HELD_WHEN
                 ),
                 input_schema=START_RUN_SCHEMA,
                 handler=start,

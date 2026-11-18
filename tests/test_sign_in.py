@@ -120,8 +120,16 @@ def no_engine(*_: Any, **__: Any) -> Any:  # noqa: ANN401
 
 
 @pytest.fixture
-def no_turns(monkeypatch: pytest.MonkeyPatch) -> None:
+def no_turns(monkeypatch: pytest.MonkeyPatch, short_runtime: Path) -> None:
+    """No engine is built, and the probe runs in a short private project.
+
+    **Round 18, item 2.** These probes take the project from the working directory,
+    so in review gate ``r-47d1a0b867ce``, whose checkout lies deep in the state
+    directory, the default socket path was 105 bytes and every probe stopped at that
+    check before reaching the one tested. The project is now a short directory of
+    the test's own, so the tests do not depend on where the gate runs."""
     monkeypatch.setattr(cli, "engine_factory", no_engine)
+    monkeypatch.chdir(short_runtime.parent)
 
 
 @pytest.mark.usefixtures("no_turns")
