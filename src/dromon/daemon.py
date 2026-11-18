@@ -884,6 +884,8 @@ class Daemon:
                 | Operation.ROLE_DELETE
                 | Operation.RETIRE_LINE
                 | Operation.RUN_CLEAR
+                | Operation.RUN_ADMIT
+                | Operation.RUN_ADMIT_END
                 | Operation.SCRATCH_PLACE
                 | Operation.RUNS
                 | Operation.OVERVIEW
@@ -1024,6 +1026,12 @@ class Daemon:
                         "operator": operator,
                         "cleared_at": cleared.cleared_at,
                     }
+                case Operation.RUN_ADMIT:
+                    result = self._run_admit(request.args)
+                case Operation.RUN_ADMIT_END:
+                    (operator,) = _text_args(request.args, ("operator",))
+                    ended = self.scheduler.end_admission(OperatorAddress(operator))
+                    result = {"operator": operator, "ended_at": ended.ended_at}
                 case Operation.SCRATCH_PLACE:
                     line_id, path, text, operator = _text_args(
                         request.args, ("line_id", "path", "text", "operator")
@@ -1041,7 +1049,10 @@ class Daemon:
                     names = ("run_id",) if "run_id" in request.args else ()
                     values = _text_args(request.args, names)
                     found = self.scheduler.runs_view(values[0] if values else None)
-                    result = {"runs": cast(object, found)}
+                    result = {
+                        "runs": cast(object, found),
+                        "admission": cast(object, self.scheduler.admission_view()),
+                    }
                 case Operation.OVERVIEW:
                     # Round 16, item 1. The line's own view, read only.
                     (line_id,) = _text_args(request.args, ("line_id",))
@@ -1315,6 +1326,31 @@ class Daemon:
             "withdrawn_questions": list(retired.withdrawn_questions),
             "withdrawn_wake": retired.withdrawn_wake,
             **lost,
+        }
+
+    def _run_admit(self, args: dict[str, object]) -> dict[str, object]:
+        """The operator's override of the machine status. **Round 18, item 1.** Takes
+        ``operator``, and optionally ``seconds``, a whole number, and ``reason``."""
+        allowed = {"operator", "seconds", "reason"}
+        if "operator" not in args or not set(args) <= allowed:
+            raise ProtocolError(
+                ErrorCode.BAD_REQUEST,
+                f"run_admit takes {sorted(allowed)}, with operator",
+            )
+        texts = {key: args[key] for key in ("operator", "reason") if key in args}
+        names = tuple(sorted(texts))
+        values = dict(zip(names, _text_args(texts, names), strict=True))
+        seconds = args.get("seconds")
+        if seconds is not None and type(seconds) is not int:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "seconds is not a whole number")
+        admitted = self.scheduler.admit_runs(
+            OperatorAddress(values["operator"]), seconds, values.get("reason", "")
+        )
+        return {
+            "operator": admitted.operator_id,
+            "admitted_at": admitted.admitted_at,
+            "expires_at": admitted.expires_at,
+            "reason": admitted.reason,
         }
 
     def _budget_set(self, args: dict[str, object]) -> dict[str, object]:
