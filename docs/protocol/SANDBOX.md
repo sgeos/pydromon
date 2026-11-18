@@ -232,6 +232,34 @@ project settings.
    while the file tools stay denied by the settings. **Residuals.** A directory made
    after the build is denied from the line's next build. A line whose sandbox is
    disabled can read them with its shell.
+   **Round 18, the operator's security fix.** The known credential paths,
+   `security_paths.CREDENTIAL_PATHS`, are protected in the same way for every Claude
+   Code line. Each is taken under the real path of the daemon's home, where it exists
+   when the line's engine is built, by that name and by its real path. Codex and Grok
+   lines have had them since round 9. The file tools are denied each path itself as
+   well as what lies under it, with `Read(//PATH)` and `Edit(//PATH)` beside the
+   `/**` rules, since several entries, such as `~/.netrc` and `~/.claude.json`, are
+   files. A grant of a path inside one, or of the path itself, is refused as above,
+   and so is an agent socket of `[git_ssh]` inside one. A grant of a directory that
+   holds one, such as the home, is accepted, and the deny entry wins over it.
+   **Why the lines differed.** **Fact, from `projectconfig.py`.** A `profile` is
+   expanded only for the lines the project file declares. **Fact, from the
+   confinement checks of 2026-11-18.** Lines the client created reported the home
+   ssh directory listable and Codex's sign-in file readable. Lines the project file
+   declares reported both denied. **Inference.** The dogfood project's Claude Code
+   profile, as [`DOGFOOD.md`](../process/DOGFOOD.md) gives it, carries `Read` deny
+   rules for those paths, and Claude Code also applies a `Read` deny rule to its
+   sandbox, so only the lines given that profile had them. Before this fix the rule
+   came from the project's own documents. Dromon itself denied a Claude Code line
+   only the protected and secret directories. **What Claude Code keeps.** Nothing,
+   as `security_paths.CLAUDE_CODE_EXEMPT` records, read from the bundled Claude Code
+   2.1.310. Its sign-in lives in the system keychain, or else in
+   `~/.claude/.credentials.json`, and its account in `~/.claude.json`. The engine's
+   own process reads both, and neither the sandbox nor the rules confine that
+   process. **Residuals.** The list is not exhaustive. The keychain is not a path,
+   and whether a command in an enabled sandbox can ask it for an item was not
+   tested. A line whose sandbox is disabled can read every listed path with its
+   shell, as it can every protected one.
 4. **Git hooks and configuration.** When the line's working directory lies in a git
    checkout, an enabled sandbox also denies writes to the hooks and configuration git
    would act on there, whether or not any layer grants the git directory. A command

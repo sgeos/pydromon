@@ -175,6 +175,7 @@ from dromon import (
 )
 from dromon.linetemp import LineTemp
 from dromon.security_paths import project_secret_paths
+from dromon import security_paths
 from dromon.handoff import Handoff
 from dromon.handoff import select as select_handoff
 from dromon import requestkeys
@@ -2454,7 +2455,14 @@ def engine_factory(
         # denied to Claude Code lines as they have been to Codex and Grok lines since
         # round 9, in the sandbox for the shell and in the settings for the file tools.
         # A layer that grants one of them back is refused, as for any protected path.
-        sandbox = effective(merged, workdir, engine_protected, guarded)
+        # Round 18, the operator's security fix. The known credential paths under the
+        # daemon's real home are denied the same way, as they are to Codex and Grok
+        # lines, and the file tools are kept from each path itself as well, since a
+        # credential may be a file. Claude Code keeps none of them, as
+        # security_paths.CLAUDE_CODE_EXEMPT explains.
+        credentials = security_paths.claude_credentials()
+        claude_protected = (*engine_protected, *credentials)
+        sandbox = effective(merged, workdir, claude_protected, guarded)
         if enabled and git_ssh is not None and sandbox is not None:
             denied = unreadable(git_ssh, sandbox)
             if denied is not None:
@@ -2468,6 +2476,19 @@ def engine_factory(
                     settings,
                     engine_settings.parse_settings(
                         {"permissions": {"deny": _read_only_path_rules(read_only)}}
+                    ),
+                ]
+            )
+        if credentials:
+            settings = engine_settings.merge(
+                [
+                    settings,
+                    engine_settings.parse_settings(
+                        {
+                            "permissions": {
+                                "deny": engine_settings.credential_rules(credentials)
+                            }
+                        }
                     ),
                 ]
             )
@@ -2491,7 +2512,7 @@ def engine_factory(
             session_id=spec.session_id,
             sandbox=sandbox,
             settings=engine_settings.effective(
-                settings, engine_protected, write_protected
+                settings, claude_protected, write_protected
             ),
             observe=spec.observe,
             mark=spec.mark,

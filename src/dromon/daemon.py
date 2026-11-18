@@ -150,6 +150,7 @@ from dromon.workdir import (
     resolve_workdir,
 )
 from dromon.security_paths import project_secret_paths
+from dromon import security_paths
 from dromon.configview import (
     OVERRIDE,
     LineFacts,
@@ -3559,10 +3560,15 @@ def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
     protected = protected_dirs(paths, config.federation)
     # Round 17, review of 0db077c, finding 1. The secret directories are checked as
     # the scheduler protects them, so a document granting one is refused at start.
+    # Round 18, the operator's security fix. So are the credential paths under the
+    # daemon's home, which every Claude Code line is denied. Only Claude Code lines
+    # take a sandbox document, so checking each line's against them refuses nothing
+    # another engine could use.
+    credentials = security_paths.claude_credentials()
     effective(
         config.sandbox,
         paths.root,
-        (*protected, *project_secret_paths(paths.root, paths.root)),
+        (*protected, *project_secret_paths(paths.root, paths.root), *credentials),
     )
     for line in config.lines.values():
         check_plugins(line.config)
@@ -3571,7 +3577,7 @@ def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
         enabled = merged is not None and merged.enabled
         guarded = git_write_guards(workdir) if enabled else ()
         secrets = project_secret_paths(paths.root, workdir)
-        effective(merged, workdir, (*protected, *secrets), guarded)
+        effective(merged, workdir, (*protected, *secrets, *credentials), guarded)
     for role_id, role in sorted(config.roles.items()):
         worktree = resolve_workdir(role.workdir, paths.root, protected)
         for line_id in role.seats:
@@ -3609,7 +3615,11 @@ def git_ssh_access(
             document = effective(
                 merge([merged, sandbox_layer(access)]),
                 workdir,
-                (*protected, *project_secret_paths(paths.root, workdir)),
+                (
+                    *protected,
+                    *project_secret_paths(paths.root, workdir),
+                    *security_paths.claude_credentials(),
+                ),
                 git_write_guards(workdir),
             )
             denied = None if document is None else unreadable(access, document)

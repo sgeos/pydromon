@@ -595,7 +595,10 @@ git_ssh = true
   well-formed key is pinned, and never that the key is GitHub's. The operator must
   compare the fingerprints, as `ssh-keygen -lf` prints them, with the ones GitHub
   publishes before starting the daemon. Any of the three inside a directory Dromon protects is refused,
-  since an enabled sandbox denies it. No path may hold a control character, a quote, a
+  since an enabled sandbox denies it. **Round 18.** For a Claude Code line with an
+  enabled sandbox that includes the known credential paths under the daemon's home,
+  such as `~/.ssh`, so an agent socket or either file kept there is refused, and is
+  kept elsewhere, as [`SANDBOX.md`](SANDBOX.md) gives. No path may hold a control character, a quote, a
   backslash, `$` or `%`, which ssh would expand or read as part of its option. No
   host key is written into Dromon's code.
 - **Sandbox.** For a Claude Code line whose merged sandbox is enabled, Dromon merges
