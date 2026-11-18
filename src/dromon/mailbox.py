@@ -302,6 +302,7 @@ def _matches(
     unanswered_only: bool,
     sender: Address | None,
     issues_only: bool,
+    since: frozenset[str] | None = None,
 ) -> list[tuple[str, Message]]:
     """The messages of ``owner``'s mailbox that every given filter selects, oldest
     first. One place for the filters, so a page and the counts beside it, which
@@ -318,7 +319,19 @@ def _matches(
         and (not unanswered_only or counts_unanswered(state, message))
         and (sender is None or message.sender == sender)
         and (not issues_only or is_open_issue(message_id, message, replied))
+        and (since is None or message_id in since)
     ]
+
+
+def ids_after(state: State, message_id: str) -> frozenset[str]:
+    """The messages recorded after ``message_id``, in the state's order, which is the
+    log's. **Round 18, item 2.** ``dromon mail --since MESSAGE`` lists these, so the
+    message named, which may be one the operator sent, is itself left out. Raises
+    ``ValueError`` for a message the state does not hold."""
+    if message_id not in state.messages:
+        raise ValueError(f"message {message_id} is not known")
+    ids = list(state.messages)
+    return frozenset(ids[ids.index(message_id) + 1 :])
 
 
 def unread_outside(
@@ -330,6 +343,7 @@ def unread_outside(
     issues_only: bool = False,
     offset: int = 0,
     limit: int = MAX_PAGE,
+    since: frozenset[str] | None = None,
 ) -> tuple[int, int]:
     """The unread messages among the matches that fall before the page and after it,
     as ``listing`` would page them, so a reader of one page learns that newer mail
@@ -348,6 +362,7 @@ def unread_outside(
         unanswered_only=False,
         sender=sender,
         issues_only=issues_only,
+        since=since,
     )
     before = sum(1 for _, message in matches[:offset] if counts_unread(message, owner))
     after = sum(
@@ -367,6 +382,7 @@ def listing(
     issues_only: bool = False,
     offset: int = 0,
     limit: int = MAX_PAGE,
+    since: frozenset[str] | None = None,
 ) -> tuple[list[tuple[str, Message]], int]:
     """A page of ``owner``'s mailbox, oldest first, and the number of matches in all.
 
@@ -380,7 +396,11 @@ def listing(
     giving both is refused rather than answered with an empty page. **Round 14 task
     of 2026-11-01.** ``unanswered_only`` selects exactly what it counts in
     ``unanswered``, which never holds an own note, so it is refused beside
-    ``own_notes_only`` for the same reason."""
+    ``own_notes_only`` for the same reason.
+
+    **Round 18, item 2.** ``since``, when given, keeps only the messages it names,
+    which ``ids_after`` or the daemon's reading of send times gives, so an operator
+    can wait for new mail without first reading a baseline."""
     if offset < 0 or not 1 <= limit <= MAX_PAGE:
         raise ValueError(f"offset must be at least 0 and limit in [1, {MAX_PAGE}]")
     if unread_only and own_notes_only:
@@ -399,6 +419,7 @@ def listing(
         unanswered_only=unanswered_only,
         sender=sender,
         issues_only=issues_only,
+        since=since,
     )
     return matches[offset : offset + limit], len(matches)
 
@@ -445,6 +466,23 @@ def outcome(message_id: str, message: Message, replied: set[str]) -> str:
     return "unanswered"
 
 
+NO_REPLY_ASKED: Final = "asks no reply"
+"""The outcome a sender's view gives a note that is neither answered nor counted as
+unanswered, as one that asks no reply. **Round 18, item 5.**"""
+
+
+def sent_outcome(
+    state: State, message_id: str, message: Message, replied: set[str]
+) -> str:
+    """``outcome``, from the sender's side, with ``unanswered`` kept for a note the
+    recipient's count counts, as ``counts_unanswered`` decides, and
+    ``NO_REPLY_ASKED`` for any other note left open. **Round 18, item 5.**"""
+    found = outcome(message_id, message, replied)
+    if found == "unanswered" and not counts_unanswered(state, message):
+        return NO_REPLY_ASKED
+    return found
+
+
 def header(message_id: str, message: Message, replied: set[str]) -> str:
     """One line describing a received message without its body."""
     parts = [f"{message_id} from {message.sender}", message.kind.value]
@@ -469,7 +507,8 @@ class SentStatus:
     delivered: bool
     read: bool
     outcome: str
-    """``replied``, ``acknowledged``, ``corrected`` or ``unanswered``."""
+    """``replied``, ``acknowledged``, ``corrected``, ``answered in thread``,
+    ``unanswered`` as the recipient's count counts it, or ``asks no reply``."""
     delivery: str
     """``waiting``, ``delivered`` or ``read`` for local mail. Mail to a peer is
     ``waiting for peer``, ``delivered to peer``, ``returned`` with its code, or
@@ -503,7 +542,15 @@ def sent(
     offset: int = 0,
     limit: int = MAX_PAGE,
 ) -> tuple[list[SentStatus], int]:
-    """A page of the mail ``owner`` has sent, oldest first, and the number in all."""
+    """A page of the mail ``owner`` has sent, oldest first, and the number in all.
+
+    **Round 18, item 5.** ``unanswered`` here means what it means in the
+    recipient's count, ``counts_unanswered``, so ``unanswered_only`` lists exactly
+    the sent mail that the recipient's ``list_mail`` counts. Two lines reported
+    that the two views disagreed, since this view called every note neither
+    answered nor acknowledged unanswered, among them notes that ask no reply, a
+    line's own wake notes and harness notices. Such a note now has the outcome
+    ``asks no reply``, which ``NO_REPLY_ASKED`` names."""
     if offset < 0 or not 1 <= limit <= MAX_PAGE:
         raise ValueError(f"offset must be at least 0 and limit in [1, {MAX_PAGE}]")
     statuses: list[SentStatus] = []
@@ -517,7 +564,7 @@ def sent(
             message.kind.value,
             message.delivered,
             message.read,
-            outcome(message_id, message, replied),
+            sent_outcome(state, message_id, message, replied),
             delivery(message),
         )
         if not unanswered_only or status.outcome == "unanswered":

@@ -5,6 +5,7 @@ import asyncio
 import json
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -388,3 +389,67 @@ def test_the_settings_view_labels_a_rebound_models_source(paths: ProjectPaths) -
         target.scheduler.override_line("alpha", "model", HAIKU)
         assert model_entry()["source"] == "override"
         assert target.log.state.lines["alpha"].rebound is True
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("limits.max_autonomous_turns", 5),
+        ("limits.max_cost_usd", "2.5"),
+        ("limits.cooldown_seconds", "3"),
+        ("wake.every_ticks", 2),
+    ],
+)
+def test_a_limit_or_wake_override_keeps_the_engine(
+    world: World, key: str, value: object
+) -> None:
+    """Round 18, item 3. A change of a limit restarted the line's kept session and
+    stopped its background tasks, since every override discarded the engine. One
+    that leaves the engine's configuration and model as they were keeps it, and
+    returning the key to the layers below keeps it as well."""
+    world.turn()
+    built = world.scheduler._engines.get("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert built is not None
+    world.scheduler.override_line("alpha", key, value)
+    assert world.scheduler._engines.get("alpha") is built  # pyright: ignore[reportPrivateUsage]
+    world.scheduler.override_line("alpha", key, None)
+    assert world.scheduler._engines.get("alpha") is built  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_change_of_sandbox_rebuilds_the_engine(world: World) -> None:
+    """Review of round 18, finding 5. A sandbox is not a key ``set_setting`` takes,
+    so it changes only by a new configuration, which rebuilds the engine whatever
+    it changes, as ``configure_line`` says."""
+    world.turn()
+    assert world.scheduler._engines.get("alpha") is not None  # pyright: ignore[reportPrivateUsage]
+    sandboxed = replace(
+        world.scheduler.baseline_config("alpha"),
+        sandbox=parse_sandbox({"enabled": True}, operator=False),
+    )
+    world.scheduler.configure_line("alpha", sandboxed)
+    assert world.scheduler._engines.get("alpha") is None  # pyright: ignore[reportPrivateUsage]
+    assert world.scheduler.effective_config("alpha").sandbox == sandboxed.sandbox
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("effort", "low"),
+        ("builtin_tools", ["Grep"]),
+        ("model", OPUS),
+        # Review of round 18, finding 5. The tool policy, the allowlist and the
+        # account's MCP servers decide what the engine may call, so a change of
+        # any rebuilds it. The sandbox is not a key ``set_setting`` takes.
+        ("tool_policy", "allow_all"),
+        ("allowed_tools", ["mcp__dromon__line_status"]),
+        ("inherit_account_mcp", True),
+        ("claude_code_prompt", True),
+    ],
+)
+def test_an_override_the_engine_reads_rebuilds_it(
+    world: World, key: str, value: object
+) -> None:
+    world.turn()
+    assert world.scheduler._engines.get("alpha") is not None  # pyright: ignore[reportPrivateUsage]
+    world.scheduler.override_line("alpha", key, value)
+    assert world.scheduler._engines.get("alpha") is None  # pyright: ignore[reportPrivateUsage]
