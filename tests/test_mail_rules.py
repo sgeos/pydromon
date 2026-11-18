@@ -23,6 +23,7 @@ from dromon.engine import TurnReport
 from dromon.eventlog import EventLog
 from dromon.mailbox import (
     asks_reply,
+    NO_REPLY_ASKED,
     counts_unanswered,
     listing,
     replied_ids,
@@ -393,6 +394,30 @@ def test_the_unanswered_listing_is_exactly_what_the_count_counts(
     assert "2 unanswered" in lines[0]
     assert lines[1].startswith(asked) and lines[1].endswith("unanswered for 1h 3m")
     assert lines[2].startswith(later) and lines[2].endswith("unanswered for 1m 5s")
+
+
+def test_the_senders_unanswered_is_the_recipients_count(world: World) -> None:
+    """Round 18, item 5. ``list_sent`` and ``dromon sent`` call unanswered exactly
+    what the recipient's ``list_mail`` counts, and label the rest of the notes left
+    open as asking no reply, as two lines found the two views disagreed."""
+    asked = world.deliver(world.scheduler.send(ANA, ALPHA, "do this"))
+    told = world.deliver(world.scheduler.send(ANA, ALPHA, "fyi", asks_reply=False))
+    state = world.log.state
+    counted = {
+        message_id
+        for message_id, message in state.messages.items()
+        if message.sender == ANA and counts_unanswered(state, message)
+    }
+    assert counted == {asked}
+    page, total = sent(state, ANA, unanswered_only=True)
+    assert {status.message_id for status in page} == counted and total == 1
+    everything, _ = sent(state, ANA)
+    outcomes = {status.message_id: status.outcome for status in everything}
+    assert outcomes[asked] == "unanswered"
+    assert outcomes[told] == NO_REPLY_ASKED
+    # Once the recipient answers, the note leaves both views.
+    world.call("acknowledge_mail", {"message_id": asked})
+    assert sent(world.log.state, ANA, unanswered_only=True) == ([], 0)
 
 
 def test_unanswered_and_own_notes_together_are_refused(world: World) -> None:

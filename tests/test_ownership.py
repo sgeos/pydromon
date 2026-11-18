@@ -862,6 +862,28 @@ def test_a_seat_that_cannot_be_confined_waits_while_another_owns(
     assert seats_waiting(unconfined) == {"alpha": True, "beta": False, "gamma": True}
 
 
+def test_mail_to_a_waiting_seat_is_told_to_name_the_owner(unconfined: World) -> None:
+    """Round 18, item 4. The seat that waits names its role and the owner, and the
+    owner, a seat that runs, and a line that is no seat are not told to wait."""
+    owner = unconfined.log.state.roles["core"].owner
+    assert owner == "alpha"
+    reason = unconfined.scheduler.role_wait_reason("beta")
+    assert reason is not None
+    assert "does not own" in reason and "role core" in reason
+    assert f"since {owner} owns it" in reason
+    for line_id in ("alpha", "delta", "no-such-line"):
+        assert unconfined.scheduler.role_wait_reason(line_id) is None
+
+
+def test_a_seat_of_a_vacant_role_is_not_told_to_wait(unconfined: World) -> None:
+    unconfined.scheduler.give_ownership(ANA, "core", None)
+    assert unconfined.scheduler.role_wait_reason("beta") is None
+
+
+def test_a_seat_on_a_confining_engine_is_not_told_to_wait(world: World) -> None:
+    assert world.scheduler.role_wait_reason("beta") is None
+
+
 def test_every_seat_of_a_vacant_role_runs_so_that_one_can_take_it(
     unconfined: World,
 ) -> None:

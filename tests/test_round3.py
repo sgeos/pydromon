@@ -1842,3 +1842,71 @@ def test_idle_task_completions_share_one_autonomous_turn(world: World) -> None:
     prompt = world.engines["alpha"].prompts[-1]
     for message_id in messages:
         assert message_id is not None and message_id in prompt
+
+
+# Round 18, item 6. Task ends reported separately share a turn within the quiet
+# period, and the hold is bounded.
+
+
+@pytest.mark.task_note_quiet
+def test_task_ends_a_moment_apart_share_one_turn(world: World) -> None:
+    world.run("start")
+    first = world.scheduler.background_ended("alpha", BackgroundEnd("a", "x", "done"))
+    world.run()
+    assert world.status()["autonomous_turns"]["used"] == 0
+    world.ticks.now += scheduler_module.TASK_NOTE_QUIET_SECONDS / 2
+    second = world.scheduler.background_ended("alpha", BackgroundEnd("b", "y", "done"))
+    world.run()
+    assert world.status()["autonomous_turns"]["used"] == 0
+    # The quiet period restarts at each end, so half of it later nothing is due.
+    world.ticks.now += scheduler_module.TASK_NOTE_QUIET_SECONDS / 2
+    held = world.scheduler.seconds_until_task_notes()
+    assert held is not None and held > 0
+    world.ticks.now += scheduler_module.TASK_NOTE_QUIET_SECONDS
+    world.run()
+    assert world.status()["autonomous_turns"]["used"] == 1
+    prompt = world.engines["alpha"].prompts[-1]
+    assert first is not None and second is not None
+    assert first in prompt and second in prompt
+    assert world.scheduler.seconds_until_task_notes() is None
+
+
+@pytest.mark.task_note_quiet
+def test_the_hold_of_task_notes_is_bounded_however_many_ends_arrive(
+    world: World,
+) -> None:
+    world.run("start")
+    step = scheduler_module.TASK_NOTE_QUIET_SECONDS / 2
+    held_for = 0.0
+    index = 0
+    while held_for < scheduler_module.TASK_NOTE_HOLD_SECONDS:
+        world.scheduler.background_ended(
+            "alpha", BackgroundEnd(f"t{index}", "x", "done")
+        )
+        assert world.status()["autonomous_turns"]["used"] == 0
+        world.ticks.now += step
+        held_for += step
+        index += 1
+    # Past the cap the held notes are due although an end came just now.
+    assert world.scheduler.seconds_until_task_notes() == 0.0
+    world.run()
+    assert world.status()["autonomous_turns"]["used"] == 1
+
+
+@pytest.mark.task_note_quiet
+def test_held_task_notes_join_other_mail_at_once(world: World) -> None:
+    world.run("start")
+    noted = world.scheduler.background_ended("alpha", BackgroundEnd("a", "x", "done"))
+    held = world.scheduler.seconds_until_task_notes()
+    assert held is not None and held > 0
+    world.run("and this")
+    # Other mail of the line releases the held note at once, within its quiet
+    # period, so the two are shown in one turn.
+    assert world.scheduler.seconds_until_task_notes() is None
+    (other,) = [
+        message_id
+        for message_id, message in world.log.state.messages.items()
+        if message.body == "and this"
+    ]
+    prompt = world.engines["alpha"].prompts[-1]
+    assert noted is not None and noted in prompt and other in prompt

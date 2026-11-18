@@ -1198,6 +1198,10 @@ def _send(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     sender = answer.get("operator")
     if arguments.operator is None and isinstance(sender, str):
         print(f"sent as @{sender}")
+    # Round 18, item 4. A recipient that waits on its role's owner says so.
+    waits = answer.get("waits")
+    if isinstance(waits, str):
+        print(f"waits: {waits}")
     return exits.OK
 
 
@@ -1247,6 +1251,10 @@ def _mail(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         args["sender"] = arguments.sender
     if arguments.issues:
         args["issues_only"] = True
+    # Round 18, item 2. The daemon resolves a message or a time, and refuses
+    # anything else, so an operator can wait for new mail without a baseline.
+    if arguments.since is not None:
+        args["since"] = arguments.since
     response = _call(paths, "mail", Operation.MAIL, args)
     if isinstance(response, int):
         return response
@@ -1313,6 +1321,11 @@ def _replies(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     **Round 9, item 5.** A wait loop can count and read them in one query."""
     if arguments.sender is not None:
         print("dromon mail: --from does not combine with --replies-to", file=sys.stderr)
+        return exits.USAGE
+    if getattr(arguments, "since", None) is not None:
+        print(
+            "dromon mail: --since does not combine with --replies-to", file=sys.stderr
+        )
         return exits.USAGE
     args: dict[str, object] = {
         "operator": arguments.operator,
@@ -4041,6 +4054,15 @@ def build_parser() -> argparse.ArgumentParser:
                 default=None,
                 metavar="MESSAGE",
                 help="the replies to one message, with their bodies, marking none read",
+            )
+            command.add_argument(
+                "--since",
+                default=None,
+                metavar="MESSAGE_OR_TIME",
+                help=(
+                    "only mail recorded after a message, or at or after a time in"
+                    " ISO 8601 with its offset"
+                ),
             )
             command.add_argument(
                 "--offset", type=int, default=0, help="matches to skip"

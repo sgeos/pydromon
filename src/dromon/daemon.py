@@ -115,6 +115,7 @@ from dromon.sealed import SealedStore, store_path
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.mailbox import (
     MAX_PAGE,
+    ids_after,
     listing,
     outcome,
     replied_ids,
@@ -204,6 +205,7 @@ from dromon.forwarder import (
     announced_name,
     orphaned,
     registered_connector,
+    ids_recorded_since,
     sent_times,
 )
 from dromon.federation_tls import TLS_HANDSHAKE_TIMEOUT_SECONDS
@@ -1383,6 +1385,36 @@ class Daemon:
         message_id = self.scheduler.answer(OperatorAddress(operator), question_id, body)
         return {"message_id": message_id}
 
+    def _mail_since(self, since: object) -> frozenset[str] | None:
+        """The messages ``since`` admits, or ``None`` when it is not given.
+        **Round 18, item 2.** ``dromon mail`` had no bound in time or by message, so
+        an operator waiting for new mail had to read a baseline first. ``since`` is
+        a message identifier the state holds, which admits the messages recorded
+        after it, or else a time in ISO 8601 with its offset, which admits those
+        whose ``message_sent`` or ``message_received`` was recorded at or after it.
+
+        **Cost, a residual.** A time is resolved by reading the whole log, as
+        ``forwarder.sent_times`` already does, since the state keeps no send time,
+        and adding one would change the state and snapshot formats. A paged reader
+        is the debt ``read_entries`` already names. A message identifier costs no
+        read. Raises ``ProtocolError`` for a value that is neither."""
+        if since is None:
+            return None
+        if not isinstance(since, str) or not since:
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "since is not a string")
+        if since in self.log.state.messages:
+            return ids_after(self.log.state, since)
+        try:
+            when = datetime.fromisoformat(since)
+        except ValueError:
+            when = None
+        if when is None or when.tzinfo is None:
+            raise InvalidField(
+                f"since {since!r} is neither a known message nor a time in ISO 8601"
+                " with its offset, such as 2026-11-18T07:00:00Z"
+            )
+        return ids_recorded_since(read_entries(self.paths.event_log), when)
+
     def _mail(self, args: dict[str, object]) -> dict[str, object]:
         """A page of an operator's mailbox, with its summary. Listing delivers.
         issues_only lists the open issues lines raised. Round 11, item 3."""
@@ -1393,6 +1425,7 @@ class Daemon:
             "issues_only",
             "offset",
             "limit",
+            "since",
         }
         if "operator" not in args or not set(args) <= allowed:
             raise ProtocolError(
@@ -1414,6 +1447,7 @@ class Daemon:
             raise ProtocolError(ErrorCode.BAD_REQUEST, "sender is not a string")
         owner = OperatorAddress(operator_text)
         self.scheduler.collect(owner)
+        since = self._mail_since(args.get("since"))
         try:
             page, total = listing(
                 self.log.state,
@@ -1423,6 +1457,7 @@ class Daemon:
                 issues_only=issues_only,
                 offset=offset,
                 limit=limit,
+                since=since,
             )
         except ValueError as error:
             raise InvalidField(str(error)) from error
@@ -1439,6 +1474,7 @@ class Daemon:
             issues_only=issues_only,
             offset=offset,
             limit=limit,
+            since=since,
         )
         return {
             "total": total,
@@ -2022,11 +2058,18 @@ class Daemon:
         message_id = self.scheduler.send(
             sender, address, body, reply_to, priority=urgent, asks_reply=asks
         )
-        return {
+        result: dict[str, object] = {
             "message_id": message_id,
             "priority": urgent,
             "operator": sender.operator_id,
         }
+        # Round 18, item 4. A recipient that waits on its role's owner is named
+        # with the owner, so the operator is told why it does not run.
+        if isinstance(address, LineAddress):
+            waits = self.scheduler.role_wait_reason(address.line_id)
+            if waits is not None:
+                result["waits"] = waits
+        return result
 
     def _restart(self, args: dict[str, object]) -> dict[str, object]:
         """Begin a restart for ``operator``. ``mode`` is ``wait``, the default, or

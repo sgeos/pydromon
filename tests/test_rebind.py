@@ -388,3 +388,40 @@ def test_the_settings_view_labels_a_rebound_models_source(paths: ProjectPaths) -
         target.scheduler.override_line("alpha", "model", HAIKU)
         assert model_entry()["source"] == "override"
         assert target.log.state.lines["alpha"].rebound is True
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("limits.max_autonomous_turns", 5),
+        ("limits.max_cost_usd", "2.5"),
+        ("limits.cooldown_seconds", "3"),
+        ("wake.every_ticks", 2),
+    ],
+)
+def test_a_limit_or_wake_override_keeps_the_engine(
+    world: World, key: str, value: object
+) -> None:
+    """Round 18, item 3. A change of a limit restarted the line's kept session and
+    stopped its background tasks, since every override discarded the engine. One
+    that leaves the engine's configuration and model as they were keeps it, and
+    returning the key to the layers below keeps it as well."""
+    world.turn()
+    built = world.scheduler._engines.get("alpha")  # pyright: ignore[reportPrivateUsage]
+    assert built is not None
+    world.scheduler.override_line("alpha", key, value)
+    assert world.scheduler._engines.get("alpha") is built  # pyright: ignore[reportPrivateUsage]
+    world.scheduler.override_line("alpha", key, None)
+    assert world.scheduler._engines.get("alpha") is built  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    ("key", "value"), [("effort", "low"), ("builtin_tools", ["Grep"]), ("model", OPUS)]
+)
+def test_an_override_the_engine_reads_rebuilds_it(
+    world: World, key: str, value: object
+) -> None:
+    world.turn()
+    assert world.scheduler._engines.get("alpha") is not None  # pyright: ignore[reportPrivateUsage]
+    world.scheduler.override_line("alpha", key, value)
+    assert world.scheduler._engines.get("alpha") is None  # pyright: ignore[reportPrivateUsage]

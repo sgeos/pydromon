@@ -64,6 +64,7 @@ from dromon.model import (
     LineAddress,
     Message,
     MessageKind,
+    MessageReceived,
     MessageSent,
     RemoteAddress,
     ReturnCode,
@@ -240,6 +241,26 @@ def sent_times(entries: Iterable[Entry], wanted: set[str]) -> dict[str, datetime
             with contextlib.suppress(ValueError):
                 found[event.message_id] = datetime.fromisoformat(entry.recorded_at)
     return found
+
+
+def ids_recorded_since(entries: Iterable[Entry], when: datetime) -> frozenset[str]:
+    """The messages whose ``message_sent`` or ``message_received`` entry was recorded
+    at or after ``when``, which must carry an offset. **Round 18, item 2.** It
+    serves ``dromon mail --since TIME`` as ``sent_times`` serves expiry, from the
+    log, since the state keeps no send time. An entry whose time does not parse is
+    left out, and so is its message."""
+    found: set[str] = set()
+    for entry in entries:
+        event = entry.event
+        if not isinstance(event, MessageSent | MessageReceived):
+            continue
+        try:
+            recorded = datetime.fromisoformat(entry.recorded_at)
+        except ValueError:
+            continue
+        if recorded.tzinfo is not None and recorded >= when:
+            found.add(event.message_id)
+    return frozenset(found)
 
 
 def envelope(state: State, message_id: str, message: Message) -> dict[str, object]:
