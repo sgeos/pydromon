@@ -37,6 +37,7 @@ import json
 import contextlib
 import fcntl
 import os
+import platform
 import shutil
 import signal
 import ssl
@@ -53,7 +54,7 @@ from typing import Any, Final, Protocol, cast
 from claude_agent_sdk import SdkMcpTool
 from OpenSSL.SSL import Context as OpenSSLContext
 
-from dromon.scheduler import StartCheckEngine
+from dromon.scheduler import StartCheckEngine, engine_config_refusal
 from dromon import __version__, exits, fleet, grok, peercred, registry, restart, runs
 from dromon import credentials, evidence, mcpstates, spawn
 from dromon import proposals as proposal_store
@@ -133,11 +134,19 @@ from dromon.lineconfig import (
 from dromon.projectconfig import (
     ConfigFileError,
     ProjectConfig,
+    apply_default_profile,
     config_path,
     declared_operators,
     load,
 )
-from dromon.sandbox import SandboxConfig, SandboxError, effective, merge
+from dromon.sandbox import (
+    SandboxConfig,
+    SandboxError,
+    claude_default,
+    effective,
+    host_unavailable_reason,
+    merge,
+)
 from dromon import gitssh
 from dromon.gitssh import GitSshAccess, GitSshError, sandbox_layer, unreadable
 from dromon.processes import environment_reading_works
@@ -150,6 +159,7 @@ from dromon.workdir import (
     resolve_workdir,
 )
 from dromon.security_paths import project_secret_paths
+from dromon import security_paths
 from dromon.configview import (
     OVERRIDE,
     LineFacts,
@@ -1165,7 +1175,10 @@ class Daemon:
             chosen = Strategy(strategy)
         except ValueError as error:
             raise DriverError(f"unknown strategy {strategy!r}") from error
-        config = _config_arg(args) if "config" in args else DEFAULT_CONFIG
+        # Round 18, last pass, item 6. A line created through the client takes the
+        # project's default profile, when one is named and the line runs on its
+        # engine, under what the client sent.
+        config = self._client_config(model, args)
         self._check_workdir(config)
         check_sandbox_required(self.project, line_id, model, config)
         raw_limits = args.get("limits", {})
@@ -1194,6 +1207,19 @@ class Daemon:
             self.log.append(initial_override)
         return {"line_id": line_id}
 
+    def _client_config(self, model: str, args: dict[str, object]) -> LineConfig:
+        """The configuration a line created or configured through the client runs
+        with, which is the client's ``config``, under the project's default profile
+        when the line runs on its engine, as ``projectconfig.DefaultProfile``
+        describes."""
+        raw = args.get("config", {})
+        if not isinstance(raw, dict):
+            raise ProtocolError(ErrorCode.BAD_REQUEST, "config is not an object")
+        config, _ = apply_default_profile(
+            self.project.default_profile, model, cast(dict[str, object], raw)
+        )
+        return config
+
     def _configure_line(self, args: dict[str, object]) -> dict[str, object]:
         texts = {key: value for key, value in args.items() if key != "config"}
         (line_id,) = _text_args(texts, ("line_id",))
@@ -1201,11 +1227,17 @@ class Daemon:
             raise ProtocolError(ErrorCode.BAD_REQUEST, "configure_line needs a config")
         if line_id not in self.log.state.lines:
             raise EventRejected(f"no line {line_id}")
-        config = _config_arg(args)
-        self._check_workdir(config)
-        check_sandbox_required(
-            self.project, line_id, self.scheduler.model_of(line_id), config
+        model = self.scheduler.model_of(line_id)
+        # Round 18, last pass, item 6. A line the project file does not declare takes
+        # the default profile again, so a configure cannot drop the denials it adds.
+        # A declared line takes what the file gives it at the next start or reload.
+        config = (
+            _config_arg(args)
+            if line_id in self.project.lines
+            else self._client_config(model, args)
         )
+        self._check_workdir(config)
+        check_sandbox_required(self.project, line_id, model, config)
         lost = self.tasks_lost([line_id])
         self.scheduler.configure_line(line_id, config)
         return {"line_id": line_id, **lost}
@@ -3689,6 +3721,20 @@ def check_plugins(config: LineConfig) -> None:
             raise ConfigError(str(error)) from error
 
 
+def line_sandbox(
+    project: SandboxConfig | None, model: str, config: LineConfig
+) -> SandboxConfig | None:
+    """The merged sandbox a line on ``model`` with ``config`` runs under, as the
+    scheduler builds it. **Round 18 follow-up, item 1.** A Claude Code line that no
+    layer enables or disables is enabled, so the daemon's checks judge the document
+    the line is given and not the one its layers spell. Other engines take no sandbox
+    document, and theirs is returned merged and unchanged."""
+    merged = merge([project, config.sandbox])
+    if ENGINE_OF.get(model) == CLAUDE_CODE_ENGINE:
+        return claude_default(merged)
+    return merged
+
+
 def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
     """Refuse a project file whose working directories are not allowed, or whose
     sandboxes cannot be made safe in them, before anything starts, rather than at
@@ -3696,19 +3742,34 @@ def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
     protected = protected_dirs(paths, config.federation)
     # Round 17, review of 0db077c, finding 1. The secret directories are checked as
     # the scheduler protects them, so a document granting one is refused at start.
+    # Round 18, the operator's security fix. So are the credential paths under the
+    # daemon's home, which every Claude Code line is denied. Only Claude Code lines
+    # take a sandbox document, so checking each line's against them refuses nothing
+    # another engine could use.
+    # Round 18 follow-up, items 1 to 3. A Claude Code line is checked with the
+    # sandbox its build gives it, enabled when no layer says, and no grant may name,
+    # hold or match a credential path.
+    credentials = security_paths.claude_credentials()
     effective(
         config.sandbox,
         paths.root,
-        (*protected, *project_secret_paths(paths.root, paths.root)),
+        (*protected, *project_secret_paths(paths.root, paths.root), *credentials),
+        ungrantable=credentials,
     )
     for line in config.lines.values():
         check_plugins(line.config)
         workdir = resolve_workdir(line.config.workdir, paths.root, protected)
-        merged = merge([config.sandbox, line.config.sandbox])
+        merged = line_sandbox(config.sandbox, line.model, line.config)
         enabled = merged is not None and merged.enabled
         guarded = git_write_guards(workdir) if enabled else ()
         secrets = project_secret_paths(paths.root, workdir)
-        effective(merged, workdir, (*protected, *secrets), guarded)
+        effective(
+            merged,
+            workdir,
+            (*protected, *secrets, *credentials),
+            guarded,
+            ungrantable=credentials,
+        )
     for role_id, role in sorted(config.roles.items()):
         worktree = resolve_workdir(role.workdir, paths.root, protected)
         for line_id in role.seats:
@@ -3740,14 +3801,20 @@ def git_ssh_access(
     for line_id, line in sorted(config.lines.items()):
         if not line.git_ssh:
             continue
-        merged = merge([config.sandbox, line.config.sandbox])
+        merged = line_sandbox(config.sandbox, line.model, line.config)
         if merged is not None and merged.enabled:
             workdir = resolve_workdir(line.config.workdir, paths.root, protected)
+            credentials = security_paths.claude_credentials()
             document = effective(
                 merge([merged, sandbox_layer(access)]),
                 workdir,
-                (*protected, *project_secret_paths(paths.root, workdir)),
+                (
+                    *protected,
+                    *project_secret_paths(paths.root, workdir),
+                    *credentials,
+                ),
                 git_write_guards(workdir),
+                ungrantable=credentials,
             )
             denied = None if document is None else unreadable(access, document)
             if denied is not None:
@@ -3776,7 +3843,7 @@ def check_sandbox_required(
     project declares peers and does not accept it, by decision 9 of the federation
     design, which counts a Claude Code line without an enabled sandbox, by the
     operator's decision of 2026-10-28. Raises ``SandboxError``."""
-    merged: SandboxConfig | None = merge([project.sandbox, config.sandbox])
+    merged = line_sandbox(project.sandbox, model, config)
     sandboxed = merged is not None and merged.enabled
     refusal = unconfined_refusal(
         project.federation, line_id, ENGINE_OF.get(model), sandboxed
@@ -3806,6 +3873,48 @@ def check_lines_sandboxed(
             scheduler.model_of(line_id),
             scheduler.effective_config(line_id),
         )
+
+
+def sandbox_host_problem() -> str | None:
+    """``sandbox.host_unavailable_reason`` for the host the daemon runs on. A function
+    of its own, so tests give a host of their own."""
+    return host_unavailable_reason(platform.system(), shutil.which)
+
+
+def unavailable_sandbox_warning(
+    config: ProjectConfig, log: EventLog, scheduler: Scheduler
+) -> str | None:
+    """A warning naming every Claude Code line, declared or created through the
+    client, whose sandbox is enabled while the host cannot start one, or ``None``.
+    **Round 18, last pass, item 7.** Such a line fails at its first turn, so a start,
+    ``dromond --check`` and ``dromon check-engines`` say so before any turn. A warning
+    and not a refusal, since the host's other lines can run, and a refusal would also
+    stop ``dromon restart``, whose preflight runs the same check."""
+    reason = sandbox_host_problem()
+    if reason is None:
+        return None
+    found = [
+        (line_id, definition.model, definition.config)
+        for line_id, definition in sorted(config.lines.items())
+    ] + [
+        (line_id, scheduler.model_of(line_id), scheduler.effective_config(line_id))
+        for line_id in sorted(set(log.state.lines) - set(config.lines))
+    ]
+    held: list[str] = []
+    for line_id, model, line in found:
+        if ENGINE_OF.get(model) != CLAUDE_CODE_ENGINE:
+            continue
+        merged = line_sandbox(config.sandbox, model, line)
+        if merged is not None and merged.enabled:
+            held.append(line_id)
+    if not held:
+        return None
+    return (
+        f"{reason}, so the Claude Code lines {', '.join(held)}, whose sandbox is"
+        " enabled, will each fail at their first turn. Install what is missing, or"
+        " set enabled false for a line knowing its shell can then read the credential"
+        " paths"
+    )
 
 
 def machine_status_path(config: ProjectConfig, paths: ProjectPaths) -> Path | None:
@@ -3878,8 +3987,18 @@ def check_grok_profiles(
 
 def check_engines(config: ProjectConfig) -> None:
     """Refuse a project file that gives a Codex line a sandbox or settings through the
-    project's own tables, which the line's engine cannot honour. Raises ``ValueError``.
-    A line's own tables are checked when the line is created or configured."""
+    project's own tables, which the line's engine cannot honour, or that names a
+    ``default_profile`` its own engine cannot run. Raises ``ValueError``. A line's own
+    tables are checked when the line is created or configured."""
+    profile = config.default_profile
+    if profile is not None:
+        given, _ = apply_default_profile(profile, profile.model, {})
+        reason = engine_config_refusal(profile.engine, given)
+        if reason is not None:
+            raise ValueError(
+                f"daemon.default_profile names profile {profile.name!r}, which a line"
+                f" created through the client on its engine could not run: {reason}"
+            )
     if config.sandbox is None and config.settings is None:
         return
     outside = sorted(
@@ -4442,6 +4561,9 @@ def run(
                 config.run_queue_max_age_seconds,
             )
             check_lines_sandboxed(config, log, scheduler)
+            unavailable = unavailable_sandbox_warning(config, log, scheduler)
+            if unavailable is not None:
+                print(f"dromond: warning: {unavailable}", file=sys.stderr)
             check_roles(scheduler, log, config)
             apply_project(scheduler, log, config)
             report_unsealed(scheduler)

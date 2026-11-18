@@ -16,9 +16,11 @@ from pathlib import Path
 
 from dromon import settings as engine_settings
 from dromon.driver import ENGINE_OF
+from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
 from dromon.lineconfig import WorkdirAccess
 from dromon.projectconfig import ProjectConfig
 from dromon.roles import CONFINING_ENGINES
+from dromon.sandbox import explicitly_disabled, merge
 from dromon.scheduler import read_only_refusal
 
 
@@ -114,7 +116,64 @@ def read_only_warnings(config: ProjectConfig) -> list[str]:
     return found
 
 
+def sandbox_warnings(config: ProjectConfig) -> list[str]:
+    """One sentence for each Claude Code line whose sandbox a layer disables, and for
+    each layer that sets ``allowUnsandboxedCommands`` true, which Dromon overrides.
+
+    **Round 18 follow-up, items 1 and 2.** A line that no layer enables or disables is
+    given an enabled sandbox, and an explicit ``enabled`` false stays the operator's
+    choice, so the operator is told that such a line's shell can read the credential
+    paths its file tools are denied. **Residual.** A line the file does not declare,
+    one created through the client, is warned of only by the daemon as it is built."""
+    found: list[str] = []
+    if config.sandbox is not None and (
+        config.sandbox.document().get("allowUnsandboxedCommands") is True
+    ):
+        found.append(
+            "the project's sandbox sets allowUnsandboxedCommands true, which Dromon"
+            " overrides with false for every line, since a command run outside the"
+            " sandbox could read every path it denies"
+        )
+    for line_id, line in sorted(config.lines.items()):
+        if ENGINE_OF.get(line.model) != CLAUDE_CODE_ENGINE:
+            continue
+        own = line.config.sandbox
+        if own is not None and own.document().get("allowUnsandboxedCommands") is True:
+            found.append(
+                f"line {line_id}'s sandbox sets allowUnsandboxedCommands true, which"
+                " Dromon overrides with false, since a command run outside the sandbox"
+                " could read every path it denies"
+            )
+        if explicitly_disabled(merge([config.sandbox, own])):
+            found.append(
+                f"line {line_id} runs Claude Code with its sandbox disabled, so its"
+                " shell can read the credential paths under the daemon's home, which"
+                " only its file tools are denied. Remove enabled false to give it the"
+                " sandbox Dromon gives by default"
+            )
+    return found
+
+
+def default_profile_warnings(config: ProjectConfig) -> list[str]:
+    """One sentence when ``[daemon] default_profile`` names a profile that sets
+    ``git_ssh``, which a line created through the client does not take, **round 18,
+    last pass, item 6**, so the operator is not left to think it does."""
+    profile = config.default_profile
+    if profile is None or not profile.git_ssh:
+        return []
+    return [
+        f"daemon.default_profile names profile {profile.name!r}, which sets git_ssh,"
+        " and a line created through the client is not given the [git_ssh] agent. Name"
+        " the line in the project file to give it the agent"
+    ]
+
+
 def config_warnings(config: ProjectConfig, root: Path) -> list[str]:
     """Every warning for ``config``, whose project is ``root``, in a fixed order, so
     that a client and a daemon give the same list."""
-    return [*slash_warnings(config, root), *read_only_warnings(config)]
+    return [
+        *slash_warnings(config, root),
+        *read_only_warnings(config),
+        *sandbox_warnings(config),
+        *default_profile_warnings(config),
+    ]

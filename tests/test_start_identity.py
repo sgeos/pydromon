@@ -618,6 +618,12 @@ def unreadable(pid: int) -> float | None:
     return None
 
 
+def present_pid(pid: int) -> bool:
+    """``launcher.process_gone`` for a table whose processes are only rows."""
+    del pid
+    return False
+
+
 def recording(sent: list[object], kind: str) -> Callable[..., None]:
     """A stand-in for a function that signals, which records that it was called."""
 
@@ -652,6 +658,7 @@ def test_a_harness_whose_start_time_cannot_be_read_is_not_signalled(
 ) -> None:
     sent: list[object] = []
     monkeypatch.setattr(launcher, "start_time", unreadable)
+    monkeypatch.setattr(launcher, "process_gone", present_pid)
     monkeypatch.setattr(launcher, "_send", recording(sent, "pid"))
     monkeypatch.setattr(launcher, "signal_group_if_started", recording(sent, "group"))
     monkeypatch.setattr(launcher, "signal_if_started", recording(sent, "one"))
@@ -659,9 +666,12 @@ def test_a_harness_whose_start_time_cannot_be_read_is_not_signalled(
         TreeRow(4343, 1, 4343, "sleep 60"),
         TreeRow(4344, 4343, 4343, "sleep 60"),
     ]
-    record_file(tmp_path, 4242, 4343, "sleep", policy=policy, harness_started=5.0)
+    path = record_file(
+        tmp_path, 4242, 4343, "sleep", policy=policy, harness_started=5.0
+    )
     [kept] = swept(tmp_path, rows)
     assert kept.skipped is not None and "cannot be read" in kept.skipped
+    assert path.exists(), "round 19, item 1, a time that did not read is tried again"
     assert kept.ended == ()
     assert sent == []
 

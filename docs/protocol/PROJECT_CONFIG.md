@@ -164,6 +164,7 @@ relay = "tail"          # the route of operator ana's mail
 | `daemon.operator` | identifier | `operator` | The default operator. It also declares that operator, whom a peer may reach before that operator has sent anything, as decision 25 of [`FEDERATION.md`](../architecture/FEDERATION.md) specifies. The built-in default declares no one |
 | `daemon.tick_seconds` | number in [0, 60] | 1 | The maximum tick wait in seconds. Zero waits for events and due timers |
 | `daemon.require_sandbox` | boolean | `false` | Whether every Claude Code line must run with an enabled sandbox, as below |
+| `daemon.default_profile` | profile name | none | The profile a line created or configured through the client takes when the file does not declare it and it runs on the engine of the profile's `model`, as below. A client `config` whose sandbox sets a key that weakens the sandbox or is operator only is refused, naming the key. Added in round 18 |
 | `daemon.disclosure_terms` | path | none | The project's disclosure list, relative to the project root, as below |
 | `daemon.machine_status` | path | none | The file the machine's monitor writes its status to, read before a run or a turn starts, as [`RUNS.md`](../architecture/RUNS.md) specifies. A leading `~` is the home directory and a relative path is relative to the project root. Nothing is read, and nothing is deferred, unless it is set. A reload applies it. No line's sandbox or file tools may write the file or its directory. A status that is stale, missing or unreadable defers runs until the monitor writes again, so the operator restores gates by restarting the monitor or removing this key and reloading. Added on 2026-11-11 |
 | `read_only_paths` | list of relative paths | empty | Existing files or directories denied writes under every line's resolved workdir. Symbolic links are resolved and targets must remain inside that workdir |
@@ -352,7 +353,75 @@ changes nothing. Codex and Grok lines run under their own permission profiles, a
 [`CODEX.md`](CODEX.md) and [`GROK.md`](GROK.md) specify, and Pi lines take no built-in
 tool, as [`PI.md`](PI.md) specifies, so all three satisfy it. **Why.** A
 line without an enabled sandbox can reach the daemon's socket from its shell and act
-with operator authority, as [`SANDBOX.md`](SANDBOX.md) records.
+with operator authority, as [`SANDBOX.md`](SANDBOX.md) records. **Round 18 follow-up.**
+A Claude Code line that no layer enables or disables is given an enabled sandbox at
+its build, so this check and the peers' check below count it as sandboxed. Only an
+explicit `enabled` false fails them.
+
+**Default profile, round 18, last pass, item 6.** A line created through a client,
+or by an agent through the client's operations, names no profile, so before this key it
+took none of the denials and ask rules a profile gives the lines the file declares.
+With `daemon.default_profile` naming a profile, `create_line` builds such a line's
+configuration from that profile under the client's `config`, when the line's model runs
+on the same engine as the profile's `model`. The profile's tool keys are replaced whole
+by any key the client sends, as a line's own key replaces its profile's in the file, and
+its `sandbox` and `settings` merge under the client's, the client's being the more
+specific layer, so a scalar both set takes the client's value and the lists of both
+are united. **The guarantee, round 18, addendum 2, item 1.** What a client cannot
+remove is every list entry the profile adds, which are its settings rules, such as
+`ask` and `deny`, and its sandbox lists, such as `filesystem.denyWrite`, together
+with the sandbox that carries them. A client document that sets `sandbox.enabled`
+false, `sandbox.failIfUnavailable` false or `sandbox.filesystem.disabled` true is
+refused with an error naming the key, unless the profile itself sets that value,
+since each would switch off or make optional the sandbox that carries the profile's
+denials. An unset key counts as its secure value, which the daemon fills in for a
+Claude Code line. The refusal fails closed rather than letting the profile's value
+win silently, so the client learns that its document was not taken as sent. **Round
+18, addendum 3.** The same refusal covers every other sandbox key that weakens the
+sandbox or that this file may not set, listed once as `HELD_SANDBOX_KEYS` in
+`dromon.projectconfig`. A client document is refused when it sets
+`allowAppleEvents`, `allowNestedUserNamespaces`, `network.allowAllUnixSockets`,
+`enableWeakerNestedSandbox`, `enableWeakerNetworkIsolation` or
+`network.allowLocalBinding` true, or `network.strictAllowlist` false, and when it
+sets `network.tlsTerminate`, `network.httpProxyPort`, `network.socksProxyPort`,
+`network.allowUnixSockets` or `network.allowMachLookup` at all, since a proxy port, a
+Unix socket or a Mach service is a way out of the sandbox rather than a grant inside
+it. It is also refused when it sets `allowUnsandboxedCommands` true or any
+`excludedCommands`, although the daemon would neutralise both when it builds the
+engine's settings, so that the client sees a refusal rather than a document silently
+not taken. A key the profile sets itself may be given the profile's own value. **What
+a client may still change.** It may replace any tool key, such as `builtin_tools`, add
+grants inside the sandbox, which are `filesystem.allowWrite`, `filesystem.allowRead`
+and `network.allowedDomains`, refused only where they reach a credential path or a
+directory Dromon protects, add denials, which are `filesystem.denyWrite`,
+`filesystem.denyRead`, `network.deniedDomains` and the `credentials` lists, and set
+`autoAllowBashIfSandboxed` and `ignoreViolations`. A test fails when the sandbox parser
+learns a key that is placed on neither side. An `allow` settings rule the client adds
+does not remove the profile's `ask` or `deny` rules, and that Claude Code applies a
+`deny` before an `allow` is an inference from its documentation that was not tested
+here. **Residuals.** The guarantee is against a client or an agent with manage
+access weakening the profile's sandbox, and not against every widening of a line,
+which the operator at a client may make by design within the grants above. That
+`ignoreViolations` only quietens reports and opens nothing is an inference from Claude
+Code's documentation, not tested. Whether an `allowRead` entry lifts a profile's
+`denyRead` entry beneath it was not tested either, and the profile this project names
+denies writes and not reads. `configure_line` does the same for a line the file
+does not declare, so a later configuration cannot drop them either. A line the file
+declares takes the file's definition, as before. A line on another engine is created
+as the client sent it, so a profile for Claude Code never reaches a Codex, Grok, Pi,
+Cursor or Antigravity line. The file is refused at load when the key names no profile,
+a profile with no `model`, or a profile that grants `secrets`, since a client-created
+line is granted none, and at start when the profile's own engine could not run it, as
+an Antigravity profile cannot, since a daemon refuses every Antigravity line. The
+profile's `git_ssh`, `limits`, `wake` and `may_own` are not applied, since each is
+authority or policy the file gives the lines it names, and `dromon config` and
+`dromond` warn when the profile sets `git_ssh`. **Lines that already exist.** The key
+changes nothing in the event log, so a line created before it was named keeps its
+configuration until it is configured again. `dromon configure LINE` with the options
+the line was created with applies the profile from the line's next turn. The command
+replaces the line's whole configuration, so options such as `--workdir` must be given
+again. **Residual.** `rebind_line` moving a line onto Claude Code from another engine
+does not apply the profile, and a line so moved takes it at its next configure.
 
 **Peers.** **Added on 2026-10-28, step 2 of phase 1 of
 [`FEDERATION.md`](../architecture/FEDERATION.md).** Each declared peer's runtime
@@ -595,7 +664,12 @@ git_ssh = true
   well-formed key is pinned, and never that the key is GitHub's. The operator must
   compare the fingerprints, as `ssh-keygen -lf` prints them, with the ones GitHub
   publishes before starting the daemon. Any of the three inside a directory Dromon protects is refused,
-  since an enabled sandbox denies it. No path may hold a control character, a quote, a
+  since an enabled sandbox denies it. **Round 18.** For a Claude Code line with an
+  enabled sandbox that includes the known credential paths under the daemon's home,
+  such as `~/.ssh`, so an agent socket or either file kept there is refused, and is
+  kept elsewhere, as [`SANDBOX.md`](SANDBOX.md) gives. **Round 18 follow-up.** A
+  Claude Code line that no layer enables or disables is given an enabled sandbox, so
+  this refusal now reaches it too, and `dromond` reaches it at start. No path may hold a control character, a quote, a
   backslash, `$` or `%`, which ssh would expand or read as part of its option. No
   host key is written into Dromon's code.
 - **Sandbox.** For a Claude Code line whose merged sandbox is enabled, Dromon merges

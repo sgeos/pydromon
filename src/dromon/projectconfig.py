@@ -24,6 +24,7 @@ line tools, MCP servers, hooks and credentials, so it deserves the review any su
 does. MCP servers may refer to secrets in the daemon's environment instead.
 """
 
+import json
 import re
 import tomllib
 from collections.abc import Mapping
@@ -32,7 +33,7 @@ from pathlib import Path
 from typing import Final, cast
 
 from dromon.disclosure import DisclosureError, accepted_entries
-from dromon.driver import MODELS, Strategy
+from dromon.driver import ENGINE_OF, MODELS, Strategy
 from dromon.limits import DEFAULT_LIMITS, Limits
 from dromon.lineconfig import (
     ConfigError,
@@ -109,6 +110,7 @@ DAEMON_KEYS: Final = frozenset(
         "operator",
         "tick_seconds",
         "require_sandbox",
+        "default_profile",
         "disclosure_terms",
         "disclosure_accepted",
         "machine_status",
@@ -273,6 +275,166 @@ class LineDefinition:
 
 
 @dataclass(frozen=True, slots=True)
+class DefaultProfile:
+    """The profile ``[daemon] default_profile`` names, as a client-created line takes
+    it. **Round 18, last pass, item 6.** A line created through the client named no
+    profile and took none, so a Claude Code line made that way had none of the
+    ``.git`` write denials and ask rules this project's profile gives its lines.
+
+    ``engine`` is the engine of the profile's ``model``, and only a line on that engine
+    takes the profile, so a profile for Claude Code never reaches an Antigravity, Codex
+    or Grok line. ``tools`` are the profile's own tool keys, as the file gives them,
+    which a key the client sends replaces whole, as a line's own key replaces its
+    profile's in the file. ``sandbox`` and ``settings`` merge under the client's, so the
+    client cannot drop a list entry the profile adds, such as a denial or an ask rule,
+    and a client sandbox that weakens one of ``HELD_SANDBOX_KEYS`` is refused, **round
+    18, addendum 2, item 1, and addendum 3**. Every other scalar the client sets
+    wins. The profile's ``git_ssh``, ``limits``, ``wake`` and ``may_own`` are not
+    applied, since each is authority or policy the file gives the lines it names, and
+    ``configwarnings`` says
+    so for ``git_ssh``. A profile that grants ``secrets`` is refused, since a
+    client-created line is granted none."""
+
+    name: str
+    model: str
+    engine: str
+    tools: dict[str, object]
+    sandbox: SandboxConfig | None
+    settings: SettingsConfig | None
+    git_ssh: bool
+
+
+HELD_SANDBOX_KEYS: Final[tuple[tuple[tuple[str, ...], bool | None], ...]] = (
+    # Round 18, addendum 2, item 1. The switches that turn the sandbox off or make it
+    # optional.
+    (("enabled",), True),
+    (("failIfUnavailable",), True),
+    (("filesystem", "disabled"), False),
+    # Round 18, addendum 3. Scalars that open a boundary, the first three of them
+    # operator only in a project file.
+    (("allowAppleEvents",), False),
+    (("allowNestedUserNamespaces",), False),
+    (("network", "allowAllUnixSockets"), False),
+    (("enableWeakerNestedSandbox",), False),
+    (("enableWeakerNetworkIsolation",), False),
+    (("network", "strictAllowlist"), True),
+    (("network", "allowLocalBinding"), False),
+    # Neutralised when the engine's settings are built, and refused here as well, so
+    # that the client sees the refusal rather than a document silently not taken.
+    (("allowUnsandboxedCommands",), False),
+    (("excludedCommands",), None),
+    # Operator only, with no value established here as the secure one.
+    (("network", "tlsTerminate"), None),
+    # A door out of the sandbox, rather than a path or a domain inside it. A proxy
+    # port hands the domain filtering to a proxy Dromon does not run, a Unix socket can
+    # reach a service outside the sandbox, and so can a Mach service.
+    (("network", "httpProxyPort"), None),
+    (("network", "socksProxyPort"), None),
+    (("network", "allowUnixSockets"), None),
+    (("network", "allowMachLookup"), None),
+)
+"""The sandbox keys a client may not weaken under a default profile, the one list of
+them. Each has the only value a client may give it, which is also what the line runs
+with when no layer sets the key, or ``None`` for a key a client may not set at all.
+A key the profile sets itself may be given the profile's own value, since that is the
+operator's choice and repeating it weakens nothing.
+
+**Round 18, addendum 2, item 1.** The sandbox layers merge with the more specific
+scalar winning, and the client's layer is the more specific, so a client document
+that set ``enabled`` false, ``failIfUnavailable`` false or ``filesystem.disabled``
+true switched off, or made optional, the sandbox that carries the profile's denials.
+An unset key counts as the secure value, since the daemon gives a Claude Code line an
+enabled sandbox, fills in ``failIfUnavailable`` and ``network.strictAllowlist`` when no
+layer sets them, and forces ``allowUnsandboxedCommands`` false.
+
+**Round 18, addendum 3.** The same holds for every other key that weakens the sandbox
+or that a project file may not set, so the list fails closed over them all. What a
+client may still send is a key not listed here. That is a list entry that grants a
+path or a domain inside the sandbox, ``allowWrite``, ``allowRead`` and
+``allowedDomains``, which the credential and protected path checks still bound, a
+denial, which only strengthens it, ``autoAllowBashIfSandboxed``, which concerns
+permission prompts and not the sandbox's bounds, and ``ignoreViolations``.
+
+**Residuals.** That ``ignoreViolations`` only quietens reports and opens nothing is an
+inference from Claude Code's documentation, not tested. Whether an ``allowRead`` entry
+lifts a profile's ``denyRead`` entry inside it is not tested either, and the profile
+this project names denies writes, not reads. A key Claude Code adds later is refused by
+the parser as unknown until Dromon lists it, and a test fails when the parser lists a
+key this list and its test's allowed keys both leave out, so it cannot pass unseen."""
+
+
+def _value_at(document: Mapping[str, object], path: tuple[str, ...]) -> object:
+    """The value at ``path``, which is not empty, in ``document``, or ``None`` where a
+    step is missing."""
+    if not path:
+        raise ValueError("an empty key path")
+    current: Mapping[str, object] = document
+    for step in path[:-1]:
+        inner = current.get(step)
+        if not isinstance(inner, dict):
+            return None
+        current = cast(dict[str, object], inner)
+    return current.get(path[-1])
+
+
+def _refuse_weakening(profile: DefaultProfile, own: SandboxConfig | None) -> None:
+    """Raise ``ConfigError`` naming the first key of ``HELD_SANDBOX_KEYS`` that the
+    client's sandbox sets to a value other than the one it may give, while the profile
+    does not set that value itself. Fail closed, rather than letting the profile's
+    value win silently, so the client learns that its document was not taken as sent.
+    A client may set the secure value, or any value the profile itself sets."""
+    if own is None:
+        return
+    given = own.document()
+    held = {} if profile.sandbox is None else profile.sandbox.document()
+    for path, secure in HELD_SANDBOX_KEYS:
+        value = _value_at(given, path)
+        if value is None or (secure is not None and value == secure):
+            continue
+        if _value_at(held, path) == value:
+            continue
+        key = ".".join(path)
+        raise ConfigError(
+            f"sandbox.{key} {json.dumps(value)} would weaken the sandbox of profile"
+            f" {profile.name!r}, which daemon.default_profile applies to this line, so"
+            f" it is refused. Leave sandbox.{key} unset, or name the line in the"
+            " project file"
+        )
+
+
+def apply_default_profile(
+    profile: DefaultProfile | None, model: str, document: Mapping[str, object]
+) -> tuple[LineConfig, bool]:
+    """The configuration a client-created line on ``model`` with the client's
+    ``document`` runs with, and whether ``profile`` was applied, which it is only for
+    a line on the profile's engine. Raises ``ConfigError`` as
+    ``config_from_document`` does, and for a client sandbox that weakens one of
+    ``HELD_SANDBOX_KEYS``.
+
+    **Order.** The profile is the less specific layer and the client's the more, so a
+    scalar both set takes the client's value, as a line's own key wins over its
+    profile's in the file, and the lists of both are united. The held keys are the
+    exception, refused rather than reordered, and a test pins the order."""
+    own = config_from_document(document)
+    if profile is None or ENGINE_OF.get(model) != profile.engine:
+        return own, False
+    _refuse_weakening(profile, own.sandbox)
+    tools = {
+        **profile.tools,
+        **{key: value for key, value in document.items() if key not in LAYERED_KEYS},
+    }
+    base = config_from_document(tools)
+    return (
+        replace(
+            base,
+            sandbox=merge([profile.sandbox, own.sandbox]),
+            settings=engine_settings.merge([profile.settings, own.settings]),
+        ),
+        True,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class RoleDefinition:
     """A ``[roles.NAME]`` table. Its seats are lines the same file declares."""
 
@@ -365,6 +527,8 @@ class ProjectConfig:
     relays: RelayConfig = NO_RELAYS
     """The project's relays to operators and each operator's route, none by
     default, so operators' mail waits for a client as before."""
+    default_profile: DefaultProfile | None = None
+    """The profile a client-created line on its engine takes, or ``None``."""
 
 
 def config_path(state_dir: Path) -> Path:
@@ -539,6 +703,9 @@ class _Reader:
             )
         read_only_paths = self.read_only_paths(top.get("read_only_paths", []))
         profiles = self.profiles(top.get("profiles", {}))
+        default_profile = self.default_profile(
+            daemon.get("default_profile"), profiles, limits, wake
+        )
         lines_table = top.get("lines", {})
         if not isinstance(lines_table, dict):
             raise self.fail("lines", "must be a table")
@@ -582,6 +749,7 @@ class _Reader:
             lines=lines,
             roles=roles,
             relays=relays,
+            default_profile=default_profile,
         )
 
     def read_only_paths(self, value: object) -> tuple[str, ...]:
@@ -940,6 +1108,51 @@ class _Reader:
             found[name] = self.table(profile, f"profiles.{name}", PROFILE_KEYS)
         return found
 
+    def default_profile(
+        self,
+        value: object,
+        profiles: Mapping[str, dict[str, object]],
+        limits: Limits,
+        wake: int,
+    ) -> DefaultProfile | None:
+        """``[daemon] default_profile``, checked whole as a line naming it would be,
+        so a profile a client-created line could not run with refuses the file and
+        not the line's creation."""
+        if value is None:
+            return None
+        key = "daemon.default_profile"
+        if not isinstance(value, str) or value not in profiles:
+            raise self.fail(key, f"names no profile: {value!r}")
+        profile = profiles[value]
+        if profile.get("model") not in MODELS:
+            raise self.fail(
+                key,
+                f"names profile {value!r}, which names no model, so the engine of"
+                " the lines it applies to is unknown",
+            )
+        if "secrets" in profile:
+            raise self.fail(
+                key,
+                f"names profile {value!r}, which grants secrets, and a line created"
+                " through the client is granted none",
+            )
+        definition = self.line(
+            value, {"profile": value}, profiles, limits, wake, key=key
+        )
+        return DefaultProfile(
+            name=value,
+            model=definition.model,
+            engine=ENGINE_OF[definition.model],
+            tools={
+                name: item
+                for name, item in profile.items()
+                if name in TOOL_KEYS and name != "secrets"
+            },
+            sandbox=definition.config.sandbox,
+            settings=definition.config.settings,
+            git_ssh=definition.git_ssh,
+        )
+
     def line(
         self,
         line_id: str,
@@ -947,8 +1160,9 @@ class _Reader:
         profiles: Mapping[str, dict[str, object]],
         limits: Limits,
         wake: int,
+        key: str | None = None,
     ) -> LineDefinition:
-        key = f"lines.{line_id}"
+        key = key or f"lines.{line_id}"
         if ID_PATTERN.fullmatch(line_id) is None:
             raise self.fail(key, "is not a valid line identifier")
         own = self.table(value, key, LINE_KEYS)

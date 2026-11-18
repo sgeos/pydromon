@@ -1364,3 +1364,37 @@ def test_a_late_cancellation_after_an_error_or_without_a_discard_ends_nothing(
     asyncio.run(scenario(fail, ended.append))
     asyncio.run(scenario(lambda: "x", None))
     assert ended == []
+
+
+def test_process_gone_is_false_for_a_live_child_and_true_once_it_is_reaped() -> None:
+    """Round 19, audit. The real function, with no stand-in, against a real child, so a
+    version that always answered one way would fail. A child that has exited and not
+    been reaped is a zombie, which the system still lists, so it is not gone."""
+    child = spawn.start(
+        [sys.executable, "-c", "import time; time.sleep(30)"], stdout=subprocess.PIPE
+    )
+    try:
+        assert processes.process_gone(child.pid) is False
+        child.kill()
+        assert child.stdout is not None
+        child.stdout.read()  # end of file comes when the child has exited, unreaped
+        assert processes.process_gone(child.pid) is False, "a zombie is not gone"
+    finally:
+        child.kill()
+        child.wait()
+        if child.stdout is not None:
+            child.stdout.close()
+    assert processes.process_gone(child.pid) is True
+
+
+def test_process_gone_is_false_where_the_system_cannot_tell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Another user's process answers ``PermissionError``, which means it exists, so
+    the sweep must not take it for gone."""
+
+    def refuse(pid: int, number: int) -> None:
+        raise PermissionError(pid, number)
+
+    monkeypatch.setattr(processes.os, "kill", refuse)
+    assert processes.process_gone(os.getpid()) is False

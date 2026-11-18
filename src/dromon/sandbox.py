@@ -41,6 +41,7 @@ unchanged. Path resolution uses ``os.path``, which matches POSIX semantics only.
 import json
 import os
 import re
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -369,16 +370,136 @@ def _with_real_forms(paths: Iterable[str]) -> list[str]:
     return sorted(forms)
 
 
+def folded_path(path: str) -> str:
+    """``path`` in Unicode's canonical caseless form, decomposed, folded and decomposed
+    again, as the Unicode standard's definition D145 of canonical caseless matching
+    gives, so that two spellings a volume treats as one name compare equal.
+
+    **Round 18, addendum 2, item 2.** Folding case alone let a grant spelled in the
+    decomposed form of an accented letter, ``e`` and a combining acute accent, pass a
+    guard spelled in the composed form, since the two strings differ while a volume
+    that ignores the normalisation form opens the same directory for both. Both sides
+    of every comparison go through this one function, so neither can be normalised
+    and the other not. **Choice.** The canonical form, NFD, and not the compatibility
+    form, NFKD, since a volume equates canonical equivalents and not compatibility
+    ones, such as a superscript digit and the digit. Case folding itself joins a few
+    such pairs, such as a ligature and its letters, which only refuses more.
+    **Cost.** As with case, a different directory whose name differs from a guarded
+    one only in normalisation form is refused on a volume that keeps the forms apart.
+    **Porting note.** A port needs the same Unicode version's tables to fold the same
+    names."""
+    decomposed = unicodedata.normalize("NFD", path)
+    return unicodedata.normalize("NFD", decomposed.casefold())
+
+
 def _within(path: str, directory: Path) -> bool:
     """Whether ``path``, with a leading ``~`` expanded as Claude Code expands it, lies
-    in ``directory``."""
+    in ``directory``, compared in the form ``folded_path`` gives, for the reasons
+    ``_overlaps`` and it give."""
     expanded = os.path.expanduser(path)
     if not expanded.startswith("/"):
         return False
     # Real paths on both sides, so a symbolic link such as macOS's /tmp cannot
     # disguise a protected directory.
-    real, guarded = os.path.realpath(expanded), os.path.realpath(directory)
+    real = folded_path(os.path.realpath(expanded))
+    guarded = folded_path(os.path.realpath(directory))
     return os.path.commonpath([real, guarded]) == guarded
+
+
+GLOB_CHARACTERS: Final = "*?[{"
+"""The characters that make a path entry a pattern Claude Code expands."""
+
+
+def claude_default(sandbox: SandboxConfig | None) -> SandboxConfig:
+    """``sandbox`` enabled when no layer says whether it is, and unchanged when one
+    does. **Round 18 follow-up, item 1.** A Claude Code line with no sandbox document,
+    or with one that leaves ``enabled`` unset, ran its shell unconfined, so every
+    credential path the file tools were denied was open to a command. Default deny. The
+    enabling layer is merged last, as the read-only mode merges its own, and it sets
+    only ``enabled``, so an explicit ``enabled`` false in any layer stays the
+    operator's choice, which ``explicitly_disabled`` names for a warning. **Effect.**
+    Such a line's shell now writes only where the sandbox allows, its working directory
+    by Claude Code's default, and reaches no host, as ``network.strictAllowlist`` is
+    filled in with no domain allowed."""
+    if sandbox is not None and "enabled" in sandbox.document():
+        return sandbox
+    enabling = SandboxConfig(canonical({"enabled": True}))
+    return (
+        enabling if sandbox is None else cast(SandboxConfig, merge([sandbox, enabling]))
+    )
+
+
+def explicitly_disabled(sandbox: SandboxConfig | None) -> bool:
+    """Whether a layer of ``sandbox`` set ``enabled`` false, which leaves the line's
+    shell able to read every path the sandbox would deny."""
+    return sandbox is not None and sandbox.document().get("enabled") is False
+
+
+def _grant_base(path: str) -> str:
+    """The directory below which an allow entry can match, with a leading ``~``
+    expanded. A plain path is its own base. A pattern's base is the directory of its
+    literal prefix, the text before its first ``GLOB_CHARACTERS``, so ``~/.s*`` has the
+    home as its base, since it can match any entry the home holds."""
+    expanded = os.path.expanduser(path)
+    cut = next(
+        (
+            index
+            for index, character in enumerate(expanded)
+            if character in GLOB_CHARACTERS
+        ),
+        None,
+    )
+    if cut is None:
+        return expanded
+    head = expanded[:cut]
+    return head[: head.rfind("/") + 1] or "/"
+
+
+def _overlaps(base: str, guarded: Path) -> bool:
+    """Whether ``base`` is ``guarded``, an ancestor of it or inside it, compared by
+    real path on both sides and in the folded form ``folded_path`` gives.
+
+    **Round 18, last pass, item 1.** A grant spelled in another case, such as
+    ``.SSH`` for ``.ssh``, names the same directory on a volume that ignores case,
+    and ``realpath`` keeps the case it was given, so the comparison as text let it
+    through. The comparison is folded always, rather than only where the volume is
+    found to ignore case, since that is a property of each directory and not of the
+    platform, a volume can be mounted from elsewhere, and a test that asks the volume
+    would differ from host to host. **Cost.** On a volume that keeps case apart, a
+    grant of a different directory whose name differs from a listed path only in case
+    is refused too, which an operator can rename around."""
+    if not base.startswith("/"):
+        return False
+    real = folded_path(os.path.realpath(base))
+    guard = folded_path(os.path.realpath(guarded))
+    return os.path.commonpath([real, guard]) in (real, guard)
+
+
+def _refuse_ungrantable(
+    filesystem: Mapping[str, object], ungrantable: Sequence[Path]
+) -> None:
+    """Refuse an ``allowRead`` or ``allowWrite`` entry that could lift a denial of a
+    path in ``ungrantable``. **Round 18 follow-up, item 3.** **Fact, recorded in
+    ``docs/protocol/SANDBOX.md`` from a live probe of 2026-11-01.** An ``allowRead``
+    entry lifts a ``denyRead`` above it on Claude Code, and its bundle expands an
+    ``allowRead`` pattern into the paths it matches. A grant inside a listed path was
+    already refused. A grant of the path itself or of an ancestor, such as the home, and
+    a pattern whose literal base is any of those, are now refused too, rather than
+    relying on a deny winning, which was observed only for ``allowWrite``. **Residual.**
+    A pattern whose base is unrelated cannot match a listed path, since a pattern does
+    not climb with ``..``, which ``_resolve`` leaves in no absolute entry."""
+    for name in ("allowRead", "allowWrite"):
+        for path in cast(list[str], filesystem.get(name, [])):
+            base = _grant_base(path)
+            for guarded in ungrantable:
+                if _overlaps(base, guarded):
+                    _fail(
+                        f"sandbox.filesystem.{name} entry {path!r} could grant"
+                        f" {guarded}, a credential path Dromon denies, since it names"
+                        " that path, a directory holding it, a path inside it or a"
+                        " pattern that could match it",
+                        f"filesystem.{name}",
+                    )
 
 
 def effective(
@@ -386,14 +507,18 @@ def effective(
     root: Path,
     protected: Sequence[Path],
     guarded_writes: Sequence[Path] = (),
+    ungrantable: Sequence[Path] = (),
 ) -> dict[str, object] | None:
     """The settings to hand the engine for a line whose merged document is
     ``sandbox``, with relative paths resolved against ``root``, the line's working
     directory, the unattended defaults filled in, ``protected`` denied, and
     ``guarded_writes``, such as a checkout's git hooks, denied to writes. ``None``
-    when nothing is set.
+    when nothing is set. ``ungrantable`` are paths, such as the credential paths, that
+    ``protected`` should also hold, and that no allow entry may name, hold or match.
 
-    Raises ``SandboxError`` when an allowed Unix socket lies in a protected directory.
+    Raises ``SandboxError`` when an allowed Unix socket lies in a protected directory,
+    when an enabled document grants a protected or ungrantable path, and when an
+    enabled document sets ``excludedCommands``.
     """
     if sandbox is None:
         return None
@@ -433,8 +558,22 @@ def effective(
                 table["allowUnixSockets"] = sockets
     if document.get("enabled") is not True:
         return document
+    # Round 18 follow-up, item 2. A command named here runs outside the sandbox and
+    # reaches every path it denies, so an enabled document may not name one. Refused
+    # rather than dropped, so the operator learns that the command will be confined.
+    if document.get("excludedCommands"):
+        _fail(
+            "sandbox.excludedCommands run outside the sandbox, where every credential"
+            " and protected path is readable, so Dromon refuses them. Remove them, or"
+            " grant what the command needs inside the sandbox",
+            "excludedCommands",
+        )
     document.setdefault("failIfUnavailable", True)
-    document.setdefault("allowUnsandboxedCommands", False)
+    # Round 18 follow-up, item 2. Forced, not defaulted. A command the model asks to
+    # run unsandboxed would read every path the sandbox denies, and nobody is at the
+    # prompt that would otherwise approve it. A layer that sets it true is overridden,
+    # and configwarnings says so.
+    document["allowUnsandboxedCommands"] = False
     network = cast(dict[str, object], document.setdefault("network", {}))
     network.setdefault("strictAllowlist", True)
     filesystem = cast(dict[str, object], document.setdefault("filesystem", {}))
@@ -458,6 +597,7 @@ def effective(
                         f"sandbox.filesystem.{name} entry {path!r} is inside a"
                         " directory Dromon protects"
                     )
+    _refuse_ungrantable(filesystem, ungrantable)
     return document
 
 
@@ -474,6 +614,42 @@ def _grant_real_workdir(filesystem: dict[str, object], root: Path) -> None:
     granted = cast(list[str], filesystem.get("allowWrite", []))
     if real not in granted:
         filesystem["allowWrite"] = sorted({*granted, real})
+
+
+LINUX_SANDBOX_TOOLS: Final = ("bwrap", "socat")
+"""The commands Claude Code's sandbox needs on Linux, found on the engine's ``PATH``.
+**Fact, read from the bundled Claude Code 2.1.327 on 2026-11-18.** Its dependency
+check reports ``bubblewrap (bwrap) not installed`` and ``socat not installed`` when
+either is missing there, and with ``failIfUnavailable`` true it then refuses to run a
+command. Its seatbelt sandbox is built into the other supported platform, and needs
+nothing installed. A missing seccomp filter only weakens the sandbox and is not
+checked."""
+
+
+def host_unavailable_reason(
+    system: str, which: Callable[[str], str | None]
+) -> str | None:
+    """Why Claude Code's sandbox cannot start on a host whose ``platform.system()``
+    is ``system`` and whose commands ``which`` finds, or ``None`` when nothing is
+    known to be missing. **Round 18, last pass, item 7.** A Claude Code line that no
+    layer enables or disables now gets an enabled sandbox with ``failIfUnavailable``
+    true, so on such a host its first turn fails, which a start check can say before
+    any turn. **Assumption.** The engine runs with the daemon's ``PATH``, as the
+    launcher passes it. **Residual.** Only missing commands are found. A host whose
+    kernel refuses the user namespaces bubblewrap needs, as some containers do, passes
+    this check and still fails at the first turn, since finding that would start a
+    sandbox."""
+    if system != "Linux":
+        return None
+    missing = [name for name in LINUX_SANDBOX_TOOLS if which(name) is None]
+    if not missing:
+        return None
+    return (
+        "Claude Code's sandbox cannot start on this host, since "
+        + " and ".join(missing)
+        + (" is" if len(missing) == 1 else " are")
+        + " not on the daemon's PATH"
+    )
 
 
 def blocks_unsandboxed(

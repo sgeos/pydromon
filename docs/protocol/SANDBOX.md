@@ -21,8 +21,7 @@ names, so that one can be copied from `.claude/settings.json` unchanged.
 ```json
 {
   "enabled": true,
-  "excludedCommands": ["docker"],
-  "filesystem": {"allowWrite": ["~/.kube"], "denyRead": ["~/.ssh"]},
+  "filesystem": {"allowWrite": ["~/.cache/uv"], "denyRead": ["~/.ssh"]},
   "network": {"allowedDomains": ["github.com", "*.npmjs.org"]},
   "credentials": {"envVars": [{"name": "GITHUB_TOKEN", "mode": "deny"}]}
 }
@@ -32,7 +31,7 @@ names, so that one can be copied from `.claude/settings.json` unchanged.
 |---|---|---|
 | `enabled`, `failIfUnavailable`, `allowUnsandboxedCommands`, `autoAllowBashIfSandboxed` | boolean | Anyone |
 | `enableWeakerNestedSandbox`, `enableWeakerNetworkIsolation` | boolean | Anyone |
-| `excludedCommands` | array of command patterns | Anyone |
+| `excludedCommands` | array of command patterns | Anyone, and refused in an enabled document from round 18 |
 | `ignoreViolations` | table of command pattern to array of text | Anyone |
 | `filesystem.allowWrite`, `denyWrite`, `denyRead`, `allowRead` | array of paths | Anyone |
 | `network.allowedDomains`, `deniedDomains` | array of domains, `*.` allowed in front | Anyone |
@@ -54,7 +53,9 @@ The meaning of each key is Claude Code's, as documented at
 - **Operator only.** Claude Code accepts these keys only from user or managed settings,
   because each removes a boundary. Dromon's project file is committed with a project,
   like a repository's `.claude/settings.json`, so it may not set them. A document given
-  through the client may.
+  through the client may, except for a line that takes `daemon.default_profile`, whose
+  client document is refused these and every other key that weakens the sandbox,
+  round 18, addendum 3, as [`PROJECT_CONFIG.md`](PROJECT_CONFIG.md) specifies.
 - **Refused.** `bwrapPath`, `socatPath`, `filesystem.allowManagedReadPathsOnly` and
   `network.allowManagedDomainsOnly` apply only to managed settings, and Dromon has no
   managed layer. `ripgrep`, credential masking, `credentials.awsPairs`,
@@ -195,9 +196,38 @@ not permitted", while a file written to the line's own `tmp` was listed and read
 its full path. An `allowRead` therefore lifts a `denyRead` above it on that engine.
 
 When a line's turn starts, Dromon merges the layers and derives the settings it hands to
-Claude Code. Nothing is passed when no layer sets anything, and the line then has no
-sandbox but any managed policy, because Dromon starts Claude Code without user or
-project settings.
+Claude Code. **Round 18 follow-up, item 1.** When no layer says whether the sandbox
+is enabled, a Claude Code line is given an enabled one, merged last as the read-only
+mode merges its own, so that its shell is held by the denials below. Before, nothing was
+passed when no layer set anything, and the line then had no sandbox but any managed
+policy, because Dromon starts Claude Code without user or project settings. An explicit
+`enabled` false in any layer stays the operator's choice. `dromond`, `dromon config`
+and the line's build then warn that the line's shell can read the credential paths that
+only its file tools are denied. **Effect, an inference from Claude Code's
+documentation.** Such a line's shell now writes only its working directory and what a
+layer grants, and reaches no host, since `network.strictAllowlist` is filled in with no
+domain allowed. A Claude Code line in a checkout whose `.git` pointer cannot be followed
+is now refused, as a sandboxed line always was. **Round 18, last pass, item 2.**
+`dromon config` reports each line's sandbox as its build gives it, through the function
+the daemon's checks use, as `sandboxed by default` for a Claude Code line that no layer
+enables or disables, and as `not sandboxed, its shell can read the credential paths`
+for one a layer disables. A line whose build would be refused, such as one naming
+`excludedCommands`, makes `dromon config` fail with the build's reason.
+
+**A host that cannot start the sandbox, round 18, last pass, item 7.** **Fact, read
+from the bundled Claude Code 2.1.327.** Its sandbox needs `bwrap` and `socat` on the
+engine's `PATH` on Linux, and reports `bubblewrap (bwrap) not installed` or `socat not
+installed` when either is missing, and seatbelt on the other supported platform is built
+in. Since `failIfUnavailable` is filled in as true, every Claude Code line with an
+enabled sandbox, including each one enabled only by the default above, fails at its
+first turn on a Linux host that lacks either. A start, `dromond --check` and
+`dromon check-engines`, which runs that check, print a warning naming every such line,
+declared or created through the client, before any turn. It is a warning and not a
+refusal, since the host's other lines can still run, and a refusal would also stop
+`dromon restart`, whose preflight runs the same check. **Assumption.** The engine runs
+with the daemon's `PATH`. **Residual.** Only missing commands are found. A host whose
+kernel refuses the user namespaces bubblewrap needs, as some containers do, passes the
+check and still fails at the first turn, since finding that would start a sandbox.
 
 1. **Paths.** A relative path is resolved against the line's working directory, its
    `workdir` as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies, which is the project root
@@ -207,7 +237,16 @@ project settings.
    `failIfUnavailable` as true, `allowUnsandboxedCommands` as false and
    `network.strictAllowlist` as true, unless the document sets them. Claude Code's own
    defaults ask a person instead, or run unsandboxed when the sandbox cannot start, and
-   a Dromon line has nobody at the prompt.
+   a Dromon line has nobody at the prompt. **Round 18 follow-up, item 2.**
+   `allowUnsandboxedCommands` is forced false, whatever a layer sets, the client's
+   included, since a command run outside the sandbox reads every path it denies, and
+   `dromon config` and `dromond` warn of a layer that sets it true. An enabled document
+   that names `excludedCommands` is refused, at `dromond`'s start for the project file
+   and at the line's build, since an excluded command runs outside the sandbox. It is
+   refused rather than dropped, so the operator learns that the command would be
+   confined. **Residuals.** `failIfUnavailable` false is still honoured, and runs every
+   command outside the sandbox where it cannot start. `filesystem.disabled`, which only
+   the client may set, still lifts the filesystem rules.
 3. **Protected directories.** An enabled sandbox denies reading and writing the
    project's state directory and runtime directory, which hold the event log, the
    project file and the daemon's socket, and since 2026-10-28 each declared peer's
@@ -232,6 +271,100 @@ project settings.
    while the file tools stay denied by the settings. **Residuals.** A directory made
    after the build is denied from the line's next build. A line whose sandbox is
    disabled can read them with its shell.
+   **Round 18, the operator's security fix.** The known credential paths,
+   `security_paths.CREDENTIAL_PATHS`, are protected in the same way for every Claude
+   Code line. Each is taken under the real path of the daemon's home, where it exists
+   when the line's engine is built, by that name and by its real path, a rule the
+   follow-up below widens. Codex and Grok
+   lines have had them since round 9. The file tools are denied each path itself as
+   well as what lies under it, with `Read(//PATH)` and `Edit(//PATH)` beside the
+   `/**` rules, since several entries, such as `~/.netrc` and `~/.claude.json`, are
+   files. A grant of a path inside one, or of the path itself, is refused as above,
+   and so is an agent socket of `[git_ssh]` inside one. A grant of a directory that
+   holds one, such as the home, was accepted, which the follow-up below reverses.
+   **Why the lines differed.** **Fact, from `projectconfig.py`.** A `profile` is
+   expanded only for the lines the project file declares. **Fact, from the
+   confinement checks of 2026-11-18.** Lines the client created reported the home
+   ssh directory listable and Codex's sign-in file readable. Lines the project file
+   declares reported both denied. **Inference.** The dogfood project's Claude Code
+   profile, as [`DOGFOOD.md`](../process/DOGFOOD.md) gives it, carries `Read` deny
+   rules for those paths, and Claude Code also applies a `Read` deny rule to its
+   sandbox, so only the lines given that profile had them. Before this fix the rule
+   came from the project's own documents. Dromon itself denied a Claude Code line
+   only the protected and secret directories. **What Claude Code keeps.** Nothing,
+   as `security_paths.CLAUDE_CODE_EXEMPT` records, read from the bundled Claude Code
+   2.1.310. Its sign-in lives in the system keychain, or else in
+   `~/.claude/.credentials.json`, and its account in `~/.claude.json`. The engine's
+   own process reads both, and neither the sandbox nor the rules confine that
+   process. **Residuals.** The list is not exhaustive. The keychain is not a path,
+   and whether a command in an enabled sandbox can ask it for an item was not
+   tested. A line whose sandbox is disabled can read every listed path with its
+   shell, as it can every protected one.
+   **Round 18 follow-up, from the audit line's review, each defect confirmed in the
+   code or a test before the change.** *Missing and linked paths, item 4.* Every
+   listed path is denied whether or not it exists, under the daemon's home as the
+   process names it and under its real path, and also by the entry's own real path
+   when it exists and a link makes that differ. A line's engine is built once and
+   kept, so a file made later, by a sign-in, was readable for the daemon's life.
+   **Fact, read from the bundled Claude Code 2.1.310.** Its Linux sandbox places a
+   placeholder over a missing deny path, and logs where it cannot, and no step that
+   skips a missing deny path was found for Seatbelt, whose rules match paths and need
+   no file. **Residual.** The real form of a path made after the build is added at the
+   line's next build. *Grants that could reach one, item 3.* An `allowRead` or
+   `allowWrite` entry is refused when it is a listed path, a directory that holds one,
+   such as the home or `/`, or a path inside one, and when it is a pattern whose
+   literal base is any of those. The base of a pattern is the directory of the text
+   before its first `*`, `?`, `[` or `{`, so `~/.s*` has the home as its base and is
+   refused, while `~/.cache/*` and `~/.cache/uv` are accepted. **Fact, from the same
+   bundle.** It expands an `allowRead` pattern into the paths it matches. **Fact,
+   recorded above, observed live on 2026-11-01.** An `allowRead` lifts a `denyRead`
+   above it. The protected and secret directories keep the rule above, which refuses
+   only a grant inside them, since a line's working directory holds its own `secret`.
+   **Residual.** A pattern under one of those, such as a grant of `PROJECT/s*`, is
+   not refused. *The keychain, item 7.* **Fact, reported by the audit line.** A
+   lookup of a made-up item from a command in an enabled sandbox reached the keychain
+   service and was told no such item exists. Whether the item that holds a sign-in is
+   returned rests on the keychain's own access rules and was not tested, since the
+   test would read a credential. It stays a residual. *Paths not added, item 5.*
+   `~/Library/Keychains`, `~/.config/gcloud` and `~/.azure` are not in the list every
+   engine takes, since it also binds Codex and Grok lines and that was not settled
+   for Grok. The last pass below adds them for Claude Code lines alone.
+
+   **Round 18, last pass.** *Letter case, item 1.* **Fact, confirmed before the
+   change.** A grant of `~/.SSH` was accepted, and on a volume that ignores case it
+   names the ssh directory. Both refusals now compare real paths in folded case, the
+   credential rule and the rule for protected and secret directories, on every host.
+   Folding always was chosen over asking whether a volume ignores case, since that is
+   a property of each directory, a volume may be mounted from elsewhere, and the
+   answer would differ between hosts and so between test runs. **Cost.** On a volume
+   that keeps case apart, a grant of another directory whose name differs from a
+   listed path only in case is refused too. **Round 18, addendum 2, item 2. Fact,
+   confirmed before the change.** A grant spelled with a decomposed accent, a letter
+   and a combining mark, was accepted under a home spelled with the composed letter,
+   and a volume that ignores the normalisation form opens the same directory for
+   both. Both sides of both refusals now pass through `sandbox.folded_path`, which
+   decomposes, folds case and decomposes again, Unicode's canonical caseless
+   matching. The canonical form is used and not the compatibility form, since a
+   volume equates canonically equivalent names and not, for example, a superscript
+   digit and the digit. **Cost.** As with case, a different directory whose name
+   differs only in normalisation form is refused on a volume that keeps the forms
+   apart. **Residual, untested.** The file-tool deny rules are written in the form the
+   home is spelled in, and whether Claude Code's own matcher folds case or form was
+   not tested. **Residual, from the audit line,
+   untested.** `$HOME/.ssh` and `~other/.ssh` are accepted as text that is neither
+   absolute nor home-relative. Whether the engine expands either was not tested.
+   *A second list for Claude Code, item 5.* `security_paths.CLAUDE_CODE_ONLY_PATHS`
+   holds `~/Library/Keychains`, `~/.config/gcloud` and `~/.azure`. They are denied to
+   every Claude Code line's shell and file tools as the list above is, a grant that
+   could reach one is refused as above, and no Codex or Grok line takes them.
+   **Fact, read from Grok 1.0.70.** Its binary carries the Google default credentials
+   loader and its sandbox code names the login keychain's files, so its own list is
+   left as it was. **Residual.** The keychain service is not a path. A command in the
+   sandbox that asks the service for an item is answered by the service's own
+   process, which no file denial binds, so denying the keychain files does not stop a
+   query to the service. **Hypothesis, not tested.** A shell command whose keychain
+   library opens the login keychain's file itself now fails, and a command that signs
+   in to Google Cloud or Azure from the shell finds no credentials.
 4. **Git hooks and configuration.** When the line's working directory lies in a git
    checkout, an enabled sandbox also denies writes to the hooks and configuration git
    would act on there, whether or not any layer grants the git directory. A command

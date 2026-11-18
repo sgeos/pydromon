@@ -524,6 +524,24 @@ def protected_rules(protected: Sequence[Path]) -> list[str]:
     return _rules(protected, ("Read", "Edit"))
 
 
+def credential_rules(paths: Sequence[Path]) -> list[str]:
+    """Deny rules that keep the built-in file tools from each of ``paths`` and from
+    what lies under it. **Round 18, the operator's security fix.** A credential path
+    may be a file, such as ``~/.netrc``, which the directory rules of
+    ``protected_rules`` do not match, since ``//path/**`` names only what lies under
+    a path. ``Read`` rules also hold ``Grep`` and ``Glob``, and ``Edit`` rules every
+    tool that writes a file."""
+    rules: set[str] = set()
+    for path in paths:
+        for form in {os.path.normpath(path), os.path.realpath(path)}:
+            if not form.startswith("/"):
+                _fail(f"the credential path {form!r} is not absolute")
+            for tool in ("Read", "Edit"):
+                rules.add(f"{tool}(/{form})")
+                rules.add(f"{tool}(/{form}/**)")
+    return sorted(rules)
+
+
 def _rules(directories: Sequence[Path], tools: Sequence[str]) -> list[str]:
     rules: set[str] = set()
     for directory in directories:

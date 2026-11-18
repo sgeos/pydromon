@@ -52,7 +52,7 @@ from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
 from dromon.engine import EngineRefused
 from dromon.agents import LINE_TOKEN_ENV, TOKEN_ENV
 from dromon.configwarnings import config_warnings
-from dromon.lineconfig import EFFORTS, can_write_workdir
+from dromon.lineconfig import EFFORTS, LineConfig, can_write_workdir
 from dromon.projectconfig import ProjectConfig
 from dromon.model import AgentAccess
 from dromon.protocol import (
@@ -65,7 +65,9 @@ from dromon.scheduler import LineSpec, engine_factory
 from dromon import settings as engine_settings
 from dromon.sandbox import (
     SandboxConfig,
+    SandboxError,
     effective as effective_sandbox,
+    explicitly_disabled,
     merge,
     sandbox_from_settings,
 )
@@ -1637,6 +1639,12 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         f"daemon: operator {config.operator}, tick_seconds {config.tick_seconds},"
         f" require_sandbox {config.require_sandbox}"
     )
+    if config.default_profile is not None:
+        profile = config.default_profile
+        print(
+            f"default profile: {profile.name}, for lines on {profile.engine} that the"
+            " file does not declare, applied when the client creates or configures one"
+        )
     print(
         f"federation: local {config.federation.local},"
         f" remote {config.federation.remote},"
@@ -1675,13 +1683,20 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         print(f"warning: {warning}")
     for line_id, line in sorted(config.lines.items()):
         line_settings = engine_settings.merge([config.settings, line.config.settings])
-        line_sandbox = merge([config.sandbox, line.config.sandbox])
+        # Round 18, last pass, item 2. The sandbox the line's build gives it, which
+        # for a Claude Code line that no layer enables or disables is enabled, and not
+        # the merge of its layers, which said "no sandbox settings" for such a line.
+        line_sandbox = _built_sandbox(config, line.model, line.config)
         raw_workdir = line.config.workdir or "."
         workdir = Path(raw_workdir).expanduser()
         if not workdir.is_absolute():
             workdir = paths.root / workdir
         workdir = workdir.resolve()
-        sandbox_document = effective_sandbox(line_sandbox, workdir, ())
+        try:
+            sandbox_document = effective_sandbox(line_sandbox, workdir, ())
+        except SandboxError as error:
+            print(f"dromon config: line {line_id}: {error}", file=sys.stderr)
+            return exits.FAILURE
         raw_filesystem = (
             sandbox_document.get("filesystem") if sandbox_document is not None else None
         )
@@ -1709,7 +1724,7 @@ def _config(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
         print(
             f"line {line_id}: {line.model} {line.strategy},"
             f" {line.config.tool_policy}, {tools}, {servers},"
-            f" {_sandbox_summary(merge([config.sandbox, line.config.sandbox]))},"
+            f" {_line_sandbox_summary(config, line.model, line.config)},"
             f" {_settings_summary(line_settings)}"
             + (f", effort {line.config.effort}" if line.config.effort else "")
             + (f", in {line.config.workdir}" if line.config.workdir else "")
@@ -2016,6 +2031,29 @@ def _sandbox_summary(sandbox: SandboxConfig | None) -> str:
     if sandbox is None:
         return "no sandbox settings"
     return "sandboxed" if sandbox.enabled else "not sandboxed"
+
+
+def _built_sandbox(
+    config: ProjectConfig, model: str, line: LineConfig
+) -> SandboxConfig | None:
+    """The merged sandbox the daemon's build gives a line, from the function the
+    daemon's own checks use, so the two cannot disagree. Imported here, as
+    ``git_ssh_access`` is, so the client loads the daemon only for this command."""
+    from dromon.daemon import line_sandbox
+
+    return line_sandbox(config.sandbox, model, line)
+
+
+def _line_sandbox_summary(config: ProjectConfig, model: str, line: LineConfig) -> str:
+    """``_sandbox_summary`` of the sandbox the build gives the line, saying when it is
+    enabled only by Dromon's default for Claude Code lines, and saying for an explicit
+    ``enabled`` false that the line's shell can read the credential paths."""
+    built = _built_sandbox(config, model, line)
+    if built != merge([config.sandbox, line.sandbox]):
+        return "sandboxed by default"
+    if explicitly_disabled(built) and ENGINE_OF.get(model) == CLAUDE_CODE_ENGINE:
+        return "not sandboxed, its shell can read the credential paths"
+    return _sandbox_summary(built)
 
 
 def _release(paths: ProjectPaths, arguments: argparse.Namespace) -> int:

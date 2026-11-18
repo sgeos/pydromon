@@ -451,7 +451,21 @@ def test_a_note_to_an_operator_without_reply_to_says_what_waits(
     assert len(sent_texts(world, reply)) == 1
     assert world.unanswered(ALPHA) == 1
     texts = sent_texts(world, {"to": "@ana", "body": "another summary"})
-    assert "none of the 1 notes from @ana" in texts[1] and first in texts[1]
+    # Round 19, item 1. One note waits, and the hint agrees with that count.
+    assert "does not answer the 1 note from @ana" in texts[1] and first in texts[1]
+    assert "notes" not in texts[1] and "the newest" not in texts[1]
+    assert "acknowledge_mail that note and name" in texts[1]
+
+
+def test_the_hint_agrees_in_number_for_several_notes(world: World) -> None:
+    """Round 19, item 1. Several waiting notes take the plural form."""
+    tasks = [
+        world.deliver(world.scheduler.send(ANA, ALPHA, f"task {n}")) for n in range(3)
+    ]
+    texts = sent_texts(world, {"to": "@ana", "body": "a summary"})
+    assert f"answers none of the {len(tasks)} notes from @ana" in texts[1]
+    assert f"the newest {tasks[-1]}" in texts[1] and " 3 note " not in texts[1]
+    assert "acknowledge_mail that one and name" in texts[1]
 
 
 def test_a_note_is_told_nothing_when_no_link_is_missing(world: World) -> None:

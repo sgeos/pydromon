@@ -321,7 +321,12 @@ def test_rebind_line_moves_the_line_for_an_operator(paths: ProjectPaths) -> None
             "an engine that takes neither",
         ),
         (
-            ProjectConfig(require_sandbox=True),
+            # Round 18 follow-up, item 1. A line no layer enables or disables is
+            # sandboxed by default, so the requirement fails only on enabled false.
+            ProjectConfig(
+                require_sandbox=True,
+                sandbox=parse_sandbox({"enabled": False}, operator=False),
+            ),
             rebind_args(OPUS),
             ErrorCode.REJECTED,
             "require_sandbox",
