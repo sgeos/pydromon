@@ -69,10 +69,23 @@ Nothing here touches the running daemon or its checkout.
    the failure modes of [`RESTART.md`](../protocol/RESTART.md) say.
 2. **Copy the state.** Make a directory with mode 0700 outside every line's reach,
    since the log holds message bodies and answers, and copy into it
-   `.dromon/events.sqlite`, and where they exist `.dromon/events.sqlite.snapshot`,
-   `.dromon/events.sqlite.sealed` and `.dromon/dromon.toml`. With the daemon stopped a
-   plain copy is consistent. While it runs, `sqlite3 .dromon/events.sqlite ".backup
-   COPY"` takes a consistent copy of the log.
+   `.dromon/events.sqlite`, and where they exist `.dromon/events.sqlite-journal`,
+   `.dromon/events.sqlite.snapshot`, `.dromon/events.sqlite.sealed` and
+   `.dromon/dromon.toml`. **Review of `513928b`, finding 4.** Copy with the daemon
+   stopped, after a clean `dromon stop`, when a plain copy is consistent. Do not use
+   `sqlite3 ".backup"` on a running daemon's log. SQLite's online backup starts again
+   whenever the log is written between its steps, so on a busy log it may not finish,
+   and its read lock keeps the daemon's commits waiting, as `eventlog.snapshot`
+   records. Where the daemon cannot be stopped yet, point `upgrade-check --from-log`
+   at the live log itself. It copies in bounded ranges with the source attached
+   read-only, as `dromond --check` does, and writes nothing beside it.
+   **After a crash.** A daemon killed while it committed leaves
+   `.dromon/events.sqlite-journal`, a hot journal, which the next open rolls back.
+   Copy it with the log, under the same name beside the copy. A log copied without its
+   hot journal can be torn. `upgrade-check` rolls the journal back inside its scratch
+   directory, as a start would, and its `copy` check warns that one was there. A log
+   in SQLite's write-ahead mode, which Dromon never writes, is copied with its `-wal`
+   file in the same way.
 3. **Give the worktrees.** The project file's working directories resolve under a
    project root. `--root` may name the live root, which the check only reads, as a test
    shows, or a copy of it holding the worktrees, without `.dromon`.
@@ -84,13 +97,22 @@ Nothing here touches the running daemon or its checkout.
    ```
 
    It copies the copy again into a private scratch directory, which it removes, and
-   never writes the file it is given, the root or the repository. It makes no socket,
-   takes no lock, builds no engine and asks no daemon anything. `--json` prints the same
-   checks as JSON. Its exit code is 0 when no check failed and 1 otherwise.
+   never writes the file it is given, anything beside it, the root or the repository.
+   It makes no socket, takes no lock of the daemon's, builds no engine and asks no
+   daemon anything. `--json` prints the same checks as JSON. Its exit code is 0 when
+   no check failed and 1 otherwise.
+
+   **A killed check.** **Review of `513928b`, finding 3.** The scratch directory,
+   `dromon-upgrade-*` in the temporary directory, holds a full copy of the log. A check
+   killed with `kill -9` cannot remove it, so the next check run in the same temporary
+   directory removes each such directory of the same user that no running check
+   holds, and its `scratch` line names them. Until then the copy stays, mode 0700.
+   After killing a check, run it again, or remove the directory by hand.
 
 | Check | Fails or warns when | What to do |
 |---|---|---|
-| `copy` | A file given is missing, or cannot be copied | Copy again |
+| `scratch` | Shown only when it removed a scratch directory a killed check left | Nothing |
+| `copy` | A file given is missing, or cannot be copied, which fails. A hot journal lay beside the log, which warns | Copy again. After a warning, keep the journal with every copy |
 | `replay` | TO cannot open the log | Stop. TO is older than the log, or the log is damaged. Choose another TO, or restore an earlier copy |
 | `snapshot` | A snapshot of TO's own version differs from a full replay | Stop and report it. A snapshot of another version only says it is ignored, which passes |
 | `start` | TO's own start check, `dromond --check` on the copies, refuses, such as for a project file or sandbox TO no longer accepts | Change the copy of the project file until the check passes, then make the same change to the live file at the upgrade |
@@ -139,6 +161,14 @@ Nothing here touches the running daemon or its checkout.
 
 ## Residuals
 
+- **What a rollback restores.** Only the log and the files beside it. The runtime
+  directory, a supervised run that outlived the daemon, the registry entry TO wrote
+  and the engines' own homes are not put back, and FROM reading a registry entry TO
+  wrote was not tested. **Review of `513928b`, noted, not addressed in this change.**
+- **A copy taken while the log is written.** The check copies a log in write-ahead
+  mode, or one with a hot journal, byte for byte before opening it, taking it to be at
+  rest. A copy of such a file taken while a process writes it can be torn, and the
+  `replay` check then fails or copies fewer events.
 - **What the check cannot find.** The `start` check is `dromond --check`, so recovery,
   the process table, engine sign-in and the first turns are not exercised, as
   [`RESTART.md`](../protocol/RESTART.md) says of the preflight. A line that fails only

@@ -11,3 +11,15 @@ Type: Fixed
   `dromon.machinestatus`, which the warning a turn proceeds with, the refusal of a
   run, the `start_run` tool and `line_status` all give. A level raised only by free
   disk space no longer tells a line to hold a full gate that the daemon lets start.
+- Review of 513928b. The floor fragment for the expiry and lowered-limit causes of
+  `lease_released` searched for a value another enumeration held long before, so
+  `upgrade-check` listed 23 newer one-way changes from 6567167 where there are 24. It
+  now searches for a value only that change added, and a test compares the codec's
+  kinds, fields and enumeration values with those of 6567167.
+- Review of 513928b. `upgrade-check` no longer writes beside a log in write-ahead
+  mode, and reads one in a directory it may not write. A log with a hot journal,
+  which a read-only open refuses, is rolled back inside the scratch directory, with a
+  warning that the journal must be copied with the log. A scratch directory left by
+  a check killed with `kill -9`, which holds a copy of the log, is removed by the
+  next check. `UPGRADE.md` no longer advises `sqlite3 .backup` on a running daemon,
+  and says what to copy after a crash.

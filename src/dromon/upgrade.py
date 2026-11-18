@@ -12,9 +12,12 @@ found only by starting the new daemon on the live state, which cannot be undone.
 **What it reads, and what it writes.** It reads the log, the snapshot and the sealed
 store beside it, the project file, the project root given, and the repository of the
 installed code for the rollback floors, and it writes only a private scratch
-directory, made owner only and removed before it returns. The log is copied as
-``dromond --check`` copies a live log, with ``eventlog.snapshot``, which never writes
-its source, so it may be pointed at the live log, though the procedure copies first.
+directory, made owner only and removed before it returns, and removes the scratch
+directories of its own earlier runs that were killed, as ``sweep_scratch`` gives. The
+log is copied as ``dromond --check`` copies a live log, with ``eventlog.snapshot``,
+which never writes its source or anything beside it, so it may be pointed at the live
+log, though the procedure copies first. A log in write-ahead mode, or with a hot
+journal, is first copied byte for byte into the scratch, as ``copy_log`` gives.
 No socket is made, no lock is taken, no engine is built, the teacher is not started,
 the registry and the fleet index are not written, and the running daemon is never
 asked anything.
@@ -51,12 +54,16 @@ not foreseen.
 """
 
 import contextlib
+import fcntl
 import io
 import os
 import re
 import shutil
+import sqlite3
+import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -141,7 +148,7 @@ def copy_inputs(
     held = state_dir / "held-snapshot.json"
     try:
         refusal = hold_snapshot(statesnapshot.snapshot_path(log_file), held)
-        through = snapshot(log_file, log_copy)
+        through, how = copy_log(log_file, log_copy, state_dir.parent / "recovered")
         sealed = store_path(log_file)
         if sealed.is_dir():
             shutil.copytree(sealed, store_path(log_copy), symlinks=True)
@@ -154,9 +161,108 @@ def copy_inputs(
             shutil.copyfile(held, statesnapshot.snapshot_path(log_copy))
     except (LogError, OSError) as error:
         return Check("copy", Outcome.FAIL, f"the copy failed: {error}"), None
-    said = f"copied {through} events into a private scratch directory"
+    said = f"copied {through} events into a private scratch directory{how.detail}"
     copied = Copied(log_copy, through, None if refusal else held, refusal)
-    return Check("copy", Outcome.PASS, said), copied
+    outcome = Outcome.WARN if how is LogForm.HOT_JOURNAL else Outcome.PASS
+    return Check("copy", outcome, said), copied
+
+
+class LogForm(StrEnum):
+    """How the log was found, which decides how it is copied."""
+
+    ROLLBACK = "rollback"
+    WAL = "wal"
+    HOT_JOURNAL = "hot_journal"
+
+    @property
+    def detail(self) -> str:
+        """What the copy check adds to its detail for this form."""
+        match self:
+            case LogForm.ROLLBACK:
+                return ""
+            case LogForm.WAL:
+                return (
+                    ". The log is in SQLite's write-ahead mode, which Dromon never"
+                    " writes, so it and its -wal file were copied byte for byte into"
+                    " the scratch directory and opened there, and nothing was written"
+                    " beside it"
+                )
+            case LogForm.HOT_JOURNAL:
+                return (
+                    ". A hot journal lies beside the log, as a crash leaves, so the"
+                    " log and its -journal file were copied byte for byte into the"
+                    " scratch directory and rolled back there, as the next start"
+                    " would. Copy the -journal file with the log whenever one is"
+                    " there, since a log copied without it can be torn"
+                )
+
+
+WAL_HEADER: Final = slice(18, 20)
+"""The bytes of a SQLite database header holding its file format write and read
+versions, each 2 in write-ahead mode and 1 in rollback mode."""
+
+
+def sidecar(log_file: Path, suffix: str) -> Path:
+    """A file SQLite keeps beside ``log_file``, such as its ``-journal``."""
+    return log_file.with_name(log_file.name + suffix)
+
+
+def in_wal_mode(log_file: Path) -> bool:
+    """Whether ``log_file`` is in write-ahead mode, by its header or a ``-wal`` file
+    beside it. Raises ``OSError``."""
+    with log_file.open("rb") as reading:
+        header = reading.read(WAL_HEADER.stop)
+    return 2 in header[WAL_HEADER] or sidecar(log_file, "-wal").exists()
+
+
+def copy_log(log_file: Path, log_copy: Path, recovered: Path) -> tuple[int, LogForm]:
+    """Copy the log into ``log_copy`` without writing anything beside ``log_file``,
+    and give the last event copied and the form the log was found in. Raises
+    ``LogError`` or ``OSError``.
+
+    **Review of 513928b, finding 2.** ``eventlog.snapshot`` attaches its source
+    read-only, which never writes a log in rollback mode, as Dromon keeps it, and so
+    may read a live one. SQLite still makes ``-shm`` and ``-wal`` files beside a log
+    in write-ahead mode that it opens, even read-only, and cannot open one at all in a
+    directory it may not write, and it refuses read-only a log whose hot journal it
+    would have to roll back. **Fact, observed on 2026-11-18.** Such a log, and its
+    ``-wal`` or ``-journal``, is therefore copied byte for byte into ``recovered``, a
+    private directory of the scratch, opened there read-write, which checkpoints the
+    one and rolls back the other, as a start would, and only then copied as any log
+    is. A hot journal is taken only after the read-only copy fails, since a live
+    daemon's commit leaves a ``-journal`` briefly and the read-only copy reads past
+    it. **Assumption.** A log in write-ahead mode, or one with a hot journal, is not
+    being written while it is copied. Dromon never writes the first, and the second
+    is left only by a daemon that has stopped. **Residual.** A plain file copy of a
+    log that is being written can be torn, and the replay check then fails or, where
+    the tear falls between whole events, copies fewer."""
+    if not in_wal_mode(log_file):
+        try:
+            return snapshot(log_file, log_copy), LogForm.ROLLBACK
+        except LogError:
+            journal = sidecar(log_file, "-journal")
+            if not (journal.is_file() and journal.stat().st_size > 0):
+                raise
+            log_copy.unlink(missing_ok=True)
+        form = LogForm.HOT_JOURNAL
+    else:
+        form = LogForm.WAL
+    os.mkdir(recovered, 0o700)
+    private = recovered / "events.sqlite"
+    shutil.copyfile(log_file, private)
+    for suffix in ("-wal", "-journal"):
+        if sidecar(log_file, suffix).is_file():
+            shutil.copyfile(sidecar(log_file, suffix), sidecar(private, suffix))
+    try:
+        opening = sqlite3.connect(private, isolation_level=None)
+        try:
+            opening.execute("SELECT count(*) FROM sqlite_schema").fetchone()
+            opening.execute("PRAGMA journal_mode = DELETE").fetchone()
+        finally:
+            opening.close()
+    except sqlite3.Error as error:
+        raise LogError(f"cannot recover the copy of {log_file}: {error}") from error
+    return snapshot(private, log_copy), form
 
 
 def check_replay(log_copy: Path, replay_copy: Path) -> tuple[Check, State | None]:
@@ -347,6 +453,26 @@ def fragment_changes(repository: Path) -> list[FloorChange]:
     return found
 
 
+def placed_changes(repository: Path, old: str) -> tuple[list[str], list[str]]:
+    """The one-way changes of the table and the fragments whose floor the commit
+    ``old`` does not contain, and those whose floor git cannot place, each by the
+    name the table or fragment gives. Raises ``OSError`` or
+    ``subprocess.TimeoutExpired`` when git cannot be asked."""
+    changes = table_changes((repository / FLOOR_TABLE).read_text(encoding="utf-8"))
+    changes += fragment_changes(repository)
+    newer: list[str] = []
+    unknown: list[str] = []
+    for change in changes:
+        held = (
+            None if change.floor is None else _contains(repository, change.floor, old)
+        )
+        if held is None:
+            unknown.append(change.change)
+        elif not held:
+            newer.append(change.change)
+    return newer, unknown
+
+
 def check_floor(repository: Path | None, from_commit: str | None) -> Check:
     """The one-way changes whose floor the old revision ``from_commit`` lacks."""
     if from_commit is None:
@@ -365,20 +491,7 @@ def check_floor(repository: Path | None, from_commit: str | None) -> Check:
         if old is None:
             return Check("floor", Outcome.FAIL, f"{from_commit} is not a commit here")
         head = _commit(repository, "HEAD")
-        changes = table_changes((repository / FLOOR_TABLE).read_text(encoding="utf-8"))
-        changes += fragment_changes(repository)
-        newer: list[str] = []
-        unknown: list[str] = []
-        for change in changes:
-            held = (
-                None
-                if change.floor is None
-                else _contains(repository, change.floor, old)
-            )
-            if held is None:
-                unknown.append(change.change)
-            elif not held:
-                newer.append(change.change)
+        newer, unknown = placed_changes(repository, old)
         behind = head is not None and _contains(repository, old, head) is False
     except (OSError, subprocess.TimeoutExpired) as error:
         return Check("floor", Outcome.FAIL, f"git could not be asked: {error}")
@@ -413,6 +526,99 @@ def installed_repository() -> Path | None:
     return candidate if (candidate / ".git").exists() else None
 
 
+SCRATCH_PREFIX: Final = "dromon-upgrade-"
+SCRATCH_LOCK: Final = "lock"
+UNLOCKED_STALE_SECONDS: Final = 3600.0
+"""How old a scratch directory without a lock file must be before a sweep removes
+it. A run makes its lock file at once, so only a directory of code before the sweep,
+or one whose run was killed between the two steps, lacks one."""
+MAX_SWEPT: Final = 64
+"""The most entries of the temporary directory a sweep removes in one run."""
+
+
+def _lock_scratch(scratch: Path) -> int | None:
+    """Make and lock the scratch directory's lock file, held until the run closes
+    it. The kernel releases the lock when the process ends in any way, ``kill -9``
+    included, so a sweep that can take it knows no run uses the directory. ``None``
+    where it cannot be made, which leaves the directory to the age rule."""
+    try:
+        descriptor = os.open(
+            scratch / SCRATCH_LOCK, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
+        )
+    except OSError:
+        return None
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(descriptor)
+        return None
+    return descriptor
+
+
+def _abandoned(entry: Path, now: float) -> bool:
+    """Whether ``entry`` is a scratch directory of this user that no run holds."""
+    try:
+        found = entry.lstat()
+    except OSError:
+        return False
+    if (
+        not stat.S_ISDIR(found.st_mode)
+        or found.st_uid != os.getuid()
+        or stat.S_IMODE(found.st_mode) != 0o700
+    ):
+        return False
+    try:
+        descriptor = os.open(entry / SCRATCH_LOCK, os.O_RDWR | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return now - found.st_mtime > UNLOCKED_STALE_SECONDS
+    except OSError:
+        return False
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+    return True
+
+
+def sweep_scratch(parent: Path) -> list[str]:
+    """Remove the scratch directories of this user's earlier runs that no run
+    holds, and give their names.
+
+    **Review of 513928b, finding 3.** A run removes its scratch directory when it
+    returns, but a run killed with ``kill -9`` left one, holding a full copy of the
+    log, which holds message bodies and answers, until someone found it. Each run
+    therefore removes, before its own, every ``dromon-upgrade-*`` entry of the same
+    parent that is a directory, not a link, owned by this user with mode 0700, and
+    whose lock it can take, or that has no lock file and is older than
+    ``UNLOCKED_STALE_SECONDS``. A directory another run holds is left alone. Nothing
+    is removed where ``shutil.rmtree`` cannot resist links, since the parent may be
+    shared. **Residual.** A copy is left until the next run in the same temporary
+    directory, which the procedure's document says. **Porting hazard.** ``flock`` is
+    Unix's. A port uses its platform's advisory lock."""
+    if not shutil.rmtree.avoids_symlink_attacks:
+        return []
+    try:
+        with os.scandir(parent) as entries:
+            names = sorted(
+                entry.name
+                for _, entry in zip(range(MAX_SWEPT * 64), entries, strict=False)
+                if entry.name.startswith(SCRATCH_PREFIX)
+            )
+    except OSError:
+        return []
+    now = time.time()
+    removed: list[str] = []
+    for name in names[:MAX_SWEPT]:
+        entry = parent / name
+        if _abandoned(entry, now):
+            shutil.rmtree(entry, ignore_errors=True)
+            if not entry.exists():
+                removed.append(name)
+    return removed
+
+
 def run_checks(
     log_file: Path,
     *,
@@ -424,7 +630,19 @@ def run_checks(
 ) -> Report:
     """Every check, on copies in a scratch directory removed before returning."""
     checks: list[Check] = []
-    scratch = Path(tempfile.mkdtemp(prefix="dromon-upgrade-", dir=scratch_parent))
+    parent = Path(scratch_parent or tempfile.gettempdir())
+    swept = sweep_scratch(parent)
+    if swept:
+        checks.append(
+            Check(
+                "scratch",
+                Outcome.PASS,
+                f"removed {len(swept)} scratch directories that a killed check left in"
+                f" {parent}, each holding a copy of a log: " + ", ".join(swept),
+            )
+        )
+    scratch = Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX, dir=parent))
+    lock = _lock_scratch(scratch)
     try:
         state_dir = scratch / "state"
         state_dir.mkdir(mode=0o700)
@@ -452,6 +670,8 @@ def run_checks(
         return Report(tuple(checks))
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+        if lock is not None:
+            os.close(lock)
 
 
 def render(report: Report) -> str:

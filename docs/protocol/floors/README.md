@@ -21,6 +21,15 @@ first commit added to `Path`, so that `git log -S` finds the commit. `Path` defa
 `Search` should name the event as well as the field, since a field name that two events
 share finds the older event's commit.
 
+**Review of `513928b`, finding 1.** The same holds for a value. The entry for the
+expiry causes of `lease_released` searched for `EXPIRED = "expired"`, which another
+enumeration of `model.py` held long before, so `dromon upgrade-check` placed the change
+as older than revisions that cannot read it. A value's `Search` names a member that no
+other enumeration holds, such as the entry's `LIMIT_LOWERED = "limit_lowered"`.
+`tests/test_upgrade.py` compares the codec's kinds, fields and enumeration values with
+those of an older revision, and fails when a kind that gained any of them is not named by
+a change the floor check lists as newer than that revision.
+
 **Review of `0db077c`, findings 3 and 4.** `Path` is relative to the repository, with no
 `..`, and a path whose real form lies outside the repository, as through a link, is
 refused, so a fragment cannot make the gate answer whether a file elsewhere on the
