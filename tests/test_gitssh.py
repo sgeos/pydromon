@@ -551,10 +551,14 @@ def test_an_enabled_sandbox_admits_the_socket_and_host_and_keeps_protection() ->
     assert isinstance(given, ClaudeCodeLine) and given.git_ssh == access
 
 
-def test_a_disabled_or_absent_sandbox_gets_no_layer() -> None:
+def test_a_disabled_sandbox_gets_no_layer_and_an_absent_one_is_enabled() -> None:
+    """Round 18 follow-up, item 1. A line no layer enables or disables is given an
+    enabled sandbox, which then carries the agent's layer."""
     access = access_at(Path("/keys"), "/run/agent.sock")
     absent = built(access)
-    assert isinstance(absent, ClaudeCodeLine) and absent.sandbox is None
+    assert isinstance(absent, ClaudeCodeLine) and absent.sandbox is not None
+    assert absent.sandbox["enabled"] is True
+    assert network_of(absent)["allowUnixSockets"] == [access.socket]
     disabled = built(access, own={"enabled": False})
     assert isinstance(disabled, ClaudeCodeLine)
     assert disabled.sandbox == {"enabled": False}
@@ -699,6 +703,24 @@ def test_the_daemon_refuses_a_line_sandbox_that_hides_the_files(
     with pytest.raises(GitSshError, match="sandbox denies reading") as raised:
         git_ssh_access(parse(project_with(agent, sandbox=hiding)), paths, {})
     assert raised.value.key == "lines.alpha.git_ssh"
+
+
+def test_the_daemon_refuses_an_agent_socket_in_a_credential_path(
+    files: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    short_runtime: Path,
+    _empty_daemon_home: Path,
+) -> None:
+    """Round 18 follow-up. The start-time check reaches the credential paths of the
+    daemon's home, and judges a Claude Code line that no layer enables or disables as
+    sandboxed, as its build does. A line whose sandbox is disabled is given the agent,
+    as before, since its shell is not confined at all."""
+    socket = fake_socket(monkeypatch, str(_empty_daemon_home / ".ssh" / "agent.sock"))
+    paths = paths_for(files, short_runtime)
+    with pytest.raises(SandboxError, match="Dromon protects"):
+        git_ssh_access(parse(project_with(socket)), paths, {})
+    disabled = project_with(socket, sandbox="[sandbox]\nenabled = false\n")
+    assert set(git_ssh_access(parse(disabled), paths, {})) == {"alpha"}
 
 
 def test_dromond_exits_on_an_inherited_agent_without_a_socket(

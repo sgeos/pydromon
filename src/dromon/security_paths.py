@@ -61,43 +61,72 @@ transcript under ``~/.claude/projects`` while that line's sandbox denies writing
 there. The same bundle also carries a list of its own that denies its tools
 ``Read(~/.claude/.credentials.json)`` and ``Read(~/.claude.json)``. **Inference.**
 Denying both to a line's shell and file tools leaves its engine signed in, so nothing
-is exempted. **Residual.** The keychain is not a path. Whether a command in an enabled
-sandbox can ask the keychain for the item was not tested, since the test would read a
-credential."""
+is exempted. **Residual.** The keychain is not a path. **Fact, reported by the audit
+line on 2026-11-18.** A lookup of a made-up item from a command in an enabled sandbox
+reached the keychain service and was answered that no such item exists. Whether the
+item holding a sign-in is returned depends on the keychain's own access rules, and was
+not tested, since the test would read a credential.
+
+**Round 18 follow-up, item 5. Not added.** ``~/Library/Keychains``,
+``~/.config/gcloud`` and ``~/.azure`` are not listed, since the list also binds Codex
+and Grok lines and that could not be settled for Grok. **Fact, read from Grok 1.0.70
+on 2026-11-18.** Its binary carries the Google default credentials loader, which reads
+``.config/gcloud/application_default_credentials.json``, and its own sandbox code names
+``Library/Keychains/login.keychain-db`` and ``metadata.keychain-db``. **Inference.**
+Grok's own process may be held by the profile that carries these denials, as the
+exemption of its sign-in suggests, so a denial could break a path of Grok's own that
+was not traced. Codex reaches Google Cloud through the ``gcloud`` command on its own
+host, by its own text, and no Dromon line is configured for that provider."""
 
 
 def daemon_home() -> Path:
-    """The real path of the daemon's home directory, under which the credential paths
-    are denied. A function, so that tests give a home of their own and a build never
-    depends on what the machine running the tests holds."""
-    return Path(os.path.realpath(Path.home()))
+    """The daemon's home directory as the process names it, absolute and not
+    resolved, under which the credential paths are denied. **Round 18 follow-up, item
+    4.** It is not resolved here, so that a home reached through a link is named both
+    ways by ``credential_paths``. A function, so that tests give a home of their own
+    and a build never depends on what the machine running the tests holds."""
+    return Path(os.path.abspath(Path.home()))
 
 
 def credential_paths(
     home: Path, exempt: Collection[Path] = frozenset()
 ) -> tuple[Path, ...]:
-    """Each entry of ``CREDENTIAL_PATHS`` that exists under ``home``, other than those
-    in ``exempt``, as named under the real form of ``home`` and by its own real path,
-    in order and without repeats. **Round 18, the operator's security fix.** Both forms
-    are given, since a deny rule for Claude Code's file tools matches the path the tool
-    is handed, and a sandbox follows a link before it matches. An entry is tested with
-    ``lexists``, so a link whose target is missing is still denied by its name. Raises
-    ``ValueError`` for an ``exempt`` entry that is not listed, since a misspelt
+    """Each entry of ``CREDENTIAL_PATHS`` other than those in ``exempt``, whether or not
+    it exists, under ``home`` as given and under its real form, and also by the entry's
+    own real path when the entry exists and a link makes that differ, in order and
+    without repeats.
+
+    **Round 18, the operator's security fix.** Several forms are given, since a deny
+    rule for Claude Code's file tools matches the path the tool is handed, and a
+    sandbox follows a link before it matches. **Round 18 follow-up, item 4.** An entry
+    that does not exist is named too, since a line's engine is built once and kept, so
+    a file made later, by a sign-in or a configuration command, was readable for the
+    daemon's life. Only the real form of a missing entry is unknown, and it is
+    resolved again at the line's next build. Whether the sandbox honours a rule for a
+    missing path is the engine's, and ``CLAUDE_CODE_EXEMPT`` records what the bundle
+    shows. An entry is tested with ``lexists``, so a link whose target is missing is
+    denied by its name and by its target.
+
+    Raises ``ValueError`` for an ``exempt`` entry that is not listed, since a misspelt
     exemption would otherwise exempt nothing and say nothing."""
+    if not home.is_absolute():
+        raise ValueError(f"the home {home} is not an absolute path")
     unknown = sorted(str(path) for path in exempt if path not in CREDENTIAL_PATHS)
     if unknown:
         raise ValueError(f"not a listed credential path: {', '.join(unknown)}")
-    real_home = Path(os.path.realpath(home))
+    homes = (Path(os.path.normpath(home)), Path(os.path.realpath(home)))
     found: list[Path] = []
     for relative in CREDENTIAL_PATHS:
         if relative in exempt:
             continue
-        named = real_home / relative
-        if not os.path.lexists(named):
-            continue
-        for form in (named, Path(os.path.realpath(named))):
-            if form not in found:
-                found.append(form)
+        for base in homes:
+            named = base / relative
+            forms = [named]
+            if os.path.lexists(named):
+                forms.append(Path(os.path.realpath(named)))
+            for form in forms:
+                if form not in found:
+                    found.append(form)
     return tuple(found)
 
 

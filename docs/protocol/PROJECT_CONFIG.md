@@ -352,7 +352,10 @@ changes nothing. Codex and Grok lines run under their own permission profiles, a
 [`CODEX.md`](CODEX.md) and [`GROK.md`](GROK.md) specify, and Pi lines take no built-in
 tool, as [`PI.md`](PI.md) specifies, so all three satisfy it. **Why.** A
 line without an enabled sandbox can reach the daemon's socket from its shell and act
-with operator authority, as [`SANDBOX.md`](SANDBOX.md) records.
+with operator authority, as [`SANDBOX.md`](SANDBOX.md) records. **Round 18 follow-up.**
+A Claude Code line that no layer enables or disables is given an enabled sandbox at
+its build, so this check and the peers' check below count it as sandboxed. Only an
+explicit `enabled` false fails them.
 
 **Peers.** **Added on 2026-10-28, step 2 of phase 1 of
 [`FEDERATION.md`](../architecture/FEDERATION.md).** Each declared peer's runtime
@@ -598,7 +601,9 @@ git_ssh = true
   since an enabled sandbox denies it. **Round 18.** For a Claude Code line with an
   enabled sandbox that includes the known credential paths under the daemon's home,
   such as `~/.ssh`, so an agent socket or either file kept there is refused, and is
-  kept elsewhere, as [`SANDBOX.md`](SANDBOX.md) gives. No path may hold a control character, a quote, a
+  kept elsewhere, as [`SANDBOX.md`](SANDBOX.md) gives. **Round 18 follow-up.** A
+  Claude Code line that no layer enables or disables is given an enabled sandbox, so
+  this refusal now reaches it too, and `dromond` reaches it at start. No path may hold a control character, a quote, a
   backslash, `$` or `%`, which ssh would expand or read as part of its option. No
   host key is written into Dromon's code.
 - **Sandbox.** For a Claude Code line whose merged sandbox is enabled, Dromon merges

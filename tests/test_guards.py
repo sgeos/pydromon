@@ -274,7 +274,10 @@ DISABLED = parse_sandbox({"enabled": False}, operator=True)
 @pytest.mark.parametrize(
     ("project", "line", "model", "refused"),
     [
-        (None, None, HAIKU, True),
+        # Round 18 follow-up, item 1. A line no layer enables or disables is given
+        # an enabled sandbox at its build, so the requirement holds.
+        (None, None, HAIKU, False),
+        (None, DISABLED, HAIKU, True),
         (ENABLED, None, HAIKU, False),
         (None, ENABLED, HAIKU, False),
         (ENABLED, DISABLED, HAIKU, True),
@@ -363,13 +366,17 @@ def test_create_and_configure_refuse_an_unsandboxed_claude_line(
     paths: ProjectPaths,
 ) -> None:
     with attached(paths, ProjectConfig(require_sandbox=True)) as client:
-        message = client.refused("create_line", create("alpha"))
+        off = {"enabled": False}
+        message = client.refused("create_line", create("alpha", sandbox=off))
         assert "line alpha" in message and "require_sandbox" in message
         assert client.ask("create_line", create("alpha", sandbox={"enabled": True})).ok
         assert client.ask("create_line", create("luna", model="gpt-6-luna")).ok
+        # Round 18 follow-up, item 1. A line no layer enables or disables is given an
+        # enabled sandbox at its build, so the requirement holds for it.
+        assert client.ask("create_line", create("beta")).ok
         message = client.refused(
             "configure_line",
-            {"line_id": "alpha", "config": {"builtin_tools": ["Read"]}},
+            {"line_id": "alpha", "config": {"sandbox": off}},
         )
         assert "line alpha" in message
         assert client.ask(
@@ -400,7 +407,7 @@ def test_a_reload_checks_every_line_against_a_new_requirement(
     paths: ProjectPaths,
 ) -> None:
     with attached(paths, ProjectConfig()) as client:
-        assert client.ask("create_line", create("alpha")).ok
+        assert client.ask("create_line", create("alpha", sandbox={"enabled": False})).ok
         write_file(paths, "[daemon]\nrequire_sandbox = true\n")
         message = client.refused("reload_project", {})
         assert "line alpha" in message
@@ -411,7 +418,8 @@ def test_a_reload_checks_every_line_against_a_new_requirement(
         write_file(
             paths,
             "[daemon]\nrequire_sandbox = true\n"
-            "[lines.beta]\nmodel = 'claude-haiku-5-5'\n",
+            "[lines.beta]\nmodel = 'claude-haiku-5-5'\n"
+            "[lines.beta.sandbox]\nenabled = false\n",
         )
         assert "line beta" in client.refused("reload_project", {})
         write_file(paths, "[daemon]\nrequire_sandbox = true\n")
@@ -424,6 +432,9 @@ def test_check_lines_sandboxed_covers_lines_outside_the_file(tmp_path: Path) -> 
         scheduler = Scheduler(log, no_engine, hold_wakes=True)
         scheduler.create_line("client", HAIKU, Strategy.SUBSCRIPTION)
         config = parse("version = 1\n[daemon]\nrequire_sandbox = true\n")
+        # Round 18 follow-up, item 1. Sandboxed by default, so accepted.
+        check_lines_sandboxed(config, log, scheduler)
+        scheduler.configure_line("client", LineConfig(sandbox=DISABLED))
         with pytest.raises(SandboxError, match="line client"):
             check_lines_sandboxed(config, log, scheduler)
         scheduler.configure_line(
@@ -485,7 +496,8 @@ def test_dromond_stops_on_an_unsandboxed_line_when_one_is_required(
     }
     write_file(
         paths,
-        "[daemon]\nrequire_sandbox = true\n[lines.alpha]\nmodel = 'claude-haiku-5-5'\n",
+        "[daemon]\nrequire_sandbox = true\n[lines.alpha]\nmodel = 'claude-haiku-5-5'\n"
+        "[lines.alpha.sandbox]\nenabled = false\n",
     )
     assert start(paths, short_runtime) == exits.FAILURE
     assert "line alpha would run on Claude Code" in capsys.readouterr().err

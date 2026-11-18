@@ -32,7 +32,7 @@ names, so that one can be copied from `.claude/settings.json` unchanged.
 |---|---|---|
 | `enabled`, `failIfUnavailable`, `allowUnsandboxedCommands`, `autoAllowBashIfSandboxed` | boolean | Anyone |
 | `enableWeakerNestedSandbox`, `enableWeakerNetworkIsolation` | boolean | Anyone |
-| `excludedCommands` | array of command patterns | Anyone |
+| `excludedCommands` | array of command patterns | Anyone, and refused in an enabled document from round 18 |
 | `ignoreViolations` | table of command pattern to array of text | Anyone |
 | `filesystem.allowWrite`, `denyWrite`, `denyRead`, `allowRead` | array of paths | Anyone |
 | `network.allowedDomains`, `deniedDomains` | array of domains, `*.` allowed in front | Anyone |
@@ -195,9 +195,18 @@ not permitted", while a file written to the line's own `tmp` was listed and read
 its full path. An `allowRead` therefore lifts a `denyRead` above it on that engine.
 
 When a line's turn starts, Dromon merges the layers and derives the settings it hands to
-Claude Code. Nothing is passed when no layer sets anything, and the line then has no
-sandbox but any managed policy, because Dromon starts Claude Code without user or
-project settings.
+Claude Code. **Round 18 follow-up, item 1.** When no layer says whether the sandbox
+is enabled, a Claude Code line is given an enabled one, merged last as the read-only
+mode merges its own, so that its shell is held by the denials below. Before, nothing was
+passed when no layer set anything, and the line then had no sandbox but any managed
+policy, because Dromon starts Claude Code without user or project settings. An explicit
+`enabled` false in any layer stays the operator's choice. `dromond`, `dromon config`
+and the line's build then warn that the line's shell can read the credential paths that
+only its file tools are denied. **Effect, an inference from Claude Code's
+documentation.** Such a line's shell now writes only its working directory and what a
+layer grants, and reaches no host, since `network.strictAllowlist` is filled in with no
+domain allowed. A Claude Code line in a checkout whose `.git` pointer cannot be followed
+is now refused, as a sandboxed line always was.
 
 1. **Paths.** A relative path is resolved against the line's working directory, its
    `workdir` as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies, which is the project root
@@ -207,7 +216,16 @@ project settings.
    `failIfUnavailable` as true, `allowUnsandboxedCommands` as false and
    `network.strictAllowlist` as true, unless the document sets them. Claude Code's own
    defaults ask a person instead, or run unsandboxed when the sandbox cannot start, and
-   a Dromon line has nobody at the prompt.
+   a Dromon line has nobody at the prompt. **Round 18 follow-up, item 2.**
+   `allowUnsandboxedCommands` is forced false, whatever a layer sets, the client's
+   included, since a command run outside the sandbox reads every path it denies, and
+   `dromon config` and `dromond` warn of a layer that sets it true. An enabled document
+   that names `excludedCommands` is refused, at `dromond`'s start for the project file
+   and at the line's build, since an excluded command runs outside the sandbox. It is
+   refused rather than dropped, so the operator learns that the command would be
+   confined. **Residuals.** `failIfUnavailable` false is still honoured, and runs every
+   command outside the sandbox where it cannot start. `filesystem.disabled`, which only
+   the client may set, still lifts the filesystem rules.
 3. **Protected directories.** An enabled sandbox denies reading and writing the
    project's state directory and runtime directory, which hold the event log, the
    project file and the daemon's socket, and since 2026-10-28 each declared peer's
@@ -235,13 +253,14 @@ project settings.
    **Round 18, the operator's security fix.** The known credential paths,
    `security_paths.CREDENTIAL_PATHS`, are protected in the same way for every Claude
    Code line. Each is taken under the real path of the daemon's home, where it exists
-   when the line's engine is built, by that name and by its real path. Codex and Grok
+   when the line's engine is built, by that name and by its real path, a rule the
+   follow-up below widens. Codex and Grok
    lines have had them since round 9. The file tools are denied each path itself as
    well as what lies under it, with `Read(//PATH)` and `Edit(//PATH)` beside the
    `/**` rules, since several entries, such as `~/.netrc` and `~/.claude.json`, are
    files. A grant of a path inside one, or of the path itself, is refused as above,
    and so is an agent socket of `[git_ssh]` inside one. A grant of a directory that
-   holds one, such as the home, is accepted, and the deny entry wins over it.
+   holds one, such as the home, was accepted, which the follow-up below reverses.
    **Why the lines differed.** **Fact, from `projectconfig.py`.** A `profile` is
    expanded only for the lines the project file declares. **Fact, from the
    confinement checks of 2026-11-18.** Lines the client created reported the home
@@ -260,6 +279,35 @@ project settings.
    and whether a command in an enabled sandbox can ask it for an item was not
    tested. A line whose sandbox is disabled can read every listed path with its
    shell, as it can every protected one.
+   **Round 18 follow-up, from the audit line's review, each defect confirmed in the
+   code or a test before the change.** *Missing and linked paths, item 4.* Every
+   listed path is denied whether or not it exists, under the daemon's home as the
+   process names it and under its real path, and also by the entry's own real path
+   when it exists and a link makes that differ. A line's engine is built once and
+   kept, so a file made later, by a sign-in, was readable for the daemon's life.
+   **Fact, read from the bundled Claude Code 2.1.310.** Its Linux sandbox places a
+   placeholder over a missing deny path, and logs where it cannot, and no step that
+   skips a missing deny path was found for Seatbelt, whose rules match paths and need
+   no file. **Residual.** The real form of a path made after the build is added at the
+   line's next build. *Grants that could reach one, item 3.* An `allowRead` or
+   `allowWrite` entry is refused when it is a listed path, a directory that holds one,
+   such as the home or `/`, or a path inside one, and when it is a pattern whose
+   literal base is any of those. The base of a pattern is the directory of the text
+   before its first `*`, `?`, `[` or `{`, so `~/.s*` has the home as its base and is
+   refused, while `~/.cache/*` and `~/.cache/uv` are accepted. **Fact, from the same
+   bundle.** It expands an `allowRead` pattern into the paths it matches. **Fact,
+   recorded above, observed live on 2026-11-01.** An `allowRead` lifts a `denyRead`
+   above it. The protected and secret directories keep the rule above, which refuses
+   only a grant inside them, since a line's working directory holds its own `secret`.
+   **Residual.** A pattern under one of those, such as a grant of `PROJECT/s*`, is
+   not refused. *The keychain, item 7.* **Fact, reported by the audit line.** A
+   lookup of a made-up item from a command in an enabled sandbox reached the keychain
+   service and was told no such item exists. Whether the item that holds a sign-in is
+   returned rests on the keychain's own access rules and was not tested, since the
+   test would read a credential. It stays a residual. *Paths not added, item 5.*
+   `~/Library/Keychains`, `~/.config/gcloud` and `~/.azure` are not listed, since
+   the list also binds Codex and Grok lines and that was not settled for Grok, as
+   `security_paths.CLAUDE_CODE_EXEMPT` records.
 4. **Git hooks and configuration.** When the line's working directory lies in a git
    checkout, an enabled sandbox also denies writes to the hooks and configuration git
    would act on there, whether or not any layer grants the git directory. A command

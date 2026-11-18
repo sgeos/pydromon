@@ -381,19 +381,108 @@ def _within(path: str, directory: Path) -> bool:
     return os.path.commonpath([real, guarded]) == guarded
 
 
+GLOB_CHARACTERS: Final = "*?[{"
+"""The characters that make a path entry a pattern Claude Code expands."""
+
+
+def claude_default(sandbox: SandboxConfig | None) -> SandboxConfig:
+    """``sandbox`` enabled when no layer says whether it is, and unchanged when one
+    does. **Round 18 follow-up, item 1.** A Claude Code line with no sandbox document,
+    or with one that leaves ``enabled`` unset, ran its shell unconfined, so every
+    credential path the file tools were denied was open to a command. Default deny. The
+    enabling layer is merged last, as the read-only mode merges its own, and it sets
+    only ``enabled``, so an explicit ``enabled`` false in any layer stays the
+    operator's choice, which ``explicitly_disabled`` names for a warning. **Effect.**
+    Such a line's shell now writes only where the sandbox allows, its working directory
+    by Claude Code's default, and reaches no host, as ``network.strictAllowlist`` is
+    filled in with no domain allowed."""
+    if sandbox is not None and "enabled" in sandbox.document():
+        return sandbox
+    enabling = SandboxConfig(canonical({"enabled": True}))
+    return (
+        enabling if sandbox is None else cast(SandboxConfig, merge([sandbox, enabling]))
+    )
+
+
+def explicitly_disabled(sandbox: SandboxConfig | None) -> bool:
+    """Whether a layer of ``sandbox`` set ``enabled`` false, which leaves the line's
+    shell able to read every path the sandbox would deny."""
+    return sandbox is not None and sandbox.document().get("enabled") is False
+
+
+def _grant_base(path: str) -> str:
+    """The directory below which an allow entry can match, with a leading ``~``
+    expanded. A plain path is its own base. A pattern's base is the directory of its
+    literal prefix, the text before its first ``GLOB_CHARACTERS``, so ``~/.s*`` has the
+    home as its base, since it can match any entry the home holds."""
+    expanded = os.path.expanduser(path)
+    cut = next(
+        (
+            index
+            for index, character in enumerate(expanded)
+            if character in GLOB_CHARACTERS
+        ),
+        None,
+    )
+    if cut is None:
+        return expanded
+    head = expanded[:cut]
+    return head[: head.rfind("/") + 1] or "/"
+
+
+def _overlaps(base: str, guarded: Path) -> bool:
+    """Whether ``base`` is ``guarded``, an ancestor of it or inside it, compared by
+    real path on both sides."""
+    if not base.startswith("/"):
+        return False
+    real, guard = os.path.realpath(base), os.path.realpath(guarded)
+    return os.path.commonpath([real, guard]) in (real, guard)
+
+
+def _refuse_ungrantable(
+    filesystem: Mapping[str, object], ungrantable: Sequence[Path]
+) -> None:
+    """Refuse an ``allowRead`` or ``allowWrite`` entry that could lift a denial of a
+    path in ``ungrantable``. **Round 18 follow-up, item 3.** **Fact, recorded in
+    ``docs/protocol/SANDBOX.md`` from a live probe of 2026-11-01.** An ``allowRead``
+    entry lifts a ``denyRead`` above it on Claude Code, and its bundle expands an
+    ``allowRead`` pattern into the paths it matches. A grant inside a listed path was
+    already refused. A grant of the path itself or of an ancestor, such as the home, and
+    a pattern whose literal base is any of those, are now refused too, rather than
+    relying on a deny winning, which was observed only for ``allowWrite``. **Residual.**
+    A pattern whose base is unrelated cannot match a listed path, since a pattern does
+    not climb with ``..``, which ``_resolve`` leaves in no absolute entry."""
+    for name in ("allowRead", "allowWrite"):
+        for path in cast(list[str], filesystem.get(name, [])):
+            base = _grant_base(path)
+            for guarded in ungrantable:
+                if _overlaps(base, guarded):
+                    _fail(
+                        f"sandbox.filesystem.{name} entry {path!r} could grant"
+                        f" {guarded}, a credential path Dromon denies, since it names"
+                        " that path, a directory holding it, a path inside it or a"
+                        " pattern that could match it",
+                        f"filesystem.{name}",
+                    )
+
+
 def effective(
     sandbox: SandboxConfig | None,
     root: Path,
     protected: Sequence[Path],
     guarded_writes: Sequence[Path] = (),
+    ungrantable: Sequence[Path] = (),
 ) -> dict[str, object] | None:
     """The settings to hand the engine for a line whose merged document is
     ``sandbox``, with relative paths resolved against ``root``, the line's working
     directory, the unattended defaults filled in, ``protected`` denied, and
     ``guarded_writes``, such as a checkout's git hooks, denied to writes. ``None``
-    when nothing is set.
+    when nothing is set. ``ungrantable`` are paths, such as the credential paths, that
+    ``protected`` should also hold, and that no allow entry may name, hold or match.
 
-    Raises ``SandboxError`` when an allowed Unix socket lies in a protected directory.
+    Raises ``SandboxError`` when an allowed Unix socket lies in a protected directory,
+    when an enabled document grants a protected or ungrantable path, and when an
+    enabled document sets ``excludedCommands``.
     """
     if sandbox is None:
         return None
@@ -433,8 +522,22 @@ def effective(
                 table["allowUnixSockets"] = sockets
     if document.get("enabled") is not True:
         return document
+    # Round 18 follow-up, item 2. A command named here runs outside the sandbox and
+    # reaches every path it denies, so an enabled document may not name one. Refused
+    # rather than dropped, so the operator learns that the command will be confined.
+    if document.get("excludedCommands"):
+        _fail(
+            "sandbox.excludedCommands run outside the sandbox, where every credential"
+            " and protected path is readable, so Dromon refuses them. Remove them, or"
+            " grant what the command needs inside the sandbox",
+            "excludedCommands",
+        )
     document.setdefault("failIfUnavailable", True)
-    document.setdefault("allowUnsandboxedCommands", False)
+    # Round 18 follow-up, item 2. Forced, not defaulted. A command the model asks to
+    # run unsandboxed would read every path the sandbox denies, and nobody is at the
+    # prompt that would otherwise approve it. A layer that sets it true is overridden,
+    # and configwarnings says so.
+    document["allowUnsandboxedCommands"] = False
     network = cast(dict[str, object], document.setdefault("network", {}))
     network.setdefault("strictAllowlist", True)
     filesystem = cast(dict[str, object], document.setdefault("filesystem", {}))
@@ -458,6 +561,7 @@ def effective(
                         f"sandbox.filesystem.{name} entry {path!r} is inside a"
                         " directory Dromon protects"
                     )
+    _refuse_ungrantable(filesystem, ungrantable)
     return document
 
 

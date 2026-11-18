@@ -11,7 +11,14 @@ readable, and the factory's Claude Code branch passed only the protected directo
 and the project's secret directories, ``engine_protected``, to the sandbox and the
 settings. Each test here builds through ``scheduler.engine_factory``, the one place a
 ``ClaudeCodeLine`` is made, and the conftest gives every test an empty daemon home of
-its own, so what the machine running the tests holds never decides a result."""
+its own, so what the machine running the tests holds never decides a result.
+
+**Round 18 follow-up, confirmed before the change by the audit line's review and in
+the code.** A line with no sandbox document, or one that left ``enabled`` unset, had no
+shell denial at all. ``excludedCommands`` and ``allowUnsandboxedCommands`` true were
+accepted. A grant of the home, or a pattern such as ``~/.s*``, passed the refusal. A
+path that did not exist at the build was not named, and a home reached through a link
+was named only by its real form."""
 
 import json
 import os
@@ -20,10 +27,12 @@ from typing import cast
 
 import pytest
 
+from dromon.configwarnings import sandbox_warnings
 from dromon.daemon import check_sandboxes
 from dromon.driver import Strategy
 from dromon.engine import ClaudeCodeLine
 from dromon.gitssh import GitSshAccess
+from dromon import security_paths
 from dromon.lineconfig import LineConfig, WorkdirAccess
 from dromon.paths import project_paths
 from dromon.projectconfig import parse
@@ -105,11 +114,13 @@ def assert_shell_denied(engine: ClaudeCodeLine, paths: tuple[Path, ...]) -> None
 # The list itself.
 
 
-def test_only_entries_that_exist_are_given(tmp_path: Path) -> None:
-    assert credential_paths(tmp_path) == ()
-    (tmp_path / ".netrc").write_text("")
-    (tmp_path / ".aws").mkdir()
-    assert credential_paths(tmp_path) == (tmp_path / ".aws", tmp_path / ".netrc")
+def test_every_entry_is_named_whether_or_not_it_exists(tmp_path: Path) -> None:
+    """Round 18 follow-up, item 4. A missing entry is named, so a file made after a
+    line's build is denied by the build it already has."""
+    home = Path(os.path.realpath(tmp_path))
+    assert credential_paths(home) == tuple(home / entry for entry in CREDENTIAL_PATHS)
+    (home / ".netrc").write_text("")
+    assert credential_paths(home) == tuple(home / entry for entry in CREDENTIAL_PATHS)
 
 
 def test_a_linked_entry_is_given_by_its_name_and_its_real_path(
@@ -119,34 +130,45 @@ def test_a_linked_entry_is_given_by_its_name_and_its_real_path(
     home.mkdir()
     elsewhere.mkdir()
     (home / ".ssh").symlink_to(elsewhere)
-    assert credential_paths(home) == (home / ".ssh", elsewhere)
+    found = credential_paths(home)
+    assert found[:2] == (home / ".ssh", elsewhere)
+    assert found.count(elsewhere) == 1
 
 
-def test_a_link_whose_target_is_missing_is_still_given_by_name(
+def test_a_link_whose_target_is_missing_is_given_by_name_and_target(
     tmp_path: Path,
 ) -> None:
     (tmp_path / ".netrc").symlink_to(tmp_path / "missing")
-    assert tmp_path / ".netrc" in credential_paths(tmp_path)
+    found = credential_paths(tmp_path)
+    assert tmp_path / ".netrc" in found and tmp_path / "missing" in found
 
 
-def test_a_home_reached_through_a_link_is_named_by_its_real_path(
-    tmp_path: Path,
-) -> None:
+def test_a_home_reached_through_a_link_is_named_both_ways(tmp_path: Path) -> None:
+    """Round 18 follow-up, item 4. Claude Code expands ``~`` with the engine's own
+    home, which may be the link's spelling, so the rules name both."""
     real = tmp_path / "real"
     (real / ".ssh").mkdir(parents=True)
     (tmp_path / "link").symlink_to(real)
-    assert credential_paths(tmp_path / "link") == (real / ".ssh",)
+    found = credential_paths(tmp_path / "link")
+    assert found[:2] == (tmp_path / "link" / ".ssh", real / ".ssh")
+    assert tmp_path / "link" / ".aws" in found and real / ".aws" in found
+    assert len(found) == 2 * len(CREDENTIAL_PATHS)
 
 
 def test_an_exempt_entry_is_left_out_and_an_unlisted_one_is_refused(
     tmp_path: Path,
 ) -> None:
-    (tmp_path / ".grok").mkdir()
-    (tmp_path / ".grok" / "auth.json").write_text("{}")
     sign_in = Path(".grok/auth.json")
-    assert credential_paths(tmp_path, {sign_in}) == ()
+    found = credential_paths(tmp_path, {sign_in})
+    assert tmp_path / sign_in not in found
+    assert len(found) == len(CREDENTIAL_PATHS) - 1
     with pytest.raises(ValueError, match="not a listed credential path"):
         credential_paths(tmp_path, {Path(".grok/other.json")})
+
+
+def test_a_relative_home_is_refused() -> None:
+    with pytest.raises(ValueError, match="not an absolute path"):
+        credential_paths(Path("home"))
 
 
 def test_claude_code_keeps_no_credential_path() -> None:
@@ -157,8 +179,10 @@ def test_claude_code_keeps_no_credential_path() -> None:
     assert Path(".claude/.credentials.json") in CREDENTIAL_PATHS
 
 
-def test_the_daemon_home_is_the_real_path_of_the_process_home() -> None:
-    assert real_daemon_home() == Path(os.path.realpath(Path.home()))
+def test_the_daemon_home_is_the_process_home_unresolved() -> None:
+    """Round 18 follow-up, item 4. Not resolved, so ``credential_paths`` names a home
+    reached through a link both ways."""
+    assert real_daemon_home() == Path(os.path.abspath(Path.home()))
 
 
 def test_credential_rules_name_each_path_and_what_lies_under_it(
@@ -183,12 +207,28 @@ def test_a_line_with_an_enabled_sandbox_is_denied_them_in_both(
     assert_tools_denied(engine, listed(home))
 
 
-def test_a_line_with_no_sandbox_keeps_its_file_tools_out(
+def test_a_line_with_no_sandbox_document_is_given_an_enabled_one(
     tmp_path: Path, home: Path
 ) -> None:
+    """Round 18 follow-up, item 1. Default deny, so the shell is held too."""
     engine = built(tmp_path)
-    assert engine.sandbox is None
+    assert engine.sandbox is not None
+    assert engine.sandbox["enabled"] is True
+    assert engine.sandbox["allowUnsandboxedCommands"] is False
+    assert engine.sandbox["failIfUnavailable"] is True
+    assert cast(dict[str, object], engine.sandbox["network"])["strictAllowlist"] is True
+    assert_shell_denied(engine, listed(home))
     assert_tools_denied(engine, listed(home))
+
+
+def test_a_sandbox_that_leaves_enabled_unset_is_enabled(
+    tmp_path: Path, home: Path
+) -> None:
+    engine = built(tmp_path, project={"network": {"allowedDomains": ["pypi.org"]}})
+    assert engine.sandbox is not None and engine.sandbox["enabled"] is True
+    network = cast(dict[str, list[str]], engine.sandbox["network"])
+    assert network["allowedDomains"] == ["pypi.org"]
+    assert_shell_denied(engine, listed(home))
 
 
 def test_a_line_whose_sandbox_is_disabled_keeps_its_file_tools_out(
@@ -205,28 +245,46 @@ def test_a_line_whose_sandbox_is_disabled_keeps_its_file_tools_out(
     assert_tools_denied(engine, listed(home))
 
 
-@pytest.mark.parametrize("sandboxed", [True, False])
+def test_a_disabled_sandbox_is_warned_of_at_the_build(
+    tmp_path: Path, home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    del home
+    built(tmp_path, project={"enabled": False})
+    assert "alpha runs Claude Code with its sandbox disabled" in capsys.readouterr().err
+    built(tmp_path)
+    assert "disabled" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "project",
+    [
+        pytest.param({"enabled": True}, id="enabled"),
+        pytest.param(None, id="absent"),
+        pytest.param({"enabled": False}, id="disabled"),
+    ],
+)
 def test_a_kept_session_s_options_carry_the_denials(
-    tmp_path: Path, home: Path, sandboxed: bool
+    tmp_path: Path, home: Path, project: dict[str, object] | None
 ) -> None:
     """A kept connection is opened with the options of its line's build, so the
     options the engine is started with are checked, not only the build's fields. A
-    kept session with a shell needs an enabled sandbox, so the unsandboxed case has
-    the file tools alone."""
+    kept session with a shell needs an enabled sandbox, so the disabled case has the
+    file tools alone."""
+    sandboxed = project is None or project["enabled"] is True
     tools = ("Read", "Edit", "Bash") if sandboxed else ("Read", "Edit")
     config = LineConfig(keep_session=True, builtin_tools=tools)
-    engine = built(tmp_path, config, {"enabled": True} if sandboxed else None)
+    engine = built(tmp_path, config, project)
     options = engine.options()
     flags = cast(dict[str, object], json.loads(cast(str, options.settings)))
     deny = set(cast(dict[str, list[str]], flags["permissions"])["deny"])
     for path in listed(home):
         assert f"Read(/{path})" in deny and f"Edit(/{path}/**)" in deny
+    sandbox = cast(dict[str, object], options.sandbox)
     if sandboxed:
-        sandbox = cast(dict[str, object], options.sandbox)
         filesystem = cast(dict[str, list[str]], sandbox["filesystem"])
         assert str(home / ".ssh") in filesystem["denyRead"]
     else:
-        assert options.sandbox is None
+        assert sandbox == {"enabled": False}
 
 
 def test_a_line_that_only_reads_its_workdir_is_denied_them(
@@ -252,23 +310,18 @@ def test_a_line_with_read_only_paths_is_denied_them(tmp_path: Path, home: Path) 
     assert_tools_denied(engine, listed(home))
 
 
-def test_an_empty_home_adds_nothing(tmp_path: Path) -> None:
-    engine = built(tmp_path)
-    assert engine.settings is None
-
-
-def test_a_path_made_after_a_build_is_denied_from_the_next(
-    tmp_path: Path, home: Path
-) -> None:
-    assert (
-        str(home / ".aws")
-        not in filesystem_of(built(tmp_path, project={"enabled": True}))["denyRead"]
-    )
-    (home / ".aws").mkdir()
-    assert (
-        str(home / ".aws")
-        in filesystem_of(built(tmp_path, project={"enabled": True}))["denyRead"]
-    )
+def test_a_path_that_does_not_exist_yet_is_denied(tmp_path: Path, home: Path) -> None:
+    """Round 18 follow-up, item 4. Denied in both layers before it is made, and a
+    link made there later is denied by its target from the next build."""
+    missing = home / ".aws"
+    assert not os.path.lexists(missing)
+    engine = built(tmp_path, project={"enabled": True})
+    assert_shell_denied(engine, (missing,))
+    assert_tools_denied(engine, (missing,))
+    target = tmp_path / "aws-elsewhere"
+    target.mkdir()
+    missing.symlink_to(target)
+    assert_shell_denied(built(tmp_path, project={"enabled": True}), (missing, target))
 
 
 def test_a_line_s_own_allow_rule_cannot_reopen_one(tmp_path: Path, home: Path) -> None:
@@ -293,14 +346,80 @@ def test_a_line_s_sandbox_that_grants_one_is_refused(
         built(tmp_path, LineConfig(sandbox=own), {"enabled": True})
 
 
-def test_a_grant_of_the_home_around_them_is_not_refused_and_loses(
-    tmp_path: Path, home: Path
+@pytest.mark.parametrize("key", ["allowRead", "allowWrite"])
+@pytest.mark.parametrize(
+    "granted",
+    [
+        pytest.param("{home}", id="the-home"),
+        pytest.param("{parent}", id="above-the-home"),
+        pytest.param("/", id="the-root"),
+        pytest.param("{home}/.s*", id="star-prefix"),
+        pytest.param("{home}/.s?h", id="question-mark"),
+        pytest.param("{home}/*", id="every-entry"),
+        pytest.param("{home}/.[a-z]sh", id="bracket"),
+        pytest.param("{home}/{{.ssh,.aws}}", id="brace"),
+        pytest.param("{home}/.ssh", id="a-missing-path-itself"),
+        pytest.param("{home}/.config/gh/*.yml", id="pattern-inside-one"),
+    ],
+)
+def test_a_grant_that_could_reach_one_is_refused(
+    tmp_path: Path, key: str, granted: str
 ) -> None:
-    """A grant of a directory that holds a credential path is not inside it, and the
-    deny entry wins over it, as verified live on 2026-10-26."""
-    own = parse_sandbox({"filesystem": {"allowRead": [str(home)]}}, operator=False)
-    engine = built(tmp_path, LineConfig(sandbox=own), {"enabled": True})
-    assert_shell_denied(engine, listed(home))
+    """Round 18 follow-up, item 3. An allow entry lifts a deny entry above it on
+    Claude Code, so a grant of the path, of a directory holding it, inside it, or a
+    pattern whose literal base is one of those, is refused. The home here is empty,
+    so the paths are refused whether or not they exist."""
+    home = security_paths.daemon_home()
+    entry = granted.format(home=home, parent=home.parent)
+    own = parse_sandbox({"filesystem": {key: [entry]}}, operator=False)
+    with pytest.raises(SandboxError, match="credential path|Dromon protects"):
+        built(tmp_path, LineConfig(sandbox=own))
+
+
+@pytest.mark.parametrize(
+    "granted",
+    [
+        pytest.param("{home}/.cache/uv", id="a-cache"),
+        pytest.param("{home}/.cache/*", id="a-pattern-elsewhere"),
+        pytest.param("{home}/.sshx", id="a-sibling-name"),
+        pytest.param("{elsewhere}/*", id="outside-the-home"),
+    ],
+)
+def test_a_grant_that_cannot_reach_one_is_accepted(
+    tmp_path: Path, granted: str
+) -> None:
+    home = security_paths.daemon_home()
+    entry = granted.format(home=home, elsewhere=tmp_path / "elsewhere")
+    own = parse_sandbox({"filesystem": {"allowWrite": [entry]}}, operator=False)
+    engine = built(tmp_path, LineConfig(sandbox=own))
+    assert entry in filesystem_of(engine)["allowWrite"]
+    assert_shell_denied(engine, (home / ".ssh",))
+
+
+def test_excluded_commands_are_refused_for_a_line_sandboxed_by_default(
+    tmp_path: Path,
+) -> None:
+    """Round 18 follow-up, item 2. A command named there runs outside the sandbox,
+    where every credential path is readable."""
+    own = parse_sandbox({"excludedCommands": ["git"]}, operator=False)
+    with pytest.raises(SandboxError, match="excludedCommands run outside"):
+        built(tmp_path, LineConfig(sandbox=own))
+    disabled = parse_sandbox(
+        {"enabled": False, "excludedCommands": ["git"]}, operator=False
+    )
+    assert built(tmp_path, LineConfig(sandbox=disabled)).sandbox is not None
+
+
+def test_unsandboxed_commands_are_forced_off(tmp_path: Path) -> None:
+    """Round 18 follow-up, item 2. Even from the client, which has operator
+    authority, and even where the project's layer sets it."""
+    own = parse_sandbox({"allowUnsandboxedCommands": True}, operator=True)
+    for engine in (
+        built(tmp_path, LineConfig(sandbox=own)),
+        built(tmp_path, project={"enabled": True, "allowUnsandboxedCommands": True}),
+    ):
+        assert engine.sandbox is not None
+        assert engine.sandbox["allowUnsandboxedCommands"] is False
 
 
 def test_an_agent_socket_inside_one_is_refused(tmp_path: Path, home: Path) -> None:
@@ -331,3 +450,49 @@ def test_the_daemon_refuses_a_project_file_that_grants_one(
         text = "version = 1\n" + granted + ("" if "lines.a" in granted else line)
         with pytest.raises(SandboxError, match="directory Dromon protects"):
             check_sandboxes(parse(text), paths)
+
+
+@pytest.mark.parametrize(
+    "layer",
+    [
+        pytest.param("[sandbox.filesystem]\nallowRead = [{home!r}]\n", id="home"),
+        pytest.param("[sandbox.filesystem]\nallowRead = [{glob!r}]\n", id="glob"),
+        pytest.param("[sandbox]\nexcludedCommands = ['git']\n", id="excluded"),
+    ],
+)
+def test_the_daemon_checks_a_line_sandboxed_by_default(
+    tmp_path: Path, short_runtime: Path, layer: str
+) -> None:
+    """Round 18 follow-up, items 1 to 3. The project file sets no ``enabled``, so the
+    line is checked with the sandbox its build gives it, and refused as the build
+    refuses it. The same layer with ``enabled`` false is accepted."""
+    paths = project_paths(tmp_path, short_runtime)
+    paths.state_dir.mkdir()
+    home = str(security_paths.daemon_home())
+    text = layer.format(home=home, glob=home + "/.s*")
+    line = "[lines.a]\nmodel = 'claude-haiku-5-5'\n"
+    with pytest.raises(SandboxError, match="credential path|excludedCommands"):
+        check_sandboxes(parse("version = 1\n" + text + line), paths)
+    if text.startswith("[sandbox]\n"):
+        disabled = text.replace("[sandbox]\n", "[sandbox]\nenabled = false\n", 1)
+    else:
+        disabled = "[sandbox]\nenabled = false\n" + text
+    check_sandboxes(parse("version = 1\n" + disabled + line), paths)
+
+
+def test_the_warnings_name_a_disabled_line_and_an_overridden_key() -> None:
+    config = parse(
+        "version = 1\n[sandbox]\nallowUnsandboxedCommands = true\n"
+        "[lines.a]\nmodel = 'claude-haiku-5-5'\n"
+        "[lines.a.sandbox]\nenabled = false\nallowUnsandboxedCommands = true\n"
+        "[lines.b]\nmodel = 'claude-haiku-5-5'\n"
+    )
+    found = sandbox_warnings(config)
+    assert len(found) == 3
+    assert found[0].startswith("the project's sandbox sets allowUnsandboxedCommands")
+    assert found[1].startswith("line a's sandbox sets allowUnsandboxedCommands")
+    assert found[2].startswith("line a runs Claude Code with its sandbox disabled")
+    assert (
+        sandbox_warnings(parse("version = 1\n[lines.b]\nmodel = 'claude-haiku-5-5'\n"))
+        == []
+    )

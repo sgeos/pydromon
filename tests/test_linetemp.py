@@ -195,7 +195,10 @@ def test_a_line_that_may_only_read_gets_directories_outside_its_worktree() -> No
 
 
 def test_a_line_without_a_sandbox_is_given_no_directories() -> None:
-    factory = engine_factory("/work/project")
+    """Round 18 follow-up, item 1. A line no layer enables or disables is given an
+    enabled sandbox, so only an explicit enabled false leaves it without one."""
+    disabled = parse_sandbox({"enabled": False}, operator=False)
+    factory = engine_factory("/work/project", project_sandbox=disabled)
     engine = factory(LineSpec("alpha", HAIKU, Strategy.SUBSCRIPTION, LineConfig()), [])
     assert isinstance(engine, ClaudeCodeLine)
     assert engine.temp is None

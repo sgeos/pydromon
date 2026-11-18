@@ -137,7 +137,13 @@ from dromon.projectconfig import (
     declared_operators,
     load,
 )
-from dromon.sandbox import SandboxConfig, SandboxError, effective, merge
+from dromon.sandbox import (
+    SandboxConfig,
+    SandboxError,
+    claude_default,
+    effective,
+    merge,
+)
 from dromon import gitssh
 from dromon.gitssh import GitSshAccess, GitSshError, sandbox_layer, unreadable
 from dromon.processes import environment_reading_works
@@ -3553,6 +3559,20 @@ def check_plugins(config: LineConfig) -> None:
             raise ConfigError(str(error)) from error
 
 
+def line_sandbox(
+    project: SandboxConfig | None, model: str, config: LineConfig
+) -> SandboxConfig | None:
+    """The merged sandbox a line on ``model`` with ``config`` runs under, as the
+    scheduler builds it. **Round 18 follow-up, item 1.** A Claude Code line that no
+    layer enables or disables is enabled, so the daemon's checks judge the document
+    the line is given and not the one its layers spell. Other engines take no sandbox
+    document, and theirs is returned merged and unchanged."""
+    merged = merge([project, config.sandbox])
+    if ENGINE_OF.get(model) == CLAUDE_CODE_ENGINE:
+        return claude_default(merged)
+    return merged
+
+
 def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
     """Refuse a project file whose working directories are not allowed, or whose
     sandboxes cannot be made safe in them, before anything starts, rather than at
@@ -3564,20 +3584,30 @@ def check_sandboxes(config: ProjectConfig, paths: ProjectPaths) -> None:
     # daemon's home, which every Claude Code line is denied. Only Claude Code lines
     # take a sandbox document, so checking each line's against them refuses nothing
     # another engine could use.
+    # Round 18 follow-up, items 1 to 3. A Claude Code line is checked with the
+    # sandbox its build gives it, enabled when no layer says, and no grant may name,
+    # hold or match a credential path.
     credentials = security_paths.claude_credentials()
     effective(
         config.sandbox,
         paths.root,
         (*protected, *project_secret_paths(paths.root, paths.root), *credentials),
+        ungrantable=credentials,
     )
     for line in config.lines.values():
         check_plugins(line.config)
         workdir = resolve_workdir(line.config.workdir, paths.root, protected)
-        merged = merge([config.sandbox, line.config.sandbox])
+        merged = line_sandbox(config.sandbox, line.model, line.config)
         enabled = merged is not None and merged.enabled
         guarded = git_write_guards(workdir) if enabled else ()
         secrets = project_secret_paths(paths.root, workdir)
-        effective(merged, workdir, (*protected, *secrets, *credentials), guarded)
+        effective(
+            merged,
+            workdir,
+            (*protected, *secrets, *credentials),
+            guarded,
+            ungrantable=credentials,
+        )
     for role_id, role in sorted(config.roles.items()):
         worktree = resolve_workdir(role.workdir, paths.root, protected)
         for line_id in role.seats:
@@ -3609,18 +3639,20 @@ def git_ssh_access(
     for line_id, line in sorted(config.lines.items()):
         if not line.git_ssh:
             continue
-        merged = merge([config.sandbox, line.config.sandbox])
+        merged = line_sandbox(config.sandbox, line.model, line.config)
         if merged is not None and merged.enabled:
             workdir = resolve_workdir(line.config.workdir, paths.root, protected)
+            credentials = security_paths.claude_credentials()
             document = effective(
                 merge([merged, sandbox_layer(access)]),
                 workdir,
                 (
                     *protected,
                     *project_secret_paths(paths.root, workdir),
-                    *security_paths.claude_credentials(),
+                    *credentials,
                 ),
                 git_write_guards(workdir),
+                ungrantable=credentials,
             )
             denied = None if document is None else unreadable(access, document)
             if denied is not None:
@@ -3649,7 +3681,7 @@ def check_sandbox_required(
     project declares peers and does not accept it, by decision 9 of the federation
     design, which counts a Claude Code line without an enabled sandbox, by the
     operator's decision of 2026-10-28. Raises ``SandboxError``."""
-    merged: SandboxConfig | None = merge([project.sandbox, config.sandbox])
+    merged = line_sandbox(project.sandbox, model, config)
     sandboxed = merged is not None and merged.enabled
     refusal = unconfined_refusal(
         project.federation, line_id, ENGINE_OF.get(model), sandboxed

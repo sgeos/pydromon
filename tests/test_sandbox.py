@@ -14,7 +14,7 @@ from claude_agent_sdk import (
     ToolPermissionContext,
 )
 
-from dromon import cli, exits
+from dromon import cli, exits, security_paths
 from dromon.daemon import check_sandboxes, protected_dirs
 from dromon.driver import Driver, Strategy
 from dromon.engine import ClaudeCodeLine, permission_gate
@@ -262,12 +262,28 @@ def test_explicit_choices_override_the_unattended_defaults() -> None:
     settings = effective(sandbox(chosen), ROOT, PROTECTED)
     assert settings is not None
     assert settings["failIfUnavailable"] is False
-    assert settings["allowUnsandboxedCommands"] is True
     assert settings["network"] == {"strictAllowlist": False}
+    # Round 18 follow-up, item 2. Forced, since an unsandboxed command reads every
+    # path the sandbox denies.
+    assert settings["allowUnsandboxedCommands"] is False
+
+
+def test_an_enabled_sandbox_with_excluded_commands_is_refused() -> None:
+    with pytest.raises(SandboxError, match="excludedCommands run outside") as caught:
+        effective(sandbox(FULL), ROOT, PROTECTED)
+    assert caught.value.key == "excludedCommands"
+
+
+def test_a_disabled_sandbox_may_name_excluded_commands() -> None:
+    document = {"enabled": False, "excludedCommands": ["git"]}
+    assert effective(sandbox(document), ROOT, PROTECTED) == document
 
 
 def test_relative_paths_resolve_against_the_project_root() -> None:
-    settings = effective(sandbox(FULL), ROOT, PROTECTED)
+    confined = {
+        name: value for name, value in FULL.items() if name != "excludedCommands"
+    }
+    settings = effective(sandbox(confined), ROOT, PROTECTED)
     assert settings is not None
     filesystem = cast(dict[str, list[str]], settings["filesystem"])
     assert filesystem["denyWrite"] == with_real(
@@ -418,7 +434,13 @@ def test_the_factory_merges_the_project_sandbox_under_each_line() -> None:
         },
         operator=True,
     )
-    assert engine.sandbox == effective(merge([project, own, grant]), ROOT, PROTECTED)
+    credentials = security_paths.claude_credentials()
+    assert engine.sandbox == effective(
+        merge([project, own, grant]),
+        ROOT,
+        (*PROTECTED, *credentials),
+        ungrantable=credentials,
+    )
     network = cast(dict[str, object], (engine.sandbox or {})["network"])
     assert network["allowedDomains"] == ["github.com", "pypi.org"]
 
