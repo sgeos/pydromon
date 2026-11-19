@@ -22,6 +22,7 @@ from dromon.driver import Strategy
 from dromon.engine import TurnReport
 from dromon.eventlog import EventLog
 from dromon.mailbox import (
+    MAX_BULK_ACKNOWLEDGE,
     asks_reply,
     NO_REPLY_ASKED,
     counts_unanswered,
@@ -878,3 +879,261 @@ def test_status_distinguishes_old_requests_from_informational_notes(
         == cast(list[dict[str, object]], status["unanswered_mail"])[0]["waited"]
     )
     assert status["oldest_unanswered_age"] != "0s"
+
+
+def invoke(tool: SdkMcpTool[Any], args: dict[str, object]) -> tuple[bool, str]:
+    """Whether ``tool`` refused ``args``, and its text."""
+
+    async def run() -> dict[str, Any]:
+        return await tool.handler(args)
+
+    result = asyncio.run(run())
+    return result.get("is_error") is True, cast(str, result["content"][0]["text"])
+
+
+def notes_from(
+    world: World, sender: OperatorAddress | LineAddress, count: int
+) -> list[str]:
+    return [
+        world.deliver(world.scheduler.send(sender, ALPHA, f"task {n}"))
+        for n in range(count)
+    ]
+
+
+def test_a_line_closes_several_named_notes_each_recorded_alone(world: World) -> None:
+    """Round 19, bulk acknowledgement. Each note gets its own event and reason."""
+    first, second, kept = notes_from(world, ANA, 3)
+    text = world.call(
+        "acknowledge_mail",
+        {"message_ids": [first, second], "reason": "superseded by the report"},
+    )
+    assert text == "acknowledged 2 messages"
+    messages = world.log.state.messages
+    for closed in (first, second):
+        assert messages[closed].acknowledged
+        assert messages[closed].closed_reason == "superseded by the report"
+    assert not messages[kept].acknowledged
+    assert world.unanswered() == 1
+    # Each one is its own event, so a replay and a rollback see the same as before.
+    events = [e for e in world.log.state.messages if e in (first, second)]
+    assert events == [first, second]
+
+
+def test_a_named_note_already_acknowledged_is_accepted_without_a_reason(
+    world: World,
+) -> None:
+    first, second = notes_from(world, ANA, 2)
+    world.call("acknowledge_mail", {"message_id": first})
+    assert world.call("acknowledge_mail", {"message_ids": [first, second]}) == (
+        "acknowledged 2 messages"
+    )
+    assert world.unanswered() == 0
+    refused = world.refused(
+        "acknowledge_mail", {"message_ids": [first], "reason": "too late"}
+    )
+    assert "its reason is kept" in refused
+
+
+def test_a_bulk_call_naming_another_mailbox_changes_nothing(world: World) -> None:
+    mine = notes_from(world, ANA, 2)
+    beta_note = world.deliver(world.scheduler.send(ANA, BETA, "for beta"))
+    unknown = "m-missing"
+    for named, expected in (
+        ([mine[0], beta_note], f"no message {beta_note} in the mailbox of alpha"),
+        ([mine[0], unknown], f"no message {unknown} in the mailbox of alpha"),
+    ):
+        assert expected in world.refused("acknowledge_mail", {"message_ids": named})
+        assert not any(world.log.state.messages[m].acknowledged for m in mine)
+    assert not world.log.state.messages[beta_note].acknowledged
+
+
+def test_a_bulk_call_never_closes_a_question_or_an_issue(world: World) -> None:
+    """Round 19. Only an operator's mailbox holds a question or an issue, since the
+    log refuses one to a line, so the refusal is tried through an operator's own
+    tool, the one a client uses. The one-message form still closes either, as before,
+    which is its own act, and the bulk forms leave them counted and say so."""
+    note = world.deliver(world.scheduler.send(ALPHA, ANA, "a note"))
+    question = world.deliver(world.scheduler.ask("alpha", ANA, "which one?"))
+    issue = world.deliver(world.scheduler.send(ALPHA, ANA, "a defect", issue=True))
+    tool = world.scheduler.acknowledge_mail_tool(ANA)
+    for kind, named in (("question", question), ("issue", issue)):
+        refused, text = invoke(tool, {"message_ids": [note, named]})
+        assert refused and f"message {named} is a {kind}" in text
+        assert not world.log.state.messages[note].acknowledged
+    refused, text = invoke(tool, {"from_sender": "alpha", "up_to_message_id": issue})
+    assert not refused
+    assert text == (
+        "acknowledged 1 notes, and left 2 questions or issues, which this form"
+        " never closes"
+    )
+    messages = world.log.state.messages
+    assert messages[note].acknowledged
+    assert not messages[question].acknowledged and not messages[issue].acknowledged
+    assert invoke(tool, {"message_id": question}) == (False, f"acknowledged {question}")
+    assert world.log.state.messages[question].acknowledged
+
+
+def test_a_bulk_call_is_bounded_and_takes_a_list_of_distinct_text(
+    world: World,
+) -> None:
+    (note,) = notes_from(world, ANA, 1)
+    assert "no message was named" in world.refused(
+        "acknowledge_mail", {"message_ids": []}
+    )
+    assert "named twice" in world.refused(
+        "acknowledge_mail", {"message_ids": [note, note]}
+    )
+    many = [f"m-{n}" for n in range(MAX_BULK_ACKNOWLEDGE + 1)]
+    assert f"at most {MAX_BULK_ACKNOWLEDGE}" in world.refused(
+        "acknowledge_mail", {"message_ids": many}
+    )
+    assert "list of text" in world.refused(
+        "acknowledge_mail", {"message_ids": [note, 7]}
+    )
+    assert "list of text" in world.refused("acknowledge_mail", {"message_ids": note})
+    assert not world.log.state.messages[note].acknowledged
+
+
+def test_a_bulk_call_with_a_bad_reason_records_nothing(world: World) -> None:
+    first, second = notes_from(world, ANA, 2)
+    long = "x" * (MAX_CLOSE_REASON_BYTES + 1)
+    for reason in ("  ", long):
+        assert "reason" in world.refused(
+            "acknowledge_mail", {"message_ids": [first, second], "reason": reason}
+        )
+    assert world.refused("acknowledge_mail", {"message_ids": [first], "reason": 7}) == (
+        "reason must be text"
+    )
+    assert world.unanswered() == 2
+
+
+def test_from_sender_closes_the_oldest_notes_up_to_the_named_one(
+    world: World,
+) -> None:
+    first, second, third = notes_from(world, ANA, 3)
+    other = world.deliver(world.scheduler.send(BETA, ALPHA, "from beta"))
+    text = world.call(
+        "acknowledge_mail",
+        {"from_sender": "@ana", "up_to_message_id": second, "reason": "stale"},
+    )
+    assert text == "acknowledged 2 notes"
+    messages = world.log.state.messages
+    assert [messages[m].acknowledged for m in (first, second, third, other)] == [
+        True,
+        True,
+        False,
+        False,
+    ]
+    assert messages[first].closed_reason == messages[second].closed_reason == "stale"
+    assert world.unanswered() == 2
+
+
+def test_from_sender_skips_a_note_already_closed_and_is_bounded(world: World) -> None:
+    notes = notes_from(world, ANA, MAX_BULK_ACKNOWLEDGE + 3)
+    world.call("acknowledge_mail", {"message_id": notes[0]})
+    text = world.call(
+        "acknowledge_mail", {"from_sender": "@ana", "up_to_message_id": notes[-1]}
+    )
+    # The first was closed, so 52 still count, and the bound takes the oldest 50.
+    assert text == (
+        f"acknowledged {MAX_BULK_ACKNOWLEDGE} notes, and 2 more up to that message"
+        " wait for another call"
+    )
+    messages = world.log.state.messages
+    assert all(messages[m].acknowledged for m in notes[: MAX_BULK_ACKNOWLEDGE + 1])
+    assert not any(messages[m].acknowledged for m in notes[-2:])
+    assert (
+        world.call(
+            "acknowledge_mail", {"from_sender": "@ana", "up_to_message_id": notes[-1]}
+        )
+        == "acknowledged 2 notes"
+    )
+    assert world.unanswered() == 0
+
+
+def test_from_sender_names_a_message_that_need_not_count_as_unanswered(
+    world: World,
+) -> None:
+    first, second = notes_from(world, ANA, 2)
+    world.call("acknowledge_mail", {"message_id": second})
+    text = world.call(
+        "acknowledge_mail", {"from_sender": "@ana", "up_to_message_id": second}
+    )
+    assert text == "acknowledged 1 notes"
+    assert world.log.state.messages[first].acknowledged
+    assert world.call(
+        "acknowledge_mail", {"from_sender": "@ana", "up_to_message_id": second}
+    ) == ("acknowledged 0 notes")
+
+
+def test_from_sender_refuses_a_message_outside_the_senders_mail_to_the_caller(
+    world: World,
+) -> None:
+    mine = notes_from(world, ANA, 1)[0]
+    beta_note = world.deliver(world.scheduler.send(BETA, ALPHA, "from beta"))
+    to_beta = world.deliver(world.scheduler.send(ANA, BETA, "for beta"))
+    for sender, up_to in (
+        ("@ana", beta_note),
+        ("beta", mine),
+        ("@ana", to_beta),
+        ("@ana", "m-missing"),
+    ):
+        refused = world.refused(
+            "acknowledge_mail", {"from_sender": sender, "up_to_message_id": up_to}
+        )
+        assert f"no message {up_to} from" in refused
+    assert not world.log.state.messages[to_beta].acknowledged
+    assert world.unanswered() == 2
+
+
+def test_the_forms_of_acknowledge_mail_are_not_mixed_or_incomplete(
+    world: World,
+) -> None:
+    note = notes_from(world, ANA, 1)[0]
+    exactly_one = "name exactly one of message_id, message_ids and from_sender"
+    mixed: list[dict[str, object]] = [
+        {},
+        {"message_id": note, "message_ids": [note]},
+        {"message_id": note, "from_sender": "@ana", "up_to_message_id": note},
+        {"reason": "nothing named"},
+    ]
+    for args in mixed:
+        assert world.refused("acknowledge_mail", args) == exactly_one
+    together = "up_to_message_id goes with from_sender, and with nothing else"
+    strays: list[dict[str, object]] = [
+        {"from_sender": "@ana"},
+        {"message_id": note, "up_to_message_id": note},
+        {"message_ids": [note], "up_to_message_id": note},
+    ]
+    for args in strays:
+        assert world.refused("acknowledge_mail", args) == together
+    assert world.refused(
+        "acknowledge_mail", {"from_sender": 7, "up_to_message_id": note}
+    ) == ("from_sender and up_to_message_id must be text")
+    assert world.refused("acknowledge_mail", {"message_id": 7}) == (
+        "message_id must be text"
+    )
+    assert "unexpected argument" in world.refused(
+        "acknowledge_mail", {"message_id": note, "sender": "@ana"}
+    )
+    assert world.refused(
+        "acknowledge_mail", {"from_sender": "not an address", "up_to_message_id": note}
+    )
+    assert world.unanswered() == 1
+
+
+def test_a_reply_to_a_line_note_closes_the_note_it_answers(world: World) -> None:
+    """Round 19. The rule the operator asked about already holds between lines, so
+    this pins it. A note that asks a reply leaves the recipient's count once the
+    recipient sends a reply that names it, and a note without a reply stays."""
+    asked = world.deliver(world.scheduler.send(BETA, ALPHA, "please do this"))
+    other = world.deliver(world.scheduler.send(BETA, ALPHA, "and this"))
+    assert world.unanswered() == 2
+    world.deliver(world.scheduler.send(ALPHA, BETA, "done", reply_to=asked))
+    assert world.unanswered() == 1
+    assert world.log.state.messages[asked].replied
+    assert not world.log.state.messages[other].replied
+    # A note that was told it asks nothing never counted, so a reply changes nothing.
+    quiet = world.deliver(world.scheduler.send(BETA, ALPHA, "fyi", asks_reply=False))
+    assert world.unanswered() == 1
+    assert not counts_unanswered(world.log.state, world.log.state.messages[quiet])
