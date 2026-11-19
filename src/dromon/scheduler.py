@@ -323,6 +323,7 @@ from dromon.roles import (
     waits_unconfined,
 )
 from dromon.mailbox import (
+    MAX_BULK_ACKNOWLEDGE,
     MAX_PAGE,
     MailSummary,
     counts_unanswered,
@@ -331,6 +332,7 @@ from dromon.mailbox import (
     listing,
     unanswered_reason,
     unanswered_from,
+    unanswered_notes_through,
     sent,
     summary,
 )
@@ -1790,6 +1792,33 @@ ACKNOWLEDGE_MAIL_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
     "properties": {
         "message_id": {"type": "string", "description": "The message"},
+        "message_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": MAX_BULK_ACKNOWLEDGE,
+            "description": (
+                "Bulk form. Several notes in your own mailbox, each recorded as"
+                " acknowledged. Use instead of message_id. A question, an issue or"
+                " a message not in your mailbox refuses the whole call"
+            ),
+        },
+        "from_sender": {
+            "type": "string",
+            "description": (
+                "Bulk form. Every note from this address that still counts as"
+                " unanswered, oldest first, up to and including up_to_message_id."
+                " Use instead of message_id, with up_to_message_id"
+            ),
+        },
+        "up_to_message_id": {
+            "type": "string",
+            "description": (
+                "With from_sender. The newest message from that sender to"
+                f" acknowledge, which counts the oldest {MAX_BULK_ACKNOWLEDGE} at"
+                " most. Repeat the call for more"
+            ),
+        },
         "reason": {
             "type": "string",
             "description": (
@@ -1799,7 +1828,6 @@ ACKNOWLEDGE_MAIL_SCHEMA: Final[dict[str, object]] = {
             ),
         },
     },
-    "required": ["message_id"],
     "additionalProperties": False,
 }
 
@@ -12808,6 +12836,77 @@ class Scheduler:
         if not self._state().messages[message_id].acknowledged:
             self._log.append(MessageAcknowledged(message_id, reason))
 
+    def acknowledge_many(
+        self, owner: Address, message_ids: Sequence[str], reason: str | None = None
+    ) -> None:
+        """Acknowledge each of ``message_ids`` in ``owner``'s mailbox, one
+        ``MessageAcknowledged`` apiece, all or none. **Round 19, bulk
+        acknowledgement.** Every identifier is checked before one is recorded, so a
+        refusal leaves the mailbox as it was. Refused are an empty list, one over
+        ``MAX_BULK_ACKNOWLEDGE``, an identifier listed twice, one that is not in
+        ``owner``'s mailbox, which another line's message is not, whatever the
+        caller names, a question or an issue, and with a ``reason`` one already
+        acknowledged, as the single form refuses it. A note already acknowledged
+        is accepted silently without a reason."""
+        if not message_ids:
+            raise EventRejected("no message was named")
+        if len(message_ids) > MAX_BULK_ACKNOWLEDGE:
+            raise EventRejected(
+                f"{len(message_ids)} messages were named, at most"
+                f" {MAX_BULK_ACKNOWLEDGE} are acknowledged at once"
+            )
+        if len(set(message_ids)) != len(message_ids):
+            raise EventRejected("a message was named twice")
+        state = self._state()
+        for message_id in message_ids:
+            message = state.messages.get(message_id)
+            if message is None or message.recipient != owner:
+                raise EventRejected(
+                    f"no message {message_id} in the mailbox of {owner}"
+                )
+            if message.kind is not MessageKind.NOTE:
+                raise EventRejected(
+                    f"message {message_id} is a {message.kind.value}, which only a"
+                    " call naming that one message may acknowledge"
+                )
+            if reason is not None and message.acknowledged:
+                raise EventRejected(
+                    f"message {message_id} was acknowledged, and its reason is kept"
+                )
+        if reason is not None:
+            # Checked before anything is appended, so a bad reason records nothing.
+            MessageAcknowledged(message_ids[0], reason)
+        for message_id in message_ids:
+            self.acknowledge(owner, message_id, reason)
+
+    def acknowledge_through(
+        self,
+        owner: Address,
+        sender: Address,
+        up_to: str,
+        reason: str | None = None,
+    ) -> tuple[list[str], int, int]:
+        """Acknowledge the oldest notes from ``sender`` that still count as
+        unanswered in ``owner``'s mailbox, up to and including ``up_to``, at most
+        ``MAX_BULK_ACKNOWLEDGE`` of them. **Round 19, bulk acknowledgement.** The
+        result is the identifiers acknowledged, how many matching notes were left
+        for another call because of the bound, and how many questions or issues
+        were left alone, which this form never closes. ``up_to`` must be a message
+        from ``sender`` in ``owner``'s mailbox, or the call is refused. It need not
+        count as unanswered itself. A note that does not count is never selected,
+        so a reason is never refused as late."""
+        found = unanswered_notes_through(self._state(), owner, sender, up_to)
+        if found is None:
+            raise EventRejected(f"no message {up_to} from {sender} in the mailbox")
+        notes, other = found
+        chosen = notes[:MAX_BULK_ACKNOWLEDGE]
+        if reason is not None:
+            # Checked before anything is appended, so a bad reason records nothing.
+            MessageAcknowledged(up_to, reason)
+        for message_id in chosen:
+            self.acknowledge(owner, message_id, reason)
+        return chosen, len(notes) - len(chosen), other
+
     def acknowledge_mail_tool(self, owner: str | Address) -> SdkMcpTool[Any]:
         """The ``acknowledge_mail`` tool, which marks a message dealt with silently."""
         mailbox_owner = _party(owner)
@@ -12817,9 +12916,40 @@ class Scheduler:
             if unexpected:
                 return _tool_error(unexpected)
             message_id: object = args.get("message_id")
+            message_ids: object = args.get("message_ids")
+            from_sender: object = args.get("from_sender")
+            up_to: object = args.get("up_to_message_id")
             reason: object = args.get("reason")
-            if not isinstance(message_id, str):
+            forms = [
+                name
+                for name, value in (
+                    ("message_id", message_id),
+                    ("message_ids", message_ids),
+                    ("from_sender", from_sender),
+                )
+                if value is not None
+            ]
+            if len(forms) != 1:
+                return _tool_error(
+                    "name exactly one of message_id, message_ids and from_sender"
+                )
+            if (up_to is not None) != (forms[0] == "from_sender"):
+                return _tool_error(
+                    "up_to_message_id goes with from_sender, and with nothing else"
+                )
+            if forms[0] == "message_id" and not isinstance(message_id, str):
                 return _tool_error("message_id must be text")
+            if forms[0] == "message_ids" and not (
+                isinstance(message_ids, list)
+                and all(
+                    isinstance(item, str) for item in cast(list[object], message_ids)
+                )
+            ):
+                return _tool_error("message_ids must be a list of text")
+            if forms[0] == "from_sender" and not (
+                isinstance(from_sender, str) and isinstance(up_to, str)
+            ):
+                return _tool_error("from_sender and up_to_message_id must be text")
             if reason is not None and not isinstance(reason, str):
                 return _tool_error("reason must be text")
             if reason is not None:
@@ -12835,10 +12965,30 @@ class Scheduler:
                 if refusal is not None:
                     return _tool_error(refusal)
             try:
-                self.acknowledge(mailbox_owner, message_id, reason)
-            except (InvalidField, EventRejected) as error:
+                if isinstance(message_id, str):
+                    self.acknowledge(mailbox_owner, message_id, reason)
+                    return _tool_text(f"acknowledged {message_id}")
+                if isinstance(message_ids, list):
+                    named = cast(list[str], message_ids)
+                    self.acknowledge_many(mailbox_owner, named, reason)
+                    return _tool_text(f"acknowledged {len(named)} messages")
+                chosen, left, other = self.acknowledge_through(
+                    mailbox_owner,
+                    parse_any_address(cast(str, from_sender)),
+                    cast(str, up_to),
+                    reason,
+                )
+            except (InvalidField, EventRejected, ValueError) as error:
                 return _tool_error(str(error))
-            return _tool_text(f"acknowledged {message_id}")
+            text = f"acknowledged {len(chosen)} notes"
+            if left:
+                text += f", and {left} more up to that message wait for another call"
+            if other:
+                text += (
+                    f", and left {other} questions or issues, which this form"
+                    " never closes"
+                )
+            return _tool_text(text)
 
         return SdkMcpTool(
             name=ACKNOWLEDGE_MAIL_TOOL_NAME,
@@ -12846,7 +12996,12 @@ class Scheduler:
                 "Mark a message in your mailbox as dealt with, without sending a"
                 " reply, with an optional short reason that is recorded. It leaves"
                 " the unanswered count. Its sender sees that it was acknowledged"
-                " rather than replied to, and never the reason."
+                " rather than replied to, and never the reason. Name one message"
+                " with message_id, or up to"
+                f" {MAX_BULK_ACKNOWLEDGE} notes with message_ids, or every"
+                " unanswered note from one sender, oldest first, up to a message"
+                " with from_sender and up_to_message_id. The bulk forms never close"
+                " a question or an issue, or a message outside your mailbox."
             ),
             input_schema=ACKNOWLEDGE_MAIL_SCHEMA,
             handler=handler,

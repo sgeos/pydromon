@@ -1299,6 +1299,40 @@ during that turn.
     sender sees `acknowledged` and never the reason, since the reason is the
     recipient's note to itself. A reason for a message already acknowledged is
     refused, since it would not be recorded.
+  - **Bulk acknowledgement, round 19, required by the operator.** The unanswered
+    count of 66 hid the few messages that matter, and closing a note at a time cost
+    a call each. `acknowledge_mail` takes exactly one of three forms, and refuses a
+    call that names none or more than one. `message_id` is the form above.
+    `message_ids` names one to 50 notes, and `from_sender` with `up_to_message_id`
+    names every note from that sender that still counts as unanswered, oldest first,
+    up to and including that message, in the mailbox's own order, which is the order
+    of arrival since an identifier carries none. The second form closes at most the
+    oldest 50 and says how many more wait, so a call is repeated for the rest. The
+    bound equals a page of `list_mail`.
+    - **Recorded per message.** Each message gets its own `message_acknowledged`
+      with the one reason, which is checked against the disclosure list once.
+      **No event changes**, so a replay and a daemon rolled back to earlier code read
+      the same log.
+    - **Refusals.** All of `message_ids` is checked before any is recorded, so a
+      refusal changes nothing. An empty list, more than 50, a message named twice, a
+      message that is not in the caller's own mailbox, which another line's message
+      never is and which answers as a message that does not exist, a question or an
+      issue, and with a reason a message already acknowledged are refused. `from_sender`
+      is refused when `up_to_message_id` is not a message from that sender in the
+      caller's mailbox. It leaves a question or an issue counted and the result says
+      how many. Only the one-message form closes those. In practice only an
+      operator's mailbox holds either, since the log refuses a question to a line,
+      so the guard is for an operator's own tool.
+    - **A reply closes the note it answers.** The operator asked whether a
+      `reply_to` on a line's note should close the note it answers when that note
+      asked for a reply. **Fact.** It already does, between lines as between an
+      operator and a line, through `Message.replied`, which `counts_unanswered`
+      reads, and `tests/test_mail_rules.py` now pins it. Only the thread rule, which
+      closes an earlier note when a later one in its thread is answered, is limited
+      to an operator's notes to a line. No rule changed.
+    - **Residual.** A bulk call is a judgement that the notes need no reply, made on
+      their headers. **Inference.** A line may close a note it should have answered.
+      The reason is the record, and the one-message form has the same risk.
   - **Failure modes.** The ages are the event log's `recorded_at`, kept as events
     apply, and follow the clock, as the peer view's ages do. From 2026-11-01
     `dromon send --no-reply` lets an operator's note ask nothing, while the curses
