@@ -117,6 +117,7 @@ from dromon.model import (
     RunAdmitted,
     RunDequeued,
     RunQueued,
+    RunRetargeted,
     PeerDeclared,
     PeerKeyed,
     PeerOpened,
@@ -346,6 +347,7 @@ SCENARIO: tuple[Event, ...] = (
         workdir_commit="b" * 40,
         dirty_paths=3,
         admitted_by="ana",
+        content="d" * 64,
     ),
     RunEnded(
         "r-1",
@@ -405,7 +407,10 @@ SCENARIO: tuple[Event, ...] = (
         "the machine status defers runs",
     ),
     RunDequeued("q-1", QueueEnd.STARTED, "r-3", "", AT),
-    RunQueued("q-2", "alpha", "gate", "r-3", None, (), "/work", None, AT, "waiting"),
+    RunQueued(
+        "q-2", "alpha", "gate", "r-3", None, (), "/work", None, AT, "waiting", "e" * 64
+    ),
+    RunRetargeted("q-2", None, "c" * 40, "e" * 64, AT),
     RunDequeued("q-2", QueueEnd.DROPPED, None, "its line was released", AT),
     RunAdmitted("ana", AT, "2026-10-27T06:00:00Z", "memory pressure from outside"),
     RunAdmissionEnded("ana", AT),
@@ -904,7 +909,11 @@ def _no_real_git_status(
     turn of a kept session, so most tests started git for an answer none of them
     checked. Only the start is replaced. A directory outside any checkout is still
     refused by the real check, as it is in the daemon. Disjoint from the spawn
-    fixtures above, which the runtime line owns."""
+    fixtures above, which the runtime line owns.
+
+    **Round 19.** The reads of ``readiness.content_digest`` are answered as git not
+    starting, so such a test sees the content as unknown, which keeps the behaviour
+    from before content was compared, a queued run dropped when ``HEAD`` moves."""
     node = cast(pytest.Item, request.node)  # pyright: ignore[reportUnknownMemberType]
     if node.get_closest_marker("real_git_status") is None:
 
@@ -912,7 +921,21 @@ def _no_real_git_status(
             del worktree
             return ""
 
+        def unstarted(
+            top: Path,
+            arguments: tuple[str, ...],
+            stdin: bytes | None,
+            limit: int,
+            seconds: float,
+        ) -> bytes:
+            del top, stdin, limit, seconds
+            raise readiness.ReadinessUnknown(
+                f"the suite does not start git {arguments[0]}",
+                readiness.ReadFailure.NOT_STARTED,
+            )
+
         monkeypatch.setattr(readiness, "_run_git_status", clean)
+        monkeypatch.setattr(readiness, "_run_git_read", unstarted)
 
 
 @pytest.fixture(autouse=True)

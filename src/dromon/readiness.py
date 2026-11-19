@@ -14,13 +14,17 @@ the repository's own names and may hold any byte git allows, so they are shown a
 git prints them, bounded in count and length, and never interpreted.
 """
 
+import contextlib
 import hashlib
 import os
+import selectors
+import stat
 import subprocess
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Final
+from typing import IO, Final
 
 from dromon import spawn, workdir
 
@@ -234,6 +238,397 @@ def tree_snapshot(worktree: Path) -> TreeSnapshot:
             error.dirty = dirty
             raise
     return TreeSnapshot(digest.hexdigest(), dirty)
+
+
+MAX_CONTENT_ENTRIES: Final = 200_000
+"""The most index entries that ``content_digest`` lists and hashes. A larger tree is
+answered as one whose content cannot be told."""
+
+MAX_LISTING_BYTES: Final = 128 * 1024 * 1024
+"""The most bytes one listing of ``content_digest`` reads, so that a tree of few
+entries with very long names is bounded too. A longer listing is answered as one
+whose content cannot be told."""
+
+CONTENT_SECONDS: Final = 30.0
+"""How long one ``content_digest`` may take, its git reads and its examination of
+every tracked path together. **Round 19 re-check, item 2.** A deadline on each git
+read alone left the whole unbounded, since each link had a read of its own. A digest
+that runs past it is answered as one whose content cannot be told."""
+
+_REAP_SECONDS: Final = 5.0
+"""How long a git read killed at its deadline is waited for, so the digest may
+outlast ``CONTENT_SECONDS`` by this much at most."""
+
+_REGULAR: Final = "100644"
+_EXECUTABLE: Final = "100755"
+_SYMLINK: Final = "120000"
+_GITLINK: Final = "160000"
+
+_UNCARRIED: Final = ("\n", "\r")
+"""Characters that ``git hash-object --stdin-paths`` cannot carry in a path. It reads
+one path a line, so a newline ends one, and it strips a carriage return that ends a
+line. A path beginning with a double quote is unquoted as a C string, which
+``_carried`` refuses apart from these."""
+
+_READ_SETTINGS: Final = ("-c", "core.fsmonitor=false")
+"""Settings given to every git read of ``content_digest``, over the repository's own.
+**Round 19 review, item 1.** No read of the digest refreshes the index, and this one
+keeps git from running a monitor hook that the repository's configuration names."""
+
+
+def content_digest(worktree: Path) -> str:
+    """The SHA-256 of the content a run in ``worktree`` would test, the path, mode
+    and bytes of every file the index tracks, as the files are on disk.
+
+    **Round 19, at core's and ops' request.** ``tree_digest`` covers ``HEAD`` and the
+    stamps of the changed paths, so a commit of exactly the uncommitted tree changes
+    it, though not one file a run reads changed. The operator committing a line's
+    tree dropped its queued gate after hours of waiting. This digest does not depend
+    on ``HEAD`` or on what is staged, only on which paths the index tracks and what
+    the files hold, so committing the tree, or resetting to a commit that holds it,
+    gives the same digest, and a change of any one tracked file gives another.
+
+    **How it is read.** Two reads of git, neither of which writes or runs a program
+    that the configuration names. ``git ls-files --stage`` lists the index, and ``git
+    hash-object --no-filters --stdin-paths`` hashes every tracked regular file as its
+    bytes are. A link is hashed in Python from its target, as git would name its
+    blob, with its mode, and a tracked path whose file is gone is left out. Nothing
+    is written to the object store. ``HEAD`` is read before and after, and a move
+    between answers that the content cannot be told now.
+
+    **Round 19 review, item 1. The configuration does not steer it.** Equality keeps
+    a queued run and lets a receipt say it covers the tree, so a difference that
+    git's configuration hides would keep a run on content it was not asked for. The
+    first form of this digest hashed only what ``git status`` listed as changed, and
+    ``git status`` honoured a ``core.fsmonitor`` hook, which hid an edit and ran, a
+    clean filter that a tracked ``.gitattributes`` chose, which mapped an edit back
+    to its blob and ran, line endings the attributes normalise, ``core.fileMode``
+    false, and ``diff.ignoreSubmodules`` or a submodule's ``ignore`` key, which a
+    tracked ``.gitmodules`` may carry. Comparing stamps with the index instead does
+    not suffice, since any ``git status`` that finds a filtered edit equal records
+    its stamps as clean. So no file is trusted to be as committed. Every one is
+    hashed from its bytes, without filters, with the mode the file system shows. A
+    repository whose index holds a submodule is answered as unknown, since the
+    submodule's files are not read. Neither the user's nor the system's
+    configuration is loaded. Every difference this finds where git would see none,
+    such as line endings a filter would convert, drops a run, the safe direction.
+
+    **Round 19 re-check.** A tracked path that ``--stdin-paths`` would read back as
+    another, one beginning with a double quote or holding a carriage return, is
+    refused as ``_carried`` says. Each link no longer starts a git read of its own,
+    and the whole digest has one deadline, ``CONTENT_SECONDS``.
+
+    **Cost.** Each read hashes the whole tracked tree, bounded by
+    ``MAX_CONTENT_ENTRIES``, ``MAX_LISTING_BYTES`` and ``CONTENT_SECONDS`` for the
+    whole, and a tree too large for those is answered as unknown, so its queued runs
+    are dropped on a move of ``HEAD`` as before round 19.
+
+    **Not covered, residuals.** Untracked files are left out, as ``tree_digest``
+    leaves them out. A submodule, a tracked path that is now a directory, a tracked
+    path that ``--stdin-paths`` cannot carry, a tree past the bounds above, and an
+    unborn or unreadable ``HEAD`` raise ``TreeUncovered``, so a caller treats the
+    content as unknown and never as unchanged. A file edited while it is hashed may
+    be read in either state. ``GIT_CONFIG_GLOBAL`` needs git 2.32 or later, and an
+    older git reads the user's configuration, which no longer bears on the bytes
+    hashed. The repository's own configuration is read, as git needs it, and a
+    line's sandbox guards it. Raises ``ReadinessUnknown`` where git cannot be read
+    or ``CONTENT_SECONDS`` pass. Blocking.
+
+    **Porting note.** Plain reads of child processes and a sorted fold, bounded by
+    the maxima and one deadline for the whole."""
+    deadline = time.monotonic() + CONTENT_SECONDS
+    head = workdir.read_head_commit(worktree)
+    top = workdir.checkout_top(worktree)
+    if head is None or top is None:
+        raise TreeUncovered(
+            f"{worktree} has no readable HEAD or checkout top",
+            Uncovered.UNSTAMPED_PATH,
+        )
+    listing: dict[str, tuple[str, str]] = {}
+    regular: list[tuple[str, str]] = []
+    for path in sorted(_index_paths(top, deadline)):
+        _remaining(deadline)
+        _carried(path)
+        try:
+            found = os.lstat(top / path)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as error:
+            raise TreeUncovered(
+                f"the tracked path {path!r} could not be stated: {error}",
+                Uncovered.UNSTAMPED_PATH,
+            ) from error
+        if stat.S_ISLNK(found.st_mode):
+            listing[path] = (_SYMLINK, _link_blob(top / path))
+        elif stat.S_ISREG(found.st_mode):
+            # The mode the file system shows, whatever core.fileMode says.
+            mode = _EXECUTABLE if found.st_mode & stat.S_IXUSR else _REGULAR
+            regular.append((path, mode))
+        else:
+            raise TreeUncovered(
+                f"the tracked path {path!r} is neither a file nor a link",
+                Uncovered.UNSTAMPED_PATH,
+            )
+    if regular:
+        paths = "".join(f"{path}\n" for path, _ in regular)
+        blobs = _git_text(
+            top,
+            ("hash-object", "--no-filters", "--stdin-paths"),
+            paths.encode("utf-8", "surrogateescape"),
+            len(regular),
+            _remaining(deadline),
+        ).split()
+        if len(blobs) != len(regular):
+            raise ReadinessUnknown(
+                "git hash-object gave a count of objects it should not",
+                ReadFailure.MALFORMED,
+            )
+        for (path, mode), blob in zip(regular, blobs, strict=True):
+            listing[path] = (mode, blob)
+    if workdir.read_head_commit(worktree) != head:
+        raise ReadinessUnknown(
+            f"HEAD moved in {worktree} while its content was read", ReadFailure.FAILED
+        )
+    digest = hashlib.sha256(b"content\0")
+    for path in sorted(listing):
+        mode, name = listing[path]
+        digest.update(f"{mode} {name} {path}\0".encode("utf-8", "surrogateescape"))
+    return digest.hexdigest()
+
+
+def _remaining(deadline: float) -> float:
+    """The seconds left before ``deadline``, a reading of ``time.monotonic``. Raises
+    ``ReadinessUnknown`` once none are left."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise ReadinessUnknown(
+            f"the content digest ran past {CONTENT_SECONDS:g} seconds",
+            ReadFailure.TIMED_OUT,
+        )
+    return left
+
+
+def _carried(path: str) -> None:
+    """Raise ``TreeUncovered`` unless ``git hash-object --stdin-paths`` reads
+    ``path`` back as itself. **Round 19 re-check, item 1.** It unquotes a line that
+    begins with a double quote and strips a carriage return that ends one, so a
+    tracked ``"a"`` or ``a`` with a carriage return beside a tracked ``a`` was hashed
+    as ``a``, and an edit of it gave an equal digest. Refusing the path, rather than
+    quoting it, keeps a run in such a tree to the behaviour before round 19."""
+    if path.startswith('"') or any(character in path for character in _UNCARRIED):
+        raise TreeUncovered(
+            f"the tracked path {path!r} begins with a double quote or holds a"
+            " carriage return or newline, which git hash-object cannot read back",
+            Uncovered.UNSTAMPED_PATH,
+        )
+
+
+def _link_blob(link: Path) -> str:
+    """The name git gives the blob of the link at ``link``, the SHA-1 of the header
+    ``blob``, a space, the length of the target in bytes and a NUL, followed by the
+    target's bytes. **Round 19 re-check, item 2.** Each link had a git read of its
+    own, and 300 links took seconds. Raises ``TreeUncovered`` where the link cannot
+    be read, as when it was replaced after it was stated.
+
+    **Porting note.** It assumes git's SHA-1 object format. In a repository of the
+    SHA-256 format the name differs from git's, and the digest stays a function of
+    the target alone, which is what equality needs."""
+    try:
+        target = os.fsencode(os.readlink(link))
+    except (OSError, ValueError) as error:
+        raise TreeUncovered(
+            f"the tracked link {str(link)!r} could not be read: {error}",
+            Uncovered.UNSTAMPED_PATH,
+        ) from error
+    header = f"blob {len(target)}\0".encode("ascii")
+    return hashlib.sha1(header + target, usedforsecurity=False).hexdigest()
+
+
+def _index_paths(top: Path, deadline: float) -> set[str]:
+    """Each path the index of the checkout at ``top`` tracks, once, whatever its
+    stages. Raises ``TreeUncovered`` past ``MAX_CONTENT_ENTRIES`` entries, counted as
+    they are read, and for a submodule, and ``ReadinessUnknown`` for output not in
+    ``git ls-files --stage -z`` form or once ``deadline`` passes."""
+    paths: set[str] = set()
+    for field in _git_records(
+        top, ("ls-files", "--stage", "-z"), MAX_CONTENT_ENTRIES, _remaining(deadline)
+    ):
+        meta, tab, path = field.partition("\t")
+        parts = meta.split(" ")
+        if not tab or len(parts) != 3:
+            raise ReadinessUnknown(
+                "git ls-files gave an entry it should not", ReadFailure.MALFORMED
+            )
+        if parts[0] == _GITLINK:
+            raise TreeUncovered(
+                f"the index holds the submodule {path!r}, whose files are not read",
+                Uncovered.UNSTAMPED_PATH,
+            )
+        paths.add(path)
+    return paths
+
+
+def _git_records(
+    top: Path, arguments: tuple[str, ...], limit: int, seconds: float
+) -> list[str]:
+    """The NUL-terminated records git with ``arguments`` writes in ``top``, at most
+    ``limit`` of them, decoded as ``_git_text`` decodes."""
+    fields = _git_text(top, arguments, None, limit, seconds).split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    return fields
+
+
+def _git_text(
+    top: Path,
+    arguments: tuple[str, ...],
+    stdin: bytes | None,
+    limit: int,
+    seconds: float,
+) -> str:
+    """The output of git with ``arguments`` in ``top``, decoded as UTF-8 with any
+    other byte kept as a surrogate, as paths may hold any byte. Raises what
+    ``_run_git_read`` raises."""
+    output = _run_git_read(top, arguments, stdin, limit, seconds)
+    return output.decode("utf-8", "surrogateescape")
+
+
+def _read_environment() -> dict[str, str]:
+    """The environment of each git read of ``content_digest``. The caller's ``GIT_``
+    variables are removed, as for ``git status``, and neither the system's nor the
+    user's configuration is loaded, so that neither can steer the digest."""
+    environment = {
+        name: value for name, value in os.environ.items() if not name.startswith("GIT_")
+    }
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    return environment
+
+
+def _run_git_read(
+    top: Path,
+    arguments: tuple[str, ...],
+    stdin: bytes | None,
+    limit: int,
+    seconds: float,
+) -> bytes:
+    """Start one git read for ``content_digest`` and give its output. The one place
+    that function starts a child, so that the test suite can stand in for it, as it
+    does for ``_run_git_status``. A read without ``stdin`` is a listing, whose
+    records are counted as they arrive and refused past ``limit`` with
+    ``TreeUncovered``. **Round 19 review, item 2.** The listing of a very large tree
+    was collected whole before it was counted. A read with ``stdin`` hashes what it
+    is given, so its output is bounded by its input. Raises ``ReadinessUnknown``
+    where git cannot start, runs past ``seconds``, what is left of the digest's
+    deadline, or fails."""
+    argv = ["git", "-C", str(top), *_READ_SETTINGS, *arguments]
+    if stdin is not None:
+        return _run_git_hash(argv, arguments[0], stdin, seconds)
+    deadline = time.monotonic() + seconds
+    try:
+        process = spawn.start(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_read_environment(),
+        )
+    except OSError as error:
+        raise ReadinessUnknown(
+            f"git could not start: {error}", ReadFailure.NOT_STARTED
+        ) from error
+    stream = process.stdout
+    try:
+        if stream is None:
+            raise ReadinessUnknown(
+                f"git {arguments[0]} gave no output pipe", ReadFailure.FAILED
+            )
+        output = _read_records(stream, limit, seconds, arguments[0])
+        code = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired as error:
+        raise ReadinessUnknown(
+            f"git {arguments[0]} ran past {seconds:.3g} seconds",
+            ReadFailure.TIMED_OUT,
+        ) from error
+    finally:
+        if process.poll() is None:
+            process.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=_REAP_SECONDS)
+        if stream is not None:
+            stream.close()
+    if code != 0:
+        raise ReadinessUnknown(
+            f"git {arguments[0]} failed with exit code {code}", ReadFailure.FAILED
+        )
+    return output
+
+
+def _run_git_hash(argv: list[str], name: str, stdin: bytes, seconds: float) -> bytes:
+    """Run ``git hash-object`` with ``stdin`` for at most ``seconds`` and give its
+    output."""
+    try:
+        done = spawn.run(
+            argv,
+            input=stdin,
+            capture_output=True,
+            timeout=seconds,
+            check=False,
+            env=_read_environment(),
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ReadinessUnknown(
+            f"git {name} ran past {seconds:.3g} seconds",
+            ReadFailure.TIMED_OUT,
+        ) from error
+    except OSError as error:
+        raise ReadinessUnknown(
+            f"git could not start: {error}", ReadFailure.NOT_STARTED
+        ) from error
+    if done.returncode != 0:
+        raise ReadinessUnknown(
+            f"git {name} failed with exit code {done.returncode}", ReadFailure.FAILED
+        )
+    return done.stdout
+
+
+def _read_records(stream: IO[bytes], limit: int, seconds: float, name: str) -> bytes:
+    """Read ``stream`` to its end within ``seconds``, counting NUL-terminated
+    records as they arrive. Raises ``TreeUncovered`` as soon as more than ``limit``
+    records or ``MAX_LISTING_BYTES`` bytes have arrived, without waiting for the
+    rest, and ``ReadinessUnknown`` once ``seconds`` pass before the end."""
+    deadline = time.monotonic() + seconds
+    chunks: list[bytes] = []
+    records = 0
+    size = 0
+    with selectors.DefaultSelector() as selector:
+        selector.register(stream, selectors.EVENT_READ)
+        # Bounded, since each pass reads at least one byte or ends, and the bytes
+        # are capped below MAX_LISTING_BYTES, and by the deadline.
+        for _ in range(MAX_LISTING_BYTES + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                break
+            chunk = os.read(stream.fileno(), 65536)
+            if not chunk:
+                return b"".join(chunks)
+            records += chunk.count(b"\0")
+            size += len(chunk)
+            if records > limit:
+                raise TreeUncovered(
+                    f"git {name} listed more than {limit} entries",
+                    Uncovered.TOO_MANY_PATHS,
+                )
+            if size > MAX_LISTING_BYTES:
+                raise TreeUncovered(
+                    f"git {name} listed more than {MAX_LISTING_BYTES} bytes",
+                    Uncovered.TOO_MANY_PATHS,
+                )
+            chunks.append(chunk)
+    raise ReadinessUnknown(
+        f"git {name} ran past {seconds:g} seconds", ReadFailure.TIMED_OUT
+    )
 
 
 def _tracked_changes(output: str) -> list[tuple[str, str]]:

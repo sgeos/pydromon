@@ -836,7 +836,12 @@ should be run again before its result is reported for the current tree, or that 
 coverage is unknown, with the fixed word for why git could not be read. A run that
 recorded no tree, from before the field or where its tree could not be read, says its
 coverage is unknown. A commit run covers its commit, records no tree, and says
-nothing. The operator's `runs` view gives `tree` as recorded.
+nothing. The operator's `runs` view gives `tree` as recorded. **Round 19.** A run in a
+working directory also records `content`, as a queued start does. Where the digest
+differs and the content read now is the content the run recorded, as after a commit of
+exactly the tree it ran, `run_status` says that the content of every tracked file is as
+it ran, so it covers the tree now. The content is read only in that case, so an
+unchanged tree costs no further read. A run without `content` is worded as before.
 
 - **Residuals.** Untracked paths are left out whole, since a run's own output in an
   untracked directory that is not ignored would otherwise make every run read as no
@@ -1481,8 +1486,83 @@ is sent a note with the reason unless it withdrew the entry. The reasons are tha
 entry waited longer than `runs.queue_max_age_seconds`, that the line no longer exists, is stopped or is hibernated, that an operator released it, which
 is done as the release is made, that it no longer owns what the run would write, that
 its working directory is another path than the one asked about, and that the commit
-checked out there has moved. **Residual.** Edits without a commit are not a change that
-drops it. A line that edits while its run waits has the edited tree run, and the
+checked out there has moved while the content the run would test changed or cannot be
+told. **Residual.** Edits without a commit are not a change that
+drops it.
+
+**Following a commit of the same tree.** **Round 19, at core's and ops' request.**
+After memory pressure had held runs for hours, the operator committed a line's
+uncommitted tree exactly, which moved `HEAD` and changed no file a run reads, and every
+such entry was dropped and lost its place. A start in a working directory now records
+`content` in `run_queued`, the SHA-256 that `readiness.content_digest` gives, read off
+the event loop as the start is queued. It is the path, mode and bytes of every file the
+index tracks, as the files are on disk, so it does not depend on `HEAD` or on what is
+staged. When `HEAD` has moved and the content read again is the same, the entry is not
+dropped. `run_retargeted` records the queue identifier, the commit it targeted, the
+commit it targets now and the content, the entry keeps its place in the queue, and the
+line is told. A content that differs, by one file or more, a content that cannot be
+told now, an entry with no recorded content, as from before the field or where it could
+not be read, and a commit command, are dropped as before, and the reason says which.
+Git is read with two commands, `git ls-files --stage` and `git hash-object
+--no-filters --stdin-paths`, neither of which writes, and only when `HEAD` has moved. A
+tracked link is hashed in Python from its target, with the name git gives its blob.
+
+**Round 19 review, item 1. The configuration does not steer the content.** The first
+form hashed only the paths `git status` listed as changed, through the clean filters.
+Audit showed, and core confirmed in real repositories, that a `core.fsmonitor` hook
+hid an edit and was run, that a clean filter a tracked `.gitattributes` chose mapped an
+edit back to its blob and was run, and that line endings the attributes normalise,
+`core.fileMode` false, `diff.ignoreSubmodules` and a submodule's `ignore` key, which a
+tracked `.gitmodules` may carry, each gave an equal content for different files.
+Equality keeps a run and lets a receipt say it covers the tree, so each was a false
+claim. Comparing stamps with the index instead was tried and does not suffice, since
+any `git status` that finds a filtered edit equal records its stamps as clean, after
+which no plumbing command lists it. So no file is trusted to be as committed. Every
+tracked file is hashed from its bytes, without filters, with the mode the file system
+shows. The reads give `-c core.fsmonitor=false` and load neither the user's nor the
+system's configuration, so no read runs a program the configuration names. A
+repository whose index holds a submodule leaves the content unknown, since the
+submodule's files are not read. Each difference this finds where git sees none, such as
+line endings a filter would convert, drops a run, which is the safe direction.
+
+**Round 19 re-check, items 1 and 2.** `git hash-object --stdin-paths` reads one path a
+line, unquotes a line that begins with a double quote and strips a carriage return that
+ends one. Audit showed, and core confirmed, that a tracked `"a"` or `a` with a
+carriage return, beside a tracked `a`, was hashed as `a`, so an edit of it gave an equal
+content. A tracked path that begins with a double quote or holds a carriage return or a
+newline now leaves the content unknown, as before round 19, rather than being quoted,
+since a refusal cannot be read back wrongly. Each link also started a git read of its
+own, and audit measured 300 links at 7.1 seconds, with no deadline on the whole. Core
+measured 100 links at 2.8 seconds. A link's blob is now named in Python, as the SHA-1 of
+`blob`, a space, the target's length in bytes and a NUL, followed by the target, which a
+test compares with git's own name. The whole digest has one deadline of 30 seconds,
+`CONTENT_SECONDS`, of which each git read is given only what is left, and the paths are
+not examined past it.
+
+- **Cost.** Each read hashes the whole tracked tree, which is bounded by 200,000 index
+  entries, 128 MiB of listing and 30 seconds for the whole digest, with at most 5
+  seconds more to end a git read killed at the deadline. A larger tree leaves the
+  content unknown, so its queued runs are dropped on a move of `HEAD` as before round 19.
+  The listing is counted as it is read and refused at the bound, not after it is read
+  whole.
+- **Failure modes.** `HEAD` can move again between the look and the start, and the
+  next look compares again. The run's own receipt records the tree it ran in any
+  case. A content that cannot be told is treated as changed, never as the same. A file
+  edited while it is hashed may be read in either state.
+- **Residuals.** Untracked files are not compared, as for `tree`. A submodule, a
+  tracked path that is now a directory, that begins with a double quote, or that holds
+  a carriage return or a newline, a tree past the bounds above, and an unborn `HEAD`,
+  all leave the content unknown. A link's name assumes git's SHA-1 object format, so
+  in a repository of the SHA-256 format it differs from git's own, while still
+  depending on the target alone, which is all equality needs. The repository's own
+  configuration is read, as git needs it, and a line's sandbox guards it. A git older
+  than 2.32 does not honour `GIT_CONFIG_GLOBAL` and reads the user's configuration,
+  which no longer bears on the bytes hashed. `tree_digest`, which a receipt compares
+  first, still reads `git status` with the repository's and the user's configuration,
+  so a monitor hook or a filter can hide an edit from it and runs as it is read. That
+  predates round 19 and is left for a later item.
+
+A line that edits while its run waits has the edited tree run, and the
 receipt names the tree that ran, as round 16 made it. A held line keeps its entry,
 which may start while it is held, since a hold stops turns and not runs.
 

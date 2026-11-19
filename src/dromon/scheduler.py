@@ -407,6 +407,7 @@ from dromon.model import (
     RunAdmitted,
     RunDequeued,
     RunQueued,
+    RunRetargeted,
     RunStarted,
     RunStatus,
     run_scope,
@@ -5958,8 +5959,11 @@ class Scheduler:
         if queue and queued is None:
             waits = self._run_wait_reason(line_id)
             if waits is not None:
+                content = (
+                    None if commit is not None else await self._content_of(line_id)
+                )
                 return self._enqueue_run(
-                    line_id, command, previous, commit, arguments, waits
+                    line_id, command, previous, commit, arguments, waits, content
                 )
         admitted_by = self._gate_start(line_id)
         if admitted_by is None:
@@ -6093,13 +6097,16 @@ class Scheduler:
         commit: str | None,
         arguments: Mapping[str, object] | None,
         reason: str,
+        content: str | None = None,
     ) -> RunQueued:
         """Keep the start of ``command`` for ``line_id`` until nothing holds it
         back. **Round 17, item 1.** Everything that is checked before the wait has
         been checked, so what is queued is a start that would begin but for
         ``reason``. The values of the parameters are stored as given and checked again
         when the run begins. Raises ``runs.RunRefused`` for a full queue or a
-        working directory that cannot be read."""
+        working directory that cannot be read. ``content`` is the working directory's
+        ``readiness.content_digest``, read by the caller off the event loop, or
+        ``None``. **Round 19.**"""
         if len(self._state().queued_runs) >= MAX_QUEUED_RUNS:
             raise runs.RunRefused(
                 f"the queue of runs holds {MAX_QUEUED_RUNS}, its limit, so this one"
@@ -6139,6 +6146,7 @@ class Scheduler:
                 head,
                 format_due(self._wall_clock()),
                 _queue_reason(reason),
+                content,
             )
         except InvalidField as error:
             raise runs.RunRefused(str(error)) from error
@@ -6166,13 +6174,74 @@ class Scheduler:
                 " it.",
             )
 
+    async def _content_of(self, line_id: str) -> str | None:
+        """``readiness.content_digest`` of ``line_id``'s working directory, read off
+        the event loop, or ``None`` where it cannot be told. **Round 19.**"""
+        try:
+            directory = Path(os.path.realpath(self._workdir_of(line_id)))
+        except LineToolRefused:
+            return None
+        return await asyncio.to_thread(_content_or_none, directory)
+
+    async def _retarget_if_same_content(self, entry: RunQueued) -> RunQueued:
+        """``entry`` moved to the commit now checked out in its working directory,
+        with ``run_retargeted`` and a note to its line, where ``HEAD`` moved and the
+        content the run would test is the content it was queued for, or ``entry`` as
+        it was. **Round 19, at core's and ops' request.** The operator committed a
+        line's uncommitted tree exactly, which moved ``HEAD`` and changed nothing a
+        run reads, and the start was dropped after hours of waiting. A start with no
+        recorded content, a commit command, a working directory that moved, and
+        content that differs or cannot be told now, are left for
+        ``_queue_drop_reason``, which drops the start as before. **Failure mode.**
+        ``HEAD`` can move again between this look and the start, and the next look
+        compares again. The run's own receipt records the tree it ran in any case."""
+        if entry.commit is not None or entry.content is None:
+            return entry
+        directory = Path(entry.workdir)
+        head = read_head_commit(directory)
+        if (
+            head is None
+            or COMMIT_PATTERN.fullmatch(head) is None
+            or head == entry.workdir_commit
+        ):
+            return entry
+        try:
+            if os.path.realpath(self._workdir_of(entry.line_id)) != entry.workdir:
+                return entry
+        except LineToolRefused:
+            return entry
+        content = await asyncio.to_thread(_content_or_none, directory)
+        current = self._state().queued_runs.get(entry.queue_id)
+        if content is None or content != entry.content or current != entry:
+            return entry if current is None else current
+        self._log.append(
+            RunRetargeted(
+                entry.queue_id,
+                entry.workdir_commit,
+                head,
+                content,
+                format_due(self._wall_clock()),
+            )
+        )
+        if entry.line_id in self._state().lines:
+            self._harness_note(
+                LineAddress(entry.line_id),
+                f"Your queued run {entry.queue_id} of {entry.command} now targets"
+                f" commit {head}, where it targeted {entry.workdir_commit}, since HEAD"
+                " moved and every tracked file it would test is as it was when you"
+                " queued it. It keeps its place in the queue.",
+            )
+        return self._state().queued_runs[entry.queue_id]
+
     def _queue_drop_reason(self, entry: RunQueued) -> str | None:
         """Why ``entry`` can no longer start, or ``None``. **Round 17, item 1.** The
         line is gone, stopped or hibernated, it no longer owns what the run would
         write, its working directory is another one, or the commit checked out there
         moved. A change of the files there without a commit is not a reason, and the
         run's receipt names the tree it ran. A release drops the line's entry as it
-        is made, in ``release``."""
+        is made, in ``release``. **Round 19.** A move of ``HEAD`` that leaves the
+        content as queued was already retargeted by ``_retarget_if_same_content``,
+        so a move that reaches here changed the content, or left it unknown."""
         waited = (self._wall_clock() - parse_due(entry.queued_at)).total_seconds()
         if waited > self._queue_max_age:
             return (
@@ -6204,6 +6273,13 @@ class Scheduler:
                 return (
                     "the commit checked out in its working directory changed from"
                     f" {entry.workdir_commit} to {head}"
+                    + (
+                        ", and whether the files it would test changed with it was"
+                        " not recorded as it was queued"
+                        if entry.content is None
+                        else ", and the tracked files it would test are not as they"
+                        " were when it was queued, or cannot be compared now"
+                    )
                 )
         return None
 
@@ -6231,6 +6307,7 @@ class Scheduler:
             for entry in list(self._state().queued_runs.values()):
                 if self._settle_if_started(entry):
                     continue
+                entry = await self._retarget_if_same_content(entry)
                 reason = self._queue_drop_reason(entry)
                 if reason is not None:
                     self._drop_queued(entry, reason)
@@ -6384,6 +6461,13 @@ class Scheduler:
             if commit is not None
             else await asyncio.to_thread(_tree_state, workdir)
         )
+        # Round 19. The content as well, so a receipt can say it still covers the
+        # files after HEAD moves to a commit of exactly the tree it ran.
+        content = (
+            None
+            if commit is not None
+            else await asyncio.to_thread(_content_or_none, workdir)
+        )
         # Round 16, item 3. The commit a run in a worktree ran, read before its
         # command starts, so the receipt names it. A file read, as line_status does,
         # and the worktree's own claim, as RunStarted.workdir_commit records.
@@ -6434,6 +6518,7 @@ class Scheduler:
                     head,
                     dirty,
                     start.admitted_by,
+                    content,
                 )
                 self._log.append(started)
             except BaseException:
@@ -6599,7 +6684,12 @@ class Scheduler:
             lambda: runs.signal_run(latest.started, self._run_start_of)
         )
 
-    def run_status(self, line_id: str, tree_now: TreeNow | None = None) -> str:
+    def run_status(
+        self,
+        line_id: str,
+        tree_now: TreeNow | None = None,
+        content_now: str | None = None,
+    ) -> str:
         """The latest runs of ``line_id``'s scope, newest first, with their
         receipts, and the commands the project declares. **Round 14, item 2.** A
         failed run names the run that corrected it, and that run names each it
@@ -6609,7 +6699,11 @@ class Scheduler:
         **Round 16, item 5.** ``tree_now`` is the working directory's
         ``readiness.tree_digest`` read now, or why it could not be read, or ``None``
         when it was not read. The latest run then says whether it still covers the
-        tree, as ``_tree_text`` words it."""
+        tree, as ``_tree_text`` words it. **Round 19.** ``content_now`` is the
+        working directory's ``readiness.content_digest``, read only where
+        ``tree_now`` differs from the run's and the run recorded its content, or
+        ``None``. An equal content says the run covers the tree though ``HEAD``
+        moved."""
         scope = self._scope_runs(line_id)
         found = scope[-MAX_RUNS_SHOWN:]
         declared = ", ".join(sorted(self._run_commands)) or "none"
@@ -6648,7 +6742,7 @@ class Scheduler:
         # reason is read with the receipt. Older tails stay in the log and in the
         # runs view.
         lines[0] += _run_tail(found[-1])
-        lines[0] += _tree_text(found[-1].started, tree_now)
+        lines[0] += _tree_text(found[-1].started, tree_now, content_now)
         return (
             f"previous is {found[-1].started.run_id}. Declared commands: {declared}.\n"
             + "\n".join(lines)
@@ -7280,11 +7374,25 @@ class Scheduler:
                 await self.fresh_runs()
             scope = self._scope_runs(line_id)
             tree_now: TreeNow | None = None
+            content_now: str | None = None
             if scope and scope[-1].started.tree is not None:
+                latest = scope[-1].started
                 tree_now = await asyncio.to_thread(
-                    _tree_or_failure, Path(scope[-1].started.workdir)
+                    _tree_or_failure, Path(latest.workdir)
                 )
-            return _tool_text(self.run_status(line_id, tree_now))
+                # Round 19. Read only where the stamps say the tree changed and the
+                # run recorded its content, so an unchanged tree costs nothing more.
+                if (
+                    not isinstance(
+                        tree_now, (readiness.ReadFailure, readiness.Uncovered)
+                    )
+                    and tree_now != latest.tree
+                    and latest.content is not None
+                ):
+                    content_now = await asyncio.to_thread(
+                        _content_or_none, Path(latest.workdir)
+                    )
+            return _tool_text(self.run_status(line_id, tree_now, content_now))
 
         async def stop(args: dict[str, Any]) -> dict[str, Any]:
             unexpected = _unexpected(args, STOP_RUN_SCHEMA)
@@ -17456,6 +17564,16 @@ def _tree_state(directory: Path) -> tuple[str | None, int | None]:
     return snapshot.digest, snapshot.dirty
 
 
+def _content_or_none(directory: Path) -> str | None:
+    """``readiness.content_digest`` of ``directory``, or ``None`` where git cannot
+    be read or the content cannot be told, which callers treat as changed. **Round
+    19.** Blocking."""
+    try:
+        return readiness.content_digest(directory)
+    except (readiness.ReadinessUnknown, readiness.TreeUncovered):
+        return None
+
+
 def _tree_or_failure(directory: Path) -> TreeNow:
     """``readiness.tree_digest`` of ``directory``, or the fixed word for why it
     cannot be read or cannot tell a change. Blocking."""
@@ -17467,7 +17585,9 @@ def _tree_or_failure(directory: Path) -> TreeNow:
         return error.cause
 
 
-def _tree_text(started: RunStarted, tree_now: TreeNow | None) -> str:
+def _tree_text(
+    started: RunStarted, tree_now: TreeNow | None, content_now: str | None = None
+) -> str:
     """Whether the run ``started`` still covers its working directory, for the
     latest run in ``run_status``, or nothing. **Round 16, item 5, core's request
     of round 15.** A gate that passed was read as covering the tree after tracked
@@ -17502,6 +17622,14 @@ def _tree_text(started: RunStarted, tree_now: TreeNow | None) -> str:
             ". The tree is as it was when it started, as far as HEAD and the status,"
             " size and time of each changed tracked file show. Untracked files are"
             " not compared"
+        )
+    if content_now is not None and content_now == started.content:
+        # Round 19. HEAD moved, as to a commit of exactly the tree the run ran, or a
+        # file was touched and restored, and every tracked file is as it ran.
+        return (
+            ". HEAD or the stamps of the tracked files changed after it started, but"
+            " the content of every tracked file is as it ran, as committed or not, so"
+            " it covers the tree now. Untracked files are not compared"
         )
     return (
         ". IT NO LONGER COVERS THE TREE, since HEAD or a tracked file changed after"

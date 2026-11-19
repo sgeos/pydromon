@@ -281,6 +281,7 @@ def test_every_event_class_is_classified_as_scrubbed_or_without_free_text() -> N
         "RoleRetired": "an identifier and a time",
         "RunAdmissionEnded": "an identifier and a time",
         "RunCleared": "identifiers and a time",
+        "RunRetargeted": "an identifier, commits, a digest and a time",
         "SeatBound": "identifiers",
         "SeatUnbound": "identifiers",
         "TurnCorrelated": "identifiers",
