@@ -1504,7 +1504,8 @@ line is told. A content that differs, by one file or more, a content that cannot
 told now, an entry with no recorded content, as from before the field or where it could
 not be read, and a commit command, are dropped as before, and the reason says which.
 Git is read with two commands, `git ls-files --stage` and `git hash-object
---no-filters --stdin-paths`, neither of which writes, and only when `HEAD` has moved.
+--no-filters --stdin-paths`, neither of which writes, and only when `HEAD` has moved. A
+tracked link is hashed in Python from its target, with the name git gives its blob.
 
 **Round 19 review, item 1. The configuration does not steer the content.** The first
 form hashed only the paths `git status` listed as changed, through the clean filters.
@@ -1524,8 +1525,23 @@ repository whose index holds a submodule leaves the content unknown, since the
 submodule's files are not read. Each difference this finds where git sees none, such as
 line endings a filter would convert, drops a run, which is the safe direction.
 
+**Round 19 re-check, items 1 and 2.** `git hash-object --stdin-paths` reads one path a
+line, unquotes a line that begins with a double quote and strips a carriage return that
+ends one. Audit showed, and core confirmed, that a tracked `"a"` or `a` with a
+carriage return, beside a tracked `a`, was hashed as `a`, so an edit of it gave an equal
+content. A tracked path that begins with a double quote or holds a carriage return or a
+newline now leaves the content unknown, as before round 19, rather than being quoted,
+since a refusal cannot be read back wrongly. Each link also started a git read of its
+own, and audit measured 300 links at 7.1 seconds, with no deadline on the whole. Core
+measured 100 links at 2.8 seconds. A link's blob is now named in Python, as the SHA-1 of
+`blob`, a space, the target's length in bytes and a NUL, followed by the target, which a
+test compares with git's own name. The whole digest has one deadline of 30 seconds,
+`CONTENT_SECONDS`, of which each git read is given only what is left, and the paths are
+not examined past it.
+
 - **Cost.** Each read hashes the whole tracked tree, which is bounded by 200,000 index
-  entries, 128 MiB of listing and 20 seconds on each git read. A larger tree leaves the
+  entries, 128 MiB of listing and 30 seconds for the whole digest, with at most 5
+  seconds more to end a git read killed at the deadline. A larger tree leaves the
   content unknown, so its queued runs are dropped on a move of `HEAD` as before round 19.
   The listing is counted as it is read and refused at the bound, not after it is read
   whole.
@@ -1534,8 +1550,11 @@ line endings a filter would convert, drops a run, which is the safe direction.
   case. A content that cannot be told is treated as changed, never as the same. A file
   edited while it is hashed may be read in either state.
 - **Residuals.** Untracked files are not compared, as for `tree`. A submodule, a
-  tracked path that is now a directory or holds a newline, a tree past the bounds
-  above, and an unborn `HEAD`, all leave the content unknown. The repository's own
+  tracked path that is now a directory, that begins with a double quote, or that holds
+  a carriage return or a newline, a tree past the bounds above, and an unborn `HEAD`,
+  all leave the content unknown. A link's name assumes git's SHA-1 object format, so
+  in a repository of the SHA-256 format it differs from git's own, while still
+  depending on the target alone, which is all equality needs. The repository's own
   configuration is read, as git needs it, and a line's sandbox guards it. A git older
   than 2.32 does not honour `GIT_CONFIG_GLOBAL` and reads the user's configuration,
   which no longer bears on the bytes hashed. `tree_digest`, which a receipt compares

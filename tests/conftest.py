@@ -922,9 +922,13 @@ def _no_real_git_status(
             return ""
 
         def unstarted(
-            top: Path, arguments: tuple[str, ...], stdin: bytes | None, limit: int
+            top: Path,
+            arguments: tuple[str, ...],
+            stdin: bytes | None,
+            limit: int,
+            seconds: float,
         ) -> bytes:
-            del top, stdin, limit
+            del top, stdin, limit, seconds
             raise readiness.ReadinessUnknown(
                 f"the suite does not start git {arguments[0]}",
                 readiness.ReadFailure.NOT_STARTED,

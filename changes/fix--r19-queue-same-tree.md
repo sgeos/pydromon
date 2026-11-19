@@ -8,7 +8,10 @@ Type: Fixed
   content that differs, by one file or more, or cannot be told, drops the start as
   before. The digest is read without clean filters, a monitor hook, the user's or the
   system's git configuration, or trust in the index's stamps, so none of these can
-  hide a difference, and a repository holding a submodule leaves it unknown.
+  hide a difference, and a repository holding a submodule leaves it unknown. A
+  tracked path that begins with a double quote or holds a carriage return or newline,
+  which git would hash as another path, also leaves it unknown. A link is hashed
+  without starting git, and the whole digest has one deadline of 30 seconds.
 - `run_status` says that the latest run still covers the tree when `HEAD` moved and
   the content of every tracked file is as it ran, where it said before that the run
   no longer covered the tree.

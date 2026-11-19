@@ -7,6 +7,8 @@ line's queued gate was dropped after memory pressure had held it for hours.
 
 import asyncio
 import os
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -294,6 +296,157 @@ def test_a_tracked_path_holding_a_newline_is_refused(tmp_path: Path) -> None:
 
 
 @pytest.mark.real_git_status
+@pytest.mark.parametrize("other", ['"a.txt"', "a.txt\r"], ids=["quoted", "return"])
+def test_a_path_read_back_as_its_plain_name_is_refused(
+    tmp_path: Path, other: str
+) -> None:
+    """**Round 19 re-check, item 1.** ``--stdin-paths`` unquotes a line beginning with
+    a double quote and strips a carriage return ending one, so this file was hashed
+    as ``a.txt`` and an edit of it gave an equal digest."""
+    work = project(tmp_path / "w")
+    (work / other).write_text("other\n")
+    git(work, "add", ".")
+    git(work, "commit", "-q", "-m", "beside a.txt")
+    with pytest.raises(readiness.TreeUncovered, match="double quote"):
+        readiness.content_digest(work)
+    (work / other).write_text("edited\n")
+    with pytest.raises(readiness.TreeUncovered, match="double quote"):
+        readiness.content_digest(work)
+
+
+@pytest.mark.real_git_status
+def test_a_quote_or_return_git_reads_back_is_content(tmp_path: Path) -> None:
+    """A double quote after the start and a path that only resembles a quoted one
+    are read back as themselves, so they are hashed and an edit is seen."""
+    work = project(tmp_path / "w")
+    for name in ('say "a".txt', 'a.txt"'):
+        (work / name).write_text("one\n")
+    git(work, "add", ".")
+    git(work, "commit", "-q", "-m", "quotes")
+    clean = readiness.content_digest(work)
+    (work / 'say "a".txt').write_text("two\n")
+    assert readiness.content_digest(work) != clean
+    git(work, "checkout", "-q", "--", ".")
+    assert readiness.content_digest(work) == clean
+    (work / 'a.txt"').write_text("two\n")
+    assert readiness.content_digest(work) != clean
+
+
+# The links and the deadline, round 19 re-check, item 2.
+
+
+@pytest.mark.real_git_status
+def test_a_link_s_blob_is_named_as_git_names_it(tmp_path: Path) -> None:
+    """The name is the one git gives the link's blob in its index, so the hash in
+    Python is git's own and not a second scheme."""
+    work = project(tmp_path / "w")
+    targets = {"short": "a.txt", "deep": "x/ü/" + "y" * 300, "spaced": "a b\tc"}
+    for name, target in targets.items():
+        os.symlink(target, work / name)
+    git(work, "add", ".")
+    for name, target in targets.items():
+        entry = git(work, "ls-files", "--stage", "--", name)
+        mode, blob = entry.split(" ")[:2]
+        assert mode == "120000"
+        assert readiness._link_blob(work / name) == blob  # pyright: ignore[reportPrivateUsage]
+        holding = tmp_path / f"{name}.target"
+        holding.write_bytes(os.fsencode(target))
+        assert git(work, "hash-object", "--no-filters", str(holding)) == blob
+
+
+def test_a_link_that_cannot_be_read_is_refused(tmp_path: Path) -> None:
+    (tmp_path / "plain").write_text("not a link\n")
+    with pytest.raises(readiness.TreeUncovered, match="could not be read"):
+        readiness._link_blob(tmp_path / "plain")  # pyright: ignore[reportPrivateUsage]
+
+
+def counted_reads(
+    monkeypatch: pytest.MonkeyPatch, before: Callable[[str], None] | None = None
+) -> list[tuple[str, float]]:
+    """Each git read of the digest, as its subcommand and the seconds it is given,
+    with ``before`` called with the subcommand once each read has ended."""
+    reads: list[tuple[str, float]] = []
+    real = readiness._run_git_read  # pyright: ignore[reportPrivateUsage]
+
+    def counting(
+        top: Path,
+        arguments: tuple[str, ...],
+        stdin: bytes | None,
+        limit: int,
+        seconds: float,
+    ) -> bytes:
+        reads.append((arguments[0], seconds))
+        output = real(top, arguments, stdin, limit, seconds)
+        if before is not None:
+            before(arguments[0])
+        return output
+
+    monkeypatch.setattr(readiness, "_run_git_read", counting)
+    return reads
+
+
+@pytest.mark.real_git_status
+def test_links_start_no_git_read_of_their_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each link started a git read, and 300 took seconds. Now the listing and one
+    hash of the regular files are the only reads, however many links there are."""
+    work = project(tmp_path / "w")
+    for number in range(40):
+        os.symlink("a.txt", work / f"link{number}")
+    git(work, "add", ".")
+    git(work, "commit", "-q", "-m", "links")
+    reads = counted_reads(monkeypatch)
+    clean = readiness.content_digest(work)
+    assert [name for name, _ in reads] == ["ls-files", "hash-object"]
+    os.remove(work / "link7")
+    os.symlink("b.txt", work / "link7")
+    assert readiness.content_digest(work) != clean
+
+
+@pytest.mark.real_git_status
+def test_each_read_is_given_only_what_is_left_of_one_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work = project(tmp_path / "w")
+    reads = counted_reads(monkeypatch)
+    readiness.content_digest(work)
+    (listing, first), (hashing, second) = reads
+    assert (listing, hashing) == ("ls-files", "hash-object")
+    assert 0 < second < first <= readiness.CONTENT_SECONDS
+
+
+@pytest.mark.real_git_status
+def test_a_digest_past_its_deadline_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spent before the first read, no git is started. Spent while the listing is
+    examined, the paths left are not examined, and the hash is never started."""
+    work = project(tmp_path / "w")
+    reads = counted_reads(monkeypatch, lambda name: time.sleep(1.2))
+    monkeypatch.setattr(readiness, "CONTENT_SECONDS", 0.0)
+    with pytest.raises(readiness.ReadinessUnknown) as raised:
+        readiness.content_digest(work)
+    assert raised.value.cause is readiness.ReadFailure.TIMED_OUT
+    assert reads == []
+    monkeypatch.setattr(readiness, "CONTENT_SECONDS", 1.0)
+    with pytest.raises(readiness.ReadinessUnknown, match="content digest ran past"):
+        readiness.content_digest(work)
+    assert [name for name, _ in reads] == ["ls-files"]
+    assert scheduler_module._content_or_none(work) is None  # pyright: ignore[reportPrivateUsage]
+    # A tree of links alone has no hash read after the paths, so only the deadline
+    # of the paths' own examination answers it.
+    links = tmp_path / "links"
+    links.mkdir()
+    git(links, "init", "-q")
+    os.symlink("nowhere", links / "link")
+    git(links, "add", ".")
+    git(links, "commit", "-q", "-m", "a link")
+    with pytest.raises(readiness.ReadinessUnknown, match="content digest ran past"):
+        readiness.content_digest(links)
+
+
+@pytest.mark.real_git_status
 def test_head_moving_while_the_content_is_read_leaves_it_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -303,11 +456,15 @@ def test_head_moving_while_the_content_is_read_leaves_it_unknown(
     real = readiness._run_git_read  # pyright: ignore[reportPrivateUsage]
 
     def committing(
-        top: Path, arguments: tuple[str, ...], stdin: bytes | None, limit: int
+        top: Path,
+        arguments: tuple[str, ...],
+        stdin: bytes | None,
+        limit: int,
+        seconds: float,
     ) -> bytes:
         if arguments[0] == "hash-object":
             git(work, "commit", "-q", "--allow-empty", "-m", "meanwhile")
-        return real(top, arguments, stdin, limit)
+        return real(top, arguments, stdin, limit, seconds)
 
     monkeypatch.setattr(readiness, "_run_git_read", committing)
     with pytest.raises(readiness.ReadinessUnknown, match="HEAD moved"):
