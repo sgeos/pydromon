@@ -129,13 +129,230 @@ def test_the_mode_and_a_links_target_are_content(tmp_path: Path) -> None:
 
 
 @pytest.mark.real_git_status
-def test_without_trusted_modes_a_mode_change_is_not_content(tmp_path: Path) -> None:
-    """With core.fileMode false git keeps the committed mode, and so does the digest."""
+def test_a_mode_change_is_content_whatever_core_filemode_says(tmp_path: Path) -> None:
+    """**Round 19 review, item 1.** With core.fileMode false git keeps the committed
+    mode, and the digest kept it too, so a mode change was equal. A mode the file
+    system shows is a difference, which drops a run and never keeps one wrongly."""
     work = project(tmp_path / "w")
     git(work, "config", "core.fileMode", "false")
     clean = readiness.content_digest(work)
     os.chmod(work / "run.sh", 0o700)
+    assert readiness.content_digest(work) != clean
+    os.chmod(work / "run.sh", 0o600)
     assert readiness.content_digest(work) == clean
+
+
+# The repository's and the user's git configuration, round 19 review, item 1. Each
+# setting below made the digest equal for content that differs, and the first two
+# made the daemon run a program the configuration names.
+
+
+def hook_marked(tmp_path: Path, name: str) -> tuple[Path, Path]:
+    """The path of a program at ``tmp_path / name``, and of the mark it leaves."""
+    mark = tmp_path / f"{name}.ran"
+    program = tmp_path / name
+    return program, mark
+
+
+@pytest.mark.real_git_status
+def test_a_monitor_hook_neither_hides_an_edit_nor_runs(tmp_path: Path) -> None:
+    """A ``core.fsmonitor`` hook that reports no change hid an edited tracked file from
+    ``git status``, and ran as the digest was read."""
+    work = project(tmp_path / "w")
+    hook, mark = hook_marked(tmp_path, "monitor")
+    hook.write_text(f"#!/bin/sh\ntouch '{mark}'\nprintf 'token\\0'\n")
+    os.chmod(hook, 0o700)
+    git(work, "config", "core.fsmonitor", str(hook))
+    git(work, "status", "--porcelain")
+    clean = readiness.content_digest(work)
+    mark.unlink(missing_ok=True)
+    (work / "a.txt").write_text("hidden\n")
+    assert git(work, "status", "--porcelain") == ""
+    mark.unlink()
+    assert readiness.content_digest(work) != clean
+    assert not mark.exists()
+
+
+@pytest.mark.real_git_status
+def test_a_clean_filter_neither_hides_an_edit_nor_runs(tmp_path: Path) -> None:
+    """A clean filter that a tracked ``.gitattributes`` names, and that maps the edited
+    file back to its committed blob, hid the edit and ran as the digest was read."""
+    work = project(tmp_path / "w")
+    (work / "a.txt").write_text("ab\n")
+    (work / ".gitattributes").write_text("a.txt filter=back\n")
+    git(work, "add", ".")
+    git(work, "commit", "-q", "-m", "filtered")
+    filter_program, mark = hook_marked(tmp_path, "filter")
+    filter_program.write_text(f"#!/bin/sh\ntouch '{mark}'\ntr X b\n")
+    os.chmod(filter_program, 0o700)
+    git(work, "config", "filter.back.clean", str(filter_program))
+    clean = readiness.content_digest(work)
+    (work / "a.txt").write_text("aX\n")
+    os.utime(work / "a.txt", ns=(1, 1))
+    assert git(work, "status", "--porcelain") == ""
+    mark.unlink()
+    assert readiness.content_digest(work) != clean
+    assert not mark.exists()
+
+
+@pytest.mark.real_git_status
+def test_a_line_ending_the_attributes_normalise_is_content(tmp_path: Path) -> None:
+    """A working file with CRLF line endings, which the attributes normalise to the
+    committed LF blob, was hashed through the filters and equal."""
+    work = project(tmp_path / "w")
+    (work / ".gitattributes").write_text("*.txt text eol=lf\n")
+    git(work, "add", ".gitattributes")
+    git(work, "commit", "-q", "-m", "line endings")
+    clean = readiness.content_digest(work)
+    (work / "a.txt").write_bytes(b"a.txt\r\n")
+    assert readiness.content_digest(work) != clean
+
+
+def submodule_project(directory: Path) -> Path:
+    """``project`` with a submodule at ``sub``, committed."""
+    work = project(directory)
+    inner = work / "sub"
+    inner.mkdir()
+    git(inner, "init", "-q")
+    (inner / "s.txt").write_text("s\n")
+    git(inner, "add", ".")
+    git(inner, "commit", "-q", "-m", "inner")
+    git(work, "add", "sub")
+    git(work, "commit", "-q", "-m", "submodule")
+    return work
+
+
+@pytest.mark.real_git_status
+@pytest.mark.parametrize("ignored_by", ["diff", "config", "gitmodules"])
+def test_a_moved_submodule_is_never_unchanged_whatever_ignores_it(
+    tmp_path: Path, ignored_by: str
+) -> None:
+    """``diff.ignoreSubmodules``, ``submodule.NAME.ignore`` in configuration and the
+    same key in a tracked ``.gitmodules``, which a line may write, each hid a
+    submodule moved to another commit. The digest does not read a submodule's files,
+    so it answers a repository holding one as unknown, before the move and after."""
+    work = submodule_project(tmp_path / "w")
+    if ignored_by == "diff":
+        git(work, "config", "diff.ignoreSubmodules", "all")
+    else:
+        # The configuration's key applies once .gitmodules names the submodule.
+        ignore = "\tignore = all\n" if ignored_by == "gitmodules" else ""
+        (work / ".gitmodules").write_text(
+            f'[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n{ignore}'
+        )
+        git(work, "add", ".gitmodules")
+        git(work, "commit", "-q", "-m", "name it")
+        if ignored_by == "config":
+            git(work, "config", "submodule.sub.ignore", "all")
+    with pytest.raises(readiness.TreeUncovered, match="submodule"):
+        readiness.content_digest(work)
+    git(work / "sub", "commit", "-q", "--allow-empty", "-m", "moved")
+    assert git(work, "status", "--porcelain") == ""
+    with pytest.raises(readiness.TreeUncovered, match="submodule"):
+        readiness.content_digest(work)
+
+
+@pytest.mark.real_git_status
+def test_the_user_s_and_the_system_s_configuration_are_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user configuration git cannot parse fails every read that loads it, so a
+    digest read with it in place shows that it was not loaded."""
+    work = project(tmp_path / "w")
+    clean = readiness.content_digest(work)
+    home = tmp_path / "home"
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".gitconfig").write_text("[core\nnot a configuration\n")
+    (home / ".config" / "git" / "config").write_text("[core\nnot either\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    (work / "a.txt").write_text("edited\n")
+    edited = readiness.content_digest(work)
+    assert edited != clean
+    environment = readiness._read_environment()  # pyright: ignore[reportPrivateUsage]
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+
+
+# The refusals and checks that audit's mutations left unpinned, round 19 review,
+# item 3.
+
+
+@pytest.mark.real_git_status
+def test_a_tracked_path_holding_a_newline_is_refused(tmp_path: Path) -> None:
+    """``--stdin-paths`` cannot carry a newline, so such a path is never hashed as
+    another one, committed or edited."""
+    work = project(tmp_path / "w")
+    (work / "two\nlines.txt").write_text("one\n")
+    git(work, "add", ".")
+    git(work, "commit", "-q", "-m", "newline")
+    with pytest.raises(readiness.TreeUncovered, match="newline"):
+        readiness.content_digest(work)
+    (work / "two\nlines.txt").write_text("two\n")
+    with pytest.raises(readiness.TreeUncovered, match="newline"):
+        readiness.content_digest(work)
+
+
+@pytest.mark.real_git_status
+def test_head_moving_while_the_content_is_read_leaves_it_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A commit made between the reads would mix two trees, so it is not answered."""
+    work = project(tmp_path / "w")
+    (work / "a.txt").write_text("edited\n")
+    real = readiness._run_git_read  # pyright: ignore[reportPrivateUsage]
+
+    def committing(
+        top: Path, arguments: tuple[str, ...], stdin: bytes | None, limit: int
+    ) -> bytes:
+        if arguments[0] == "hash-object":
+            git(work, "commit", "-q", "--allow-empty", "-m", "meanwhile")
+        return real(top, arguments, stdin, limit)
+
+    monkeypatch.setattr(readiness, "_run_git_read", committing)
+    with pytest.raises(readiness.ReadinessUnknown, match="HEAD moved"):
+        readiness.content_digest(work)
+
+
+# The bounded read, round 19 review, item 2.
+
+
+def test_a_listing_past_its_bound_is_refused_while_it_is_read() -> None:
+    """The writer never closes the pipe, so a reader that collected the whole output
+    before counting would wait for its deadline and answer a timeout instead."""
+    reading, writing = os.pipe()
+    try:
+        os.write(writing, b"one\0two\0three\0")
+        with (
+            os.fdopen(reading, "rb", buffering=0) as stream,
+            pytest.raises(readiness.TreeUncovered, match="more than 2"),
+        ):
+            readiness._read_records(stream, 2, 30.0, "ls-tree")  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(writing)
+
+
+def test_a_listing_that_does_not_end_is_answered_as_a_timeout() -> None:
+    reading, writing = os.pipe()
+    try:
+        os.write(writing, b"one\0")
+        with (
+            os.fdopen(reading, "rb", buffering=0) as stream,
+            pytest.raises(readiness.ReadinessUnknown) as raised,
+        ):
+            readiness._read_records(stream, 2, 0.2, "ls-tree")  # pyright: ignore[reportPrivateUsage]
+        assert raised.value.cause is readiness.ReadFailure.TIMED_OUT
+    finally:
+        os.close(writing)
+
+
+def test_a_listing_within_its_bound_is_read_whole() -> None:
+    reading, writing = os.pipe()
+    os.write(writing, b"one\0two\0")
+    os.close(writing)
+    with os.fdopen(reading, "rb", buffering=0) as stream:
+        found = readiness._read_records(stream, 2, 30.0, "ls-tree")  # pyright: ignore[reportPrivateUsage]
+    assert found == b"one\0two\0"
 
 
 @pytest.mark.real_git_status
@@ -150,12 +367,12 @@ def test_content_that_cannot_be_told_is_refused_and_never_unchanged(
     assert scheduler_module._content_or_none(unborn) is None  # pyright: ignore[reportPrivateUsage]
     work = project(tmp_path / "w")
     (work / "a.txt").write_text("edited\n")
-    monkeypatch.setattr(readiness, "MAX_TREE_PATHS", 0)
-    with pytest.raises(readiness.TreeUncovered):
-        readiness.content_digest(work)
-    monkeypatch.setattr(readiness, "MAX_TREE_PATHS", 10)
     monkeypatch.setattr(readiness, "MAX_CONTENT_ENTRIES", 2)
-    with pytest.raises(readiness.TreeUncovered):
+    with pytest.raises(readiness.TreeUncovered, match="more than 2"):
+        readiness.content_digest(work)
+    monkeypatch.setattr(readiness, "MAX_CONTENT_ENTRIES", 200)
+    monkeypatch.setattr(readiness, "MAX_LISTING_BYTES", 8)
+    with pytest.raises(readiness.TreeUncovered, match="more than 8 bytes"):
         readiness.content_digest(work)
     monkeypatch.undo()
     (work / "a.txt").unlink()
