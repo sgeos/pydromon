@@ -216,6 +216,11 @@ def project_entries(
                 config.machine_status or "none",
             ),
             info(
+                "daemon.session_name",
+                "the template of the name each Claude Code session is given",
+                "off" if config.session_name is None else config.session_name.text,
+            ),
+            info(
                 "leases",
                 "the leases lines may acquire, and how long each lasts",
                 (", ".join(config.lease_names) or "none")

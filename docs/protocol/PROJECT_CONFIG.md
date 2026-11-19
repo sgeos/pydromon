@@ -167,6 +167,7 @@ relay = "tail"          # the route of operator ana's mail
 | `daemon.default_profile` | profile name | none | The profile a line created or configured through the client takes when the file does not declare it and it runs on the engine of the profile's `model`, as below. A client `config` whose sandbox sets a key that weakens the sandbox or is operator only is refused, naming the key. Added in round 18 |
 | `daemon.disclosure_terms` | path | none | The project's disclosure list, relative to the project root, as below |
 | `daemon.machine_status` | path | none | The file the machine's monitor writes its status to, read before a run or a turn starts, as [`RUNS.md`](../architecture/RUNS.md) specifies. A leading `~` is the home directory and a relative path is relative to the project root. Nothing is read, and nothing is deferred, unless it is set. A reload applies it. No line's sandbox or file tools may write the file or its directory. A status that is stale, missing or unreadable defers runs until the monitor writes again, so the operator restores gates by restarting the monitor or removing this key and reloading. Added on 2026-11-11 |
+| `daemon.session_name` | template or `false` | `"PDr{vv}-{project}-{role}-{variant-}{model}{effort}"` | The display name each Claude Code session Dromon starts is given, or `false` for none, as below. Checked when the file is read. A reload applies it to engines built afterwards. Added in round 19 |
 | `read_only_paths` | list of relative paths | empty | Existing files or directories denied writes under every line's resolved workdir. Symbolic links are resolved and targets must remain inside that workdir |
 | `leases.names` | list of identifiers | none | The leases lines may acquire, each named once, as [`LINE_CONFIG.md`](LINE_CONFIG.md) specifies |
 | `leases.ttl_seconds` | integer in [60, 86400] | 10800 | How long an acquired lease lasts unless released first, and from round 16 the longest a line may ask for with `acquire_lease`'s `seconds` |
@@ -734,6 +735,65 @@ git_ssh = true
   none during the test, and any push. Whether Codex's and Grok's own sandboxes let a
   command connect to the socket or reach the network, and Codex's workspace profile is
   believed to deny the network.
+
+## Session names
+
+**Round 19, by the operator's direction.** Claude Code names a session from its working
+directory unless it is given `--name`, so the sessions of several lines in one project
+were hard to tell apart on the machine. Dromon gives each Claude Code session it starts
+a name from the `daemon.session_name` template, through the Agent SDK's `extra_args`,
+which the bundled Claude Code 2.1.310 takes as `-n` or `--name`. `dromon.sessionname`
+holds the one naming function.
+
+- **Fields.** A template is literal text and fields in braces, each field at most once.
+  - `{vv}` is the installed pydromon's major version followed by its minor version,
+    each in decimal, so 0.0.0 gives `00`.
+  - `{project}` is the last step of the project root, the name the fleet index gives.
+  - `{role}` is the role the line is a seat of, or the line's identifier when it is a
+    seat of none.
+  - `{variant-}` is empty, or the variant followed by `-`. The variant is the part of
+    the line identifier beyond the role. A seat `review-luna` or `luna-review` of role
+    `review` gives `luna`. A seat whose identifier neither begins with the role and
+    `-` nor ends with `-` and the role gives its whole identifier.
+  - `{model}` is the model's code and version, `Op`, `Ha`, `Fa` or `Sn` for Opus,
+    Haiku, Fable or Sonnet, followed by the version's digits, so `claude-opus-5-5`
+    gives `Op55`.
+  - `{effort}` is `lo`, `me`, `hi`, `xh` or `mx` for low, medium, high, xhigh or max.
+- **Model and effort.** Both are the ones the engine is started with, the line's
+  configured effort or else its driver's, which Dromon always passes as `--effort`. So
+  the effort is always known for a Claude Code line, and is left out only for an effort
+  without a code. A model without a code gives no name, with a warning.
+- **Uniqueness.** When a name would equal the name of another line whose engine is
+  live, digits are appended to the variant, the fewest that make it unique, trying 1,
+  2 and on in order. A role's own line then takes the digits alone as its variant, so
+  `PDr00-pydromon-core-Sn55hi` is followed by `PDr00-pydromon-core-1-Sn55hi`. A
+  dropped engine, or a build refused after it was named, frees its name. A rebuilt
+  engine is named again, and keeps its name when no other live line has taken it.
+- **Checks at load.** A template is 1 to 128 characters, holds only letters, digits,
+  `.`, `_` and `-` outside its fields, names only the fields above, does not begin with
+  `-`, and holds `{variant-}`, where the digits go. Any other is refused with the file.
+- **Checks on each name.** A name must be one argument of at most 96 letters, digits,
+  `.`, `_` and `-`, not beginning with `-`, and must hold no term of the disclosure
+  list. A name that fails is not given, the session keeps Claude Code's own, and the
+  daemon writes a warning naming the line and the reason, never the term, to its
+  standard error.
+- **Every start.** The name is part of the options every start, resume and kept
+  connection of the engine is built from. `dromon probe` and a scheduler without a
+  project give no name.
+- **Residuals.** The bound of 96 is Dromon's own, since no limit of Claude Code's is
+  known. Two versions can give one `{vv}` once a major or minor version reaches 10,
+  such as 1.12 and 11.2. Uniqueness holds among the sessions of one daemon, not across
+  daemons, so two projects of one name on one machine could show equal names. A
+  warning reaches only the daemon's standard error, not a line's status. Whether
+  Claude Code keeps a name across a resume, or takes the latest given, was not
+  observed, since Dromon passes the same name on each.
+- **Other engines.** Out of scope for round 19. From strings in the installed files,
+  not from running them, which is an inference. Grok Build 1.0.70 has an interactive
+  `/rename` command, a protocol method `x.ai/session/rename`, and `-s` or
+  `--session-id` to choose a session identifier, but no launch option like `--name`
+  was found. Cursor Agent 2026.10.01 has an interactive `/rename` command. Pi holds a
+  `setSessionName` function whose use was not established. Codex was not examined,
+  since its native binary was not found where it was sought.
 
 ## Trust
 

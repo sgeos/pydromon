@@ -2984,6 +2984,20 @@ configured. Pi lines take no built-in tool. Cursor and Antigravity lines are ref
 whatever their configuration, as [`CURSOR.md`](CURSOR.md) and
 [`ANTIGRAVITY.md`](ANTIGRAVITY.md) record.
 
+## Session names
+
+**Round 19.** Each Claude Code session Dromon starts for a line is given a display name
+with `--name`, from the project file's `daemon.session_name` template, such as
+`PDr00-pydromon-review-luna-Ha55lo` for the seat `review-luna` of role `review` on
+Claude Haiku 5.5 at low effort. The name is the line's role, its variant, its model and
+its effort as the engine is started with them, and is given on every start, resume and
+kept connection. Two live lines are never given one name. A name that is not one safe
+argument, is too long, holds a disclosure term or would need a model with no code is
+not given, and the session keeps Claude Code's own.
+[`PROJECT_CONFIG.md`](PROJECT_CONFIG.md#session-names) specifies the template and
+each rule. A line's configuration sets nothing here. Lines on other engines are not
+named.
+
 ## Timestamps
 
 **Round 15, item 6.** Every time a record accepts, and every time Dromon shows a caller,

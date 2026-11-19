@@ -2376,6 +2376,7 @@ class ClaudeCodeLine:
         secret_names: Callable[[], Sequence[str]] | Sequence[str] = (),
         git_ssh: GitSshAccess | None = None,
         temp: LineTemp | None = None,
+        session_name: str | None = None,
     ) -> None:
         if driver.settings.engine != ENGINE_NAME:
             raise EngineRefused(
@@ -2403,6 +2404,12 @@ class ClaudeCodeLine:
         self.temp = temp
         """The temporary directory and package cache the sandbox lets the line's shell
         write, if it has an enabled sandbox and they could be made."""
+        self.session_name = session_name
+        """The display name every session this engine starts or resumes is given with
+        ``--name``, or ``None`` to leave Claude Code's own. **Round 19.** The caller,
+        ``dromon.sessionname``, checked it is one argument and screened it against the
+        disclosure list. It is passed in ``options``, which every start, resume and
+        kept connection is built from."""
         self._kept_factory = kept_factory
         self._task_ended = task_ended
         self._begin_self_started_callback = begin_self_started
@@ -2558,6 +2565,7 @@ class ClaudeCodeLine:
             cli_path=self._launcher(),
             system_prompt=self._system_prompt(),
             max_buffer_size=MAX_MESSAGE_CHARACTERS,
+            extra_args={} if self.session_name is None else {"name": self.session_name},
         )
 
     def _selected_shell(self) -> str | None:
