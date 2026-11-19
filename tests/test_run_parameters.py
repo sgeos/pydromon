@@ -8,7 +8,8 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -335,6 +336,110 @@ def test_the_child_is_killed_when_the_start_is_cancelled(
         for child in started:
             with child:
                 child.kill()
+
+
+class LateExecutor(ThreadPoolExecutor):
+    """An executor that is late to run ``communicate``, as a loaded machine's is. With
+    ``mode`` ``slow`` the worker has started and sleeps first. With ``queued`` the job
+    has not started, so a cancellation of its future wins, as it does for a job still
+    in a real executor's queue, and the job is run by a timer only if it was not
+    cancelled. **Round 19.**"""
+
+    def __init__(self, mode: str, delay: float) -> None:
+        super().__init__(max_workers=4)
+        self.mode = mode
+        self.delay = delay
+        self.submitted = threading.Event()
+
+    @staticmethod
+    def is_communicate(job: object) -> bool:
+        arguments = cast(tuple[object, ...], getattr(job, "args", ()))
+        return any(getattr(a, "__name__", "") == "communicate" for a in arguments[:1])
+
+    def submit[**P, T](
+        self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
+    ) -> Future[T]:
+        if not self.is_communicate(fn):
+            return super().submit(fn, *args, **kwargs)
+        self.submitted.set()
+        if self.mode == "slow":
+
+            def late() -> T:
+                time.sleep(self.delay)
+                return fn(*args, **kwargs)
+
+            return super().submit(late)
+        job: Future[T] = Future()
+
+        def run() -> None:
+            if job.set_running_or_notify_cancel():
+                try:
+                    job.set_result(fn(*args, **kwargs))
+                except BaseException as error:  # noqa: BLE001, as an executor does
+                    job.set_exception(error)
+
+        threading.Timer(self.delay, run).start()
+        return job
+
+
+@pytest.mark.parametrize("mode", ["slow", "queued"])
+@pytest.mark.parametrize("cancels", [1, 2])
+def test_a_cancelled_match_leaves_no_pipe_open_when_the_worker_is_late(
+    monkeypatch: pytest.MonkeyPatch, mode: str, cancels: int
+) -> None:
+    """Round 19. Main's run on Linux failed with the child killed and reaped and its
+    stdin still open, because the call returned once the child was reaped, while the
+    worker thread running ``communicate`` had not closed the pipes, or, when it had not
+    started, was cancelled with the call and never would. Here the worker is late on
+    purpose, in both ways, and a second cancellation arrives while the child is being
+    ended. The call must still end the child, wait for the worker and close the pipes
+    before the cancellation goes on, and the cancellation must not be lost."""
+    monkeypatch.setattr(runparams, "MATCHER", SLOW_MATCHER)
+    started = spawned_children(monkeypatch)
+    executor = LateExecutor(mode, delay=0.4)
+    prepared = runparams.prepare(
+        ("prog", "{test}"), {"test": TEST_PATH}, {"test": "tests/a.py"}
+    )
+
+    async def scenario() -> None:
+        asyncio.get_running_loop().set_default_executor(executor)
+        task = asyncio.create_task(runparams.match(prepared, 3 * WAIT_SECONDS))
+        assert await asyncio.to_thread(executor.submitted.wait, WAIT_SECONDS)
+        task.cancel()
+        if cancels == 2:
+            await asyncio.sleep(0.1)
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        [(child, _)] = started
+        assert_killed(child)
+
+    try:
+        asyncio.run(asyncio.wait_for(scenario(), 3 * WAIT_SECONDS))
+    finally:
+        for child, _ in started:
+            with child:
+                child.kill()
+
+
+def test_until_done_says_whether_a_cancellation_was_held_back() -> None:
+    """The caller of ``_until_done`` raises a cancellation of its own when one was held,
+    so none is lost, and one that never came is not invented."""
+
+    async def scenario() -> tuple[bool, bool]:
+        loop = asyncio.get_running_loop()
+        quiet: asyncio.Future[int] = loop.create_future()
+        loop.call_later(0.05, quiet.set_result, 1)
+        undisturbed = await runparams._until_done(quiet)  # pyright: ignore[reportPrivateUsage]
+        slow: asyncio.Future[int] = loop.create_future()
+        waiting = asyncio.ensure_future(runparams._until_done(slow))  # pyright: ignore[reportPrivateUsage]
+        await asyncio.sleep(0.01)
+        waiting.cancel()
+        await asyncio.sleep(0.01)
+        slow.set_result(2)
+        return undisturbed, await waiting
+
+    assert asyncio.run(scenario()) == (False, True)
 
 
 def test_the_child_is_killed_when_the_cancellation_comes_during_the_start(
