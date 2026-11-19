@@ -97,6 +97,7 @@ from dromon.model import (
     RunAdmitted,
     RunDequeued,
     RunQueued,
+    RunRetargeted,
     RunEnded,
     RunStarted,
     RunStatus,
@@ -298,6 +299,7 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "workdir_commit",
         "dirty_paths",
         "admitted_by",
+        "content",
     ),
     "run_ended": (
         "run_id",
@@ -330,8 +332,10 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "workdir_commit",
         "queued_at",
         "reason",
+        "content",
     ),
     "run_dequeued": ("queue_id", "outcome", "run_id", "reason", "at"),
+    "run_retargeted": ("queue_id", "from_commit", "to_commit", "content", "at"),
     "run_admitted": ("operator_id", "admitted_at", "expires_at", "reason"),
     "run_admission_ended": ("operator_id", "ended_at"),
     "peer_declared": ("peer_id", "transport", "policy"),
@@ -462,8 +466,10 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
         "workdir_commit",
         "dirty_paths",
         "admitted_by",
+        "content",
     ),
     "run_ended": ("output_tail", "coverage"),
+    "run_queued": ("content",),
     "line_configured": ("sealed",),
     "disclosure_checked": ("checked_bytes",),
     "line_cost_recorded": ("estimated", "between", "partial"),
@@ -503,7 +509,10 @@ round 18, item 1 and item 2, so a daemon that predates them still reads every ru
 records none of them, and refuses the log once a run records one. A run in a worktree
 whose status was read records ``dirty_paths``, so a daemon that predates it refuses the
 log of nearly every run of the next gate, which is the rollback hazard
-``docs/protocol/EVENT_LOG.md`` states."""
+``docs/protocol/EVENT_LOG.md`` states. ``content`` was added to ``run_started`` and
+``run_queued`` in round 19, so a daemon that predates it still reads every run and
+queued start whose content could not be told, and refuses the log once one records
+it."""
 
 
 def _without_nulls(kind: str, data: dict[str, object]) -> dict[str, object]:
@@ -877,6 +886,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "workdir_commit": event.workdir_commit,
                 "dirty_paths": event.dirty_paths,
                 "admitted_by": event.admitted_by,
+                "content": event.content,
             }
         case RunEnded():
             return "run_ended", {
@@ -922,6 +932,7 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "workdir_commit": event.workdir_commit,
                 "queued_at": event.queued_at,
                 "reason": event.reason,
+                "content": event.content,
             }
         case RunAdmitted():
             return "run_admitted", {
@@ -934,6 +945,14 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
             return "run_admission_ended", {
                 "operator_id": event.operator_id,
                 "ended_at": event.ended_at,
+            }
+        case RunRetargeted():
+            return "run_retargeted", {
+                "queue_id": event.queue_id,
+                "from_commit": event.from_commit,
+                "to_commit": event.to_commit,
+                "content": event.content,
+                "at": event.at,
             }
         case RunDequeued():
             return "run_dequeued", {
@@ -1294,6 +1313,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _optional_str(data, "workdir_commit"),
                 _optional_int(data, "dirty_paths"),
                 _optional_str(data, "admitted_by"),
+                _optional_str(data, "content"),
             )
         case "run_ended":
             return RunEnded(
@@ -1335,6 +1355,7 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 _optional_str(data, "workdir_commit"),
                 _str(data, "queued_at"),
                 _str(data, "reason"),
+                _optional_str(data, "content"),
             )
         case "run_admitted":
             return RunAdmitted(
@@ -1345,6 +1366,14 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
             )
         case "run_admission_ended":
             return RunAdmissionEnded(_str(data, "operator_id"), _str(data, "ended_at"))
+        case "run_retargeted":
+            return RunRetargeted(
+                _str(data, "queue_id"),
+                _optional_str(data, "from_commit"),
+                _str(data, "to_commit"),
+                _str(data, "content"),
+                _str(data, "at"),
+            )
         case "run_dequeued":
             return RunDequeued(
                 _str(data, "queue_id"),

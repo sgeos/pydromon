@@ -758,7 +758,12 @@ should be run again before its result is reported for the current tree, or that 
 coverage is unknown, with the fixed word for why git could not be read. A run that
 recorded no tree, from before the field or where its tree could not be read, says its
 coverage is unknown. A commit run covers its commit, records no tree, and says
-nothing. The operator's `runs` view gives `tree` as recorded.
+nothing. The operator's `runs` view gives `tree` as recorded. **Round 19.** A run in a
+working directory also records `content`, as a queued start does. Where the digest
+differs and the content read now is the content the run recorded, as after a commit of
+exactly the tree it ran, `run_status` says that the content of every tracked file is as
+it ran, so it covers the tree now. The content is read only in that case, so an
+unchanged tree costs no further read. A run without `content` is worded as before.
 
 - **Residuals.** Untracked paths are left out whole, since a run's own output in an
   untracked directory that is not ignored would otherwise make every run read as no
@@ -1403,8 +1408,36 @@ is sent a note with the reason unless it withdrew the entry. The reasons are tha
 entry waited longer than `runs.queue_max_age_seconds`, that the line no longer exists, is stopped or is hibernated, that an operator released it, which
 is done as the release is made, that it no longer owns what the run would write, that
 its working directory is another path than the one asked about, and that the commit
-checked out there has moved. **Residual.** Edits without a commit are not a change that
-drops it. A line that edits while its run waits has the edited tree run, and the
+checked out there has moved while the content the run would test changed or cannot be
+told. **Residual.** Edits without a commit are not a change that
+drops it.
+
+**Following a commit of the same tree.** **Round 19, at core's and ops' request.**
+After memory pressure had held runs for hours, the operator committed a line's
+uncommitted tree exactly, which moved `HEAD` and changed no file a run reads, and every
+such entry was dropped and lost its place. A start in a working directory now records
+`content` in `run_queued`, the SHA-256 that `readiness.content_digest` gives, read off
+the event loop as the start is queued. It is the path, mode and git object of every
+tracked file, the tree `HEAD` names with each path `git status` lists as changed
+replaced by its file now, so it does not depend on how the content is split between
+`HEAD` and the working files. When `HEAD` has moved and the content read again is the
+same, the entry is not dropped. `run_retargeted` records the queue identifier, the
+commit it targeted, the commit it targets now and the content, the entry keeps its
+place in the queue, and the line is told. A content that differs, by one file or more,
+a content that cannot be told now, an entry with no recorded content, as from before
+the field or where it could not be read, and a commit command, are dropped as before,
+and the reason says which. Git is read with four commands, none of which writes, and
+only when `HEAD` has moved.
+
+- **Failure modes.** `HEAD` can move again between the look and the start, and the
+  next look compares again. The run's own receipt records the tree it ran in any
+  case. A content that cannot be told is treated as changed, never as the same.
+- **Residuals.** Untracked files are not compared, as for `tree`. A changed
+  submodule, a changed path that is now a directory or holds a newline, more than
+  10,000 changed paths or 200,000 entries in `HEAD`'s tree, and an unborn `HEAD`, all
+  leave the content unknown. A path marked assume-unchanged or skip-worktree is read
+  from `HEAD`. Clean filters are applied as `git add` would apply them, so a filter
+  that is not deterministic gives another content. A line that edits while its run waits has the edited tree run, and the
 receipt names the tree that ran, as round 16 made it. A held line keeps its entry,
 which may start while it is held, since a hold stops turns and not runs.
 

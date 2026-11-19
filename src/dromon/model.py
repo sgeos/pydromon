@@ -2396,6 +2396,12 @@ class RunStarted:
     machine status deferred runs, or ``None`` for a run the status allowed. It says the
     run started at a status the project defers runs at, by that operator's decision,
     which ``run_admitted`` records with its time and expiry."""
+    content: str | None = None
+    """**Round 19.** The SHA-256 ``readiness.content_digest`` gave for the working
+    directory as the run started, the tracked content whether committed or not, or
+    ``None`` for a commit run, for a run recorded before the field, or where the
+    content could not be told. Where ``tree`` differs later and this does not, the
+    run still covers the files, as after a commit of exactly the tree it ran."""
 
     def __post_init__(self) -> None:
         check_id("run_id", self.run_id)
@@ -2403,6 +2409,13 @@ class RunStarted:
             raise InvalidField("tree must be null or a SHA-256 digest in hex")
         if self.tree is not None and self.commit is not None:
             raise InvalidField("a commit run records no tree")
+        if self.content is not None and (
+            DIGEST_PATTERN.fullmatch(self.content) is None or self.commit is not None
+        ):
+            raise InvalidField(
+                "content must be null or a SHA-256 digest in hex, and a commit run"
+                " has none"
+            )
         if self.dirty_paths is not None and (
             type(self.dirty_paths) is not int
             or not 0 <= self.dirty_paths < 2**31
@@ -2635,6 +2648,11 @@ class RunQueued:
     workdir_commit: str | None
     queued_at: str
     reason: str
+    content: str | None = None
+    """**Round 19.** ``readiness.content_digest`` of the working directory as the
+    start was queued, or ``None`` for a commit command, for an entry recorded before
+    the field, or where the content could not be told. When ``HEAD`` moves and this
+    is unchanged, ``run_retargeted`` keeps the start rather than dropping it."""
 
     def __post_init__(self) -> None:
         check_id("queue_id", self.queue_id)
@@ -2643,6 +2661,13 @@ class RunQueued:
         check_optional_id("previous", self.previous)
         if self.commit is not None and COMMIT_PATTERN.fullmatch(self.commit) is None:
             raise InvalidField("commit must be null or a full hexadecimal commit")
+        if self.content is not None and (
+            DIGEST_PATTERN.fullmatch(self.content) is None or self.commit is not None
+        ):
+            raise InvalidField(
+                "content must be null or a SHA-256 digest in hex, and a commit"
+                " command has none"
+            )
         if len(self.arguments) > MAX_RUN_ARGUMENTS:
             raise InvalidField(f"at most {MAX_RUN_ARGUMENTS} arguments")
         names: set[str] = set()
@@ -2684,6 +2709,38 @@ class RunDequeued:
         if (self.run_id is not None) != (self.outcome is QueueEnd.STARTED):
             raise InvalidField("run_id is given exactly when the run started")
         check_text("reason", self.reason, MAX_QUEUE_REASON_BYTES)
+        check_instant("at", self.at)
+
+
+@dataclass(frozen=True, slots=True)
+class RunRetargeted:
+    """A queued run in a working directory now targets ``to_commit``, where it
+    targeted ``from_commit``, since ``HEAD`` moved there and the content the run
+    would test, ``content``, is the content it was queued for. **Round 19, at core's
+    and ops' request.** The operator committed a line's uncommitted tree exactly,
+    after memory pressure had held runs for hours, and every such start was dropped
+    and lost its place. Both commits are recorded, so the receipt of the run that
+    begins can be read against the commit it was asked for. ``from_commit`` is
+    ``None`` where ``HEAD`` could not be read as the start was queued."""
+
+    queue_id: str
+    from_commit: str | None
+    to_commit: str
+    content: str
+    at: str
+
+    def __post_init__(self) -> None:
+        check_id("queue_id", self.queue_id)
+        if self.from_commit is not None and (
+            COMMIT_PATTERN.fullmatch(self.from_commit) is None
+        ):
+            raise InvalidField("from_commit must be null or a full commit")
+        if COMMIT_PATTERN.fullmatch(self.to_commit) is None:
+            raise InvalidField("to_commit must be a full commit")
+        if self.from_commit == self.to_commit:
+            raise InvalidField("a retarget moves to another commit")
+        if DIGEST_PATTERN.fullmatch(self.content) is None:
+            raise InvalidField("content must be a SHA-256 digest in hex")
         check_instant("at", self.at)
 
 
@@ -2811,6 +2868,7 @@ type Event = (
     | CommitRunRefused
     | RunQueued
     | RunDequeued
+    | RunRetargeted
     | RunAdmitted
     | RunAdmissionEnded
     | PeerDeclared
@@ -3681,6 +3739,24 @@ class State:
                     raise EventRejected(f"no queued run {event.queue_id}")
                 if event.run_id is not None and event.run_id not in self.runs:
                     raise EventRejected(f"no run {event.run_id}")
+            case RunRetargeted():
+                queued = self.queued_runs.get(event.queue_id)
+                if queued is None:
+                    raise EventRejected(f"no queued run {event.queue_id}")
+                if queued.commit is not None:
+                    raise EventRejected(
+                        f"{event.queue_id} is a commit command, which names its commit"
+                    )
+                if queued.workdir_commit != event.from_commit:
+                    raise EventRejected(
+                        f"{event.queue_id} targets {queued.workdir_commit}, not"
+                        f" {event.from_commit}"
+                    )
+                if queued.content != event.content:
+                    raise EventRejected(
+                        f"{event.queue_id} was queued for other content, so it is"
+                        " dropped rather than retargeted"
+                    )
             case RunAdmitted():
                 if event.operator_id not in self.operators:
                     raise EventRejected(f"no operator {event.operator_id}")
@@ -4111,6 +4187,11 @@ class State:
                 self.queued_runs[event.queue_id] = event
             case RunDequeued():
                 del self.queued_runs[event.queue_id]
+            case RunRetargeted():
+                queued = self.queued_runs[event.queue_id]
+                self.queued_runs[event.queue_id] = replace(
+                    queued, workdir_commit=event.to_commit
+                )
             case RunAdmitted():
                 self.run_admission = event
             case RunAdmissionEnded():
