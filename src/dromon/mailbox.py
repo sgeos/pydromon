@@ -33,6 +33,11 @@ from dromon.model import (
 MAX_PAGE: Final = 50
 """Upper bound on the messages one listing returns, so a large mailbox is paged."""
 
+MAX_BULK_ACKNOWLEDGE: Final = 50
+"""Upper bound on the messages one bulk ``acknowledge_mail`` call closes. **Round 19.**
+It equals a page, so a line can list a page of unanswered mail and close it in one
+call, and a mistaken call closes at most this many."""
+
 
 @dataclass(frozen=True, slots=True)
 class MailSummary:
@@ -196,6 +201,32 @@ def unanswered_from(state: State, owner: Address, sender: Address) -> list[str]:
         for message_id, message in mailbox(state, owner)
         if message.sender == sender and counts_unanswered(state, message)
     ]
+
+
+def unanswered_notes_through(
+    state: State, owner: Address, sender: Address, up_to: str
+) -> tuple[list[str], int] | None:
+    """The notes from ``sender`` in ``owner``'s mailbox that ``counts_unanswered``
+    counts, oldest first, up to and including ``up_to``, and how many messages of
+    another kind that count were left out, or ``None`` when ``up_to`` is not a
+    message from ``sender`` in that mailbox. **Round 19, bulk acknowledgement.**
+    Position is the mailbox's own order, which is the order of arrival, since a
+    message identifier carries none. A question or an issue is never selected, so
+    a bulk call cannot close the one kind of mail that needs a decision. The
+    bounded loop reads each message of the mailbox at most once."""
+    notes: list[str] = []
+    other = 0
+    for message_id, message in mailbox(state, owner):
+        if message.sender != sender:
+            continue
+        if counts_unanswered(state, message):
+            if message.kind is MessageKind.NOTE:
+                notes.append(message_id)
+            else:
+                other += 1
+        if message_id == up_to:
+            return notes, other
+    return None
 
 
 def is_open_issue(message_id: str, message: Message, replied: set[str]) -> bool:
