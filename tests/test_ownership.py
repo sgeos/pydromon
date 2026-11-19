@@ -1861,10 +1861,18 @@ def test_a_real_unreadable_directory_is_reported_unreadable(tmp_path: Path) -> N
 # Round 15, item 4. Whether the former holder's processes are shown to have ended.
 
 
+# Fake process identifiers for the tables below. former_holder_reading skips the
+# daemon's own pid, which in a test is this process's, so a fixed identifier that
+# happened to equal it was skipped and a count came out one short, as on a macOS
+# runner on 2026-11-18. These are chosen to differ from it.
+FAKE_PID_A, FAKE_PID_B = [pid for pid in range(4001, 4004) if pid != os.getpid()][:2]
+
+
 class _Table:
     """A process table the test writes. ``refuse`` makes every read fail."""
 
     def __init__(self, marked: dict[int, str], refuse: bool = False) -> None:
+        assert os.getpid() not in marked, "a fake pid equals this process's own"
         self.marked = marked
         self.refuse = refuse
 
@@ -1912,7 +1920,7 @@ def test_no_marked_process_is_shown_as_ended_with_what_that_means(
     world: World,
 ) -> None:
     world.scheduler.relinquish_ownership("alpha", "over", "beta", None)
-    view = observe(world, _Table({4001: "gamma.0123"}))
+    view = observe(world, _Table({FAKE_PID_A: "gamma.0123"}))
     assert view["state"] == "ended" and view["count"] == 0
     assert "every process of the daemon's user was read" in view["basis"]
     assert view["observed_at"] is not None and view["unseen"] == 0
@@ -2024,7 +2032,7 @@ def test_a_process_with_the_former_holders_mark_is_shown_as_running(
     world: World,
 ) -> None:
     world.scheduler.relinquish_ownership("alpha", "over", "beta", None)
-    view = observe(world, _Table({4001: "alpha.0123", 4002: "alpha.9999"}))
+    view = observe(world, _Table({FAKE_PID_A: "alpha.0123", FAKE_PID_B: "alpha.9999"}))
     assert view["state"] == "running" and view["count"] == 2
 
 
@@ -2078,3 +2086,11 @@ def test_the_role_status_tool_reads_the_table_before_it_answers(world: World) ->
 
     text = str(asyncio.run(invoke())["content"][0]["text"])
     assert '"state": "ended"' in text
+
+
+def test_a_fake_table_refuses_this_process_s_own_pid() -> None:
+    """former_holder_reading skips the daemon's pid, which in a test is this
+    process's, so a fake table holding it would make a count silently one short."""
+    with pytest.raises(AssertionError, match="this process's own"):
+        _Table({os.getpid(): "alpha.0123"})
+    assert os.getpid() not in (FAKE_PID_A, FAKE_PID_B) and FAKE_PID_A != FAKE_PID_B

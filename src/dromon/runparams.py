@@ -39,6 +39,7 @@ declarations load.
 """
 
 import asyncio
+import contextlib
 import json
 import re
 import subprocess
@@ -300,10 +301,16 @@ async def match(prepared: Prepared, seconds: float = MATCH_SECONDS) -> tuple[str
         raise ParameterRefused(
             "the values could not be matched against their patterns"
         ) from error
+    # Round 19. The worker that runs ``communicate`` is a thread that a cancellation or
+    # a deadline cannot stop. One that has not started yet, on a loaded machine, is
+    # cancelled with its future and never runs, so ``communicate`` never closes the
+    # pipes. Waiting on a shield of the future, and ending it in the ``finally`` below,
+    # leaves the child killed, the thread finished or never started, and the pipes
+    # closed before the call returns or the cancellation goes on.
+    communicating = asyncio.ensure_future(asyncio.to_thread(child.communicate, payload))
+    lost = False
     try:
-        output, _ = await asyncio.wait_for(
-            asyncio.to_thread(child.communicate, payload), seconds
-        )
+        output, _ = await asyncio.wait_for(asyncio.shield(communicating), seconds)
     except TimeoutError as error:
         raise ParameterRefused(
             f"the values took longer than {seconds:g} seconds to match their"
@@ -311,30 +318,47 @@ async def match(prepared: Prepared, seconds: float = MATCH_SECONDS) -> tuple[str
             " alternatives in a row can take time exponential in a value's length"
         ) from error
     finally:
-        # The kill ends the worker thread's ``communicate`` too, since its pipes
-        # close, so no thread outlives the call by more than the reap.
         if child.poll() is None:
             child.kill()
-        await asyncio.to_thread(child.wait)
+        lost = await _end_match(child, communicating)
+    if lost:
+        # A cancellation that arrived while the child was being ended was held back so
+        # that the ending finished, and is not dropped.
+        raise asyncio.CancelledError
     _check_answers(prepared, output, child.returncode)
     return prepared.argv
 
 
-async def _until_done[T](future: asyncio.Future[T]) -> None:
+async def _until_done[T](future: asyncio.Future[T]) -> bool:
     """Wait for ``future`` to finish, however many times the caller is cancelled while
-    it waits. Review of round 16, finding 2. A second cancellation used to end the
-    wait early and leave the child the start made running with its pipes open. The
-    cancellations are not lost, since the caller raises the first again afterwards, so
-    they delay the end by at most the wait for ``future``, which ``spawn.START_SECONDS``
-    bounds for a start and a kill bounds for a reap. The loop ends when ``future`` is
-    done, and each pass that does not end it consumed one cancellation."""
+    it waits, and say whether any cancellation was held back. Review of round 16,
+    finding 2. A second cancellation used to end the wait early and leave the child the
+    start made running with its pipes open. The cancellations are not lost, since the
+    caller raises the first again afterwards, or raises one itself when this returns
+    true, so they delay the end by at most the wait for ``future``, which
+    ``spawn.START_SECONDS`` bounds for a start and a kill bounds for a reap. The loop
+    ends when ``future`` is done, and each pass that does not end it consumed one
+    cancellation."""
+    held = False
     while not future.done():
         try:
             await asyncio.shield(future)
         except asyncio.CancelledError:
+            held = True
             continue
         except Exception:  # noqa: BLE001, the caller reads the outcome from ``future``
-            return
+            break
+    return held
+
+
+def _close_pipes(child: subprocess.Popen[bytes]) -> None:
+    """Close the child's pipes, which ``communicate`` would have closed had it run to
+    the end. Closing again is harmless. A pipe whose last write fails, because the child
+    is gone, is still closed by the call that raises."""
+    for pipe in (child.stdin, child.stdout):
+        if pipe is not None:
+            with contextlib.suppress(OSError):
+                pipe.close()
 
 
 def _reap(child: subprocess.Popen[bytes]) -> None:
@@ -343,9 +367,23 @@ def _reap(child: subprocess.Popen[bytes]) -> None:
     if child.poll() is None:
         child.kill()
     child.wait()
-    for pipe in (child.stdin, child.stdout):
-        if pipe is not None:
-            pipe.close()
+    _close_pipes(child)
+
+
+async def _end_match(
+    child: subprocess.Popen[bytes], communicating: asyncio.Future[tuple[bytes, bytes]]
+) -> bool:
+    """End a match whose child has been killed or has ended. Wait for the worker thread
+    that ran ``communicate``, which the kill ends by closing the child's pipes, so it
+    is not still using them, then reap the child and close the pipes, which also covers
+    a worker that was cancelled before it started and so never closed them. The waits
+    are bounded by the kill. Say whether a cancellation was held back, as
+    ``_until_done`` does."""
+    held = await _until_done(communicating)
+    if not communicating.cancelled():
+        communicating.exception()  # read, so it is not reported as never retrieved
+    reaped = asyncio.ensure_future(asyncio.to_thread(_reap, child))
+    return await _until_done(reaped) or held
 
 
 async def _end_late_start(starting: asyncio.Future[subprocess.Popen[bytes]]) -> None:

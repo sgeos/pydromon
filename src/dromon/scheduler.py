@@ -180,6 +180,7 @@ from dromon.handoff import Handoff
 from dromon.handoff import select as select_handoff
 from dromon import requestkeys
 from dromon import commitruns, machinestatus, runparams, runs
+from dromon.protocol import RUNS_BUDGET_BYTES, RUNS_LIMIT_DEFAULT
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
 from dromon.requestkeys import (
     REQUEST_KEY,
@@ -685,6 +686,24 @@ STOP_RUN_TOOL_NAME: Final = "stop_run"
 RUN_ID_VARIABLE: Final = "DROMON_RUN_ID"
 """The run's identifier, in its command's environment."""
 MAX_RUNS_SHOWN: Final = 10
+
+MAX_RETIRED_SHOWN: Final = 100
+"""The most retired lines, and the most retired roles, that an operator's ``status`` or
+``roles`` answer names, the newest of each, with the total beside it. **Round 19.**
+They grow with the log, since a retired identifier is never used again, and each takes
+about a hundred bytes of the line."""
+
+MAX_CORRECTS_SHOWN: Final = 8
+"""The most failed runs a run's view names as the ones it corrected, the newest of
+them. **Round 19.** A passing run corrects every failed run of its command since the
+last pass, which is as many as the log holds, so the view cut it, and gives how many
+it left out in ``corrects_left_out``."""
+
+MAX_QUEUED_WAIT_BYTES: Final = 512
+"""The most bytes, as written in JSON with the quotes, of what holds a queued run
+back that the ``runs`` answer gives for it, cut with a mark. **Round 19.** The
+sentence is built by the daemon and is shorter in practice. The bound is what lets the
+answer's reserve be derived."""
 
 START_RUN_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
@@ -4646,10 +4665,15 @@ class Scheduler:
         )
 
     def retired_lines_view(self) -> list[dict[str, object]]:
-        """Every retired line, by identifier, with who retired it and when."""
+        """The retired lines, by identifier, with who retired it and when, the newest
+        ``MAX_RETIRED_SHOWN`` of them. **Round 19.** ``status`` gives the total."""
+        newest = sorted(
+            self._state().retired_lines.items(),
+            key=lambda item: (item[1].retired_at, item[0]),
+        )[-MAX_RETIRED_SHOWN:]
         return [
             {"line_id": line_id, "by": str(event.by), "retired_at": event.retired_at}
-            for line_id, event in sorted(self._state().retired_lines.items())
+            for line_id, event in sorted(newest)
         ]
 
     # Restart to upgrade, decided by the operator on 2026-10-27.
@@ -6673,44 +6697,129 @@ class Scheduler:
         return "\n".join(lines)
 
     def runs_view(self, run_id: str | None) -> list[dict[str, object]]:
-        """Supervised runs for an operator, as plain data. **Round 14, item 11.**
-        With ``run_id``, that run alone. Without, the latest ``MAX_RUNS_SHOWN`` of
-        every scope, scopes in sorted order and each scope's runs newest first, so
-        the list is bounded by the number of scopes. Each run carries the links
-        ``runs.corrections`` derives within its scope. Raises ``EventRejected`` for
-        an unknown run. It reads the log only and records nothing."""
+        """The runs of ``runs_page`` with no limit but the default, for a reader that
+        wants the list alone."""
+        runs_shown = self.runs_page(run_id, RUNS_LIMIT_DEFAULT, RUNS_BUDGET_BYTES)[
+            "runs"
+        ]
+        return cast(list[dict[str, object]], runs_shown)
+
+    def runs_page(
+        self, run_id: str | None, limit: int, budget: int
+    ) -> dict[str, object]:
+        """Supervised runs for an operator, as plain data, in a page whose size is
+        bounded. **Round 14, item 11, and round 19.** With ``run_id``, that run alone,
+        whole, with its note and the tail of its output. Without, at most ``limit``
+        runs, and no more than ``budget`` bytes of them as written in JSON, chosen as
+        follows. Each scope offers its latest ``MAX_RUNS_SHOWN`` runs. Of those, the
+        runs that block their scope, open or lost, come first, since an operator looks
+        for them, and then the rest, newest first by the order the log holds them. The
+        choice stops at ``limit``, or at the first run that does not fit ``budget``, and
+        counts what it left out. The shown runs are then grouped by scope, in sorted
+        order, each scope's runs newest first. A list gives no note and no output tail,
+        which one run's view gives, so a view is small. Each run carries the links
+        ``runs.corrections`` derives within its scope. ``queued`` gives the runs that
+        wait in the queue, at most ``MAX_QUEUED_RUNS``, in their order. ``total`` is
+        every run the log holds and ``left_out`` is how many of them this page does not
+        show. Raises ``EventRejected`` for an unknown run. It reads the log only and
+        records nothing.
+
+        **Failure mode this closes.** The answer was bounded per scope and not by the
+        number of scopes, and each run carried its tail, so with enough lines it passed
+        the protocol's line limit and the operator could not read it."""
         state = self._state()
         by_scope: dict[tuple[str, str], list[Run]] = {}
-        for run in state.runs.values():
+        order: dict[str, int] = {}
+        for position, run in enumerate(state.runs.values()):
             scope = run_scope(run.started.line_id, run.started.role_id)
             by_scope.setdefault(scope, []).append(run)
+            order[run.started.run_id] = position
+        total = len(state.runs)
+        links: dict[tuple[str, str], tuple[dict[str, tuple[str, ...]], dict[str, str]]]
+        links = {}
+
+        def view_of(run: Run, detail: bool) -> dict[str, object]:
+            scope = run_scope(run.started.line_id, run.started.role_id)
+            if scope not in links:
+                corrected = runs.corrections(by_scope[scope])
+                links[scope] = (
+                    corrected,
+                    {
+                        failed: passed
+                        for passed, ids in corrected.items()
+                        for failed in ids
+                    },
+                )
+            corrected, corrected_by = links[scope]
+            key = run.started.run_id
+            return _run_view(
+                run, scope, corrected.get(key, ()), corrected_by.get(key), detail
+            )
+
         if run_id is not None:
             found = state.runs.get(run_id)
             if found is None:
                 raise EventRejected(f"no run {run_id}")
-            scope = run_scope(found.started.line_id, found.started.role_id)
-            chosen = {scope: [found]}
-        else:
-            chosen = {
-                scope: list(reversed(scope_runs[-MAX_RUNS_SHOWN:]))
-                for scope, scope_runs in sorted(by_scope.items())
+            return {
+                "runs": [view_of(found, True)],
+                "queued": [],
+                "total": total,
+                "left_out": 0,
             }
+        candidates = [
+            run
+            for scope_runs in by_scope.values()
+            for run in scope_runs[-MAX_RUNS_SHOWN:]
+        ]
+        candidates.sort(key=lambda run: (not run.blocks, -order[run.started.run_id]))
+        chosen: list[tuple[Run, dict[str, object]]] = []
+        room = budget
+        for run in candidates[:limit]:
+            view = view_of(run, False)
+            size = _written_size(view)
+            if size > room:
+                break
+            room -= size
+            chosen.append((run, view))
+        # Grouped by scope in sorted order, each scope's runs newest first.
+        chosen.sort(
+            key=lambda pair: (
+                run_scope(pair[0].started.line_id, pair[0].started.role_id),
+                -order[pair[0].started.run_id],
+            )
+        )
+        return {
+            "runs": [view for _, view in chosen],
+            "queued": self._queued_views(),
+            "total": total,
+            "left_out": total - len(chosen),
+        }
+
+    def _queued_views(self) -> list[dict[str, object]]:
+        """The runs that wait in the queue, in their order, at most ``MAX_QUEUED_RUNS``
+        by the queue's own bound, each with what holds it back now, cut to
+        ``MAX_QUEUED_WAIT_BYTES`` as written in JSON. **Round 19.** The operator could
+        not see them."""
         views: list[dict[str, object]] = []
-        for scope, shown in chosen.items():
-            corrected = runs.corrections(by_scope[scope])
-            corrected_by = {
-                failed: passed for passed, ids in corrected.items() for failed in ids
-            }
-            for run in shown:
-                key = run.started.run_id
-                views.append(
-                    _run_view(
-                        run,
-                        scope,
-                        corrected.get(key, ()),
-                        corrected_by.get(key),
-                    )
-                )
+        entries = list(self._state().queued_runs.values())
+        for position, entry in enumerate(entries[:MAX_QUEUED_RUNS], start=1):
+            waits = self._run_wait_reason(entry.line_id)
+            views.append(
+                {
+                    "queue_id": entry.queue_id,
+                    "line_id": entry.line_id,
+                    "command": entry.command,
+                    "commit": entry.commit,
+                    "queued_at": entry.queued_at,
+                    "position": position,
+                    "of": len(entries),
+                    "waits": (
+                        None
+                        if waits is None
+                        else _clip_text(waits, MAX_QUEUED_WAIT_BYTES)
+                    ),
+                }
+            )
         return views
 
     def check_runs(self) -> None:
@@ -11757,10 +11866,15 @@ class Scheduler:
         self._work.set()
 
     def retired_roles_view(self) -> list[dict[str, object]]:
-        """Every retired role, by identifier, with who retired it and when."""
+        """The retired roles, by identifier, with who retired it and when, the newest
+        ``MAX_RETIRED_SHOWN`` of them. **Round 19.** ``roles`` gives the total."""
+        newest = sorted(
+            self._state().retired_roles.items(),
+            key=lambda item: (item[1].retired_at, item[0]),
+        )[-MAX_RETIRED_SHOWN:]
         return [
             {"role_id": role_id, "by": str(event.by), "retired_at": event.retired_at}
-            for role_id, event in sorted(self._state().retired_roles.items())
+            for role_id, event in sorted(newest)
         ]
 
     def state_budget(
@@ -17226,16 +17340,67 @@ def _correction_text(corrects: tuple[str, ...], corrected_by: str | None) -> str
     return ""
 
 
+def _written_size(value: object) -> int:
+    """The bytes ``value`` takes in a protocol line, which is written compactly and
+    without escaping beyond JSON's own, as ``dromon.protocol`` writes it, and a comma
+    for its place in a list. **Round 19.**"""
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return len(text.encode("utf-8")) + 1
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """``text`` cut so that it takes at most ``limit`` bytes as written in JSON, its
+    quotes included, with a mark that it was cut. **Round 19, review.** The budget of
+    a page is in written bytes, and a character takes up to six of them, a control
+    character as ``\\u0001``, so a cut by UTF-8 bytes could write six times its limit.
+    Found by halving, so the loop runs at most as many times as ``text`` has bits in
+    its length."""
+
+    def written(value: str) -> int:
+        return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+    if written(text) <= limit:
+        return text
+    mark = "..."
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if written(text[:middle] + mark) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low] + mark
+
+
+def _listed_text(text: str | None, run_id: str, detail: bool) -> str | None:
+    """``text`` in one run's view, or in a list the words that say it is not there.
+    **Round 19, review.** The list gave ``null``, which a client that predates the
+    cut cannot tell from a run with no note, so a run's own words were silently
+    missing. The words name the size and the request that gives the text, and an empty
+    or absent text stays as it is, since nothing is missing."""
+    if detail or not text:
+        return text
+    return (
+        f"[not in a list, {len(text.encode('utf-8'))} bytes, dromon run status"
+        f" {run_id} gives it]"
+    )
+
+
 def _run_view(
     run: Run,
     scope: tuple[str, str],
     corrects: tuple[str, ...],
     corrected_by: str | None,
+    detail: bool = True,
 ) -> dict[str, object]:
     """One run as the ``runs`` request gives it. Round 14, item 11. ``state`` is
     ``running`` until ``run_ended``, then the end's status. Every field is plain
-    data the log holds, so a port gives the same view."""
+    data the log holds, so a port gives the same view. **Round 19.** ``detail`` is
+    false for a run in a list, which gives no note and no output tail, the two
+    fields that are long, so a list stays small. A list gives the words
+    ``_listed_text`` says for a text that exists, and one run's view gives the text."""
     started, ended, cleared = run.started, run.ended, run.cleared
+    run_id = started.run_id
     return {
         "run_id": started.run_id,
         "scope": f"{scope[0]} {scope[1]}",
@@ -17258,8 +17423,10 @@ def _run_view(
         "exit_code": None if ended is None else ended.exit_code,
         "output_bytes": None if ended is None else ended.output_bytes,
         "output_digest": None if ended is None else ended.output_digest,
-        "note": None if ended is None else ended.note,
-        "output_tail": None if ended is None else ended.output_tail,
+        "note": None if ended is None else _listed_text(ended.note, run_id, detail),
+        "output_tail": (
+            None if ended is None else _listed_text(ended.output_tail, run_id, detail)
+        ),
         "coverage": (
             None
             if ended is None or ended.coverage is None
@@ -17268,7 +17435,8 @@ def _run_view(
         "blocks": run.blocks,
         "cleared_at": None if cleared is None else cleared.cleared_at,
         "cleared_by": None if cleared is None else cleared.operator_id,
-        "corrects": list(corrects),
+        "corrects": list(corrects[-MAX_CORRECTS_SHOWN:]),
+        "corrects_left_out": max(0, len(corrects) - MAX_CORRECTS_SHOWN),
         "corrected_by": corrected_by,
     }
 
