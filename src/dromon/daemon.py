@@ -1938,6 +1938,7 @@ class Daemon:
         self.scheduler.set_disclosure_terms(terms)
         self.scheduler.set_disclosure_accepted(config.disclosure_accepted)
         self.scheduler.set_machine_status(machine_status_path(config, self.paths))
+        self.scheduler.set_session_name(config.session_name)
         self.scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
         self.scheduler.set_runs(
             config.run_commands,
@@ -4550,6 +4551,7 @@ def run(
             scheduler.set_disclosure_terms(terms)
             scheduler.set_disclosure_accepted(config.disclosure_accepted)
             scheduler.set_machine_status(machine_status_path(config, paths))
+            scheduler.set_session_name(config.session_name)
             scheduler.set_git_ssh(line_git_ssh)
             scheduler.set_leases(config.lease_names, config.lease_ttl_seconds)
             scheduler.set_runs(

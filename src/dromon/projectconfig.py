@@ -60,7 +60,7 @@ from dromon.model import (
     check_reviews,
     check_workdir,
 )
-from dromon import commitruns, runparams
+from dromon import commitruns, runparams, sessionname
 from dromon.runparams import RunParameter
 from dromon import settings as engine_settings
 from dromon.sandbox import SandboxConfig, SandboxError, merge, parse_sandbox
@@ -114,6 +114,7 @@ DAEMON_KEYS: Final = frozenset(
         "disclosure_terms",
         "disclosure_accepted",
         "machine_status",
+        "session_name",
     }
 )
 LIMIT_KEYS: Final = frozenset(
@@ -493,6 +494,9 @@ class ProjectConfig:
     disclosure_accepted: dict[str, tuple[str, ...]] = field(
         default_factory=dict[str, tuple[str, ...]]
     )
+    session_name: sessionname.Template | None = sessionname.DEFAULT
+    """The template of the name each Claude Code session Dromon starts is given, or
+    ``None`` to give none. **Round 19.** ``dromon.sessionname`` describes it."""
     lease_names: tuple[str, ...] = ()
     """The leases the project's lines may acquire, by name."""
     lease_ttl_seconds: int = DEFAULT_LEASE_TTL
@@ -626,6 +630,22 @@ class _Reader:
             )
         return document
 
+    def session_name(self, value: object) -> sessionname.Template | None:
+        """``[daemon] session_name``, a template, or false for no name. An absent
+        key, given here as ``None``, gives the default template."""
+        if value is None:
+            return sessionname.DEFAULT
+        if value is False:
+            return None
+        if not isinstance(value, str):
+            raise self.fail(
+                "daemon.session_name", "must be a template, or false for no name"
+            )
+        try:
+            return sessionname.parse_template(value)
+        except sessionname.SessionNameError as error:
+            raise self.fail("daemon.session_name", str(error)) from error
+
     def project(self, document: dict[str, object]) -> ProjectConfig:
         top = self.table(document, "", TOP_KEYS)
         version = top.get("version")
@@ -660,6 +680,7 @@ class _Reader:
             or "\x00" in machine_status
         ):
             raise self.fail("daemon.machine_status", "must be a path to a file")
+        session_name = self.session_name(daemon.get("session_name"))
         try:
             accepted = accepted_entries(daemon.get("disclosure_accepted", {}))
         except DisclosureError as error:
@@ -737,6 +758,7 @@ class _Reader:
             disclosure_terms=terms,
             disclosure_accepted=accepted,
             machine_status=machine_status,
+            session_name=session_name,
             lease_names=lease_names,
             lease_ttl_seconds=lease_ttl,
             run_commands=run_tables.commands,

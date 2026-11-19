@@ -178,7 +178,7 @@ from dromon.security_paths import project_secret_paths
 from dromon import security_paths
 from dromon.handoff import Handoff
 from dromon.handoff import select as select_handoff
-from dromon import requestkeys
+from dromon import requestkeys, sessionname
 from dromon import commitruns, machinestatus, runparams, runs
 from dromon.protocol import RUNS_BUDGET_BYTES, RUNS_LIMIT_DEFAULT
 from dromon.engine_environment import BASE_ENVIRONMENT, allowlisted
@@ -2042,6 +2042,13 @@ class LineSpec:
         default=lambda remaining, reset, note, window: None, compare=False
     )
     """Where an engine reports a positive remaining provider-window percentage."""
+    session_name: Callable[[str, str | None], str | None] = field(
+        default=lambda model, effort: None, compare=False
+    )
+    """The display name of a session of the line on ``model`` at ``effort``, or
+    ``None`` for none, which a Claude Code engine passes as ``--name``. **Round 19.**
+    The scheduler records the name it gives while the engine lives, so that two live
+    sessions are never given one name."""
 
 
 type EngineFactory = Callable[[LineSpec, Sequence[SdkMcpTool[Any]]], LineEngine]
@@ -2599,6 +2606,11 @@ def engine_factory(
             budget_reported=spec.budget_reported,
             secret_names=lambda: tuple((line_secrets or {}).get(spec.line_id, ())),
             temp=line_temp,
+            # The model and effort ClaudeCodeLine.options passes, so the name says
+            # what the session runs. Named last, so a build refused above takes no name.
+            session_name=spec.session_name(
+                driver.settings.model, spec.config.effort or driver.settings.effort
+            ),
         )
 
     return build
@@ -3215,6 +3227,13 @@ class Scheduler:
         """The latest ownership change each seat's in-flight turn was told of.
         Persisted turn-end events suppress repeat notices after a restart."""
         self._engine_built: dict[str, int] = {}
+        self._session_template: sessionname.Template | None = None
+        """The template of the names Claude Code sessions are given, or ``None`` for
+        none, which ``set_session_name`` sets from the project file."""
+        self._session_names: dict[str, str] = {}
+        """The name each line's engine was last given. Only the names of lines with
+        an engine in ``_engines`` are taken, so a dropped engine, or a build refused
+        after it was named, frees its name. One entry for each line, so bounded."""
         """When each engine was built, in nanoseconds of the wall clock, so that only a
         launcher started since is taken for the engine's own. Review N1."""
         self._turns: dict[str, int] = {}
@@ -4170,6 +4189,50 @@ class Scheduler:
                 "path must be a relative path in your working directory, or an"
                 " absolute path under it"
             ) from error
+
+    def set_session_name(self, template: sessionname.Template | None) -> None:
+        """Name the Claude Code sessions engines built from now on start by
+        ``template``, or name none for ``None``. An engine already built keeps its
+        name until it is rebuilt. **Round 19.**"""
+        self._session_template = template
+
+    def name_session(self, line_id: str, model: str, effort: str | None) -> str | None:
+        """The name a session of ``line_id`` on ``model`` at ``effort`` is given, or
+        ``None``, recorded as the line's while its engine lives. A line given no name
+        for a reason other than naming being off is warned of on standard error, with
+        the reason, which never holds a disclosure term."""
+        self._session_names.pop(line_id, None)
+        template = self._session_template
+        if template is None:
+            return None
+        if self._root is None:
+            named = sessionname.Named(None, "the scheduler has no project")
+        else:
+            seat = self._state().seats.get(line_id)
+            named = sessionname.session_name(
+                template,
+                version=__version__,
+                project=self._root.name,
+                line_id=line_id,
+                role=None if seat is None else seat.role_id,
+                model=model,
+                effort=effort,
+                taken=(
+                    name
+                    for other, name in self._session_names.items()
+                    if other != line_id and other in self._engines
+                ),
+                terms=self._disclosure,
+            )
+        if named.name is None:
+            print(
+                f"dromond: line {line_id} keeps Claude Code's own session name, since"
+                f" {named.reason}",
+                file=sys.stderr,
+            )
+            return None
+        self._session_names[line_id] = named.name
+        return named.name
 
     def set_disclosure_terms(self, terms: Sequence[str]) -> None:
         """Replace the disclosure terms the tools check, already case folded."""
@@ -16349,6 +16412,9 @@ class Scheduler:
                 begin_self_started=lambda ends: self.begin_self_started(line_id, ends),
                 budget_reported=lambda remaining, reset, note, window: (
                     self.engine_budget_reported(line_id, remaining, reset, note, window)
+                ),
+                session_name=lambda model, effort: self.name_session(
+                    line_id, model, effort
                 ),
             )
             tools = self.own_tools(line_id)
