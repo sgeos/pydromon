@@ -4,42 +4,53 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-11-17, round 17, address all known issues and drivers for new models
+## 2026-11-19, rounds 18 and 19, the other project's recovery, all known issues and drivers
 
-**Done, merged in pull requests 143, 149 and 154 to 162.**
+**The other project.** It was blocked pending a supported recovery and an independent
+review. Round 18 gave both. `docs/architecture/UPGRADE.md` and `dromon upgrade-check` are
+the supported path, and audit reviewed the diagnosis of its failed Codex starts, which
+names three candidates, all fixed on main, and proves none for that installation. Its
+later Codex `account/read` failure did not reproduce with its exact arguments a day
+later. Three notices went by the mailbox. It has not replied, and it still ran 6567167
+when last observed.
 
-- **Drivers.** Every coding model Anthropic, OpenAI and xAI released between
-  2026-08-18 and 2026-11-16 already had a driver. Google's `gemini-4-argon`,
-  `gemini-4-carbon` and `gemini-4-hydrogen` now have Cursor Agent drivers at medium
-  effort for every strategy, and Argon a Pi driver on its API key. No Antigravity
-  id is documented, so none was added.
-- **Confinement.** Codex lines deny credentials and the project's `secret/` since round
-  9, and Claude Code lines now deny `secret/` too. A live check on 2026-11-17 from six
-  Codex lines found `secret/`, `~/.ssh` and Codex's sign-in file all denied.
-- **Gates and state.** The disclosure scan runs from worktrees, `check.sh` runs under
-  bash 3.2, and state versions and rollback floors are per-branch files.
-- **Runs.** Declared runs queue on the machine status and a lease, with an age limit.
-- **Mail and leases.** Only mail that asks counts as unanswered, leases record expiry
-  and are capped in place, and the overview reads an index.
-- **Processes.** A stalled start records a sample of the stuck child. A Grok bridge
-  that fails is named as the cause, and its stderr is kept, scrubbed.
-- **CI.** The scheduler's idle wait busy-polled, which made two ownership tests run
-  past five minutes on Linux and turned main red at `aa45ba3`. Fixed in #158.
+**Done, merged in pull requests 164 to 178.**
 
-**Team.** From 23:04Z on 2026-11-16, by the operator's direction, every role passed to
-an OpenAI seat on Codex, with Anthropic seats as fallback.
+- **Security.** Four client-created Claude Code lines could list the home ssh directory
+  and read the Codex sign-in file, which the round 18 report brief's confinement check
+  found. Every Claude Code line now denies the shared credential paths in its sandbox and
+  file tools, a line with no sandbox setting gets an enabled one, escape settings are
+  refused, and `daemon.default_profile` gives client-created lines the project profile's
+  commit guards. A live check on 2026-11-18 from six lines found all denied. Audit
+  reviewed the change four times.
+- **Runs and answers.** `dromon run status` overflowed the line cap and is bounded, with
+  other answers. A queued run follows a commit of the same content, hashed from the files
+  with hooks and filters off.
+- **Processes.** A launch record whose start time cannot be read is retained, and a
+  cancelled match closes its pipes, which a Linux CI failure exposed.
+- **Mail.** The evidence index screens only quoted text, and lines can acknowledge many
+  notes at once.
+- **Session names.** Claude Code sessions are named by the operator's pattern, such as
+  `PDr00-pydromon-runtime-Sn55hi`, configurable as `daemon.session_name`.
+- **Drivers.** Every model Anthropic, OpenAI, xAI and Google released publicly between
+  2026-08-21 and 2026-11-19 has a driver. GPT-6.2 Astra and Sol were added. Mythos 5.2
+  and GPT-6 Cyber are restricted, so they were not counted as public.
 
-**Verified.** Full gates outside the sandbox or through the daemon on each branch,
-continuous integration on every merge, reviews with mutation checks on every branch,
-the no-cost engine check on every line, and the live confinement check above.
+**Team.** Anthropic seats owned every role from 2026-11-18T07:17Z, renewed to 21:26Z.
+At about 20:30Z Claude's weekly window fell below 10 percent, and the roles failed over
+to their OpenAI seats as designed. The operator's session returned them after the reset.
 
-**Found broken and fixed.** On `c4cfe6f` the daemon's sweep killed every Claude Code
-and Grok engine early in a turn, because a live launcher read as exited. Runtime
-reproduced it without a model, and #162 fixed it. A Claude Code turn completed on the
-restarted daemon. A Grok turn was refused for an exhausted usage balance, so Grok is
-not yet confirmed live.
+**Decided by the operator in session.** Session name rules, Sonnet's code `Sn`, the line
+identifier as the variant, and a version code from the package version.
 
-**Experience reports.** Seven Codex seats reported, five SATISFIED and two NOT
-SATISFIED, in each worktree's `tmp/reports`. The operator's report is in the main
-checkout's `tmp/reports`. The Anthropic seats and the Grok line wrote none, since
-their turns failed until #162, and Grok's balance then ran out.
+**Declined by the operator's session.** Locations in disclosure refusals, by the
+operator's decision of 2026-10-30. A brief that asked for them was withdrawn unbuilt.
+
+**Experience reports.** Rounds 18 and 19 from every Anthropic line that worked and from
+capabilities-sol, in each worktree's `tmp/reports`, and the operator's in the main
+checkout's `tmp/reports`. Most were satisfied. Requests not yet built are in the
+handoff's Open list.
+
+**Not verified.** A live Claude Code turn after the session name change, Linux, and the
+GPT-6.2 drivers live. Several merges relied on continuous integration while memory
+pressure held local gates.
