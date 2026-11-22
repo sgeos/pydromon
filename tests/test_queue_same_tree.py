@@ -87,11 +87,11 @@ def test_committing_exactly_the_uncommitted_tree_keeps_the_content(
     git(work, "rm", "-q", "b.txt")
     (work / "d.txt").unlink()
     git(work, "mv", "e.txt", "f.txt")
-    (work / "notes.md").write_text("untracked, never compared\n")
+    (work / "notes.md").write_text("untracked, compared before and after commit\n")
     dirty = readiness.content_digest(work)
     stamps = readiness.tree_digest(work)
     assert dirty != clean
-    git(work, "add", "-A", "--", ".", ":!notes.md")
+    git(work, "add", "-A", "--", ".")
     git(work, "commit", "-q", "-m", "the tree as it was")
     assert readiness.content_digest(work) == dirty
     assert readiness.tree_digest(work) != stamps
@@ -390,7 +390,7 @@ def test_links_start_no_git_read_of_their_own(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Each link started a git read, and 300 took seconds. Now the listing and one
-    hash of the regular files are the only reads, however many links there are."""
+    hash of the regular files are bounded reads, however many links there are."""
     work = project(tmp_path / "w")
     for number in range(40):
         os.symlink("a.txt", work / f"link{number}")
@@ -398,7 +398,7 @@ def test_links_start_no_git_read_of_their_own(
     git(work, "commit", "-q", "-m", "links")
     reads = counted_reads(monkeypatch)
     clean = readiness.content_digest(work)
-    assert [name for name, _ in reads] == ["ls-files", "hash-object"]
+    assert [name for name, _ in reads] == ["ls-files", "ls-files", "hash-object"]
     os.remove(work / "link7")
     os.symlink("b.txt", work / "link7")
     assert readiness.content_digest(work) != clean
@@ -411,9 +411,9 @@ def test_each_read_is_given_only_what_is_left_of_one_deadline(
     work = project(tmp_path / "w")
     reads = counted_reads(monkeypatch)
     readiness.content_digest(work)
-    (listing, first), (hashing, second) = reads
-    assert (listing, hashing) == ("ls-files", "hash-object")
-    assert 0 < second < first <= readiness.CONTENT_SECONDS
+    (listing, first), (others, second), (hashing, third) = reads
+    assert (listing, others, hashing) == ("ls-files", "ls-files", "hash-object")
+    assert 0 < third < second < first <= readiness.CONTENT_SECONDS
 
 
 @pytest.mark.real_git_status
@@ -572,11 +572,13 @@ def test_a_queued_run_follows_a_commit_of_exactly_its_tree(git_rig: Rig) -> None
     rig = git_rig
     try:
         (rig.root / "a.txt").write_text("edited\n")
+        (rig.root / "new.txt").write_text("new and initially untracked\n")
         first = head(rig.root)
         queued = rig.queue("alpha")
         behind = rig.queue("beta")
         assert queued.content == readiness.content_digest(rig.root)
-        git(rig.root, "commit", "-q", "-am", "the operator commits the tree")
+        git(rig.root, "add", "-A")
+        git(rig.root, "commit", "-q", "-m", "the operator commits the tree")
         second = head(rig.root)
         rig.advance()
         assert not dropped(rig)
@@ -745,3 +747,59 @@ def test_a_receipt_without_content_is_worded_as_before() -> None:
     assert run.content is None
     text = scheduler_module._tree_text(run, "e" * 64, "f" * 64)  # pyright: ignore[reportPrivateUsage]
     assert "IT NO LONGER COVERS THE TREE" in text
+
+
+@pytest.mark.real_git_status
+def test_nonignored_new_file_changes_content_before_commit(tmp_path: Path) -> None:
+    work = project(tmp_path / "w")
+    original = readiness.content_digest(work)
+    (work / "new.txt").write_text("first")
+    before_commit = readiness.content_digest(work)
+    assert before_commit != original
+    git(work, "add", "new.txt")
+    git(work, "commit", "-q", "-m", "new file")
+    assert readiness.content_digest(work) == before_commit
+    (work / "new.txt").write_text("second")
+    assert readiness.content_digest(work) != before_commit
+
+
+@pytest.mark.real_git_status
+def test_ignored_new_file_is_outside_content(tmp_path: Path) -> None:
+    work = project(tmp_path / "w")
+    before = readiness.content_digest(work)
+    (work / "tmp").mkdir()
+    (work / "tmp" / "ignored").write_text("first")
+    assert readiness.content_digest(work) == before
+
+
+@pytest.mark.real_git_status
+def test_new_unstaged_paths_obey_the_combined_entry_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work = project(tmp_path / "w")
+    count = len(git(work, "ls-files").splitlines())
+    monkeypatch.setattr(readiness, "MAX_CONTENT_ENTRIES", count)
+    readiness.content_digest(work)
+    (work / "extra").write_text("too many")
+    with pytest.raises(readiness.TreeUncovered):
+        readiness.content_digest(work)
+
+
+@pytest.mark.real_git_status
+@pytest.mark.parametrize("name", ['"quoted', "new\nline", "return\r"])
+def test_new_untracked_unsafe_names_are_refused(tmp_path: Path, name: str) -> None:
+    work = project(tmp_path / "w")
+    (work / name).write_text("unsafe")
+    with pytest.raises(readiness.TreeUncovered):
+        readiness.content_digest(work)
+
+
+@pytest.mark.real_git_status
+def test_external_ignore_configuration_cannot_hide_a_new_file(tmp_path: Path) -> None:
+    work = project(tmp_path / "w")
+    ignore = tmp_path / "external-ignore"
+    ignore.write_text("new.txt\n")
+    git(work, "config", "core.excludesFile", str(ignore))
+    before = readiness.content_digest(work)
+    (work / "new.txt").write_text("must be included")
+    assert readiness.content_digest(work) != before

@@ -126,6 +126,9 @@ def test_the_overview_joins_what_the_three_tools_answer(scheduler: Scheduler) ->
     cost = status["cost_usd"]
     assert view["cost"] == {
         "since_release_usd": cost["estimate"],
+        "epoch": cost["epoch"],
+        "unknown_turns": cost["unknown_turns"],
+        "estimated_turns": cost["estimated_turns"],
         "basis": cost["basis"],
         "carried": cost["whole"],
     }
@@ -133,6 +136,7 @@ def test_the_overview_joins_what_the_three_tools_answer(scheduler: Scheduler) ->
     assert ceilings["autonomous_turns"] == {
         "used": status["autonomous_turns"]["used"],
         "allowed": status["autonomous_turns"]["allowed"],
+        "epoch": status["autonomous_turns"]["epoch"],
     }
     assert ceilings["cost_usd"] == {
         "limit": cost["limit"],

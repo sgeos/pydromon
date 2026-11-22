@@ -322,6 +322,30 @@ def _line_row(line: Mapping[str, object]) -> str:
         parts.append("not in the project file")
     if line.get("held_by") is not None and line.get("condition") != "held":
         parts.append(f"held by {line.get('held_by')}")
+    if "limit_epoch" in line:
+        estimate = line.get("cost_estimate_usd")
+        shown_cost = "unknown" if estimate is None else str(estimate)
+        parts.append(
+            f"limit cost {shown_cost} USD"
+            f" with {line.get('cost_unknown_turns')} unknown turns"
+            f" and {line.get('cost_estimated_turns')} estimated turns"
+        )
+        parts.append(
+            f"{line.get('turns')} session turns"
+            f" and {line.get('autonomous_turns')} autonomous turns"
+        )
+    for key, label in (
+        ("turns_epoch", "session turns"),
+        ("limit_epoch", "limit cost and unknown turns"),
+        ("autonomous_epoch", "autonomous turns"),
+    ):
+        epoch = line.get(key)
+        if isinstance(epoch, dict):
+            stamp = cast(Mapping[str, object], epoch)
+            parts.append(
+                f"{label} since {stamp.get('cause')} at {stamp.get('at')}"
+                f" epoch {stamp.get('id')}"
+            )
     whole = line.get("cost_whole")
     if isinstance(whole, dict):
         # Round 15, item 1. A daemon from before round 15 gives no whole cost.

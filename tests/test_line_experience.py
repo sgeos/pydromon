@@ -216,7 +216,10 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
     assert status["line_id"] == "alpha" and status["held_by"] == question
     turns = status["autonomous_turns"]
     assert (turns["used"], turns["allowed"]) == (0, 5)
+    alpha = next(row for row in scheduler.line_summaries() if row["line_id"] == "alpha")
+    assert turns["epoch"] == alpha["autonomous_epoch"]
     assert status["cost_usd"] == {
+        "epoch": scheduler.cost_status("alpha")["epoch"],
         "estimate": "0.2500",
         "basis": "exact",
         "unknown_turns": 0,
@@ -252,6 +255,7 @@ def test_line_status_is_compact_and_details_are_requested(world: World) -> None:
     full = json.loads(full_text)
     assert full["autonomous_turns"]["current_turn_counts"] is None
     assert full["cost_usd"] == {
+        "epoch": scheduler.cost_status("alpha")["epoch"],
         "estimate": "0.2500",
         "basis": "exact",
         "estimated_turns": 0,

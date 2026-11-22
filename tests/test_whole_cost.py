@@ -27,6 +27,7 @@ from dromon.model import (
     MAX_COST_MICRO_USD,
     HoldCause,
     InvalidField,
+    EventRejected,
     LineCost,
     LineCostRecorded,
     LineCreated,
@@ -234,7 +235,7 @@ def test_the_state_sums_each_kind_apart_and_holds_at_the_bound() -> None:
 
 
 def test_a_record_for_an_unknown_line_is_rejected() -> None:
-    with pytest.raises(Exception, match="no line"):
+    with pytest.raises(EventRejected, match="no line"):
         State().apply(LineCostRecorded("nobody", 1))
 
 
@@ -353,3 +354,42 @@ def test_partial_cost_roundtrips_and_replays_as_one_uncertain_subtotal() -> None
     found = state.line_costs["a"]
     assert found.reported_micro_usd == 200_000
     assert found.turns == 1 and found.unknown == 1
+
+
+def test_counter_epochs_change_but_unknown_totals_survive(world: World) -> None:
+    world.scheduler.spent_between("claude", INTERRUPTED_KIND, None, None)
+    cost = world.scheduler.cost_status("claude")
+    assert cost["unknown_turns"] == 1
+    whole = world.scheduler.whole_cost("claude")
+    assert whole["unknown_cost"] == 1
+    first = cost["epoch"]
+    world.scheduler.hold("claude", "epoch test", cause=HoldCause.COST)
+    world.scheduler.release("claude")
+    released = world.scheduler.cost_status("claude")
+    assert released["epoch"] != first
+    assert released["unknown_turns"] == 0
+    assert world.scheduler.whole_cost("claude") == whole
+    world.restart()
+    restarted = world.scheduler.cost_status("claude")
+    assert restarted["epoch"] not in (first, released["epoch"])
+    assert restarted["unknown_turns"] == 0
+    assert world.scheduler.whole_cost("claude") == whole
+    summary = next(
+        x for x in world.scheduler.line_summaries() if x["line_id"] == "claude"
+    )
+    assert summary["limit_epoch"] == restarted["epoch"]
+    assert "epoch " in _line_row(summary)
+
+
+def test_operator_turn_changes_only_autonomous_epoch(world: World) -> None:
+    target = world.scheduler
+    cost_epoch = target.cost_status("claude")["epoch"]
+    previous = next(x for x in target.line_summaries() if x["line_id"] == "claude")
+    target._apply_limits("claude", TurnCause.OPERATOR, True, None)  # pyright: ignore[reportPrivateUsage]
+    after = next(x for x in target.line_summaries() if x["line_id"] == "claude")
+    assert after["autonomous_epoch"] != previous["autonomous_epoch"]
+    assert after["limit_epoch"] == cost_epoch
+    assert after["turns_epoch"] == previous["turns_epoch"]
+    with pytest.raises(EventRejected, match="no line"):
+        target.release("missing")
+    assert target.cost_status("claude")["epoch"] == cost_epoch
