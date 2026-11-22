@@ -176,7 +176,9 @@ observed live.
 Codex loads the operator's user configuration, which cannot be skipped by the
 app-server. Dromon starts it with these arguments.
 
-- `-c mcp_servers.NAME.enabled=false` for every server `codex mcp list --json` names.
+- `-c 'mcp_servers.NAME={enabled=false,command="false"}'` for each standard
+  input and output server, or a complete disabled table with
+  `url="https://disabled.invalid/"` for each HTTP server, among the servers `codex mcp list --json` names.
   A name that is not a bare key is refused, because Codex rejects a quoted one.
 - `--disable` for `apps`, `browser_use`, `browser_use_external`, `computer_use`,
   `goals`, `hooks`, `image_generation`, `in_app_browser`, `memories`, `multi_agent`,
@@ -566,6 +568,9 @@ and field identified.
 This does not repair a failure inside Codex before its listing returns.
 
 
+Historical evidence. The complete transport-matched tables below supersede the
+sparse workaround described in this paragraph.
+
 **Fact, observed by the operator on 2026-11-01 with Codex 0.166.0.** A round 14
 change supplied a complete disabled standard input and output transport,
 `{enabled=false,command="/usr/bin/false",args=[]}`, for each named server. Merged
@@ -596,12 +601,11 @@ alone do not establish that execution required Dromon's response.
 
 ## Round 15 transport-aware disabling
 
-**Fact.** Dromon retains each listing entry's name and whether its transport is
-usable. A reported `stdio` transport requires a nonempty command, and a reported
+**Fact.** Dromon retains each listing entry's name and transport kind. A reported `stdio` transport requires a nonempty command, and a reported
 `streamable_http` transport requires a nonempty URL. Unknown or malformed transports
 are refused with the entry index and field, without echoing transport values.
 Round 20 supersedes the earlier inert table fallback. A missing or null transport
-now refuses startup. Existing transports receive only `enabled=false`. Conflicting duplicate names are refused. Transport addresses and
+now refuses startup. Existing transports receive complete disabled placeholder tables of their own kind. Conflicting duplicate names are refused. Transport addresses and
 credentials are not retained by the listing parser.
 
 Historical inference. The round 15 fallback was intended to preserve URL
@@ -728,8 +732,8 @@ initialization. No model prompt was sent. This seat did not execute that experim
 
 Inference. Using the line's own listing prevents the demonstrated undefined server
 override failure. The experiment does not reproduce an `account/read` error saying
-`failed to load workspace requirements` and `invalid data`. Its cause remains
-unexplained. A separate incomplete server definition is a hypothesis, not a finding.
+`failed to load workspace requirements` and `invalid data`. That earlier experiment did not establish its cause. The later observation below
+supersedes this uncertainty.
 
 Fact from Dromon code inspection. The disabling override is the only Codex server
 table Dromon generates. Codex lines reject configured server tables and account
@@ -737,3 +741,41 @@ server inheritance. Dromon sends `account/read` with empty parameters and writes
 Codex configuration file. The command that prints external agent configuration
 includes a command transport and does not install it into Codex. No alternative
 Dromon writer explaining the workspace requirement error was found.
+
+
+### Complete disabling overrides
+
+Fact reported by the operator on 2026-11-22. Twenty-four no-model observations
+isolated a project-defined streamable HTTP server override as the trigger on
+Codex 0.171.0. A bare disabling field allowed initialization but caused
+`account/read` to return error `-32603` with `failed to load workspace requirements`
+and `invalid data`. Omitting that override succeeded. A home-defined server did
+not show the failure. A complete disabled table using either placeholder transport
+allowed account reading. Status reported null runtime state and the HTTP case
+reported the placeholder origin. This seat did not run those live experiments.
+
+Inference. The workspace requirements loader rejects a command-line server table
+without a transport when the original definition lives in another layer. Earlier
+success with a home-defined server did not establish project-layer compatibility.
+
+Fact. Dromon now emits a complete table for each listed server. A streamable HTTP
+transport gets `{enabled=false,url="https://disabled.invalid/"}`. A standard input
+and output transport gets `{enabled=false,command="false"}`. Matching the listed
+kind avoids mixing a real URL with a command transport during configuration merge.
+Only identity and transport kind are retained. Real commands, arguments, addresses,
+headers and environment values are not copied into overrides. The reserved `.invalid`
+name prevents a placeholder origin from resolving through public domain name service.
+Disabling remains required even though the transport is inert.
+
+Fact. The started process must report an explicit null `runtimeStatus` for every
+server, with no tools and no affirmative enabled flag. Missing status and all
+non-null statuses refuse prompting. The bounded pagination check remains active.
+This observes startup state and cannot undo prior side effects or prove inventory
+completeness. Scripted tests cover both configuration layers and exact arguments.
+They do not establish live installed-engine compatibility.
+
+Fact from code inspection. Other command-line overrides set feature scalars,
+`default_permissions`, a complete permissions profile and individual shell
+environment variables. Dromon generates no other server table. Inference. Those
+other overrides have no demonstrated instance of this transport-layer defect.
+Their engine-specific merge semantics remain an external compatibility assumption.

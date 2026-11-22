@@ -613,13 +613,13 @@ def split_session(session: str | None) -> tuple[str | None, str | None]:
 
 @dataclass(frozen=True, slots=True)
 class ListedServer:
-    """Listing identity and whether Codex already has a usable transport.
+    """Listing identity and transport kind without addresses or credentials.
 
     Transport addresses and credentials are deliberately not retained.
     """
 
     name: str
-    has_transport: bool
+    transport: str | None
 
 
 def server_arguments(
@@ -655,7 +655,7 @@ def server_arguments(
             "-c",
             f"shell_environment_policy.set.{name}={_toml_string(value)}",
         ]
-    listed: dict[str, bool] = {}
+    listed: dict[str, str | None] = {}
     for index, server in enumerate(servers):
         name = server if isinstance(server, str) else server.name
         if BARE_KEY.fullmatch(name) is None:
@@ -663,7 +663,7 @@ def server_arguments(
                 f"codex mcp list field [{index}].name cannot be disabled by a Codex"
                 " override, so the line cannot be isolated"
             )
-        present = True if isinstance(server, str) else server.has_transport
+        present = "stdio" if isinstance(server, str) else server.transport
         if name in listed and listed[name] != present:
             raise EngineRefused(
                 "codex mcp list repeats a server with conflicting transport"
@@ -671,12 +671,19 @@ def server_arguments(
         listed[name] = present
     for name, present in sorted(listed.items()):
         # Codex's -c parser takes bare dotted keys only, and rejects a quoted one.
-        if not present:
+        if present not in ("stdio", "streamable_http"):
             raise EngineRefused(
                 "codex mcp list names a server without a usable transport,"
                 " so the line cannot start"
             )
-        arguments += ["-c", f"mcp_servers.{name}.enabled=false"]
+        # A sparse override can leave the command-line layer without a transport.
+        # Match the listed kind without carrying its real endpoint or credentials.
+        placeholder = (
+            'url="https://disabled.invalid/"'
+            if present == "streamable_http"
+            else 'command="false"'
+        )
+        arguments += ["-c", f"mcp_servers.{name}={{enabled=false,{placeholder}}}"]
     for feature in DISABLED_FEATURES:
         arguments += ["--disable", feature]
     image = "enable" if VIEW_IMAGE in config.builtin_tools else "disable"
@@ -1076,7 +1083,7 @@ def list_servers(
                 f"codex mcp list field [{index}].transport "
                 "is unsupported or incomplete, so the line cannot start"
             )
-        names.append(ListedServer(name, True))
+        names.append(ListedServer(name, str(kind)))
     return names
 
 
@@ -2342,7 +2349,8 @@ class CodexLine:
                         raise EngineRefused("the engine MCP status entry is malformed")
                     fields = cast(dict[str, object], entry)
                     if (
-                        fields.get("runtimeStatus") != "disabled"
+                        "runtimeStatus" not in fields
+                        or fields["runtimeStatus"] is not None
                         or not isinstance(fields.get("tools"), dict)
                         or fields["tools"]
                         or fields.get("enabled") is True

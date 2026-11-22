@@ -164,7 +164,7 @@ class FakeServer:
         account: object = {"type": "chatgpt", "planType": "pro", "email": None},
         model: str = LUNA,
         provider: str = "openai",
-        servers: Sequence[tuple[str, str, int]] = (("gmail", "disabled", 0),),
+        servers: Sequence[tuple[str, str | None, int]] = (("gmail", None, 0),),
         apps: Sequence[object] = (),
         failing: str | None = None,
         failing_error: dict[str, object] | None = None,
@@ -536,11 +536,10 @@ def test_the_arguments_disable_every_server_feature_and_the_shell() -> None:
     arguments = server_arguments(["slack", "gmail", "gmail"], LineConfig())
     assert arguments[0] == "app-server"
     entries = [value for value in arguments if value.startswith("mcp_servers.")]
-    # Sparse overrides, since a whole table with a command broke a server the
-    # operator defines by url under Codex 0.166.0.
+    # Complete tables avoid a transportless command-line configuration layer.
     assert entries == [
-        "mcp_servers.gmail.enabled=false",
-        "mcp_servers.slack.enabled=false",
+        'mcp_servers.gmail={enabled=false,command="false"}',
+        'mcp_servers.slack={enabled=false,command="false"}',
     ]
     with pytest.raises(EngineRefused, match="cannot be disabled"):
         server_arguments(["mail.example"], LineConfig())
@@ -2173,18 +2172,13 @@ def test_listing_preserves_transport_and_selects_valid_disabled_toml(
     entry = next(value for value in arguments if value.startswith("mcp_servers.mail"))
     disabled = tomllib.loads(entry)["mcp_servers"]["mail"]
     assert disabled["enabled"] is False
-    if transport is not None:
-        assert disabled == {"enabled": False}
-        # Model the ordinary table merge that must preserve the existing transport.
-        assert isinstance(transport, dict)
-        original = {
-            key: value
-            for key, value in cast(dict[str, str], transport).items()
-            if key != "type"
-        }
-        merged = {**original, **disabled}
-        assert merged == {**original, "enabled": False}
-        assert not ({"url", "command"} <= merged.keys())
+    assert isinstance(transport, dict)
+    key, placeholder = (
+        ("command", "false")
+        if transport["type"] == "stdio"
+        else ("url", "https://disabled.invalid/")
+    )
+    assert disabled == {"enabled": False, key: placeholder}
 
 
 @pytest.mark.parametrize(
@@ -2222,8 +2216,8 @@ def test_conflicting_listed_transports_are_refused() -> None:
     with pytest.raises(EngineRefused, match="conflicting transport"):
         server_arguments(
             [
-                codex_module.ListedServer("mail", True),
-                codex_module.ListedServer("mail", False),
+                codex_module.ListedServer("mail", "stdio"),
+                codex_module.ListedServer("mail", None),
             ],
             LineConfig(),
         )
@@ -2437,7 +2431,7 @@ def test_listing_uses_each_lines_project_configuration(
             current: FakeServer = server,
         ) -> AsyncGenerator[Connection]:
             overrides = {
-                value.split(".")[1]
+                value.split(".")[1].split("=")[0]
                 for value in arguments
                 if value.startswith("mcp_servers.")
             }
@@ -2484,7 +2478,7 @@ def test_a_transportless_listing_refuses_before_connection(tmp_path: Path) -> No
         tmp_path,
         environment={},
         connection_factory=never_connect,
-        server_lister=lambda cwd, env: [codex_module.ListedServer("broken", False)],
+        server_lister=lambda cwd, env: [codex_module.ListedServer("broken", None)],
     )
     with pytest.raises(EngineRefused, match="without a usable transport"):
         asyncio.run(target.check_start())
@@ -2802,3 +2796,67 @@ def test_complete_paginated_disabled_mcp_inventory_allows_the_turn() -> None:
     server = Paged([message("allowed"), completed()])
     assert run(line(server)).text == "allowed"
     assert server.methods().count("mcpServerStatus/list") == 2
+
+
+def test_complete_disable_tables_for_project_and_home_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    project = tmp_path / "project"
+    home = tmp_path / "home"
+    for directory, text in (
+        (
+            project,
+            '[mcp_servers.project]\nurl="https://real.example/mcp"\nhttp_headers={Authorization="synthetic-token"}\n',
+        ),
+        (
+            home,
+            '[mcp_servers.home]\ncommand="real-worker"\nargs=["private-argument"]\nenv={TOKEN="synthetic-token"}\n',
+        ),
+    ):
+        (directory / ".codex").mkdir(parents=True)
+        (directory / ".codex/config.toml").write_text(text)
+
+    def listing(*args: object, **kwargs: object) -> SimpleNamespace:
+        assert kwargs["cwd"] == project
+        entries: list[dict[str, object]] = []
+        for directory in (home, project):
+            config = tomllib.loads((directory / ".codex/config.toml").read_text())
+            for name, fields in config["mcp_servers"].items():
+                kind = "streamable_http" if "url" in fields else "stdio"
+                entries.append({"name": name, "transport": {"type": kind, **fields}})
+        return SimpleNamespace(returncode=0, stdout=json.dumps(entries))
+
+    monkeypatch.setattr(spawn, "run", listing)
+    monkeypatch.setattr(codex_module, "codex_path", unused_codex)
+    arguments = server_arguments(
+        codex_module.list_servers(project, {"HOME": str(home)}), LineConfig()
+    )
+    assert [a for a in arguments if a.startswith("mcp_servers.")] == [
+        'mcp_servers.home={enabled=false,command="false"}',
+        'mcp_servers.project={enabled=false,url="https://disabled.invalid/"}',
+    ]
+    for private in (
+        "real.example",
+        "Authorization",
+        "synthetic-token",
+        "real-worker",
+        "private-argument",
+        "TOKEN",
+    ):
+        assert private not in " ".join(arguments)
+
+
+@pytest.mark.parametrize("status", ["disabled", "ready", "", False, {}])
+def test_disabled_servers_must_have_no_runtime_status(status: object) -> None:
+    class Runtime(FakeServer):
+        def result(self, method: str) -> dict[str, Any]:
+            if method == "mcpServerStatus/list":
+                return {"data": [{"runtimeStatus": status, "tools": {}}]}
+            return super().result(method)
+
+    server = Runtime([])
+    with pytest.raises(EngineRefused, match="loads MCP servers"):
+        run(line(server))
+    assert "turn/start" not in server.methods()
