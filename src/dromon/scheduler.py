@@ -16380,9 +16380,11 @@ class Scheduler:
             "tasks": status.get("tasks", []),
         }
 
-    def engine_for(self, line_id: str, *, startup_only: bool = False) -> LineEngine:
+    def engine_for(
+        self, line_id: str, *, startup_only: bool = False, fresh: bool = False
+    ) -> LineEngine:
         """The line's engine, built on first use and kept for the session's life."""
-        engine = self._engines.get(line_id)
+        engine = None if fresh else self._engines.get(line_id)
         if engine is None:
             line = self._state().lines[line_id]
             try:
@@ -16431,8 +16433,9 @@ class Scheduler:
 
                 tools = [replace(tool, handler=refused) for tool in tools]
             engine = self._engine_factory(spec, tools)
-            self._engines[line_id] = engine
-            self._engine_built[line_id] = time.time_ns()
+            if not fresh:
+                self._engines[line_id] = engine
+                self._engine_built[line_id] = time.time_ns()
         return engine
 
     def line_summaries(self) -> list[Mapping[str, object]]:
