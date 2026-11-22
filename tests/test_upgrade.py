@@ -48,6 +48,82 @@ OLD_COMMIT = "6567167"
 REPOSITORY = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize("mode", ["upgrade", "live"])
+@pytest.mark.parametrize("destination", ["state", "runtime", "outside"])
+def test_relay_paths_use_live_protections(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, destination: str
+) -> None:
+    from dromon import daemon
+    from dromon.paths import ProjectPaths
+
+    root = tmp_path / "root"
+    state = root / ".dromon"
+    runtime = tmp_path / "runtime"
+    state.mkdir(parents=True)
+    runtime.mkdir()
+    monkeypatch.setenv("DROMON_RUNTIME_DIR", str(runtime))
+    target = {"state": state, "runtime": runtime, "outside": root}[destination]
+    notice = target / "notices.jsonl"
+    project = state / "dromon.toml"
+    project.write_text(
+        f"version = 1\n[relays.tail]\nkind = 'file'\npath = '{notice}'\n"
+        "[operators.ana]\nrelay = 'tail'\n"
+    )
+    old_log(state)
+    before = {p: p.read_bytes() for p in state.iterdir() if p.is_file()}
+    if mode == "upgrade":
+        result = by_name(
+            upgrade.run_checks(
+                state / "events.sqlite",
+                project_file=project,
+                root=root,
+                scratch_parent=tmp_path,
+            )
+        )["start"]
+        assert result.outcome is (
+            Outcome.FAIL if destination == "outside" else Outcome.PASS
+        ), result.detail
+        if destination == "outside":
+            assert "protected state or runtime" in result.detail
+    else:
+        code = daemon.run(ProjectPaths(root, state, runtime), check_only=True)
+        assert code == (exits.FAILURE if destination == "outside" else exits.OK)
+    assert not notice.exists()
+    assert {p: p.read_bytes() for p in state.iterdir() if p.is_file()} == before
+    assert list(runtime.iterdir()) == []
+
+
+def test_upgrade_refuses_workdirs_in_live_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dromon.lineconfig import LineConfig, encode_config
+
+    root = tmp_path / "root"
+    root.mkdir()
+    runtime = tmp_path / "live-runtime"
+    runtime.mkdir()
+    monkeypatch.setenv("DROMON_RUNTIME_DIR", str(runtime))
+    source = tmp_path / "events.sqlite"
+    project = tmp_path / "project.toml"
+    project.write_text(
+        "version = 1\n"
+        f"[lines.sleeper]\nmodel = 'claude-opus-5-5'\nworkdir = '{runtime}'\n"
+    )
+    with EventLog(source) as log:
+        log.append(LineCreated("sleeper", "claude-opus-5-5", "subscription"))
+        log.append(
+            LineConfigured("sleeper", encode_config(LineConfig(workdir=str(runtime))))
+        )
+    result = by_name(
+        upgrade.run_checks(
+            source, project_file=project, root=root, scratch_parent=tmp_path
+        )
+    )["start"]
+    assert result.outcome is Outcome.FAIL, result.detail
+    assert "inside a directory Dromon protects" in result.detail
+    assert list(runtime.iterdir()) == []
+
+
 def old_log(directory: Path) -> Path:
     """The fixture as the log file the old revision left."""
     path = directory / "events.sqlite"

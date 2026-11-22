@@ -311,3 +311,15 @@ a warning outcome. Other daemon warnings remain diagnostic notes in the start
 detail. Host sandbox prerequisites therefore remain visible without changing
 the outcome of checking whether copied state can start. A failed start still
 fails the check regardless of its warnings.
+
+**Fact.** Upgrade start validation uses live state and runtime protection paths
+for file relay destinations, sandbox grants, declared line and role working
+directories, Git SSH access and scheduler checks of replayed line configuration.
+Grok profiles use those same paths. File relays still refuse destinations outside
+the live state and runtime directories. Validation constructs routes without
+forwarding notices. Copied logs, token stores, snapshots and check runtime files
+continue to use isolated scratch paths. Registry and federation protections retain
+their existing rules. No engine is launched in this mode.
+
+**Residual.** This change corrects the protection paths used by existing checks.
+It does not add a complete sandbox preflight for every replayed Claude Code line.
