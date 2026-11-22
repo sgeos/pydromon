@@ -24,7 +24,10 @@ process that is not its own.
 **The kinds.** ``claude-code`` starts the ``dromon-launch`` script with the environment
 ``engine.launch_environment`` gives, which re-executes itself through the module
 command, as the Agent SDK's start does. ``codex`` and ``grok`` start through their own
-``_app_server`` and ``_grok_agent``. ``pi``, ``cursor-agent`` and ``antigravity`` start
+``_app_server_process`` and ``_grok_agent``. The Codex check passes the stand-in
+it generated explicitly to the shared process wrapper. It does not resolve an
+executable from a line's search path or bypass the resolver for a normal line.
+``pi``, ``cursor-agent`` and ``antigravity`` start
 through ``jsonlines.json_lines_factory``, the one function their adapters share, with
 each adapter's own input setting. Each runs under both stop policies, since the sweep
 decides differently under each. **Limit.** Claude Code's real start goes through the
@@ -218,7 +221,11 @@ def _starter(
     if kind == engine.ENGINE_NAME:
         return _claude(stand_in, environment, cwd)
     if kind == codex.ENGINE_NAME:
-        return codex._app_server([], cwd, environment)  # pyright: ignore[reportPrivateUsage]
+        # This is the stand-in we just generated, not a line's PATH selection.
+        # Share the production process wrapper without weakening its path guard.
+        return codex._app_server_process(  # pyright: ignore[reportPrivateUsage]
+            str(stand_in), [], cwd, environment
+        )
     if kind == grok.ENGINE_NAME:
         return grok._grok_agent([], cwd, environment)  # pyright: ignore[reportPrivateUsage]
     keep_input = kind != cursor.ENGINE_NAME

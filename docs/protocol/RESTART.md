@@ -278,6 +278,22 @@ worktrees or engine configurations are opened. They cannot refuse a restart.
 Each remaining effective line in the copied state is built through the production factory,
 including lines recorded only in the event log and the current role access policy.
 The check reports each supported line and engine as passed or failed.
+Fact. Engine failures use fixed reason codes named `startup_timeout`,
+`engine_refused`, `engine_io_failed` or `engine_start_failed`. Raw exception text,
+exception type names and captured engine standard error are not printed. The whole
+result record is screened against the configured disclosure list before printing.
+A match or screening failure withholds the diagnostic. This also withholds the
+line and engine names when they match. The operator client accepts only the fixed
+result and skip record formats and screens them again, withholding other child
+output, including raw diagnostics from an older daemon. Its own subprocess errors
+use fixed reason codes. A configuration or disclosure list that cannot be read
+refuses the check without printing the raw error.
+
+Residual. This intentionally loses detailed startup errors and captured standard
+error in the public check output. Named reason codes identify only a failure class.
+Static fallback wording is public and does not include adapter-supplied content.
+Restart preflight without the operator `check-engines` output mode retains its
+existing diagnostics and is not covered by this client output restriction.
 Cursor and Antigravity have no no-prompt startup check. They are reported as not
 checkable and skipped without refusing restart before adapter construction.
 Their launch arguments and configuration remain unverified by preflight. Any failure refuses
@@ -358,3 +374,10 @@ A turn report naming the restart reason is recorded as ending at a safe point fo
 the restart even if another redirect has since overwritten the pending reason.
 This produces the restart note without an additional driver-stop note. Reports
 naming another stop or no stop retain their own outcome.
+
+Fact. The Codex smoke check passes its own freshly generated stand-in explicitly
+to the process wrapper shared with normal launches. It does not use the normal
+line executable resolver, which deliberately refuses executable files in temporary
+or line-writable directories. No line configuration can select this smoke entry
+point or supply its command. Recording tests similarly inject their known stand-in
+when they exercise process framing rather than executable selection.

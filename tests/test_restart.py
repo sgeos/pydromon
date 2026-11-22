@@ -2128,6 +2128,7 @@ def test_a_restart_the_preflight_passes_goes_on_to_the_successor(
 
 
 @pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("screen", ["clear", "match", "error"])
 def test_launch_checks_report_each_line_and_never_run_turns(
     world: World,
     paths: ProjectPaths,
@@ -2135,6 +2136,7 @@ def test_launch_checks_report_each_line_and_never_run_turns(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     failed: bool,
+    screen: str,
 ) -> None:
     from dromon.engine import EngineRefused
 
@@ -2145,7 +2147,7 @@ def test_launch_checks_report_each_line_and_never_run_turns(
         async def check_start(self) -> None:
             checked.append("checked")
             if failed and len(checked) == 1:
-                raise EngineRefused("unexpected argument --deny")
+                raise EngineRefused("synthetic-private-value\nsecond-private-line")
 
         async def run_turn(self, prompt: str) -> TurnReport:
             raise AssertionError("startup checks must not send a prompt")
@@ -2171,6 +2173,14 @@ def test_launch_checks_report_each_line_and_never_run_turns(
     monkeypatch.setattr(world.scheduler, "_engine_factory", build)
     monkeypatch.setattr(daemon.asyncio, "start_unix_server", start)
     target = make_daemon(world, paths)
+    if screen == "match":
+        world.scheduler.set_disclosure_terms(("engine_refused",))
+    elif screen == "error":
+
+        def broken_screen(*texts: str) -> bool:
+            raise RuntimeError("synthetic-screening-error")
+
+        monkeypatch.setattr(world.scheduler, "discloses", broken_screen)
     assert asyncio.run(daemon.check_engine_launches(target, socket_path)) == (
         not failed
     )
@@ -2179,7 +2189,15 @@ def test_launch_checks_report_each_line_and_never_run_turns(
     assert not socket_path.exists()
     output = capsys.readouterr().err
     assert "line beta engine claude-code passed" in output
-    assert ("line alpha engine claude-code failed" in output) == failed
+    assert ("line alpha engine claude-code failed" in output) == (
+        failed and screen == "clear"
+    )
+    assert ("diagnostic withheld" in output) == (failed and screen != "clear")
+    assert "synthetic-screening-error" not in output
+    assert "synthetic-private-value" not in output
+    assert "second-private-line" not in output
+    if failed and screen == "clear":
+        assert "engine_refused" in output
     assert world.prompts == {}
 
 
@@ -2413,7 +2431,7 @@ def test_operator_engine_check_shows_per_line_results_and_returns_failure(
     ) -> subprocess.CompletedProcess[str]:
         assert argv[-2:] == ["--check", "--check-engines"]
         assert kwargs["capture_output"] is True
-        result = "passed" if code == 0 else "failed: invalid MCP merge"
+        result = "passed" if code == 0 else "failed: engine_refused"
         return subprocess.CompletedProcess(
             argv, code, "", f"dromond: line alpha engine codex {result}\n"
         )
@@ -2549,3 +2567,90 @@ def test_restart_report_survives_redirect_overwrite(world: World) -> None:
     assert "ended at a safe point for" in world.endings("alpha")[0]
     assert "driver" not in world.endings("alpha")[0]
     assert len(restart_notes(world)) == 1
+
+
+@pytest.mark.parametrize("term", ["unrelated", "alpha", "screen-error"])
+def test_engine_check_client_never_forwards_raw_child_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], term: str
+) -> None:
+    def execute(
+        argv: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv,
+            1,
+            "synthetic-private-output\n",
+            "dromond: line alpha engine codex failed: engine_refused\n"
+            "dromond: line beta engine codex failed: ValueError: private-exception\n",
+        )
+
+    monkeypatch.setattr(spawn, "run", execute)
+    if term == "screen-error":
+
+        def broken_screen(terms: Sequence[str], text: str) -> int:
+            raise RuntimeError("private-screening-error")
+
+        monkeypatch.setattr(cli, "matching_lines", broken_screen)
+    result = cli._preflight(  # pyright: ignore[reportPrivateUsage]
+        ["stand-in"], show_output=True, diagnostic_terms=(term,)
+    )
+    assert result == "engine_check_failed status 1"
+    output = capsys.readouterr()
+    assert "synthetic-private-output" not in output.out + output.err
+    assert "private-exception" not in output.out + output.err
+    assert "private-screening-error" not in output.out + output.err
+    assert ("line alpha engine codex failed: engine_refused" in output.err) == (
+        term == "unrelated"
+    )
+    assert "diagnostic withheld" in output.err
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_engine_check_client_uses_named_subprocess_error_reasons(
+    monkeypatch: pytest.MonkeyPatch, timeout: bool
+) -> None:
+    def execute(
+        argv: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if timeout:
+            raise subprocess.TimeoutExpired("synthetic-private-command", 1)
+        raise OSError("synthetic-private-exception")
+
+    monkeypatch.setattr(spawn, "run", execute)
+    result = cli._preflight(["stand-in"], show_output=True)  # pyright: ignore[reportPrivateUsage]
+    assert result == ("startup_timeout" if timeout else "engine_io_failed")
+
+
+def test_operator_engine_check_refuses_unreadable_disclosure_list_without_raw_error(
+    paths: ProjectPaths,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    config_path(paths.state_dir).write_text(
+        "version = 1\n[daemon]\ndisclosure_terms = 'terms.txt'\n"
+    )
+
+    def unreadable(path: Path) -> tuple[str, ...]:
+        raise OSError("synthetic-private-list-path")
+
+    def never_run(*args: object, **kwargs: object) -> None:
+        pytest.fail("an engine check started without disclosure screening")
+
+    monkeypatch.setattr(cli, "load_terms", unreadable)
+    monkeypatch.setattr(spawn, "run", never_run)
+    assert (
+        cli.main(
+            [
+                "--project",
+                str(paths.root),
+                "--runtime-dir",
+                str(paths.runtime_dir),
+                "check-engines",
+            ]
+        )
+        == exits.FAILURE
+    )
+    output = capsys.readouterr()
+    assert "configuration_unavailable" in output.err
+    assert "synthetic-private-list-path" not in output.out + output.err

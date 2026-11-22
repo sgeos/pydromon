@@ -11,7 +11,7 @@ import stat
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -370,6 +370,16 @@ def test_codex_and_grok_are_recorded_with_their_standard_error(
     script.write_text(f"#!{sys.executable}\n{HARNESS}")
     script.chmod(0o755)
     monkeypatch.setenv("PATH", str(directory))
+
+    def stand_in_path(
+        cwd: Path,
+        environment: Mapping[str, str],
+        *,
+        writable_paths: Sequence[Path] = (),
+    ) -> str:
+        return str(script)
+
+    monkeypatch.setattr(codex, "codex_path", stand_in_path)
     path = tmp_path / "probe.jsonl"
     recording = Recording(path, command, "m", stderr=True)
 
@@ -423,6 +433,16 @@ def test_standard_error_is_drained_alike_without_a_recording(
         script.write_text(f"#!{sys.executable}\n{LOUD_HARNESS}")
         script.chmod(0o755)
     monkeypatch.setenv("PATH", str(directory))
+
+    def stand_in_path(
+        cwd: Path,
+        environment: Mapping[str, str],
+        *,
+        writable_paths: Sequence[Path] = (),
+    ) -> str:
+        return str(directory / "codex")
+
+    monkeypatch.setattr(codex, "codex_path", stand_in_path)
 
     async def go() -> dict[str, Any] | None:
         async with start([], tmp_path, {"PATH": str(directory)}) as engine:

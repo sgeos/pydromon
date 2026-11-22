@@ -37,8 +37,11 @@ from the engine before reading on. The process is stopped when the turn ends.
 4. The response's `modelProvider` must be `openai`, its `activePermissionProfile` must
    be `dromon-line`, and its `model` is handed to the driver, which refuses any model
    but its own.
-5. `mcpServerStatus/list` for the thread must report every server as `disabled` with
-   no tools, and `app/list` must list nothing.
+5. `mcpServerStatus/list` for the started thread must report every server as
+   `disabled` with no tools and no true `enabled` flag. Every page is checked before
+   `turn/start`. A malformed inventory, repeated or invalid cursor, more than 32
+   pages or a status check exceeding 30 seconds refuses the turn. `app/list` must
+   list nothing.
 6. `turn/start` with the wake prompt as text and the line's effort, or the driver's.
 7. Notifications become driver events until `turn/completed`. A started
    `dynamicToolCall` of one of Dromon's tools, a `commandExecution` for a line given
@@ -628,9 +631,30 @@ its app-server. Launcher control variables are removed from the listing environm
 as they are before the app-server executes. `CODEX_HOME` remains reserved and is
 excluded from both commands under the existing environment policy. Dromon does not
 read Codex configuration files directly or use a daemon-wide server inventory.
-Executable lookup uses the line's search path. Relative and empty search entries
-are resolved from the line's working directory, and a missing search path uses the
-operating system default rather than the daemon's search path.
+Executable lookup considers only absolute entries in the line's search path.
+Relative and empty entries are ignored. A missing search path uses the operating
+system default rather than the daemon's search path. The selected executable is
+resolved through symbolic links and refused if its selected path or resolved target
+is inside the workspace, scratch, a temporary or cache directory, or an
+operator-granted writable directory. Both commands receive these write grants.
+The resolver returns the absolute resolved executable path that it selected.
+
+Fact. The listing runs outside the launcher's isolation. Tests before the review
+fix confirmed that a relative or empty search entry could execute a planted
+stand-in in the workspace. Tests after the fix require refusal without executing
+that stand-in. Absolute writable entries and symbolic links into the workspace
+are also refused. The command environment removes relative, empty and writable
+search directories before either command starts, so an interpreter selected by an
+`env` shebang cannot use those directories either. This restriction also applies
+to the search path inherited by the app-server.
+
+Assumption. The operator controls the installation and its interpreter and helper
+dependencies in retained search directories. Dromon does not inspect arbitrary
+program dependencies or detect hard links to writable executable content. It does
+not lock an installation against replacement between checking and execution.
+The workspace is excluded conservatively even for a read-only line. Installations
+inside an excluded root must be moved to an operator-controlled installation
+outside those roots. No fallback executable is invented after an unsafe selection.
 
 Fact. Previously the listing inherited the daemon's working directory while the
 app-server used the line's worktree. A deterministic test with a root project
@@ -640,6 +664,9 @@ Only names returned by the line's own listing now receive disabling overrides.
 Every named listing entry must describe a supported transport with a nonblank
 command or Uniform Resource Locator. Missing or malformed transport information
 refuses startup with a listing field reason before any app-server connection.
+An invalid server name is identified only by its zero-based position in the
+listing, never by its text. Server names are untrusted and can contain sensitive
+values or line breaks. Tests require that neither reaches the refusal.
 Dromon does not invent a transport to repair an incomplete configuration.
 
 Fact. Tests use a configuration-reading stand-in and scripted initialization,
@@ -649,7 +676,25 @@ Codex's own project trust rules or configuration merge behavior live.
 
 Residual. Configuration files and executable files can change between listing and
 startup. Dromon does not lock them or snapshot Codex's configuration hierarchy.
-Post-start checks still refuse active servers or server tools. A kept app-server
+After initialize, account verification and thread opening, the started app-server's
+`mcpServerStatus/list` inventory is checked before any prompt, including all pages
+up to the stated limit. Tests add an enabled server after the disk listing and
+require refusal before `turn/start`, without echoing the server name.
+
+Inference. This detects a server added during the window if the app-server reports
+its current inventory completely and accurately. It does not prove that the server
+did not already start or connect before the check, and cannot undo such effects.
+The status method is already used by the adapter. Its completeness on the installed
+Codex version has not been independently verified live. A dishonest or incomplete
+inventory can escape detection.
+
+Bound. The external listing has a 60 second subprocess timeout. Engine startup
+checks have a 90 second asynchronous deadline and the status inventory has a 30
+second asynchronous deadline and a 32 page limit. Normal fresh initialization and
+account and thread responses do not have a whole-startup deadline. Therefore there
+is no proven finite elapsed-time bound on the entire listing-to-status window for
+normal fresh turns. These deadlines are cooperative, not hard real-time bounds.
+A kept app-server
 retains the configuration loaded at its launch, and each turn checks its live
 isolation state. Refreshing its disk configuration requires reopening the process.
 

@@ -4371,10 +4371,28 @@ async def check_engine_launches(daemon: Daemon, socket_path: Path) -> bool:
                         await engine.check_start()
                 except Exception as error:  # noqa: BLE001
                     passed = False
+                    # Exceptions and engine standard error are untrusted. Even a
+                    # type name can be supplied by an adapter, so use fixed reason
+                    # codes and screen the complete diagnostic before printing.
+                    if isinstance(error, TimeoutError):
+                        reason = "startup_timeout"
+                    elif isinstance(error, EngineRefused):
+                        reason = "engine_refused"
+                    elif isinstance(error, OSError):
+                        reason = "engine_io_failed"
+                    else:
+                        reason = "engine_start_failed"
+                    message = (
+                        f"dromond: line {line_id} engine {engine_name} failed: {reason}"
+                    )
+                    try:
+                        withheld = daemon.scheduler.discloses(message)
+                    except Exception:  # noqa: BLE001, screening fails closed
+                        withheld = True
                     print(
-                        f"dromond: line {line_id} engine {engine_name} failed:"
-                        f" {type(error).__name__}: {error}"
-                        f" {diagnostics.text()}",
+                        "dromond: engine startup check failed, diagnostic withheld"
+                        if withheld
+                        else message,
                         file=sys.stderr,
                     )
                 else:
