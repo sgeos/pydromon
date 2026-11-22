@@ -2870,6 +2870,9 @@ class Scheduler:
         the log, as ``dromon.sealed`` describes."""
         self._engine_factory = engine_factory
         self._wall_clock = wall_clock
+        self._counter_start = self._new_counter_epoch("daemon_start")
+        self._limit_epochs: dict[str, dict[str, str]] = {}
+        self._autonomous_epochs: dict[str, dict[str, str]] = {}
         self._root = root
         """The project root, against which a line's working directory resolves, or
         ``None`` where the scheduler runs without a project, as in some tests."""
@@ -8305,6 +8308,7 @@ class Scheduler:
             "autonomous_turns": {
                 "used": self._autonomous.get(line_id, 0),
                 "allowed": limits.max_autonomous_turns,
+                "epoch": self._autonomous_epoch(line_id),
                 "current_turn_counts": (
                     self._counting.get(line_id) if line_id in self._running else None
                 ),
@@ -8335,6 +8339,9 @@ class Scheduler:
             "shell": self._shell_status(line_id, config),
             "kept_session": self.kept_session(line_id),
             "recent_turns": list(self._turn_costs.get(line_id, ())),
+            "recent_turns_epoch": dict(self._counter_start),
+            "turns": self._turns.get(line_id, 0),
+            "turns_epoch": dict(self._counter_start),
             "peers": self.peers_for(line_id),
             "last_fired_wake": self._last_fired.get(line_id),
             "last_task_note": self._last_task_note.get(line_id),
@@ -8743,6 +8750,20 @@ class Scheduler:
             )
         return " ".join(lines)
 
+    def _new_counter_epoch(self, cause: str) -> dict[str, str]:
+        """Identify a reset even when the wall clock repeats or moves back."""
+        return {
+            "id": new_id("epoch"),
+            "cause": cause,
+            "at": format_due(self._wall_clock()),
+        }
+
+    def _limit_epoch(self, line_id: str) -> dict[str, str]:
+        return dict(self._limit_epochs.get(line_id, self._counter_start))
+
+    def _autonomous_epoch(self, line_id: str) -> dict[str, str]:
+        return dict(self._autonomous_epochs.get(line_id, self._limit_epoch(line_id)))
+
     def cost_status(self, line_id: str) -> dict[str, object]:
         """**Row 8 of the T3 Code review.** The line's cost since its release, with
         unknown kept apart from zero. ``estimate`` is the sum of the costs turns
@@ -8782,6 +8803,7 @@ class Scheduler:
                 UNKNOWN if basis == "unknown" else f"{self._cost.get(line_id, 0.0):.4f}"
             ),
             "basis": basis,
+            "epoch": self._limit_epoch(line_id),
             "estimated_turns": estimated,
             "unknown_turns": unknown,
             "unknown_counts_as_usd": f"{UNKNOWN_TURN_COST_USD:.4f}",
@@ -10421,6 +10443,9 @@ class Scheduler:
             "leases_omitted": max(0, len(leases) - MAX_OVERVIEW_LEASES),
             "cost": {
                 "since_release_usd": cost["estimate"],
+                "epoch": cost["epoch"],
+                "unknown_turns": cost["unknown_turns"],
+                "estimated_turns": cost["estimated_turns"],
                 "basis": cost["basis"],
                 "carried": cost["whole"],
             },
@@ -10428,6 +10453,7 @@ class Scheduler:
                 "autonomous_turns": {
                     "used": self._autonomous.get(line_id, 0),
                     "allowed": limits.max_autonomous_turns,
+                    "epoch": self._autonomous_epoch(line_id),
                 },
                 "cost_usd": {
                     "limit": cost["limit"],
@@ -13824,6 +13850,8 @@ class Scheduler:
         waiting = self._queued_of(line_id)
         if waiting is not None:
             self._drop_queued(waiting, "an operator released its line")
+        self._limit_epochs[line_id] = self._new_counter_epoch("line_released")
+        self._autonomous_epochs.pop(line_id, None)
         self._autonomous.pop(line_id, None)
         self._cost.pop(line_id, None)
         self._cost_unknown.pop(line_id, None)
@@ -13847,6 +13875,9 @@ class Scheduler:
         used = self._autonomous.get(line_id, 0)
         match cause:
             case TurnCause.OPERATOR:
+                self._autonomous_epochs[line_id] = self._new_counter_epoch(
+                    "operator_turn"
+                )
                 turns = 0
             case TurnCause.PEER:
                 turns = used
@@ -16568,6 +16599,9 @@ class Scheduler:
                 "last_failure": failure_view(line),
                 "pending": len(self.pending(line_id)),
                 "turns": self._turns.get(line_id, 0),
+                "turns_epoch": dict(self._counter_start),
+                "limit_epoch": self._limit_epoch(line_id),
+                "autonomous_epoch": self._autonomous_epoch(line_id),
                 "autonomous_turns": self._autonomous.get(line_id, 0),
                 # A decimal string, because the client protocol carries no floats,
                 # or null when no turn since the release reported a cost and some
@@ -17045,6 +17079,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         "autonomous_turns": {
             "used": autonomous["used"],
             "allowed": autonomous["allowed"],
+            "epoch": autonomous["epoch"],
         },
         "cost_usd": {
             "estimate": cost["estimate"],
@@ -17056,6 +17091,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
             "limit_enforced": cost["limit_enforced"],
             "estimated_turns": cost["estimated_turns"],
             "whole": cost["whole"],
+            "epoch": cost["epoch"],
         },
         "provider_budget": full["provider_budget"],
         "disclosure": full["disclosure"],
@@ -17101,6 +17137,7 @@ def _compact_line_status(full: dict[str, object]) -> dict[str, object]:
         "background_task_count": len(cast(list[dict[str, object]], kept["tasks"])),
         "background_tasks_unknown": kept.get("background_tasks_unknown") is True,
         "recent_turn_count": len(cast(list[dict[str, object]], full["recent_turns"])),
+        "recent_turns_epoch": full["recent_turns_epoch"],
         "other_line_count": full["other_line_count"],
     }
 

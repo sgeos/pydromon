@@ -1495,15 +1495,16 @@ After memory pressure had held runs for hours, the operator committed a line's
 uncommitted tree exactly, which moved `HEAD` and changed no file a run reads, and every
 such entry was dropped and lost its place. A start in a working directory now records
 `content` in `run_queued`, the SHA-256 that `readiness.content_digest` gives, read off
-the event loop as the start is queued. It is the path, mode and bytes of every file the
-index tracks, as the files are on disk, so it does not depend on `HEAD` or on what is
+the event loop as the start is queued. It is the path, mode and bytes of every tracked and nonignored untracked
+file on disk, so it does not depend on `HEAD` or on what is
 staged. When `HEAD` has moved and the content read again is the same, the entry is not
 dropped. `run_retargeted` records the queue identifier, the commit it targeted, the
 commit it targets now and the content, the entry keeps its place in the queue, and the
 line is told. A content that differs, by one file or more, a content that cannot be
 told now, an entry with no recorded content, as from before the field or where it could
 not be read, and a commit command, are dropped as before, and the reason says which.
-Git is read with two commands, `git ls-files --stage` and `git hash-object
+Git is read with `git ls-files --stage`,
+`git ls-files --others --exclude-standard -z` and `git hash-object
 --no-filters --stdin-paths`, neither of which writes, and only when `HEAD` has moved. A
 tracked link is hashed in Python from its target, with the name git gives its blob.
 
@@ -1549,7 +1550,22 @@ not examined past it.
   next look compares again. The run's own receipt records the tree it ran in any
   case. A content that cannot be told is treated as changed, never as the same. A file
   edited while it is hashed may be read in either state.
-- **Residuals.** Untracked files are not compared, as for `tree`. A submodule, a
+- **Coverage limits accepted on 2026-11-22.** A `.gitignore` the line writes can
+  hide an untracked input from the digest. If the rule is already present when the
+  digest is taken, changing the ignored input leaves the digest unchanged. Hashing
+  `.gitignore` itself does not prevent this. An unchanged symbolic link also hides
+  a changed referent outside the tree. The digest hashes the link target text and
+  mode rather than the bytes reached through it. Equal digests therefore do not
+  establish that all inputs read by a gate are unchanged.
+  A gate that depends on either kind of input should use a tracked regular-file
+  snapshot inside the checkout, prepared before queuing, and read that snapshot
+  instead of the ignored input or external referent. If this is not possible, the
+  operator must independently pin and validate those inputs and run a fresh gate
+  for the selected versions. Digest equality alone cannot preserve verification
+  coverage for them. These limits apply to both queued content comparisons and
+  receipt comparisons. The tests pin both observed equalities. Ignored files are
+  excluded deliberately because reading them all would include caches.
+- **Residuals.** Ignored untracked files are not compared. A submodule, a
   tracked path that is now a directory, that begins with a double quote, or that holds
   a carriage return or a newline, a tree past the bounds above, and an unborn `HEAD`,
   all leave the content unknown. A link's name assumes git's SHA-1 object format, so
@@ -1640,3 +1656,17 @@ its reading of a link or a named pipe, and the links between failed runs and the
 corrections in `run_status`. **Round 15.** The descendant walk is stood in for by a
 function in the sandbox, and a real-supervisor test that starts a child with `setsid`
 runs only where `ps` runs, which is the supervised full gate.
+
+
+**Round 20.** A new untracked file was absent from the queued content digest,
+so committing it changed tracked membership and dropped a gate even when no file
+changed. Nonignored untracked files now use the same isolated git environment,
+mode inspection, link hashing and raw byte hashing as tracked paths. The combined
+listing is bounded by the existing entry limit, with the untracked read limited to
+the entries still available, and every read shares the existing deadline. Listing
+byte bounds and unsafe path refusals still apply. Repository ignore rules determine
+which untracked files participate. User and system git configuration remain disabled.
+The external `core.excludesFile` is set to the null device, so a user ignore file
+or a repository setting that points outside the checkout cannot hide new files.
+Committing a previously untracked file with identical bytes and mode preserves the
+content. Ignored files and edits concurrent with hashing remain outside this guarantee.

@@ -3164,3 +3164,36 @@ is treated as expired by inventory and acquisition, and expiry maintenance later
 records its release. The holder receives an informational own note. A crash before
 the note can omit notification. Lease expiry never proves that the holder's
 processes have stopped.
+
+
+## Counter epochs
+
+**Fact.** Limit counters are in memory. A daemon start resets the known cost
+subtotal, the counts of missing or partial cost and estimated cost, the consecutive
+autonomous turn count, the session turn count and the bounded recent turn history.
+A line release resets only the limit cost counters and consecutive autonomous
+turns. An operator turn resets only consecutive autonomous turns when it finishes.
+Peer mail does not reset that count. These resets give a released line a fresh
+allowance and reflect the absence of persisted limit accounting at daemon start.
+They do not mean that earlier spending was zero.
+
+Each counting period has an epoch with `id`, `cause` and `at`. The identifier
+changes even when wall clock timestamps coincide or move backwards. The causes are
+`daemon_start`, `line_released` and `operator_turn`. The timestamp uses Coordinated
+Universal Time. The epoch describes the counting boundary rather than a stored event
+identifier. It is observational metadata and does not change enforcement.
+
+`line_status.cost_usd.epoch` identifies the period for `estimate`, `unknown_turns`
+and `estimated_turns`. `line_status.autonomous_turns.epoch` identifies its separate
+period. `recent_turns_epoch` identifies the daemon start for the bounded recent
+history, whose count is only the number retained. The overview carries the same
+cost and autonomous epochs beside the carried totals. Client line summaries carry
+`limit_epoch`, `autonomous_epoch` and `turns_epoch` and print their identifiers,
+reset causes and times beside the current counts and durable totals.
+
+**Fact.** Whole-line cost, turn and unknown-cost totals never reset on release or
+restart. They are reconstructed from `line_cost_recorded` and count only from the
+first recorded cost event, as `since` says. Missing or partial costs remain counted
+across epochs even when the new limit subtotal is zero. Costs omitted by an engine
+remain unknown and cannot be inferred from the known subtotal. Retiring a line does
+not turn these totals into a complete billing record.

@@ -270,28 +270,35 @@ one path a line, so a newline ends one, and it strips a carriage return that end
 line. A path beginning with a double quote is unquoted as a C string, which
 ``_carried`` refuses apart from these."""
 
-_READ_SETTINGS: Final = ("-c", "core.fsmonitor=false")
+_READ_SETTINGS: Final = (
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    f"core.excludesFile={os.devnull}",
+)
 """Settings given to every git read of ``content_digest``, over the repository's own.
 **Round 19 review, item 1.** No read of the digest refreshes the index, and this one
-keeps git from running a monitor hook that the repository's configuration names."""
+keeps git from running a monitor hook that the repository's configuration names.
+The external ignore file is disabled so no user ignore file is read."""
 
 
 def content_digest(worktree: Path) -> str:
     """The SHA-256 of the content a run in ``worktree`` would test, the path, mode
-    and bytes of every file the index tracks, as the files are on disk.
+    and bytes of every tracked and nonignored untracked file on disk.
 
     **Round 19, at core's and ops' request.** ``tree_digest`` covers ``HEAD`` and the
     stamps of the changed paths, so a commit of exactly the uncommitted tree changes
     it, though not one file a run reads changed. The operator committing a line's
     tree dropped its queued gate after hours of waiting. This digest does not depend
-    on ``HEAD`` or on what is staged, only on which paths the index tracks and what
-    the files hold, so committing the tree, or resetting to a commit that holds it,
+    on ``HEAD`` or on what is staged, only on the tracked and nonignored
+    untracked paths and what the files hold. Committing the tree, or resetting
+    to a commit that holds it,
     gives the same digest, and a change of any one tracked file gives another.
 
-    **How it is read.** Two reads of git, neither of which writes or runs a program
+    **How it is read.** Three reads of git, none of which writes or runs a program
     that the configuration names. ``git ls-files --stage`` lists the index, and ``git
-    hash-object --no-filters --stdin-paths`` hashes every tracked regular file as its
-    bytes are. A link is hashed in Python from its target, as git would name its
+    hash-object --no-filters --stdin-paths`` hashes every participating regular
+    file as its bytes are. A link is hashed in Python from its target, as git names its
     blob, with its mode, and a tracked path whose file is gone is left out. Nothing
     is written to the object store. ``HEAD`` is read before and after, and a move
     between answers that the content cannot be told now.
@@ -318,13 +325,16 @@ def content_digest(worktree: Path) -> str:
     refused as ``_carried`` says. Each link no longer starts a git read of its own,
     and the whole digest has one deadline, ``CONTENT_SECONDS``.
 
-    **Cost.** Each read hashes the whole tracked tree, bounded by
+    **Cost.** Each read hashes the tracked and nonignored untracked tree, bounded by
     ``MAX_CONTENT_ENTRIES``, ``MAX_LISTING_BYTES`` and ``CONTENT_SECONDS`` for the
     whole, and a tree too large for those is answered as unknown, so its queued runs
     are dropped on a move of ``HEAD`` as before round 19.
 
-    **Not covered, residuals.** Untracked files are left out, as ``tree_digest``
-    leaves them out. A submodule, a tracked path that is now a directory, a tracked
+    **Round 20.** A bounded isolated `ls-files --others --exclude-standard` read
+    includes new files before they are added to the index. The combined unique
+    path count has the same entry bound. Ignored untracked files remain excluded.
+
+    **Not covered, residuals.** A submodule, a path that is now a directory, a
     path that ``--stdin-paths`` cannot carry, a tree past the bounds above, and an
     unborn or unreadable ``HEAD`` raise ``TreeUncovered``, so a caller treats the
     content as unknown and never as unchanged. A file edited while it is hashed may
@@ -346,7 +356,20 @@ def content_digest(worktree: Path) -> str:
         )
     listing: dict[str, tuple[str, str]] = {}
     regular: list[tuple[str, str]] = []
-    for path in sorted(_index_paths(top, deadline)):
+    paths_to_read = _index_paths(top, deadline)
+    others = _git_records(
+        top,
+        ("ls-files", "--others", "--exclude-standard", "-z"),
+        MAX_CONTENT_ENTRIES - len(paths_to_read),
+        _remaining(deadline),
+    )
+    paths_to_read.update(others)
+    if len(paths_to_read) > MAX_CONTENT_ENTRIES:
+        raise TreeUncovered(
+            "tracked and untracked paths exceed the content entry bound",
+            Uncovered.UNSTAMPED_PATH,
+        )
+    for path in sorted(paths_to_read):
         _remaining(deadline)
         _carried(path)
         try:
