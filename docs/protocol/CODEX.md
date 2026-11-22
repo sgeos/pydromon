@@ -597,15 +597,14 @@ alone do not establish that execution required Dromon's response.
 usable. A reported `stdio` transport requires a nonempty command, and a reported
 `streamable_http` transport requires a nonempty URL. Unknown or malformed transports
 are refused with the entry index and field, without echoing transport values.
-A missing or null transport receives the inert disabled table with
-`command="/usr/bin/false"` and empty arguments. Existing transports receive only
-`enabled=false`. Conflicting duplicate names are refused. Transport addresses and
+Round 20 supersedes the earlier inert table fallback. A missing or null transport
+now refuses startup. Existing transports receive only `enabled=false`. Conflicting duplicate names are refused. Transport addresses and
 credentials are not retained by the listing parser.
 
-**Inference.** This preserves URL transports while giving transport-less listing
-entries a syntactically complete disabled configuration. Parsed TOML tests cover
-both cases, malformed listings and conflicting duplicates. These tests model table
-merging and do not establish actual engine configuration merging. Post-start zero
+Historical inference. The round 15 fallback was intended to preserve URL
+transports while giving entries without transports a complete disabled configuration.
+Round 20 replaces that fallback with refusal. Parsed TOML tests model table merging
+and do not establish actual engine configuration merging. Post-start zero
 server-tool checks remain necessary. No live launch was performed in the sandbox.
 Official OpenAI documentation could not be fetched because its host did not resolve.
 
@@ -618,3 +617,78 @@ reading and fresh thread isolation checks. The connection closes before
 `turn/start`. The check therefore catches launch and configuration merge failures
 without a model query. It can create an unused thread record. It does not establish
 that post-prompt model behavior or resumed session recovery will succeed.
+
+
+## Round 20 configuration context
+
+Fact. The server listing runs for each line before every turn and startup check,
+including a kept or resumed session. It uses that line's working directory and
+filtered engine environment, including the same home and executable search path as
+its app-server. Launcher control variables are removed from the listing environment
+as they are before the app-server executes. `CODEX_HOME` remains reserved and is
+excluded from both commands under the existing environment policy. Dromon does not
+read Codex configuration files directly or use a daemon-wide server inventory.
+Executable lookup uses the line's search path. Relative and empty search entries
+are resolved from the line's working directory, and a missing search path uses the
+operating system default rather than the daemon's search path.
+
+Fact. Previously the listing inherited the daemon's working directory while the
+app-server used the line's worktree. A deterministic test with a root project
+`.codex/config.toml` and a separate worktree reproduces an override for a root-only
+server. Such an override can create a table without a transport in the worktree.
+Only names returned by the line's own listing now receive disabling overrides.
+Every named listing entry must describe a supported transport with a nonblank
+command or Uniform Resource Locator. Missing or malformed transport information
+refuses startup with a listing field reason before any app-server connection.
+Dromon does not invent a transport to repair an incomplete configuration.
+
+Fact. Tests use a configuration-reading stand-in and scripted initialization,
+without querying a model. They cover separate line directories, environment
+filtering, executable lookup and refusals before connection. They do not verify
+Codex's own project trust rules or configuration merge behavior live.
+
+Residual. Configuration files and executable files can change between listing and
+startup. Dromon does not lock them or snapshot Codex's configuration hierarchy.
+Post-start checks still refuse active servers or server tools. A kept app-server
+retains the configuration loaded at its launch, and each turn checks its live
+isolation state. Refreshing its disk configuration requires reopening the process.
+
+### Other engines
+
+Fact from code inspection. Claude Code checks project settings against the line's
+working directory and passes that directory to its software development kit.
+Project setting sources are disabled unless explicitly enabled. Grok inspects
+server state on the line's launched connection rather than using an external
+server listing. Cursor and Antigravity check the line workspace and pass it to
+their connection factories. None uses the Codex listing and override mechanism.
+
+Fact from code inspection. Pi starts its session in the line's working directory,
+but its separate `pi auth check` receives an environment without an explicit working
+directory. Inference. This is a similar context mismatch if Pi authentication
+resolution depends on project configuration. That dependency has not been reproduced
+and the Pi authentication path is unchanged in this fix. These observations do not
+establish equivalent behavior in installed engines or live provider sessions.
+
+
+### Codex 0.171.0 metadata experiment
+
+Fact reported by the operator on 2026-11-22. With Codex 0.171.0 and an isolated
+home, a project directory listing showed a server that a separate worktree listing
+did not show. The worktree app-server initialized with no override, exited with
+`invalid transport` before any answer with an undefined server disable override,
+and initialized with a complete disabled transport. No isolated account request
+received an answer. With the signed-in home, no override allowed initialization
+and account reading. An undefined server disable override again failed before
+initialization. No model prompt was sent. This seat did not execute that experiment.
+
+Inference. Using the line's own listing prevents the demonstrated undefined server
+override failure. The experiment does not reproduce an `account/read` error saying
+`failed to load workspace requirements` and `invalid data`. Its cause remains
+unexplained. A separate incomplete server definition is a hypothesis, not a finding.
+
+Fact from Dromon code inspection. The disabling override is the only Codex server
+table Dromon generates. Codex lines reject configured server tables and account
+server inheritance. Dromon sends `account/read` with empty parameters and writes no
+Codex configuration file. The command that prints external agent configuration
+includes a command transport and does not install it into Codex. No alternative
+Dromon writer explaining the workspace requirement error was found.

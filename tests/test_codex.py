@@ -107,6 +107,12 @@ def test_first_usage_notice_on_resumed_thread_excludes_inherited_totals() -> Non
 CWD = Path("/work")
 
 
+def unused_codex(cwd: Path, environment: Mapping[str, str]) -> str:
+    """A typed executable substitute for tests that replace process startup."""
+    del cwd, environment
+    return "/unused/codex"
+
+
 def luna(strategy: Strategy = Strategy.SUBSCRIPTION) -> Driver:
     return Driver.for_model(LUNA, strategy)
 
@@ -260,7 +266,7 @@ def line(
         session_id=session_id,
         environment={} if environment is None else environment,
         connection_factory=connect,
-        server_lister=lambda env: ["gmail", "slack"],
+        server_lister=lambda cwd, env: ["gmail", "slack"],
         observe=observe,
         credits_spent=(credits if credits is not None else []).append,
     )
@@ -723,7 +729,7 @@ def test_a_recorded_turn_replays_through_the_real_adapter(tmp_path: Path) -> Non
             mcp_tools=[RECORD],
             environment={},
             connection_factory=factory,
-            server_lister=lambda env: ["gmail"],
+            server_lister=lambda cwd, env: ["gmail"],
         )
 
     live = run(target(tapped))
@@ -796,9 +802,9 @@ def test_a_recorded_turn_replays_through_the_process_wrapper(
             workspace,
             config=LineConfig(),
             mcp_tools=[RECORD],
-            environment={},
+            environment={"PATH": str(directory)},
             connection_factory=factory,
-            server_lister=lambda env: ["gmail"],
+            server_lister=lambda cwd, env: ["gmail"],
         )
 
     live = run(target(tapped))
@@ -1282,7 +1288,7 @@ def scratch_line(server: FakeServer, workdir: Path, config: LineConfig) -> Codex
         mcp_tools=[RECORD],
         environment={"SHELL": "/bin/sh"},
         connection_factory=connect,
-        server_lister=lambda env: [],
+        server_lister=lambda cwd, env: [],
         scratch=own_scratch(workdir, "beta"),
     )
 
@@ -1960,17 +1966,17 @@ def test_disabled_connector_does_not_need_a_name(
 ) -> None:
     from types import SimpleNamespace
 
-    monkeypatch.setattr(codex_module, "codex_path", lambda: "/unused/codex")
+    monkeypatch.setattr(codex_module, "codex_path", unused_codex)
 
     def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(returncode=0, stdout=json.dumps([{"enabled": enabled}]))
 
     monkeypatch.setattr(spawn, "run", fake_run)
     if enabled is False:
-        assert codex_module.list_servers({}) == []
+        assert codex_module.list_servers(CWD, {}) == []
     else:
         with pytest.raises(EngineRefused, match=r"\[0\].name"):
-            codex_module.list_servers({})
+            codex_module.list_servers(CWD, {})
 
 
 def test_replacement_failure_explains_resume(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2099,7 +2105,6 @@ def test_replacement_cannot_reuse_contested_id(monkeypatch: pytest.MonkeyPatch) 
 @pytest.mark.parametrize(
     "transport",
     [
-        None,
         {"type": "stdio", "command": "worker"},
         {"type": "streamable_http", "url": "https://example.invalid/mcp"},
     ],
@@ -2110,7 +2115,7 @@ def test_listing_preserves_transport_and_selects_valid_disabled_toml(
 ) -> None:
     from types import SimpleNamespace
 
-    monkeypatch.setattr(codex_module, "codex_path", lambda: "/unused/codex")
+    monkeypatch.setattr(codex_module, "codex_path", unused_codex)
 
     def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(
@@ -2118,14 +2123,12 @@ def test_listing_preserves_transport_and_selects_valid_disabled_toml(
         )
 
     monkeypatch.setattr(spawn, "run", fake_run)
-    listed = codex_module.list_servers({})
+    listed = codex_module.list_servers(CWD, {})
     arguments = server_arguments(listed, LineConfig())
     entry = next(value for value in arguments if value.startswith("mcp_servers.mail"))
     disabled = tomllib.loads(entry)["mcp_servers"]["mail"]
     assert disabled["enabled"] is False
-    if transport is None:
-        assert disabled == {"enabled": False, "command": "/usr/bin/false", "args": []}
-    else:
+    if transport is not None:
         assert disabled == {"enabled": False}
         # Model the ordinary table merge that must preserve the existing transport.
         assert isinstance(transport, dict)
@@ -2142,10 +2145,13 @@ def test_listing_preserves_transport_and_selects_valid_disabled_toml(
 @pytest.mark.parametrize(
     "transport",
     [
+        None,
         [],
         {},
         {"type": "stdio"},
+        {"type": "stdio", "command": "   "},
         {"type": "streamable_http", "url": ""},
+        {"type": "streamable_http", "url": "   "},
         {"type": "unknown", "url": "x"},
     ],
 )
@@ -2155,7 +2161,7 @@ def test_listing_refuses_malformed_transport_without_echoing_values(
 ) -> None:
     from types import SimpleNamespace
 
-    monkeypatch.setattr(codex_module, "codex_path", lambda: "/unused/codex")
+    monkeypatch.setattr(codex_module, "codex_path", unused_codex)
 
     def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(
@@ -2164,7 +2170,7 @@ def test_listing_refuses_malformed_transport_without_echoing_values(
 
     monkeypatch.setattr(spawn, "run", fake_run)
     with pytest.raises(EngineRefused, match=r"\[0\].transport"):
-        codex_module.list_servers({})
+        codex_module.list_servers(CWD, {})
 
 
 def test_conflicting_listed_transports_are_refused() -> None:
@@ -2240,7 +2246,7 @@ def test_cancelled_start_check_closes_its_connection_without_a_prompt(
             session_id="existing-session",
             environment={},
             connection_factory=connect,
-            server_lister=lambda env: [],
+            server_lister=lambda cwd, env: [],
         )
         task = asyncio.create_task(target.check_start())
         await asyncio.wait_for(opened.wait(), timeout=2)
@@ -2289,7 +2295,7 @@ def test_a_start_refusal_reaches_the_closing_reason_with_its_credential_masked(
         config=LineConfig(keep_session=keep_session),
         mcp_tools=[RECORD],
         environment={"PATH": str(directory)},
-        server_lister=lambda env: [],
+        server_lister=lambda cwd, env: [],
     )
 
     async def go() -> None:
@@ -2319,3 +2325,139 @@ def test_a_closed_connection_without_standard_error_keeps_its_reason() -> None:
     with pytest.raises(EngineClosed) as raised:
         run(line(Silent([])))
     assert str(raised.value) == "the engine closed its connection during the turn"
+
+
+def test_listing_uses_each_lines_project_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A root-only server must never become an override in a worktree.
+
+    The stand-in reads real project TOML, without launching Codex or a model.
+    Its merge check reproduces Codex's transport requirement at startup.
+    """
+    from types import SimpleNamespace
+
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / ".codex").mkdir()
+    (root / ".codex/config.toml").write_text(
+        '[mcp_servers.root_only]\ncommand = "worker"\n'
+    )
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(codex_module, "codex_path", unused_codex)
+    contexts: list[tuple[Path, dict[str, str]]] = []
+
+    def fake_list(*args: object, **kwargs: object) -> SimpleNamespace:
+        cwd = Path(cast(Path, kwargs.get("cwd") or Path.cwd()))
+        env = dict(cast(Mapping[str, str], kwargs["env"]))
+        contexts.append((cwd, env))
+        path = cwd / ".codex/config.toml"
+        config = tomllib.loads(path.read_text()) if path.exists() else {}
+        servers = config.get("mcp_servers", {})
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {"name": name, "transport": {"type": "stdio", **transport}}
+                    for name, transport in servers.items()
+                ]
+            ),
+        )
+
+    monkeypatch.setattr(spawn, "run", fake_list)
+    cases: tuple[tuple[Path, set[str]], ...] = (
+        (worktree, set()),
+        (root, {"root_only"}),
+    )
+    for directory, expected in cases:
+        server = FakeServer(servers=())
+
+        @asynccontextmanager
+        async def connect(
+            arguments: list[str],
+            cwd: Path,
+            env: Mapping[str, str],
+            *,
+            expected_names: set[str] = expected,
+            current: FakeServer = server,
+        ) -> AsyncGenerator[Connection]:
+            overrides = {
+                value.split(".")[1]
+                for value in arguments
+                if value.startswith("mcp_servers.")
+            }
+            assert overrides == expected_names, (
+                "override creates a table without transport"
+            )
+            assert contexts[-1] == (
+                cwd,
+                {k: v for k, v in env.items() if k not in LAUNCH_VARIABLES},
+            )
+            assert "CODEX_HOME" not in env  # Reserved, excluded from both commands.
+            assert "OPENAI_API_KEY" not in env
+            yield current
+
+        target = CodexLine(
+            luna(),
+            directory,
+            environment={
+                "HOME": str(tmp_path),
+                "CODEX_HOME": "/discarded",
+                "OPENAI_API_KEY": "discarded",
+            },
+            connection_factory=connect,
+            server_lister=codex_module.list_servers,
+        )
+        asyncio.run(target.check_start())
+        assert "initialize" in server.methods()
+    assert [cwd for cwd, _ in contexts] == [worktree, root]
+
+
+def test_a_transportless_listing_refuses_before_connection(tmp_path: Path) -> None:
+    @asynccontextmanager
+    async def never_connect(
+        arguments: list[str], cwd: Path, env: Mapping[str, str]
+    ) -> AsyncGenerator[Connection]:
+        pytest.fail("a transportless server reached app-server startup")
+        yield FakeServer()
+
+    target = CodexLine(
+        luna(),
+        tmp_path,
+        environment={},
+        connection_factory=never_connect,
+        server_lister=lambda cwd, env: [codex_module.ListedServer("broken", False)],
+    )
+    with pytest.raises(EngineRefused, match="without a usable transport"):
+        asyncio.run(target.check_start())
+
+
+@pytest.mark.parametrize("path", ["bin", "", None])
+def test_codex_executable_lookup_uses_line_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str | None
+) -> None:
+    line_dir = tmp_path / "line"
+    line_dir.mkdir()
+    directory = line_dir / "bin" if path == "bin" else line_dir
+    directory.mkdir(exist_ok=True)
+    executable = directory / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path / "wrong"))
+    environment = {} if path is None else {"PATH": path}
+    if path is None:
+        monkeypatch.setattr(os, "defpath", str(directory))
+    assert codex_module.codex_path(line_dir, environment) == str(executable)
+
+
+def test_codex_executable_missing_from_line_path_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(EngineRefused, match="not installed or not on PATH"):
+        codex_module.codex_path(tmp_path, {"PATH": str(tmp_path / "missing")})

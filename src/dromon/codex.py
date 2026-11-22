@@ -619,16 +619,12 @@ def server_arguments(
                 f"the MCP server name {name!r} cannot be disabled by a Codex override,"
                 " so the line cannot be isolated"
             )
-        # Preserve existing transports. Adding command to a URL table broke
-        # account/read on Codex 0.166.0. Only transport-less entries need a full
-        # inert table so their disabled override remains valid TOML configuration.
-        value = (
-            "enabled=false"
-            if present
-            else '={enabled=false,command="/usr/bin/false",args=[]}'
-        )
-        key = f"mcp_servers.{name}." if present else f"mcp_servers.{name}"
-        arguments += ["-c", key + value]
+        if not present:
+            raise EngineRefused(
+                "codex mcp list names a server without a usable transport,"
+                " so the line cannot start"
+            )
+        arguments += ["-c", f"mcp_servers.{name}.enabled=false"]
     for feature in DISABLED_FEATURES:
         arguments += ["--disable", feature]
     image = "enable" if VIEW_IMAGE in config.builtin_tools else "disable"
@@ -682,7 +678,7 @@ class Connection(Protocol):
 type ConnectionFactory = Callable[
     [list[str], Path, Mapping[str, str]], AbstractAsyncContextManager[Connection]
 ]
-type ServerLister = Callable[[Mapping[str, str]], Sequence[str | ListedServer]]
+type ServerLister = Callable[[Path, Mapping[str, str]], Sequence[str | ListedServer]]
 
 
 class _Process:
@@ -722,8 +718,18 @@ class _Process:
         return record
 
 
-def codex_path() -> str:
-    found = shutil.which("codex")
+def codex_path(cwd: Path, environment: Mapping[str, str]) -> str:
+    """Resolve the executable using the line's PATH, including relative entries.
+
+    Missing PATH uses the operating system default, never the daemon's PATH.
+    Both the listing and app-server must select the same executable.
+    """
+    cwd = cwd.absolute()
+    search = os.pathsep.join(
+        str(cwd / entry) if not Path(entry).is_absolute() else entry
+        for entry in environment.get("PATH", os.defpath).split(os.pathsep)
+    )
+    found = shutil.which("codex", path=search)
     if found is None:
         raise EngineRefused("the codex command is not installed or not on PATH")
     return found
@@ -733,7 +739,9 @@ def codex_path() -> str:
 async def _app_server(
     arguments: list[str], cwd: Path, environment: Mapping[str, str]
 ) -> AsyncGenerator[Connection]:
-    command, launched, policy = launcher.wrap([codex_path(), *arguments], environment)
+    command, launched, policy = launcher.wrap(
+        [codex_path(cwd, environment), *arguments], environment
+    )
     recording = evidence.RECORDING.get()
     process = await spawn.subprocess_exec(
         *command,
@@ -755,13 +763,22 @@ async def _app_server(
         await evidence.stop_draining(draining)
 
 
-def list_servers(environment: Mapping[str, str]) -> Sequence[ListedServer]:
-    """The names of every MCP server Codex would load, from ``codex mcp list``."""
+def list_servers(cwd: Path, environment: Mapping[str, str]) -> Sequence[ListedServer]:
+    """List only the line's servers in its launch context, never the daemon's.
+
+    The environment is the filtered engine environment. Launcher control variables
+    are removed as they are before app-server exec. No transport values are retained
+    or included in a refusal. Configuration changes between listing and startup are
+    not locked, so the post-start isolation checks remain necessary.
+    """
     completed = spawn.run(
-        [codex_path(), "mcp", "list", "--json"],
+        [codex_path(cwd, environment), "mcp", "list", "--json"],
         capture_output=True,
         text=True,
-        env=dict(environment),
+        env={
+            k: v for k, v in environment.items() if k not in launcher.LAUNCH_VARIABLES
+        },
+        cwd=cwd,
         timeout=60,
         check=False,
     )
@@ -785,26 +802,24 @@ def list_servers(environment: Mapping[str, str]) -> Sequence[ListedServer]:
                 continue
             raise EngineRefused(f"codex mcp list field [{index}].name must be text")
         transport = fields.get("transport")
-        present = False
-        if transport is not None:
-            if not isinstance(transport, dict):
-                raise EngineRefused(
-                    f"codex mcp list field [{index}].transport must be a table"
-                )
-            details = cast(dict[str, object], transport)
-            kind = details.get("type")
-            endpoint = details.get("command" if kind == "stdio" else "url")
-            if (
-                kind not in ("stdio", "streamable_http")
-                or not isinstance(endpoint, str)
-                or not endpoint
-            ):
-                raise EngineRefused(
-                    f"codex mcp list field [{index}].transport "
-                    "is unsupported or incomplete"
-                )
-            present = True
-        names.append(ListedServer(name, present))
+        if not isinstance(transport, dict):
+            raise EngineRefused(
+                f"codex mcp list field [{index}].transport must be a usable table,"
+                " so the line cannot start"
+            )
+        details = cast(dict[str, object], transport)
+        kind = details.get("type")
+        endpoint = details.get("command" if kind == "stdio" else "url")
+        if (
+            kind not in ("stdio", "streamable_http")
+            or not isinstance(endpoint, str)
+            or not endpoint.strip()
+        ):
+            raise EngineRefused(
+                f"codex mcp list field [{index}].transport "
+                "is unsupported or incomplete, so the line cannot start"
+            )
+        names.append(ListedServer(name, True))
     return names
 
 
@@ -1416,7 +1431,7 @@ class CodexLine:
                 else checked_scratch(self.cwd, self.scratch)
             )
             arguments = server_arguments(
-                self._list_servers(environment),
+                self._list_servers(self.cwd, environment),
                 self.config,
                 self.protected,
                 self.mark,
