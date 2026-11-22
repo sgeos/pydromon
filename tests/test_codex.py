@@ -225,6 +225,7 @@ class FakeServer:
                     {
                         "name": n,
                         "runtimeStatus": s,
+                        "enabled": False,
                         "tools": {str(i): {} for i in range(t)},
                     }
                     for n, s, t in self.servers
@@ -538,8 +539,8 @@ def test_the_arguments_disable_every_server_feature_and_the_shell() -> None:
     entries = [value for value in arguments if value.startswith("mcp_servers.")]
     # Complete tables avoid a transportless command-line configuration layer.
     assert entries == [
-        'mcp_servers.gmail={enabled=false,command="false"}',
-        'mcp_servers.slack={enabled=false,command="false"}',
+        'mcp_servers.gmail={enabled=false,command="/nonexistent/dromon-disabled-server"}',
+        'mcp_servers.slack={enabled=false,command="/nonexistent/dromon-disabled-server"}',
     ]
     with pytest.raises(EngineRefused, match="cannot be disabled"):
         server_arguments(["mail.example"], LineConfig())
@@ -2174,7 +2175,7 @@ def test_listing_preserves_transport_and_selects_valid_disabled_toml(
     assert disabled["enabled"] is False
     assert isinstance(transport, dict)
     key, placeholder = (
-        ("command", "false")
+        ("command", "/nonexistent/dromon-disabled-server")
         if transport["type"] == "stdio"
         else ("url", "https://disabled.invalid/")
     )
@@ -2834,7 +2835,7 @@ def test_complete_disable_tables_for_project_and_home_servers(
         codex_module.list_servers(project, {"HOME": str(home)}), LineConfig()
     )
     assert [a for a in arguments if a.startswith("mcp_servers.")] == [
-        'mcp_servers.home={enabled=false,command="false"}',
+        'mcp_servers.home={enabled=false,command="/nonexistent/dromon-disabled-server"}',
         'mcp_servers.project={enabled=false,url="https://disabled.invalid/"}',
     ]
     for private in (
@@ -2860,3 +2861,30 @@ def test_disabled_servers_must_have_no_runtime_status(status: object) -> None:
     with pytest.raises(EngineRefused, match="loads MCP servers"):
         run(line(server))
     assert "turn/start" not in server.methods()
+
+
+@pytest.mark.parametrize("enabled", [1, "true", None, 0, "false"])
+def test_server_status_requires_exact_false(enabled: object) -> None:
+    class Malformed(FakeServer):
+        def result(self, method: str) -> dict[str, Any]:
+            if method == "mcpServerStatus/list":
+                return {
+                    "data": [{"runtimeStatus": None, "tools": {}, "enabled": enabled}]
+                }
+            return super().result(method)
+
+    server = Malformed([])
+    with pytest.raises(EngineRefused, match="loads MCP servers"):
+        run(line(server))
+    assert "turn/start" not in server.methods()
+
+
+def test_stdio_placeholder_cannot_select_a_path_program() -> None:
+    arguments = server_arguments(
+        [codex_module.ListedServer("mail", "stdio")], LineConfig()
+    )
+    entry = next(a for a in arguments if a.startswith("mcp_servers.mail="))
+    command = Path(tomllib.loads(entry)["mcp_servers"]["mail"]["command"])
+    assert command.is_absolute()
+    assert not command.exists()
+    assert str(command) == "/nonexistent/dromon-disabled-server"

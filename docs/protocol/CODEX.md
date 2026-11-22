@@ -176,7 +176,7 @@ observed live.
 Codex loads the operator's user configuration, which cannot be skipped by the
 app-server. Dromon starts it with these arguments.
 
-- `-c 'mcp_servers.NAME={enabled=false,command="false"}'` for each standard
+- `-c 'mcp_servers.NAME={enabled=false,command="/nonexistent/dromon-disabled-server"}'` for each standard
   input and output server, or a complete disabled table with
   `url="https://disabled.invalid/"` for each HTTP server, among the servers `codex mcp list --json` names.
   A name that is not a bare key is refused, because Codex rejects a quoted one.
@@ -760,15 +760,21 @@ success with a home-defined server did not establish project-layer compatibility
 
 Fact. Dromon now emits a complete table for each listed server. A streamable HTTP
 transport gets `{enabled=false,url="https://disabled.invalid/"}`. A standard input
-and output transport gets `{enabled=false,command="false"}`. Matching the listed
+and output transport gets `{enabled=false,command="/nonexistent/dromon-disabled-server"}`. Matching the listed
 kind avoids mixing a real URL with a command transport during configuration merge.
 Only identity and transport kind are retained. Real commands, arguments, addresses,
 headers and environment values are not copied into overrides. The reserved `.invalid`
-name prevents a placeholder origin from resolving through public domain name service.
+name is reserved by RFC 6761 and prevents a placeholder origin from resolving.
+The standard input and output placeholder is an absolute absent path under a
+root-owned directory outside line-writable roots. It performs no search through
+PATH if disabling fails. Assumption. The operator does not create that path or
+grant a line write access to its root. Neither placeholder substitutes for the
+post-start checks.
 Disabling remains required even though the transport is inert.
 
 Fact. The started process must report an explicit null `runtimeStatus` for every
-server, with no tools and no affirmative enabled flag. Missing status and all
+server, with no tools and an exact JSON boolean false enabled flag. Missing or malformed
+enabled flags are refused, including numeric and string values. Missing status and all
 non-null statuses refuse prompting. The bounded pagination check remains active.
 This observes startup state and cannot undo prior side effects or prove inventory
 completeness. Scripted tests cover both configuration layers and exact arguments.

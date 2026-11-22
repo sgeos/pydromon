@@ -681,7 +681,7 @@ def server_arguments(
         placeholder = (
             'url="https://disabled.invalid/"'
             if present == "streamable_http"
-            else 'command="false"'
+            else 'command="/nonexistent/dromon-disabled-server"'
         )
         arguments += ["-c", f"mcp_servers.{name}={{enabled=false,{placeholder}}}"]
     for feature in DISABLED_FEATURES:
@@ -2353,7 +2353,7 @@ class CodexLine:
                         or fields["runtimeStatus"] is not None
                         or not isinstance(fields.get("tools"), dict)
                         or fields["tools"]
-                        or fields.get("enabled") is True
+                        or fields.get("enabled") is not False
                     ):
                         turn.refusal = (
                             "the engine loads MCP servers the line was not given"
