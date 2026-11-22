@@ -28,7 +28,10 @@ completed, moved or abandoned.
 
 ## Next step
 
-The daemon runs `955b8bd`. A Claude Code turn completed live on it on 2026-11-19, and
+The daemon was stopped cleanly on 2026-11-22 for a machine restart, with every line idle
+and every worktree clean. Start it again with `uv run dromon start` from the main
+checkout, then run `uv run dromon check-engines`. Before the stop it ran `955b8bd`. A
+Claude Code turn completed live on it on 2026-11-19, and
 its session showed as `PDr00-pydromon-review-Ha55lo`. Next, build the Open items the
 operator chooses. The operator directed Anthropic seats as role owners until
 2026-11-18T21:26Z, with OpenAI seats as fallback only through round 20. The project file
