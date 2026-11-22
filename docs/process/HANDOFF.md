@@ -11,7 +11,7 @@ completed, moved or abandoned.
 
 - **Milestone 0.1.0 is complete.** Modules and protocol are listed in
   `docs/architecture/DESIGN.md` and `docs/protocol/README.md`.
-- **Rounds 18 to 20 merged**, pull requests 164 to 189. Changelog fragments in
+- **Rounds 18 to 20 merged**, pull requests 164 to 191. Changelog fragments in
   `changes/` hold the detail until a release.
 - **Round 20.** Every fix the other project's reports needed: Codex resumes without
   their turns and recover from an oversized frame, servers listed in each line's own
@@ -19,15 +19,13 @@ completed, moved or abandoned.
   `account/read` failure, an upgrade check that warns for dormant Grok profiles, a
   no-model account check, counter epochs, a Gemini 4 Neon driver for Pi, and queued runs
   that follow a commit of new files.
-- **In flight.** The upgrade check validates relay paths against its temporary copies'
-  directories, so the other project's live operator notice path is refused in the copy.
-  Ops is on `fix/r20-upgrade-check-relay-paths`. Until it merges, its upgrade is blocked.
+- **In flight.** None.
 - **Dependencies.** `claude-agent-sdk==0.2.174`, bundling Claude Code 2.1.310,
   `pykeleusma==0.2.2.0`, `cryptography==50.0.2`. Observed Codex 0.171.0.
 
 ## Next step
 
-The daemon runs `2e69b34`, where every line passed `dromon check-engines` and a Codex
+The daemon runs `d703cb3`, where every line passed `dromon check-engines` and a Codex
 account check answered on 2026-11-22. Read the other project's mailbox in full with `tmp/r20/interline-unread.sh` or a
 read-only query of the store, since `inbox` shows only the oldest twenty, and
 acknowledge each message after reading it. By the operator's direction of
@@ -39,8 +37,8 @@ are fallback only through round 21. The project file names the OpenAI owners.
 - **The other project.** At 6567167 its Codex lines were held by an oversized resume
   frame, by a listing in the wrong directory and by a bare disable override that broke
   `account/read`. Main fixes all three, and the operator confirmed the last fix live
-  from its directory. It has not yet upgraded, and the relay path defect in flight
-  still blocks its upgrade check. Its remaining requests are a bounded retry
+  from its directory. Pull request 191 fixed a fourth, the upgrade check refusing its
+  live relay path in the copy. It has not yet upgraded. Its remaining requests are a bounded retry
   for a transient account refusal, hold wording and causes, a preflight for a missing
   Codex, compact status output, launch-context checks for build caches, image input and
   silent cuts in the recent thread context.
