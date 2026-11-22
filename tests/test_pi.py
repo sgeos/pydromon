@@ -1201,3 +1201,27 @@ def test_priced_google_argon_turn_reports_catalogue_cost(home: Path) -> None:
     assert not report.cost_partial
     assert report.cost_estimate_usd == pytest.approx(expected)
     assert report.usage_note == pi.PI_USAGE_NOTE
+
+
+def test_priced_google_neon_turn_reports_promotional_cost(home: Path) -> None:
+    # Installed Google catalogue promotional input and output prices.
+    # This checks cost propagation, rather than claiming live billing verification.
+    spent = usage(100, 20)
+    expected = (100 * 3 + 20 * 15 + 100 * 0.15) / 1_000_000
+    spent["cost"]["total"] = expected
+    server = FakePi(
+        [TURN_START, assistant("done", spent=spent)],
+        model={"provider": "google", "id": "gemini-4-neon"},
+    )
+    target = line(
+        server,
+        home,
+        strategy=Strategy.API,
+        answer={"provider": "google", "status": "ready", "authType": "api_key"},
+    )
+    target.driver = Driver.for_model("pi:google/gemini-4-neon", Strategy.API)
+    report = run(target)
+    assert report.credential is Credential.API
+    assert not report.cost_partial
+    assert report.cost_estimate_usd == pytest.approx(expected)
+    assert report.usage_note == pi.PI_USAGE_NOTE

@@ -64,6 +64,7 @@ ENGINE_OF: Final[dict[str, str]] = {
     "cursor-agent:gemini-4-carbon-medium": "cursor-agent",
     "cursor-agent:gemini-4-hydrogen-medium": "cursor-agent",
     "pi:google/gemini-4-argon": "pi",
+    "pi:google/gemini-4-neon": "pi",
     "antigravity:gemini-3.8-flash-high": "antigravity",
 }
 """Each model with a packaged driver for a supported strategy, and its engine.
@@ -134,7 +135,9 @@ class Strategy(StrEnum):
     FLEXIBLE = "flexible"
 
 
-API_ONLY_MODELS: Final = frozenset({"pi:google/gemini-4-argon"})
+API_ONLY_MODELS: Final = frozenset(
+    {"pi:google/gemini-4-argon", "pi:google/gemini-4-neon"}
+)
 """Models whose documented provider has no subscription strategy."""
 
 

@@ -483,8 +483,11 @@ def test_gemini_cursor_settings_derive_from_luna(
     )
 
 
-def test_pi_argon_derives_metered_settings_and_refuses_other_strategies() -> None:
-    model = "pi:google/gemini-4-argon"
+@pytest.mark.parametrize("element", ["argon", "neon"])
+def test_pi_google_derives_metered_settings_and_refuses_other_strategies(
+    element: str,
+) -> None:
+    model = f"pi:google/gemini-4-{element}"
     driver = Driver.for_model(model, Strategy.API)
     previous = Driver.for_model("pi:openai/gpt-6-sol", Strategy.API)
     assert driver.settings == replace(
