@@ -576,3 +576,22 @@ def test_role_status_is_offered_only_to_a_seat(tmp_path: Path) -> None:
         assert unexpected["is_error"] is True
     finally:
         log.close()
+
+
+def test_profile_refusal_precedes_ownership_events(tmp_path: Path) -> None:
+    log, scheduler = scheduler_with_roles(tmp_path)
+    try:
+        scheduler.give_ownership(OperatorAddress("ana"), "core", None)
+        scheduler.hibernate("alpha")
+        before = log.last_seq
+
+        def refuse(line_id: str) -> None:
+            raise EventRejected(f"profile for {line_id} needs repair")
+
+        scheduler.set_awaken_check(refuse)
+        with pytest.raises(EventRejected, match="profile for alpha"):
+            scheduler.give_ownership(OperatorAddress("ana"), "core", "alpha")
+        assert log.last_seq == before
+        assert log.state.lines["alpha"].hibernated
+    finally:
+        log.close()

@@ -309,21 +309,27 @@ def check_snapshot_of(copied: Copied) -> Check:
     )
 
 
-def check_start(paths: ProjectPaths) -> tuple[Check, State | None]:
+def check_start(
+    paths: ProjectPaths, protection_paths: ProjectPaths | None = None
+) -> tuple[Check, State | None]:
     """The daemon's own start check on the copies, its words captured."""
     seen: list[State] = []
     words = io.StringIO()
     try:
         with contextlib.redirect_stderr(words):
             code = daemon.run(
-                paths, check_only=True, observe=lambda log: seen.append(log.state)
+                paths,
+                check_only=True,
+                observe=lambda log: seen.append(log.state),
+                protection_paths=protection_paths,
             )
     except Exception as error:  # noqa: BLE001 - every refusal is reported, not raised
         return Check("start", Outcome.FAIL, f"the start check raised {error!r}"), None
     said = " ".join(line.strip() for line in words.getvalue().splitlines() if line)
     if code != 0:
         return Check("start", Outcome.FAIL, said or f"exit code {code}"), None
-    return Check("start", Outcome.PASS, said), seen[-1] if seen else None
+    outcome = Outcome.WARN if "dromond: warning:" in said else Outcome.PASS
+    return Check("start", outcome, said), seen[-1] if seen else None
 
 
 def held_lines(state: State) -> Check:
@@ -661,7 +667,17 @@ def run_checks(
             checks.append(replay_check)
             checks.append(check_snapshot_of(copied))
             paths = ProjectPaths(root.resolve(), state_dir, scratch / "run")
-            start_check, started = check_start(paths)
+            # Copies are replay inputs, never engine workspaces. Check the paths
+            # a real start would protect, without asking a static Grok profile to
+            # predict a fresh temporary directory. No engine is built here.
+            live_state = root.resolve() / ".dromon"
+            live_runtime = Path(
+                os.environ.get("DROMON_RUNTIME_DIR", str(live_state / "run"))
+            )
+            live_paths = ProjectPaths(
+                root.resolve(), live_state, live_runtime.resolve()
+            )
+            start_check, started = check_start(paths, live_paths)
             checks.append(start_check)
             final = started or state
             if final is not None:

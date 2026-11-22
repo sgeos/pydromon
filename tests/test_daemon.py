@@ -1454,3 +1454,34 @@ def test_start_checks_every_logged_grok_profile(
                 daemon_module.check_grok_profiles(
                     config, paths, scheduler, registry_dir
                 )
+
+
+def test_invalid_dormant_grok_profile_cannot_awaken(
+    paths: ProjectPaths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dromon import grok
+    from dromon.model import LineHibernated
+    from dromon.sandbox import SandboxError
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    paths.state_dir.mkdir(exist_ok=True)
+    with EventLog(paths.event_log) as log:
+        log.append(LineCreated("sleeper", "grok-4.7", "subscription"))
+        log.append(LineHibernated("sleeper"))
+        scheduler = held_scheduler(log)
+        Daemon(paths, log, "2026-11-22T00:00:00Z", scheduler)
+        before = log.last_seq
+        with pytest.raises(SandboxError, match="sleeper.*dromon-reader"):
+            scheduler.awaken("sleeper")
+        assert log.last_seq == before
+        assert log.state.lines["sleeper"].hibernated
+        grok_home = home / grok.HOME_DIR
+        grok_home.mkdir(parents=True)
+        # An ancestor deny is stronger than the required descendant denials.
+        snippet = grok.profile_snippet(grok.READER_PROFILE, paths.root, (), home)
+        snippet = snippet.replace('deny = [".dromon"]', 'deny = ["/"]')
+        (grok_home / "sandbox.toml").write_text(snippet)
+        assert scheduler.awaken("sleeper")
+        assert not log.state.lines["sleeper"].hibernated
