@@ -2849,8 +2849,10 @@ def test_complete_disable_tables_for_project_and_home_servers(
         assert private not in " ".join(arguments)
 
 
-@pytest.mark.parametrize("status", ["disabled", "ready", "", False, {}])
-def test_disabled_servers_must_have_no_runtime_status(status: object) -> None:
+@pytest.mark.parametrize("status", ["ready", "", False, {}])
+def test_a_runtime_status_other_than_null_or_disabled_is_refused(
+    status: object,
+) -> None:
     class Runtime(FakeServer):
         def result(self, method: str) -> dict[str, Any]:
             if method == "mcpServerStatus/list":
@@ -2874,6 +2876,61 @@ def test_server_status_requires_exact_false(enabled: object) -> None:
             return super().result(method)
 
     server = Malformed([])
+    with pytest.raises(EngineRefused, match="loads MCP servers"):
+        run(line(server))
+    assert "turn/start" not in server.methods()
+
+
+def test_server_status_without_an_enabled_field_is_accepted() -> None:
+    """Codex 0.171.0 sends no enabled field in an MCP status entry, as observed live on
+    2026-11-22, so a stopped server without one must not refuse the turn. Requiring
+    the field refused every Codex line."""
+
+    class Live(FakeServer):
+        def result(self, method: str) -> dict[str, Any]:
+            if method == "mcpServerStatus/list":
+                return {"data": [{"name": "mail", "runtimeStatus": None, "tools": {}}]}
+            return super().result(method)
+
+    server = Live([completed()])
+    run(line(server))
+    assert "turn/start" in server.methods()
+
+
+@pytest.mark.parametrize("runtime", [None, "disabled"])
+def test_a_stopped_server_in_the_live_thread_shape_is_accepted(runtime: object) -> None:
+    """Inside a thread Codex 0.171.0 reports a disabled server with runtimeStatus
+    "disabled", empty tools and no enabled field, as observed live on 2026-11-22."""
+
+    class Live(FakeServer):
+        def result(self, method: str) -> dict[str, Any]:
+            if method == "mcpServerStatus/list":
+                return {
+                    "data": [
+                        {
+                            "name": "mail",
+                            "runtimeStatus": runtime,
+                            "tools": {},
+                            "authStatus": "unsupported",
+                        }
+                    ]
+                }
+            return super().result(method)
+
+    server = Live([completed()])
+    run(line(server))
+    assert "turn/start" in server.methods()
+
+
+@pytest.mark.parametrize("runtime", ["running", "starting", "", 0])
+def test_a_server_that_runs_is_refused(runtime: object) -> None:
+    class Running(FakeServer):
+        def result(self, method: str) -> dict[str, Any]:
+            if method == "mcpServerStatus/list":
+                return {"data": [{"runtimeStatus": runtime, "tools": {}}]}
+            return super().result(method)
+
+    server = Running([])
     with pytest.raises(EngineRefused, match="loads MCP servers"):
         run(line(server))
     assert "turn/start" not in server.methods()
