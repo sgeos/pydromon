@@ -265,3 +265,8 @@ absent from the project file under the existing retirement rule.
 every turn. An external edit after the start or awakening can therefore refuse a
 later turn. These checks do not establish the installed engine's live sandbox
 behaviour. The existing Grok confinement limits still apply.
+
+**Round 20 audit follow-up.** An empty `DROMON_RUNTIME_DIR` has the same meaning
+as an unset value and selects the default `.dromon/run` directory. Existing lines
+are checked using their current binding and effective configuration rather than
+a declaration that a client may have superseded.

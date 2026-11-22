@@ -1186,3 +1186,9 @@ its profile check before every turn, including after a profile changes on disk.
 The upgrade check validates live protection paths while replaying its private
 copies and never asks a profile to name fresh temporary directories. See
 [`UPGRADE.md`](../architecture/UPGRADE.md) for the migration requirements.
+
+**Round 20 audit follow-up.** For an existing line, the preflight and awakening
+checks use the scheduler's current model and effective configuration, including
+client overrides. A declaration is used only before the line exists. This prevents
+a rebind or configuration change while hibernated from selecting an obsolete
+profile. The same validator checks dormant ownership destinations.

@@ -3972,24 +3972,23 @@ def check_grok_profiles(
     )
     home = Path.home()
     grok_home = home / grok.HOME_DIR
-    from dromon.overrides import apply_config
-
     for line_id in sorted(set(scheduler.state.lines) | set(config.lines)):
         if waking is not None and line_id != waking:
             continue
         definition = config.lines.get(line_id)
         existing = line_id in scheduler.state.lines
-        overrides = scheduler.line_overrides(line_id) if existing else {}
-        model = overrides.get("model") or (
-            definition.model if definition is not None else scheduler.model_of(line_id)
-        )
-        if ENGINE_OF[str(model)] != grok.ENGINE_NAME:
+        # A rebind or configure may supersede the declaration without clearing
+        # hibernation. Validate exactly what the scheduler would run now.
+        if existing:
+            model = scheduler.model_of(line_id)
+            line = scheduler.effective_config(line_id)
+        elif definition is not None:
+            model = definition.model
+            line = definition.config
+        else:
             continue
-        line = (
-            apply_config(definition.config, overrides)
-            if definition is not None
-            else scheduler.effective_config(line_id)
-        )
+        if ENGINE_OF[model] != grok.ENGINE_NAME:
+            continue
         try:
             workspace = resolve_workdir(line.workdir, paths.root, protected)
             grok.check_profile(

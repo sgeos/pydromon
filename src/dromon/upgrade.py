@@ -672,7 +672,7 @@ def run_checks(
             # predict a fresh temporary directory. No engine is built here.
             live_state = root.resolve() / ".dromon"
             live_runtime = Path(
-                os.environ.get("DROMON_RUNTIME_DIR", str(live_state / "run"))
+                os.environ.get("DROMON_RUNTIME_DIR") or str(live_state / "run")
             )
             live_paths = ProjectPaths(
                 root.resolve(), live_state, live_runtime.resolve()

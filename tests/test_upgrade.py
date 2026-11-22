@@ -838,8 +838,9 @@ def test_old_grok_profile_on_dormant_lines_warns_at_start(
         assert "before" in result.detail
 
 
+@pytest.mark.parametrize("runtime_override", ["nondefault", "empty", "unset"])
 def test_upgrade_checks_live_protections_not_copy_directories(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime_override: str
 ) -> None:
     from dromon import daemon, grok, registry
     from dromon.paths import ProjectPaths
@@ -852,8 +853,17 @@ def test_upgrade_checks_live_protections_not_copy_directories(
     grok_home = home / grok.HOME_DIR
     grok_home.mkdir(parents=True)
     monkeypatch.setattr(Path, "home", lambda: home)
-    runtime = tmp_path / "live-run"
-    monkeypatch.setenv("DROMON_RUNTIME_DIR", str(runtime))
+    runtime = (
+        tmp_path / "live-run"
+        if runtime_override == "nondefault"
+        else root / ".dromon" / "run"
+    )
+    if runtime_override == "unset":
+        monkeypatch.delenv("DROMON_RUNTIME_DIR", raising=False)
+    else:
+        monkeypatch.setenv(
+            "DROMON_RUNTIME_DIR", "" if runtime_override == "empty" else str(runtime)
+        )
     live = ProjectPaths(root, root / ".dromon", runtime)
     protected = daemon.protected_dirs(
         live, ProjectConfig().federation, registry.configured_directory(os.environ)

@@ -1485,3 +1485,63 @@ def test_invalid_dormant_grok_profile_cannot_awaken(
         (grok_home / "sandbox.toml").write_text(snippet)
         assert scheduler.awaken("sleeper")
         assert not log.state.lines["sleeper"].hibernated
+
+
+@pytest.mark.parametrize("change", ["rebind", "configure"])
+@pytest.mark.parametrize("operation", ["awaken", "ownership"])
+def test_awaken_checks_current_binding_and_config(
+    paths: ProjectPaths,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+    operation: str,
+) -> None:
+    from dromon import grok
+    from dromon.driver import Strategy
+    from dromon.lineconfig import LineConfig
+    from dromon.model import LineHibernated, RoleDeclared, SeatBound
+    from dromon.projectconfig import LineDefinition, ProjectConfig
+    from dromon.sandbox import SandboxError
+
+    home = tmp_path / "home"
+    grok_home = home / grok.HOME_DIR
+    grok_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    # Only the reader profile is valid. The current binding needs a writer.
+    reader = grok.profile_snippet(grok.READER_PROFILE, paths.root, (), home)
+    (grok_home / "sandbox.toml").write_text(
+        reader.replace('deny = [".dromon"]', 'deny = ["/"]')
+    )
+    model = HAIKU if change == "rebind" else "grok-4.7"
+    config = (
+        LineConfig(builtin_tools=("Write",)) if change == "rebind" else LineConfig()
+    )
+    project = ProjectConfig(
+        lines={
+            "sleeper": LineDefinition(
+                "sleeper", model, Strategy.SUBSCRIPTION, config, None, None
+            )
+        }
+    )
+    paths.state_dir.mkdir(exist_ok=True)
+    with EventLog(paths.event_log) as log:
+        scheduler = held_scheduler(log)
+        scheduler.create_line("sleeper", model, Strategy.SUBSCRIPTION, config)
+        log.append(LineHibernated("sleeper"))
+        Daemon(paths, log, "2026-11-22T00:00:00Z", scheduler, project=project)
+        if change == "rebind":
+            scheduler.rebind_line("sleeper", "grok-4.7", Strategy.SUBSCRIPTION)
+        else:
+            scheduler.configure_line("sleeper", LineConfig(builtin_tools=("Write",)))
+        if operation == "ownership":
+            scheduler.ensure_operator("ana")
+            log.append(RoleDeclared("core", "tmp/worktrees/core", 1800))
+            log.append(SeatBound("sleeper", "core", True))
+        before = log.last_seq
+        with pytest.raises(SandboxError, match="dromon-writer"):
+            if operation == "awaken":
+                scheduler.awaken("sleeper")
+            else:
+                scheduler.give_ownership(OperatorAddress("ana"), "core", "sleeper")
+        assert log.last_seq == before
+        assert log.state.lines["sleeper"].hibernated
