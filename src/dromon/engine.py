@@ -327,6 +327,35 @@ class EngineRefused(Exception):
         self.stderr = stderr
 
 
+class EngineStreamTooLong(EngineRefused):
+    """A framed engine stream exceeded its declared record bound."""
+
+    recoverable: bool = False
+    replace_session: bool = False
+
+
+async def read_engine_record(
+    reader: asyncio.StreamReader, *, stream: str, limit: int
+) -> bytes:
+    """Read one engine record and name a stream overrun without retaining its data.
+
+    The caller must close the process after refusal. Continuing on a truncated
+    record could interpret engine output as a different message. The consumed
+    count is a lower bound because the delimiter need not have arrived yet.
+    """
+    try:
+        return await reader.readuntil(b"\n")
+    except asyncio.IncompleteReadError as error:
+        return error.partial
+    except asyncio.LimitOverrunError as error:
+        raise EngineStreamTooLong(
+            f"ENGINE_STREAM_TOO_LONG: {stream} exceeded {limit} bytes before"
+            f" its newline, with at least {error.consumed} bytes observed."
+            " The turn ended. Reduce the output or start a fresh engine session"
+            " before answering the failure question to resume the line."
+        ) from error
+
+
 class EngineClosed(EngineRefused):
     """The engine's process or connection ended before the turn's result. **Round 15
     follow-up of 2026-11-05.** A type of its own, so the scheduler records the cause

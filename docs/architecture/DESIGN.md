@@ -268,6 +268,9 @@ excluded.
 
 ## Session lines and engines
 
+The [engine stream audit](ENGINE_STREAMS.md) records stream bounds, separator
+overrun handling and recovery without an upgrade.
+
 **Proposed.** Coordinate existing harnesses rather than replace them, so that each model
 runs in the harness its vendor tuned for it. Dromon then owns the loop around each
 engine, which is what makes wakes possible. Candidate interfaces, with how far each was

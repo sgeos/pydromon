@@ -118,6 +118,12 @@ def test_the_sdks_refusal_of_a_long_message_is_recognised() -> None:
     assert "16" in error.line
 
 
+def test_sdk_refuses_one_character_over_the_production_bound() -> None:
+    assert message_too_long(
+        sdk_refusal(MAX_MESSAGE_CHARACTERS, MAX_MESSAGE_CHARACTERS + 1)
+    )
+
+
 def test_other_decode_errors_and_other_errors_are_not_taken_for_one() -> None:
     assert not message_too_long(CLIJSONDecodeError("{not json", ValueError("bad")))
     assert not message_too_long(EngineRefused("the engine is not connected"))

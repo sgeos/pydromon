@@ -213,6 +213,7 @@ from dromon.engine import (
     EngineClosed,
     EnginePlanLimit,
     EngineRefused,
+    EngineStreamTooLong,
     TurnReport,
     composed_instructions,
     instruction_sizes,
@@ -14383,11 +14384,19 @@ class Scheduler:
         except Exception as error:  # noqa: BLE001
             # The boundary between the scheduler and an engine. Any engine failure
             # ends only this turn, and is reported rather than crashing the daemon.
-            self._failed.add(line_id)
+            recoverable_stream = (
+                isinstance(error, EngineStreamTooLong) and error.recoverable
+            )
+            if recoverable_stream:
+                self._failed.discard(line_id)
+                if isinstance(error, EngineStreamTooLong) and error.replace_session:
+                    self._log.append(LineSessionCleared(line_id))
+            else:
+                self._failed.add(line_id)
             if isinstance(error, EngineRefused):
                 stop_cause = str(error)
             ending = "failed"
-            failed = True
+            failed = not recoverable_stream
             closing_error = error
             failure = raised_failure(
                 error,
@@ -14485,7 +14494,11 @@ class Scheduler:
         failure if it failed, and write that cause to the daemon log. **Round 15
         follow-up of 2026-11-05.** A turn marked failed for which no path named a
         cause records ``unknown``, so no failed turn is recorded without one."""
-        failed = line_id in self._failed
+        # A recoverable stream failure records its cause without suppressing the
+        # next turn through the scheduler's failed-line set.
+        failed = line_id in self._failed or (
+            isinstance(closing_error, EngineStreamTooLong) and closing_error.recoverable
+        )
         if failed and failure is None:
             failure = (FailureCause.UNKNOWN, None)
         closing_reason = (

@@ -715,6 +715,65 @@ def test_a_hold_asks_the_default_operator_when_none_messaged(
     assert recipient == OperatorAddress("operator")
 
 
+def test_stream_overrun_can_resume_after_answering_the_failure_question(
+    make_world: MakeWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dromon.engine import read_engine_record
+
+    target = make_world({"alpha": [[], []]})
+    engine = target.engine("alpha")
+    original = engine.run_turn
+
+    async def overrun(prompt: str) -> TurnReport:
+        del prompt
+        reader = asyncio.StreamReader(limit=16)
+        reader.feed_data(b"x" * 17)
+        await read_engine_record(reader, stream="test engine stdout", limit=16)
+        raise AssertionError("overrun was accepted")
+
+    monkeypatch.setattr(engine, "run_turn", overrun)
+    run(target, send(target, "alpha", "first"))
+    (question_id,) = questions_for(target)
+    assert target.log.state.lines["alpha"].held_by == question_id
+    assert "test engine stdout" in str(
+        target.log.state.lines["alpha"].last_closing_reason
+    )
+    monkeypatch.setattr(engine, "run_turn", original)
+    target.scheduler.send(ANA, LineAddress("alpha"), "resume", reply_to=question_id)
+    run(target, send(target, "alpha", "next"))
+    assert engine.prompts
+    assert target.log.state.lines["alpha"].held_by is None
+
+
+def test_recoverable_codex_overrun_does_not_hold_next_turn(
+    make_world: MakeWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dromon.engine import EngineStreamTooLong
+
+    target = make_world({"alpha": [[], []]})
+    engine = target.engine("alpha")
+    original = engine.run_turn
+
+    async def overrun(prompt: str) -> TurnReport:
+        del prompt
+        error = EngineStreamTooLong("ENGINE_STREAM_TOO_LONG: Codex stdout")
+        error.recoverable = True
+        error.replace_session = True
+        raise error
+
+    monkeypatch.setattr(engine, "run_turn", overrun)
+    run(target, send(target, "alpha", "first"))
+    assert target.log.state.lines["alpha"].held_by is None
+    assert not questions_for(target)
+    assert "ENGINE_STREAM_TOO_LONG" in str(
+        target.log.state.lines["alpha"].last_closing_reason
+    )
+    monkeypatch.setattr(engine, "run_turn", original)
+    run(target, send(target, "alpha", "next"))
+    assert len(engine.prompts) == 1
+    assert target.log.state.lines["alpha"].held_by is None
+
+
 def test_an_engine_failure_holds_the_line_and_asks_an_operator(
     make_world: MakeWorld, capsys: pytest.CaptureFixture[str]
 ) -> None:

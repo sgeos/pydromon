@@ -82,7 +82,13 @@ from dromon.activity import ActivityKind, Observer, ignore
 from dromon.capabilities import GROK as GROK_CAPABILITIES
 from dromon.capabilities import Known
 from dromon.driver import TOOL_RESULT, ActionTag, Credential, Driver, Event, Strategy
-from dromon.engine import EngineClosed, EngineRefused, TurnReport, read_instructions
+from dromon.engine import (
+    EngineClosed,
+    EngineRefused,
+    TurnReport,
+    read_instructions,
+    read_engine_record,
+)
 from dromon import launcher
 from dromon.launcher import STOP_POLICY_VARIABLE
 from dromon.processes import MARK_VARIABLE
@@ -1403,7 +1409,9 @@ class _Process:
         stdout = self._process.stdout
         if stdout is None:
             raise EngineRefused("the engine was started without a standard output")
-        line = await stdout.readline()
+        line = await read_engine_record(
+            stdout, stream="Grok bridge stdout", limit=MAX_LINE
+        )
         if not line:
             return None
         decoded: object = json.loads(line)

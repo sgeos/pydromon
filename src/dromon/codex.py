@@ -82,6 +82,7 @@ from dromon import __version__
 from dromon.activity import ActivityKind, Observer, ignore
 from dromon.driver import TOOL_RESULT, ActionTag, Credential, Driver, Event, Strategy
 from dromon.engine import (
+    EngineStreamTooLong,
     COMPACTION_REQUESTED,
     DIED_NOTE,
     HALT_REASON,
@@ -198,6 +199,9 @@ BARE_KEY: Final = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 MAX_LINE: Final = 64 * 1024 * 1024
 """The longest protocol line Dromon reads, so a runaway engine cannot exhaust memory."""
+
+FRAME_DRAIN_SECONDS: Final = 10
+"""The total time allowed to discard the rest of an oversized frame."""
 
 LIST_TERMINALS: Final = "thread/backgroundTerminals/list"
 TERMINATE_TERMINAL: Final = "thread/backgroundTerminals/terminate"
@@ -693,6 +697,57 @@ class _Process:
     ) -> None:
         self._process = process
         self._recording = recording
+        self._buffer = bytearray()
+
+    async def _record(self, stdout: asyncio.StreamReader) -> bytes:
+        """Keep a bounded record, discarding an oversized frame through its newline.
+
+        A discarded frame is never parsed. The drain has a total ten second bound
+        so an unterminated producer cannot keep the turn alive indefinitely.
+        MAX_LINE counts bytes before the newline, matching asyncio readuntil.
+        """
+        record = bytearray()
+        size = 0
+        deadline: float | None = None
+        complete = False
+        while True:
+            if self._buffer:
+                chunk = bytes(self._buffer)
+                self._buffer.clear()
+            elif deadline is None:
+                chunk = await stdout.read(65536)
+            else:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    chunk = await asyncio.wait_for(stdout.read(65536), remaining)
+                except TimeoutError:
+                    break
+            end = chunk.find(b"\n")
+            part = chunk if end < 0 else chunk[:end]
+            size += len(part)
+            if size <= MAX_LINE:
+                record.extend(part)
+            else:
+                record.clear()
+                if deadline is None:
+                    deadline = asyncio.get_running_loop().time() + FRAME_DRAIN_SECONDS
+            if end >= 0:
+                self._buffer.extend(chunk[end + 1 :])
+                complete = True
+            if complete or not chunk:
+                break
+        if size > MAX_LINE:
+            extent = "exactly" if complete else "at least"
+            error = EngineStreamTooLong(
+                f"ENGINE_STREAM_TOO_LONG: Codex app-server stdout frame has {extent}"
+                f" {size} bytes before its newline, exceeding {MAX_LINE}."
+                " The turn ended. Send a new instruction with bounded output."
+            )
+            error.recoverable = True
+            raise error
+        return bytes(record) + (b"\n" if complete else b"")
 
     async def send(self, message: Mapping[str, object]) -> None:
         stdin = self._process.stdin
@@ -707,7 +762,7 @@ class _Process:
         stdout = self._process.stdout
         if stdout is None:
             raise EngineRefused("the engine was started without a standard output")
-        line = await stdout.readline()
+        line = await self._record(stdout)
         if not line:
             if self._process.returncode is None:
                 with contextlib.suppress(TimeoutError):
@@ -1105,6 +1160,7 @@ class _Routed:
         self.pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self.active = False
         self.alive = True
+        self.error: Exception | None = None
         self._between = between
 
     async def send(self, message: Mapping[str, object]) -> None:
@@ -1112,7 +1168,10 @@ class _Routed:
             await self.inner.send(message)
 
     async def receive(self) -> dict[str, Any] | None:
-        return await self.queue.get()
+        message = await self.queue.get()
+        if message is None and self.error is not None:
+            raise self.error
+        return message
 
     async def pump(self) -> None:
         try:
@@ -1133,17 +1192,18 @@ class _Routed:
                     self.queue.put_nowait(message)
                 else:
                     await self._between(message)
-        except Exception:  # noqa: BLE001, S110
+        except Exception as error:  # noqa: BLE001
             # The engine's process or its pipe ended, which marks the connection
             # dead below, and the next turn starts a new one.
-            pass
+            self.error = error
         finally:
             self.alive = False
             self.queue.put_nowait(None)
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(
-                        EngineRefused(
+                        self.error
+                        or EngineRefused(
                             "the Codex app-server output closed; pending requests "
                             "failed"
                         )
@@ -1533,7 +1593,21 @@ class CodexLine:
         request_id = self._next_id
         await self._send({"id": request_id, "method": method, "params": params})
         while True:
-            message = await self._receive()
+            try:
+                message = await self._receive()
+            except EngineStreamTooLong as error:
+                error.args = (f"{error} While awaiting {method}.",)
+                if method == "thread/resume":
+                    error.replace_session = True
+                    self.session_id = None
+                    notice = (
+                        "Dromon replaced your Codex session after an oversized"
+                        " thread/resume response. This is a fresh session. Your mail,"
+                        " worktree, ownership and evidence index are preserved."
+                    )
+                    self._notes.append(notice)
+                    error.args = (f"{error} {notice}",)
+                raise
             if message.get("id") == request_id and "method" not in message:
                 if "error" in message:
                     error = message["error"]
@@ -1876,7 +1950,9 @@ class CodexLine:
             for attempt in range(2):
                 try:
                     result = await self._call(
-                        "thread/resume", {**settings, "threadId": resumable}, turn
+                        "thread/resume",
+                        {**settings, "threadId": resumable, "excludeTurns": True},
+                        turn,
                     )
                     break
                 except _RpcError as error:
@@ -1967,6 +2043,9 @@ class CodexLine:
         return hashlib.sha256(names.encode("utf-8")).hexdigest()[:16]
 
     async def _run(self, thread_id: str, prompt: str, turn: _Turn) -> None:
+        if self._notes:
+            prompt = "\n\n".join([*self._notes, prompt])
+            self._notes.clear()
         if turn.tools_changed:
             prompt = f"{TOOLS_CHANGED_NOTE}\n\n{prompt}"
         if turn.writer_replaced:
