@@ -11,3 +11,5 @@ Type: Fixed
 - Recoverable failures remain eligible after replay. Mail not submitted to Codex
   is requeued by its turn-end event. Submitted mail is not replayed and the next
   notice names its identifiers and uncertain outcome.
+- The scheduler restart test closes its original event log before replacing it,
+  avoiding an unclosed SQLite connection in each parameter case.

@@ -801,6 +801,9 @@ def test_stream_recovery_mail_survives_restart_without_duplicate_delivery(
 
     asyncio.run(one_turn())
     target.scheduler.stop_workers()
+    # The fixture closes target.log, which the restart replaces below. Close the
+    # original connection first so neither parameter case leaves it for collection.
+    target.log.close()
     with EventLog(target.path) as replayed:
         assert not replayed.state.lines["alpha"].failed
         assert replayed.state.messages[message_id].delivered is submitted
@@ -824,6 +827,8 @@ def test_stream_recovery_mail_survives_restart_without_duplicate_delivery(
         assert bodies(target, prompts[-1]) == ["one more"]
         assert "outcome is uncertain" not in prompts[-1]
         target.scheduler.stop_workers()
+    # Attribute a leaked connection in either scheduler cycle to this test.
+    gc.collect()
 
 
 def test_an_engine_failure_holds_the_line_and_asks_an_operator(
