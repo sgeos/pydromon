@@ -7,3 +7,6 @@ Type: Fixed
 - Awakening and ownership checks use the current binding and configuration after
   client changes. An empty runtime override selects the normal default directory
   during upgrade checks.
+- Upgrade start checks retain host sandbox warnings as diagnostic notes without
+  changing a successful outcome. Dormant Grok profile warnings still request
+  repair through a warning outcome.

@@ -325,10 +325,18 @@ def check_start(
             )
     except Exception as error:  # noqa: BLE001 - every refusal is reported, not raised
         return Check("start", Outcome.FAIL, f"the start check raised {error!r}"), None
-    said = " ".join(line.strip() for line in words.getvalue().splitlines() if line)
+    lines = [line.strip() for line in words.getvalue().splitlines() if line]
+    said = " ".join(lines)
     if code != 0:
         return Check("start", Outcome.FAIL, said or f"exit code {code}"), None
-    outcome = Outcome.WARN if "dromond: warning:" in said else Outcome.PASS
+    # Dormant Grok profiles need repair before awakening. Other start warnings,
+    # including host sandbox prerequisites, remain diagnostic notes and do not
+    # change whether the copied state passes the upgrade start check.
+    outcome = (
+        Outcome.WARN
+        if any(line.startswith("dromond: warning: Grok line ") for line in lines)
+        else Outcome.PASS
+    )
     return Check("start", outcome, said), seen[-1] if seen else None
 
 

@@ -68,7 +68,15 @@ def by_name(report: Report) -> dict[str, upgrade.Check]:
     return {check.name: check for check in report.checks}
 
 
-def test_the_old_revision_s_log_opens_under_this_code(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "host_problem", [None, "Claude Code needs bubblewrap and socat"]
+)
+def test_the_old_revision_s_log_opens_under_this_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_problem: str | None
+) -> None:
+    from dromon import daemon
+
+    monkeypatch.setattr(daemon, "sandbox_host_problem", lambda: host_problem)
     log = old_log(tmp_path)
     before = digest(log)
     scratch = tmp_path / "scratch"
@@ -82,6 +90,8 @@ def test_the_old_revision_s_log_opens_under_this_code(tmp_path: Path) -> None:
     assert checks["snapshot"].outcome is Outcome.PASS
     assert checks["start"].outcome is Outcome.PASS
     assert "the start checks pass" in checks["start"].detail
+    if host_problem is not None:
+        assert host_problem in checks["start"].detail
     assert checks["floor"].outcome is Outcome.SKIP
     assert digest(log) == before, "the source is never written"
     assert list(scratch.iterdir()) == [], "the scratch directory is removed"
@@ -171,7 +181,15 @@ def test_a_project_file_this_code_refuses_fails_the_start_alone(
     assert not report.passed
 
 
-def test_the_given_root_is_only_read(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "host_problem", [None, "Claude Code needs bubblewrap and socat"]
+)
+def test_the_given_root_is_only_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_problem: str | None
+) -> None:
+    from dromon import daemon
+
+    monkeypatch.setattr(daemon, "sandbox_host_problem", lambda: host_problem)
     root = tmp_path / "root"
     (root / "tmp" / "worktrees" / "gamma").mkdir(parents=True)
     project = tmp_path / "dromon.toml"
@@ -186,6 +204,8 @@ def test_the_given_root_is_only_read(tmp_path: Path) -> None:
         old_log(tmp_path), project_file=project, root=root, scratch_parent=tmp_path
     )
     assert by_name(report)["start"].outcome is Outcome.PASS, upgrade.render(report)
+    if host_problem is not None:
+        assert host_problem in by_name(report)["start"].detail
     after = sorted(
         (str(p.relative_to(root)), p.stat().st_mtime_ns) for p in root.rglob("*")
     )

@@ -270,3 +270,9 @@ behaviour. The existing Grok confinement limits still apply.
 as an unset value and selects the default `.dromon/run` directory. Existing lines
 are checked using their current binding and effective configuration rather than
 a declaration that a client may have superseded.
+
+**Fact.** Only dormant Grok profile warnings change a successful start check to
+a warning outcome. Other daemon warnings remain diagnostic notes in the start
+detail. Host sandbox prerequisites therefore remain visible without changing
+the outcome of checking whether copied state can start. A failed start still
+fails the check regardless of its warnings.
