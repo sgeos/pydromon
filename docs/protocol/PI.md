@@ -270,3 +270,25 @@ than rely on this estimate to cap total spending.
 reflect legitimately free usage. Dromon cannot distinguish these from the total.
 Verify first with an operator turn that checks the selected provider and model,
 credential source, tool routing, context limit and reported cost.
+
+## Gemini 4 Neon evidence on 2026-11-22
+
+**Fact.** The installed `@earendil-works/pi-coding-agent` package includes
+`node_modules/@earendil-works/pi-ai/dist/providers/data/google.json`.
+Its `google-generative-ai` table lists `chat:gemini-4-neon` with provider `google`,
+identifier `gemini-4-neon`, 1,048,576 context tokens and low, medium, high and xhigh
+thinking levels. The bundled `dist/bundle/chunks/chunk-P5VHIEWH.js` also contains
+the Google entry. Dromon packages the api strategy at medium effort and preserves
+the Google key restriction and refusal of other credential strategies.
+
+**Fact.** The catalogue prices input at 3 and output at 15 dollars per million
+tokens, with cache reads at 0.15 and cache writes at zero. The operator reports
+that the published input and output prices are promotional, with the end unknown,
+and become 4 and 20 thereafter. Dromon propagates Pi reported costs rather than
+embedding these prices in a second estimator. Catalogue updates and actual billing
+remain outside this driver's control. The scripted priced turn checks propagation
+of the promotional total. Existing missing cost and partial cost rules still apply.
+
+**Inference.** The reported replacement of Argon in the Gemini app does not imply
+withdrawal of Argon from the Google provider. Argon bindings remain unchanged.
+No live model identity, billing or effective context limit was verified.

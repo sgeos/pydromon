@@ -100,6 +100,7 @@ subscription draws on a plan's limits while API usage is charged for every token
 | `cursor_agent__gemini_4_hydrogen_medium_api.kel` | Gemini 4 Hydrogen on Cursor Agent | api | medium | 4 | 20 |
 | `cursor_agent__gemini_4_hydrogen_medium_flexible.kel` | Gemini 4 Hydrogen on Cursor Agent | flexible | medium | 4 | 20 |
 | `pi__google__gemini_4_argon_api.kel` | Gemini 4 Argon on Pi | api | medium | 4 | 20 |
+| `pi__google__gemini_4_neon_api.kel` | Gemini 4 Neon on Pi | api | medium | 4 | 20 |
 | `antigravity__gemini_3_8_flash_high_subscription.kel` | Gemini 3.8 Flash at high effort on Antigravity | subscription | high | 200 | 400 |
 | `antigravity__gemini_3_8_flash_high_api.kel` | Gemini 3.8 Flash at high effort on Antigravity | api | high | 4 | 20 |
 | `antigravity__gemini_3_8_flash_high_flexible.kel` | Gemini 3.8 Flash at high effort on Antigravity | flexible | high | 4 | 20 |
@@ -358,3 +359,22 @@ limit. Cursor and Pi retain their existing isolation restrictions.
 A scripted priced Argon turn checks cost propagation. Pi can still omit call costs,
 so its dollar limit is labelled unenforceable for total spend. Known parts are
 retained and partial totals are labelled. This is not a live billing verification.
+
+## Gemini 4 Neon evidence on 2026-11-22
+
+**Fact.** The installed Pi Google catalogue lists `gemini-4-neon` with
+1,048,576 context tokens and medium thinking support. The api driver uses
+`google/gemini-4-neon` and derives settings from the Argon driver.
+Subscription and flexible strategies remain refused for this provider.
+[Pi evidence](PI.md#gemini-4-neon-evidence-on-2026-11-22) records the source and prices.
+
+**Fact.** Neither installed Cursor Agent version contains a Neon identifier.
+No Cursor Neon driver is added because an account model list cannot be queried
+without network access. No installed Antigravity application or executable was
+found in the standard application and executable locations. No Antigravity Neon
+identifier was established and no driver is added.
+
+**Inference.** Replacing Argon in the Gemini app does not establish retirement of
+its application programming interface or harness identifiers. Argon drivers remain
+unchanged. The new Pi binding is not verified live and requires the existing
+operator verification before use.
