@@ -394,6 +394,23 @@ operator is never forced into an option that does not fit.
 
 **Rejection.** An event that does not apply is rejected whole and changes nothing.
 
+## Recoverable engine failures
+
+From round 20, `line_turn_ended.recoverable` may be true only with `failed` true.
+It retains the diagnostic while replay leaves the line eligible for another turn.
+False is refused and absence retains the prior failure behavior.
+
+`retry_messages` is an optional array of unique message identifiers, permitted
+only with `recoverable` true. Each must already be delivered to that line. Applying
+the event atomically makes that mail undelivered and restores its delivery
+accounting. The scheduler records it only when the engine has not submitted the
+prompt. After submission, acceptance and side effects may be uncertain, so mail
+is not replayed. A harness note persisted before turn end names those identifiers
+in the next recovery notice. Empty arrays are omitted by the writer.
+
+These fields are a rollback floor. An older daemon refuses them. The branch state
+change invalidates snapshots whose replay does not apply these semantics.
+
 ## Encoding
 
 An event is stored as one JSON object.

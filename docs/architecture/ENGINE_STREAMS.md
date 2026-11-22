@@ -23,16 +23,37 @@ through its newline, preserving any following frame. The drain has a total ten
 second deadline. Completed drains report the exact byte count before newline.
 Timeout or end of file reports only a lower bound. The turn then ends with
 `EngineStreamTooLong` and the scheduler does not create a failure hold for it.
-Normal conversation limits still apply. No automatic retry is requested.
+Normal conversation limits still apply.
 
-Fact. If the overrun occurs while awaiting `thread/resume`, Dromon clears the
+Fact. If the visible frame header identifies a result or error for the pending
+`thread/resume` request by its root identifier, with no observed method field,
+Dromon clears the
 engine session identifier in memory and in the event log. Its next turn starts a
 fresh session and receives a replacement notice. The line identity, mail, files,
 role ownership and evidence index remain. The diagnostic names the outstanding
-request rather than claiming to identify the method of a discarded response.
+request separately from the frame identifier and method. The reader inspects at
+most 8192 prefix bytes. Nested identifiers and truncated fields do not identify
+a response. Fields after a large result remain unknown. The discarded payload
+is not validated, so correlation is evidence from the visible header.
 The kept connection pump preserves the exception rather than replacing it with
 a generic end of stream. A failure during another request keeps the session
 identifier, so the next instruction can avoid repeating the oversized operation.
+
+Fact. A recoverable turn end records `recoverable` as true. Replay retains its
+diagnostic but leaves the line eligible for another turn. Before Codex submits
+`turn/start`, that event records `retry_messages` and restores those identifiers
+to the delivery queue. A restart reconstructs the same queue. A successful next
+turn delivers those identifiers once.
+
+Fact. Once `turn/start` has been submitted, its acceptance may be unknown if the
+answer is lost. Such mail remains delivered. A persisted recovery notice names
+the triggering identifiers and says that the outcome is uncertain. The next turn
+must inspect for side effects before acting. The notice retires only after a turn
+reports a result. Exactly once execution of external side effects is not promised.
+Unknown submission state also follows this conservative path. The notice is
+written before the turn-end event so an ended recoverable turn cannot lose that
+notice on restart. A crash before turn end retains existing interrupted-turn
+semantics. Repeated failures before submission remain subject to normal turn limits.
 
 | Stream and reader | Limit at both revisions unless stated | Handling |
 | --- | --- | --- |

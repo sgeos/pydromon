@@ -570,7 +570,8 @@ def test_the_next_turn_resumes_the_thread() -> None:
     assert TOOLS_CHANGED_NOTE not in str(server.params("turn/start")["input"])
 
 
-def test_resume_overrun_replaces_session_and_next_turn_says_so() -> None:
+@pytest.mark.parametrize("identity", ["matching", "other", "notice", "unknown"])
+def test_resume_overrun_replaces_session_and_next_turn_says_so(identity: str) -> None:
     from dromon.engine import EngineStreamTooLong
 
     class OverflowServer(FakeServer):
@@ -579,6 +580,9 @@ def test_resume_overrun_replaces_session_and_next_turn_says_so() -> None:
                 self.queue.clear()
                 error = EngineStreamTooLong("oversized frame")
                 error.recoverable = True
+                error.frame_id = self.sent[-1]["id"] if identity != "other" else -1
+                error.frame_is_response = identity != "unknown"
+                error.frame_method = "notice" if identity == "notice" else None
                 raise error
             return await super().receive()
 
@@ -587,6 +591,10 @@ def test_resume_overrun_replaces_session_and_next_turn_says_so() -> None:
     target = line(server, session_id=f"th:{fingerprint}")
     with pytest.raises(EngineStreamTooLong, match="thread/resume") as caught:
         run(target)
+    if identity != "matching":
+        assert not caught.value.replace_session
+        assert target.session_id == f"th:{fingerprint}"
+        return
     assert caught.value.replace_session
     assert target.session_id is None
     server.sent.clear()

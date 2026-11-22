@@ -181,6 +181,8 @@ KIND_FIELDS: Final[dict[str, tuple[str, ...]]] = {
         "failure",
         "failure_class",
         "closing_reason",
+        "recoverable",
+        "retry_messages",
     ),
     "task_noted": ("line_id", "message_id", "task_id", "status", "body"),
     "task_recorded": (
@@ -454,6 +456,8 @@ OMITTED_WHEN_NULL: Final[dict[str, tuple[str, ...]]] = {
         "failure",
         "failure_class",
         "closing_reason",
+        "recoverable",
+        "retry_messages",
     ),
     "brief_set": ("workdir_dirty",),
     "lease_acquired": ("note",),
@@ -657,6 +661,10 @@ def _to_wire(event: Event) -> tuple[str, dict[str, object]]:
                 "failure": None if event.failure is None else event.failure.value,
                 "failure_class": event.failure_class,
                 "closing_reason": event.closing_reason,
+                "recoverable": event.recoverable,
+                "retry_messages": list(event.retry_messages)
+                if event.retry_messages
+                else None,
             }
         case TaskRecorded():
             return "task_recorded", {
@@ -1096,6 +1104,10 @@ def _from_wire(kind: str, data: dict[str, object]) -> Event:
                 else _member(data, "failure", FailureCause),
                 _optional_str(data, "failure_class"),
                 _optional_str(data, "closing_reason"),
+                _optional_bool(data, "recoverable"),
+                ()
+                if data["retry_messages"] is None
+                else tuple(_list(data, "retry_messages", str)),
             )
         case "task_recorded":
             return TaskRecorded(

@@ -203,6 +203,53 @@ MAX_LINE: Final = 64 * 1024 * 1024
 FRAME_DRAIN_SECONDS: Final = 10
 """The total time allowed to discard the rest of an oversized frame."""
 
+FRAME_PREFIX_BYTES: Final = 8192
+
+
+def frame_identity(prefix: bytes) -> tuple[int | str | None, str | None, bool]:
+    """Read complete root fields before a truncated value, never nested identifiers.
+
+    Only a bounded prefix is inspected. An identifier after a large result is
+    unknown. No discarded payload is included in diagnostics.
+    """
+    text = prefix.decode("utf-8", "replace").lstrip()
+    if not text.startswith("{"):
+        return None, None, False
+    text = text[1:].lstrip()
+    decoder = json.JSONDecoder()
+    request_id: int | str | None = None
+    method: str | None = None
+    response = False
+    seen: set[str] = set()
+    while text:
+        try:
+            key, end = decoder.raw_decode(text)
+            if not isinstance(key, str) or key in seen:
+                return None, None, False
+            seen.add(key)
+            text = text[end:].lstrip()
+            if not text.startswith(":"):
+                break
+            text = text[1:].lstrip()
+            if key in ("result", "error"):
+                response = True
+            value, end = decoder.raw_decode(text)
+        except (ValueError, RecursionError):
+            break
+        tail = text[end:].lstrip()
+        if not tail.startswith((",", "}")):
+            break
+        if key == "id" and type(value) in (int, str):
+            request_id = value
+        if key == "method" and isinstance(value, str):
+            method = value
+        text = text[end:].lstrip()
+        if not text.startswith(","):
+            break
+        text = text[1:].lstrip()
+    return request_id, method, response and method is None
+
+
 LIST_TERMINALS: Final = "thread/backgroundTerminals/list"
 TERMINATE_TERMINAL: Final = "thread/backgroundTerminals/terminate"
 """The app-server's methods for a thread's background terminals. **Fact, read from the
@@ -707,6 +754,7 @@ class _Process:
         MAX_LINE counts bytes before the newline, matching asyncio readuntil.
         """
         record = bytearray()
+        prefix = bytearray()
         size = 0
         deadline: float | None = None
         complete = False
@@ -726,6 +774,7 @@ class _Process:
                     break
             end = chunk.find(b"\n")
             part = chunk if end < 0 else chunk[:end]
+            prefix.extend(part[: max(0, FRAME_PREFIX_BYTES - len(prefix))])
             size += len(part)
             if size <= MAX_LINE:
                 record.extend(part)
@@ -746,6 +795,13 @@ class _Process:
                 " The turn ended. Send a new instruction with bounded output."
             )
             error.recoverable = True
+            error.frame_id, error.frame_method, error.frame_is_response = (
+                frame_identity(bytes(prefix))
+            )
+            identity = json.dumps(
+                {"id": error.frame_id, "method": error.frame_method}, ensure_ascii=True
+            )
+            error.args = (f"{error} Frame identity {identity}, null means unknown.",)
             raise error
         return bytes(record) + (b"\n" if complete else b"")
 
@@ -1437,7 +1493,12 @@ class CodexLine:
             self.session_id = session_id
 
     async def run_turn(self, prompt: str) -> TurnReport:
-        result = await self._execute(prompt)
+        self._prompt_sent = False
+        try:
+            result = await self._execute(prompt)
+        except EngineStreamTooLong as error:
+            error.prompt_may_have_run = self._prompt_sent
+            raise
         if result is None:
             raise RuntimeError("a turn ended without its report")
         return result
@@ -1597,7 +1658,12 @@ class CodexLine:
                 message = await self._receive()
             except EngineStreamTooLong as error:
                 error.args = (f"{error} While awaiting {method}.",)
-                if method == "thread/resume":
+                if (
+                    method == "thread/resume"
+                    and error.frame_id == request_id
+                    and error.frame_method is None
+                    and error.frame_is_response
+                ):
                     error.replace_session = True
                     self.session_id = None
                     notice = (
@@ -2051,6 +2117,8 @@ class CodexLine:
         if turn.writer_replaced:
             prompt = f"{WRITER_REPLACED_NOTE}\n\n{prompt}"
         self.driver.step(Event("turn_start"))
+        # A sent request may have been accepted even if its response was lost.
+        self._prompt_sent = True
         started = await self._call(
             "turn/start",
             {

@@ -291,6 +291,8 @@ def test_kept_resume_overrun_preserves_reason_and_replaces_session(
         ):
             error = EngineStreamTooLong("ENGINE_STREAM_TOO_LONG: test frame")
             error.recoverable = True
+            error.frame_id = message["id"]
+            error.frame_is_response = True
             raise error
         return message
 

@@ -774,6 +774,58 @@ def test_recoverable_codex_overrun_does_not_hold_next_turn(
     assert target.log.state.lines["alpha"].held_by is None
 
 
+@pytest.mark.parametrize("submitted", [False, True])
+def test_stream_recovery_mail_survives_restart_without_duplicate_delivery(
+    make_world: MakeWorld, monkeypatch: pytest.MonkeyPatch, submitted: bool
+) -> None:
+    from dromon.engine import EngineStreamTooLong
+
+    target = make_world({"alpha": [[], []]})
+    engine = target.engine("alpha")
+
+    async def overrun(prompt: str) -> TurnReport:
+        del prompt
+        error = EngineStreamTooLong("ENGINE_STREAM_TOO_LONG")
+        error.recoverable = True
+        error.prompt_may_have_run = submitted
+        raise error
+
+    monkeypatch.setattr(engine, "run_turn", overrun)
+    message_id = target.scheduler.send(ANA, LineAddress("alpha"), "original assignment")
+
+    async def one_turn() -> None:
+        target.scheduler._begin_turn(  # pyright: ignore[reportPrivateUsage]
+            "alpha", [(message_id, target.log.state.messages[message_id])]
+        )
+        await asyncio.gather(*target.scheduler._running.values())  # pyright: ignore[reportPrivateUsage]
+
+    asyncio.run(one_turn())
+    target.scheduler.stop_workers()
+    with EventLog(target.path) as replayed:
+        assert not replayed.state.lines["alpha"].failed
+        assert replayed.state.messages[message_id].delivered is submitted
+        target.log = replayed
+        target.scheduler = Scheduler(replayed, target.build, tick_seconds=0)
+
+        async def next_turn() -> None:
+            if submitted:
+                target.scheduler.send(ANA, LineAddress("alpha"), "new instruction")
+
+        run(target, next_turn)
+        prompts = target.engines["alpha"].prompts
+        assert len(prompts) == 1
+        if submitted:
+            assert "outcome is uncertain" in prompts[0]
+            assert message_id in prompts[0]
+            assert bodies(target, prompts[0]) == ["new instruction"]
+        else:
+            assert bodies(target, prompts[0]) == ["original assignment"]
+        run(target, send(target, "alpha", "one more"))
+        assert bodies(target, prompts[-1]) == ["one more"]
+        assert "outcome is uncertain" not in prompts[-1]
+        target.scheduler.stop_workers()
+
+
 def test_an_engine_failure_holds_the_line_and_asks_an_operator(
     make_world: MakeWorld, capsys: pytest.CaptureFixture[str]
 ) -> None:

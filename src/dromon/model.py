@@ -940,7 +940,24 @@ class LineTurnEnded:
     """Credential-masked and disclosure-screened first exception line, at most
     240 characters. Absent on old events or when screening withholds it."""
 
+    recoverable: bool | None = None
+    """A recorded failure that permits the next turn without a failure hold."""
+    retry_messages: tuple[str, ...] = ()
+    """Mail not submitted to the engine, atomically made deliverable again."""
+
     def __post_init__(self) -> None:
+        if self.recoverable is not None and (
+            self.recoverable is not True or self.failed is not True
+        ):
+            raise InvalidField("recoverable requires a failed turn")
+        if self.retry_messages and self.recoverable is not True:
+            raise InvalidField("retry_messages requires a recoverable turn")
+        if self.retry_messages and self.unreported is not True:
+            raise InvalidField("retry_messages requires an unreported turn")
+        if len(set(self.retry_messages)) != len(self.retry_messages):
+            raise InvalidField("retry_messages must be unique")
+        for message_id in self.retry_messages:
+            check_id("message_id", message_id)
         if self.closing_reason is not None and (
             self.failure is None
             or len(self.closing_reason) > 240
@@ -3575,12 +3592,15 @@ class State:
                 self._check_prioritized(event)
             case MessageCorrelated():
                 self._check_correlated(event)
-            case (
-                TurnCorrelated()
-                | LineTurnEnded()
-                | DisclosureChecked()
-                | TaskRecorded()
-            ):
+            case LineTurnEnded():
+                self._line(event.line_id)
+                for message_id in event.retry_messages:
+                    message = self._message(message_id)
+                    if not message.delivered or message.recipient != LineAddress(
+                        event.line_id
+                    ):
+                        raise EventRejected("retry mail must be delivered to this line")
+            case TurnCorrelated() | DisclosureChecked() | TaskRecorded():
                 self._line(event.line_id)
             case WakeRequested():
                 self._check_wake_requested(event)
@@ -3940,13 +3960,29 @@ class State:
                 if event.failed is True:
                     self.lines[event.line_id] = replace(
                         line,
-                        failed=True,
+                        failed=event.recoverable is not True,
                         last_failure=event.failure,
                         last_failure_class=event.failure_class,
                         last_closing_reason=event.closing_reason,
                     )
                 elif line.failed:
                     self.lines[event.line_id] = replace(line, failed=False)
+                for message_id in event.retry_messages:
+                    message = self.messages[message_id]
+                    self._put_message(
+                        message_id,
+                        replace(
+                            message, delivered=False, reported_ends_at_delivery=None
+                        ),
+                    )
+                    if isinstance(message.sender, RemoteAddress):
+                        peer_id = message.sender.peer_id
+                        self.waiting_from[peer_id] = (
+                            self.waiting_from.get(peer_id, 0) + 1
+                        )
+                        self.waiting_for[LineAddress(event.line_id)] = (
+                            self.waiting_for.get(LineAddress(event.line_id), 0) + 1
+                        )
                 if event.unreported is None:
                     self.reported_turn_ends[event.line_id] = (
                         self.reported_turn_ends.get(event.line_id, 0) + 1

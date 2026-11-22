@@ -11,6 +11,54 @@ from dromon import codex, evidence, grok, jsonlines, spawn
 from dromon.engine import EngineRefused
 
 
+@pytest.mark.parametrize(
+    ("prefix", "expected"),
+    [
+        (b'{"id":7,"result":{"large":"', (7, None, True)),
+        (b'{"method":"notice","params":{"id":7,"large":"', (None, "notice", False)),
+        (b'{"result":{"id":7,"large":"', (None, None, True)),
+        (b'{"id":123', (None, None, False)),
+        (b'{"id":7,"id":8,"result":', (None, None, False)),
+    ],
+)
+def test_frame_identity_uses_only_complete_root_fields(
+    prefix: bytes, expected: tuple[int | str | None, str | None, bool]
+) -> None:
+    assert codex.frame_identity(prefix) == expected
+
+
+@pytest.mark.parametrize("notification", [False, True])
+def test_discarded_frame_identity_through_process_reader(
+    monkeypatch: pytest.MonkeyPatch, notification: bool
+) -> None:
+    monkeypatch.setattr(codex, "MAX_LINE", 64)
+
+    async def exercise() -> None:
+        header = '{"method":"notice","params":' if notification else '{"id":7,"result":'
+        process = await spawn.subprocess_exec(
+            sys.executable,
+            "-c",
+            'import sys; sys.stdout.write(sys.argv[1]+\'{"text":"\''
+            "+'x'*1024+'\"}}\\n')",
+            header,
+            stdout=asyncio.subprocess.PIPE,
+        )
+        connection = codex._Process(process)  # pyright: ignore[reportPrivateUsage]
+        try:
+            with pytest.raises(EngineRefused) as caught:
+                await connection.receive()
+            from dromon.engine import EngineStreamTooLong
+
+            assert isinstance(caught.value, EngineStreamTooLong)
+            assert caught.value.frame_id == (None if notification else 7)
+            assert caught.value.frame_method == ("notice" if notification else None)
+            assert caught.value.frame_is_response is not notification
+        finally:
+            await process.communicate()
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("adapter", ["codex", "grok", "jsonlines"])
 @pytest.mark.parametrize("oversize", [False, True])
 def test_adapter_pipe_names_overrun(

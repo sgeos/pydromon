@@ -332,6 +332,10 @@ class EngineStreamTooLong(EngineRefused):
 
     recoverable: bool = False
     replace_session: bool = False
+    prompt_may_have_run: bool = True
+    frame_id: int | str | None = None
+    frame_method: str | None = None
+    frame_is_response: bool = False
 
 
 async def read_engine_record(

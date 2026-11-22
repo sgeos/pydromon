@@ -6,4 +6,8 @@ Type: Fixed
 - Document the stream limits and recovery procedure for a separator overrun.
 - Codex resumes exclude unused turn history. Oversized frames are drained with
   bounded chunks and end the turn without a failure hold. An overrun while
-  resuming replaces the engine session on its next turn and says so explicitly.
+  a correlated resume response replaces the engine session on its next turn and
+  says so explicitly.
+- Recoverable failures remain eligible after replay. Mail not submitted to Codex
+  is requeued by its turn-end event. Submitted mail is not replayed and the next
+  notice names its identifiers and uncertain outcome.
