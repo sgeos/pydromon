@@ -896,14 +896,17 @@ class Daemon:
         self.scheduler.peer_reports = forwarder.reports
         return forwarder
 
-    def relay_routes(self, config: ProjectConfig) -> dict[str, AsyncRelay]:
+    def relay_routes(
+        self, config: ProjectConfig, *, protection_paths: ProjectPaths | None = None
+    ) -> dict[str, AsyncRelay]:
         """The relay of each operator ``config`` routes. Raises ``ProjectMismatch``
         for a relay refused now, including a notice file outside the daemon's
         protected state or runtime directories, so a start or reload names it and
         changes nothing."""
-        protected_dirs(self.paths, config.federation, self.registry_dir)
+        paths = protection_paths or self.paths
+        protected_dirs(paths, config.federation, self.registry_dir)
         root = self.paths.root
-        state_runtime_dirs = (self.paths.state_dir, self.paths.runtime_dir)
+        state_runtime_dirs = (paths.state_dir, paths.runtime_dir)
 
         try:
             return build_routes(config.relays, root, state_runtime_dirs)
@@ -4565,6 +4568,7 @@ def run(
     """
     if protection_paths is not None and (not check_only or launch_checks):
         raise ValueError("protection_paths requires a check without engine launches")
+    validation_paths = protection_paths or paths
     os.umask(0o077)
     given = overrides or Overrides()
     try:
@@ -4576,8 +4580,8 @@ def run(
         check_token_store(paths.state_dir / PEERS_DIR_NAME)
         file = config_path(paths.state_dir)
         config = load(file, paths.root) if file.exists() else ProjectConfig()
-        check_sandboxes(config, paths)
-        line_git_ssh = git_ssh_access(config, paths, os.environ)
+        check_sandboxes(config, validation_paths)
+        line_git_ssh = git_ssh_access(config, validation_paths, os.environ)
         check_engines(config)
         terms = project_terms(config, paths)
         limits, operator, tick = resolve(config, given)
@@ -4644,7 +4648,9 @@ def run(
                     str(paths.root),
                     project_sandbox=config.sandbox,
                     project_settings=config.settings,
-                    protected=protected_dirs(paths, config.federation, registry_dir),
+                    protected=protected_dirs(
+                        validation_paths, config.federation, registry_dir
+                    ),
                     line_tokens=line_tokens,
                     line_socket=(
                         scratch / "lines.sock"
@@ -4655,7 +4661,7 @@ def run(
                     line_git_ssh=line_git_ssh,
                     read_only_paths=config.read_only_paths,
                     extra_protected=registry_protected(
-                        paths, config.federation, registry_dir
+                        validation_paths, config.federation, registry_dir
                     ),
                     # Read at each build, so a reload that names another file guards
                     # it from the next turn. The name is bound just below.
@@ -4669,7 +4675,9 @@ def run(
                 tick_seconds=tick,
                 wake_every_ticks=config.wake_every_ticks,
                 root=paths.root,
-                protected=protected_dirs(paths, config.federation, registry_dir),
+                protected=protected_dirs(
+                    validation_paths, config.federation, registry_dir
+                ),
                 read_only_paths=config.read_only_paths,
                 daemon_commit=daemon_commit,
                 daemon_checkout=Path(__file__).parent,
@@ -4706,9 +4714,7 @@ def run(
             check_roles(scheduler, log, config)
             apply_project(scheduler, log, config)
             report_unsealed(scheduler)
-            check_grok_profiles(
-                config, protection_paths or paths, scheduler, registry_dir
-            )
+            check_grok_profiles(config, validation_paths, scheduler, registry_dir)
             for event in plan_peers(log.state, config.federation):
                 log.append(event)
             scheduler.federation = config.federation
@@ -4742,7 +4748,7 @@ def run(
                     print(f"dromond: warning: {warning}", file=sys.stderr)
                 # Checked here as well as in ``serve``, so a refused relay stops the
                 # start before any socket is made.
-                daemon.relay_routes(config)
+                daemon.relay_routes(config, protection_paths=validation_paths)
                 if check_only:
                     if held is None:
                         raise LogError(
