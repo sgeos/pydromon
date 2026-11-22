@@ -56,7 +56,7 @@ from OpenSSL.SSL import Context as OpenSSLContext
 
 from dromon.scheduler import StartCheckEngine, engine_config_refusal
 from dromon import __version__, exits, fleet, grok, peercred, registry, restart, runs
-from dromon import credentials, evidence, mcpstates, spawn
+from dromon import credentials, evidence, mcpstates, spawn, codex, redact
 from dromon import proposals as proposal_store
 from dromon.federation import (
     MAX_OPEN_REMOTE_PEERS,
@@ -318,6 +318,7 @@ def acquire_lock(path: Path) -> int:
 
 @dataclass(slots=True)
 class Daemon:
+    _account_check_busy: bool = field(default=False, init=False)
     """The request handling of one daemon, separate from its sockets for testing."""
 
     paths: ProjectPaths
@@ -359,6 +360,18 @@ class Daemon:
         default_factory=lambda: set[asyncio.Task[None]](), init=False, repr=False
     )
     """The watch of a draining restart, kept so that it is not collected."""
+
+    def __post_init__(self) -> None:
+        self.scheduler.set_awaken_check(self.check_awaken_profile)
+
+    def check_awaken_profile(self, line_id: str) -> None:
+        check_grok_profiles(
+            self.project,
+            self.paths,
+            self.scheduler,
+            self.registry_dir,
+            waking=line_id,
+        )
 
     # Settings, at the project's scope and each line's.
 
@@ -449,6 +462,82 @@ class Daemon:
                 error_message=str(error),
             )
         return self.execute(request)
+
+    async def respond_operator(self, line: bytes) -> Response:
+        """The operator socket alone permits a bounded account diagnostic."""
+        try:
+            request = decode_request(line)
+        except ProtocolError:
+            return self.respond(line)
+        if request.operation is not Operation.ACCOUNT_CHECK:
+            return self.respond(line)
+        try:
+            (line_id,) = _text_args(request.args, ("line",))
+        except ProtocolError as error:
+            return _refusal(request.request_id, error.code, str(error))
+        if line_id not in self.log.state.lines:
+            return _refusal(request.request_id, ErrorCode.REJECTED, "no such line")
+        if self._account_check_busy:
+            return _refusal(
+                request.request_id,
+                ErrorCode.REJECTED,
+                "an account check is already running",
+            )
+        if ENGINE_OF[self.scheduler.model_of(line_id)] != codex.ENGINE_NAME:
+            return _refusal(
+                request.request_id,
+                ErrorCode.REJECTED,
+                "this engine has no supported account-only read",
+            )
+        self._account_check_busy = True
+        diagnostics = evidence.StartupDiagnostics()
+        token = evidence.STARTUP_STDERR.set(diagnostics)
+        try:
+            async with asyncio.timeout(ENGINE_CHECK_SECONDS):
+                engine = self.scheduler.engine_for(
+                    line_id, startup_only=True, fresh=True
+                )
+                if not isinstance(engine, codex.CodexLine):
+                    raise EngineRefused("the configured adapter has no account check")
+                account = await engine.check_account()
+            return Response(
+                request.request_id, True, result={"passed": True, **account}
+            )
+        except codex.AccountCheckError as error:
+            # Scrub and screen the whole message before bounding it. No error data,
+            # account object or standard error is included in this response.
+            message = redact.mask(
+                evidence.home_masked(self.log.scrub_text(error.message))
+            )
+            if self.scheduler.discloses(message):
+                message = "withheld by the disclosure list"
+            elif message not in {
+                "failed to load workspace requirements: invalid data",
+                "no message",
+            }:
+                # Unknown free text may contain identifiers in any syntax.
+                message = "unrecognized provider message withheld for privacy"
+            message = " ".join(message.split())[:512]
+            return Response(
+                request.request_id,
+                True,
+                result={"passed": False, "code": error.code, "message": message},
+            )
+        except TimeoutError:
+            return Response(
+                request.request_id,
+                True,
+                result={"passed": False, "message": "account check timed out"},
+            )
+        except Exception:  # noqa: BLE001
+            return Response(
+                request.request_id,
+                True,
+                result={"passed": False, "message": "account check could not complete"},
+            )
+        finally:
+            evidence.STARTUP_STDERR.reset(token)
+            self._account_check_busy = False
 
     def line_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
         """A line's own tools, the same ones an in-process engine receives."""
@@ -835,6 +924,12 @@ class Daemon:
     def execute(self, request: Request) -> Response:
         """Answer one decoded request with operator authority."""
         match request.operation:
+            case Operation.ACCOUNT_CHECK:
+                return _refusal(
+                    request.request_id,
+                    ErrorCode.REJECTED,
+                    "account checks require the asynchronous operator socket",
+                )
             case Operation.PING:
                 return Response(request.request_id, ok=True, result={})
             case Operation.STATUS:
@@ -3145,7 +3240,7 @@ async def serve(daemon: Daemon) -> None:
     writers: set[asyncio.StreamWriter] = set()
 
     async def operator_responder(line: bytes) -> Response:
-        return daemon.respond(line)
+        return await daemon.respond_operator(line)
 
     def accepting(
         responder: Callable[[], Responder], limit: int = MAX_LINE_BYTES
@@ -3942,11 +4037,16 @@ def check_grok_profiles(
     paths: ProjectPaths,
     scheduler: Scheduler,
     registry_dir: Path,
+    *,
+    waking: str | None = None,
 ) -> None:
     """Check every effective Grok line without creating homes or starting engines.
 
-    Start and restart preflight share this check. A missing profile is an operator
-    action and the adapter's error supplies the table or missing entries to add.
+    Start and restart preflight share this check. Dormant lines warn because no
+    engine can run them. Awakening validates only the named line and refuses before
+    recording the wake. Every Grok turn also checks the profile again, so changing
+    the file after awakening does not grant a weaker sandbox. A missing profile is
+    an operator action and the adapter supplies the table or missing entries.
     """
     dynamic = registry_protected(paths, config.federation, registry_dir)
     protected = (
@@ -3955,22 +4055,23 @@ def check_grok_profiles(
     )
     home = Path.home()
     grok_home = home / grok.HOME_DIR
-    from dromon.overrides import apply_config
-
     for line_id in sorted(set(scheduler.state.lines) | set(config.lines)):
+        if waking is not None and line_id != waking:
+            continue
         definition = config.lines.get(line_id)
         existing = line_id in scheduler.state.lines
-        overrides = scheduler.line_overrides(line_id) if existing else {}
-        model = overrides.get("model") or (
-            definition.model if definition is not None else scheduler.model_of(line_id)
-        )
-        if ENGINE_OF[str(model)] != grok.ENGINE_NAME:
+        # A rebind or configure may supersede the declaration without clearing
+        # hibernation. Validate exactly what the scheduler would run now.
+        if existing:
+            model = scheduler.model_of(line_id)
+            line = scheduler.effective_config(line_id)
+        elif definition is not None:
+            model = definition.model
+            line = definition.config
+        else:
             continue
-        line = (
-            apply_config(definition.config, overrides)
-            if definition is not None
-            else scheduler.effective_config(line_id)
-        )
+        if ENGINE_OF[model] != grok.ENGINE_NAME:
+            continue
         try:
             workspace = resolve_workdir(line.workdir, paths.root, protected)
             grok.check_profile(
@@ -3983,7 +4084,18 @@ def check_grok_profiles(
                 resolve_read_only_paths(config.read_only_paths, workspace),
             )
         except (EngineRefused, ConfigError) as error:
-            raise SandboxError(f"Grok line {line_id}: {error}") from error
+            message = f"Grok line {line_id}, profile {grok.profile_name(line)}: {error}"
+            dormant = line_id in scheduler.state.retired_lines or (
+                existing and scheduler.state.lines[line_id].hibernated
+            )
+            if dormant and waking is None:
+                print(
+                    f"dromond: warning: {message}. Fix this profile before waking"
+                    " the line. Retired lines cannot be woken.",
+                    file=sys.stderr,
+                )
+            else:
+                raise SandboxError(message) from error
 
 
 def check_engines(config: ProjectConfig) -> None:
@@ -4422,6 +4534,7 @@ def run(
     check_only: bool = False,
     launch_checks: bool = False,
     observe: Callable[[EventLog], None] | None = None,
+    protection_paths: ProjectPaths | None = None,
 ) -> int:
     """Run the daemon for ``paths`` in the foreground and return its exit status.
 
@@ -4445,7 +4558,13 @@ def run(
     log once every check has passed, after the start applied the project file to it,
     so ``dromon upgrade-check`` can say which lines the started daemon would hold. It
     must only read.
+
+    ``protection_paths`` gives an upgrade check the live paths while its state is
+    replayed from a copy. It is refused outside checks that build no engine. The
+    copied directories cannot be reached by a line because no line is launched.
     """
+    if protection_paths is not None and (not check_only or launch_checks):
+        raise ValueError("protection_paths requires a check without engine launches")
     os.umask(0o077)
     given = overrides or Overrides()
     try:
@@ -4587,7 +4706,9 @@ def run(
             check_roles(scheduler, log, config)
             apply_project(scheduler, log, config)
             report_unsealed(scheduler)
-            check_grok_profiles(config, paths, scheduler, registry_dir)
+            check_grok_profiles(
+                config, protection_paths or paths, scheduler, registry_dir
+            )
             for event in plan_peers(log.state, config.federation):
                 log.append(event)
             scheduler.federation = config.federation

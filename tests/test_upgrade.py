@@ -29,10 +29,12 @@ from dromon import cli, exits, spawn, statesnapshot, upgrade
 from dromon.eventlog import EventLog
 from dromon.model import (
     LineCreated,
+    LineConfigured,
     LineHibernated,
     LineRetired,
     LineAddress,
     OperatorAddress,
+    OperatorRegistered,
     OwnershipCause,
     OwnershipChanged,
     SeatUnbound,
@@ -66,7 +68,15 @@ def by_name(report: Report) -> dict[str, upgrade.Check]:
     return {check.name: check for check in report.checks}
 
 
-def test_the_old_revision_s_log_opens_under_this_code(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "host_problem", [None, "Claude Code needs bubblewrap and socat"]
+)
+def test_the_old_revision_s_log_opens_under_this_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_problem: str | None
+) -> None:
+    from dromon import daemon
+
+    monkeypatch.setattr(daemon, "sandbox_host_problem", lambda: host_problem)
     log = old_log(tmp_path)
     before = digest(log)
     scratch = tmp_path / "scratch"
@@ -80,6 +90,8 @@ def test_the_old_revision_s_log_opens_under_this_code(tmp_path: Path) -> None:
     assert checks["snapshot"].outcome is Outcome.PASS
     assert checks["start"].outcome is Outcome.PASS
     assert "the start checks pass" in checks["start"].detail
+    if host_problem is not None:
+        assert host_problem in checks["start"].detail
     assert checks["floor"].outcome is Outcome.SKIP
     assert digest(log) == before, "the source is never written"
     assert list(scratch.iterdir()) == [], "the scratch directory is removed"
@@ -169,7 +181,15 @@ def test_a_project_file_this_code_refuses_fails_the_start_alone(
     assert not report.passed
 
 
-def test_the_given_root_is_only_read(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "host_problem", [None, "Claude Code needs bubblewrap and socat"]
+)
+def test_the_given_root_is_only_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_problem: str | None
+) -> None:
+    from dromon import daemon
+
+    monkeypatch.setattr(daemon, "sandbox_host_problem", lambda: host_problem)
     root = tmp_path / "root"
     (root / "tmp" / "worktrees" / "gamma").mkdir(parents=True)
     project = tmp_path / "dromon.toml"
@@ -184,6 +204,8 @@ def test_the_given_root_is_only_read(tmp_path: Path) -> None:
         old_log(tmp_path), project_file=project, root=root, scratch_parent=tmp_path
     )
     assert by_name(report)["start"].outcome is Outcome.PASS, upgrade.render(report)
+    if host_problem is not None:
+        assert host_problem in by_name(report)["start"].detail
     after = sorted(
         (str(p.relative_to(root)), p.stat().st_mtime_ns) for p in root.rglob("*")
     )
@@ -784,3 +806,126 @@ def test_the_command_needs_no_project_of_its_own(
         ]
     )
     assert code == exits.OK
+
+
+@pytest.mark.parametrize("dormant", ["hibernated", "retired", "active"])
+def test_old_grok_profile_on_dormant_lines_warns_at_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dormant: str
+) -> None:
+    from dromon import grok
+    from dromon.lineconfig import LineConfig, encode_config
+
+    home = tmp_path / "home"
+    grok_home = home / grok.HOME_DIR
+    grok_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    (grok_home / "sandbox.toml").write_text(
+        '[profiles.dromon-writer]\nextends = "workspace"\ndeny = [".dromon"]\n'
+    )
+    root = tmp_path / "root"
+    root.mkdir()
+    project = tmp_path / "project.toml"
+    project.write_text(
+        'version = 1\n[lines.sleeper]\nmodel = "grok-4.7"\n'
+        'builtin_tools = ["Read", "Write"]\n'
+    )
+    source = tmp_path / "source.sqlite"
+    with EventLog(source) as log:
+        log.append(LineCreated("sleeper", "grok-4.7", "subscription"))
+        log.append(
+            LineConfigured(
+                "sleeper", encode_config(LineConfig(builtin_tools=("Read", "Write")))
+            )
+        )
+        if dormant != "active":
+            log.append(LineHibernated("sleeper"))
+        if dormant == "retired":
+            log.append(OperatorRegistered("ana"))
+            log.append(
+                LineRetired("sleeper", OperatorAddress("ana"), "2026-11-22T00:00:00Z")
+            )
+    if dormant == "retired":
+        project.write_text("version = 1\n")
+    result = by_name(
+        upgrade.run_checks(
+            source, project_file=project, root=root, scratch_parent=tmp_path
+        )
+    )["start"]
+    assert result.outcome is (Outcome.FAIL if dormant == "active" else Outcome.WARN)
+    assert "sleeper" in result.detail
+    assert "dromon-writer" in result.detail
+    if dormant != "active":
+        assert "before" in result.detail
+
+
+@pytest.mark.parametrize("runtime_override", ["nondefault", "empty", "unset"])
+def test_upgrade_checks_live_protections_not_copy_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime_override: str
+) -> None:
+    from dromon import daemon, grok, registry
+    from dromon.paths import ProjectPaths
+    from dromon.projectconfig import ProjectConfig
+    from dromon.security_paths import project_secret_paths
+
+    root = tmp_path / "root"
+    root.mkdir()
+    home = tmp_path / "home"
+    grok_home = home / grok.HOME_DIR
+    grok_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    runtime = (
+        tmp_path / "live-run"
+        if runtime_override == "nondefault"
+        else root / ".dromon" / "run"
+    )
+    if runtime_override == "unset":
+        monkeypatch.delenv("DROMON_RUNTIME_DIR", raising=False)
+    else:
+        monkeypatch.setenv(
+            "DROMON_RUNTIME_DIR", "" if runtime_override == "empty" else str(runtime)
+        )
+    live = ProjectPaths(root, root / ".dromon", runtime)
+    protected = daemon.protected_dirs(
+        live, ProjectConfig().federation, registry.configured_directory(os.environ)
+    )
+    profile = grok.profile_snippet(
+        grok.WRITER_PROFILE,
+        root,
+        (*protected, *project_secret_paths(root, root)),
+        home,
+    )
+    (grok_home / "sandbox.toml").write_text(profile)
+    project = tmp_path / "project.toml"
+    project.write_text(
+        'version = 1\n[lines.writer]\nmodel = "grok-4.7"\nbuiltin_tools = ["Write"]\n'
+    )
+    source = tmp_path / "source.sqlite"
+    with EventLog(source):
+        pass
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    for _ in range(2):
+        start = by_name(
+            upgrade.run_checks(
+                source, project_file=project, root=root, scratch_parent=scratch
+            )
+        )["start"]
+        assert start.outcome is Outcome.PASS, start.detail
+    assert list(scratch.iterdir()) == []
+    assert (grok_home / "sandbox.toml").read_text() == profile
+
+
+@pytest.mark.parametrize("check_only,launch", [(False, False), (True, True)])
+def test_live_protection_context_cannot_launch_an_engine(
+    tmp_path: Path, check_only: bool, launch: bool
+) -> None:
+    from dromon import daemon
+    from dromon.paths import ProjectPaths
+
+    paths = ProjectPaths(tmp_path, tmp_path / "state", tmp_path / "run")
+    with pytest.raises(ValueError, match="without engine launches"):
+        daemon.run(
+            paths, check_only=check_only, launch_checks=launch, protection_paths=paths
+        )
+    assert not paths.state_dir.exists()
+    assert not paths.runtime_dir.exists()

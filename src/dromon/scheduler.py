@@ -3153,6 +3153,7 @@ class Scheduler:
         self._repeats: dict[str, str] = {}
         """Each undelivered message to a line that repeats an earlier one, and that
         earlier message, until the repeat is delivered."""
+        self._awaken_check: Callable[[str], None] | None = None
         self._machine_path: Path | None = None
         """The machine monitor's status file, or ``None`` to read none. **Round 16,
         item 3.**"""
@@ -4654,6 +4655,10 @@ class Scheduler:
         self._log.restore_checked(mismatch)
         self._work.set()
 
+    def set_awaken_check(self, check: Callable[[str], None]) -> None:
+        """Validate dormant engine profiles before any awakening event is written."""
+        self._awaken_check = check
+
     def awaken(self, line_id: str) -> bool:
         """Awaken ``line_id``, and say whether it was hibernated. Its kept mail and any
         scheduled wake that fell due wake it from the next tick. A hold stays."""
@@ -4662,6 +4667,8 @@ class Scheduler:
             raise EventRejected(f"no line {line_id}")
         if not line.hibernated:
             return False
+        if self._awaken_check is not None:
+            self._awaken_check(line_id)
         self._log.append(LineAwakened(line_id))
         self._work.set()
         return True
@@ -10938,6 +10945,10 @@ class Scheduler:
         state the ones before it leave, and nothing else appends between them, since
         the scheduler runs on one thread. A crash between them leaves a journal entry
         without the change it was for, which records nothing false."""
+        if plan.owner is not None and self._awaken_check is not None:
+            line = self._state().lines.get(plan.owner)
+            if line is not None and line.hibernated:
+                self._awaken_check(plan.owner)
         for event in plan.events:
             self._log.append(event)
 
@@ -16380,9 +16391,11 @@ class Scheduler:
             "tasks": status.get("tasks", []),
         }
 
-    def engine_for(self, line_id: str, *, startup_only: bool = False) -> LineEngine:
+    def engine_for(
+        self, line_id: str, *, startup_only: bool = False, fresh: bool = False
+    ) -> LineEngine:
         """The line's engine, built on first use and kept for the session's life."""
-        engine = self._engines.get(line_id)
+        engine = None if fresh else self._engines.get(line_id)
         if engine is None:
             line = self._state().lines[line_id]
             try:
@@ -16431,8 +16444,9 @@ class Scheduler:
 
                 tools = [replace(tool, handler=refused) for tool in tools]
             engine = self._engine_factory(spec, tools)
-            self._engines[line_id] = engine
-            self._engine_built[line_id] = time.time_ns()
+            if not fresh:
+                self._engines[line_id] = engine
+                self._engine_built[line_id] = time.time_ns()
         return engine
 
     def line_summaries(self) -> list[Mapping[str, object]]:

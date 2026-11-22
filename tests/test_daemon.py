@@ -1454,3 +1454,94 @@ def test_start_checks_every_logged_grok_profile(
                 daemon_module.check_grok_profiles(
                     config, paths, scheduler, registry_dir
                 )
+
+
+def test_invalid_dormant_grok_profile_cannot_awaken(
+    paths: ProjectPaths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dromon import grok
+    from dromon.model import LineHibernated
+    from dromon.sandbox import SandboxError
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    paths.state_dir.mkdir(exist_ok=True)
+    with EventLog(paths.event_log) as log:
+        log.append(LineCreated("sleeper", "grok-4.7", "subscription"))
+        log.append(LineHibernated("sleeper"))
+        scheduler = held_scheduler(log)
+        Daemon(paths, log, "2026-11-22T00:00:00Z", scheduler)
+        before = log.last_seq
+        with pytest.raises(SandboxError, match="sleeper.*dromon-reader"):
+            scheduler.awaken("sleeper")
+        assert log.last_seq == before
+        assert log.state.lines["sleeper"].hibernated
+        grok_home = home / grok.HOME_DIR
+        grok_home.mkdir(parents=True)
+        # An ancestor deny is stronger than the required descendant denials.
+        snippet = grok.profile_snippet(grok.READER_PROFILE, paths.root, (), home)
+        snippet = snippet.replace('deny = [".dromon"]', 'deny = ["/"]')
+        (grok_home / "sandbox.toml").write_text(snippet)
+        assert scheduler.awaken("sleeper")
+        assert not log.state.lines["sleeper"].hibernated
+
+
+@pytest.mark.parametrize("change", ["rebind", "configure"])
+@pytest.mark.parametrize("operation", ["awaken", "ownership"])
+def test_awaken_checks_current_binding_and_config(
+    paths: ProjectPaths,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+    operation: str,
+) -> None:
+    from dromon import grok
+    from dromon.driver import Strategy
+    from dromon.lineconfig import LineConfig
+    from dromon.model import LineHibernated, RoleDeclared, SeatBound
+    from dromon.projectconfig import LineDefinition, ProjectConfig
+    from dromon.sandbox import SandboxError
+
+    home = tmp_path / "home"
+    grok_home = home / grok.HOME_DIR
+    grok_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    # Only the reader profile is valid. The current binding needs a writer.
+    reader = grok.profile_snippet(grok.READER_PROFILE, paths.root, (), home)
+    (grok_home / "sandbox.toml").write_text(
+        reader.replace('deny = [".dromon"]', 'deny = ["/"]')
+    )
+    model = HAIKU if change == "rebind" else "grok-4.7"
+    config = (
+        LineConfig(builtin_tools=("Write",)) if change == "rebind" else LineConfig()
+    )
+    project = ProjectConfig(
+        lines={
+            "sleeper": LineDefinition(
+                "sleeper", model, Strategy.SUBSCRIPTION, config, None, None
+            )
+        }
+    )
+    paths.state_dir.mkdir(exist_ok=True)
+    with EventLog(paths.event_log) as log:
+        scheduler = held_scheduler(log)
+        scheduler.create_line("sleeper", model, Strategy.SUBSCRIPTION, config)
+        log.append(LineHibernated("sleeper"))
+        Daemon(paths, log, "2026-11-22T00:00:00Z", scheduler, project=project)
+        if change == "rebind":
+            scheduler.rebind_line("sleeper", "grok-4.7", Strategy.SUBSCRIPTION)
+        else:
+            scheduler.configure_line("sleeper", LineConfig(builtin_tools=("Write",)))
+        if operation == "ownership":
+            scheduler.ensure_operator("ana")
+            log.append(RoleDeclared("core", "tmp/worktrees/core", 1800))
+            log.append(SeatBound("sleeper", "core", True))
+        before = log.last_seq
+        with pytest.raises(SandboxError, match="dromon-writer"):
+            if operation == "awaken":
+                scheduler.awaken("sleeper")
+            else:
+                scheduler.give_ownership(OperatorAddress("ana"), "core", "sleeper")
+        assert log.last_seq == before
+        assert log.state.lines["sleeper"].hibernated

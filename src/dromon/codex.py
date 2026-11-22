@@ -791,6 +791,62 @@ def codex_path(
     )
 
 
+async def _joined[T](work: asyncio.Future[T]) -> T:
+    """Join owned work before propagating even repeated caller cancellations.
+
+    The work supplies its own finite bound. Cancelling a shield alone would leave
+    it active after its owner returned. Each loop consumes a cancellation or ends
+    when the owned work finishes. Observe its exception even after cancellation.
+    """
+    cancelled = False
+    while not work.done():
+        try:
+            await asyncio.shield(work)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:  # noqa: BLE001, result below retrieves the owned failure
+            break
+    if cancelled:
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            work.result()
+        raise asyncio.CancelledError
+    return work.result()
+
+
+async def _close_server(
+    process: spawn.ChildProcess,
+    policy: StopPolicy,
+    draining: asyncio.Task[None] | None,
+) -> None:
+    """Use the launcher's bounded termination, kill and reap waits, then drain.
+
+    This task has an independent lifetime from the request deadline. Draining has
+    its own bound and still runs if launcher cleanup fails.
+    """
+
+    async def drain_output() -> None:
+        if process.stdout is not None:
+            while await process.stdout.read(64 * 1024):
+                pass
+
+    output = asyncio.create_task(drain_output())
+    try:
+        await launcher.end(process, policy, close_input=False)
+    finally:
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        finally:
+            results = await asyncio.gather(
+                evidence.stop_draining(draining),
+                evidence.stop_draining(output),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+
+
 @asynccontextmanager
 async def _app_server(
     arguments: list[str],
@@ -838,8 +894,7 @@ async def _app_server_process(
     finally:
         # The launcher ends the app-server and, by the line's stop policy, its group
         # and every descendant.
-        await launcher.end(process, policy, close_input=False)
-        await evidence.stop_draining(draining)
+        await _joined(asyncio.create_task(_close_server(process, policy, draining)))
 
 
 def list_servers(
@@ -927,10 +982,26 @@ def identifier(value: object) -> str | None:
     return None
 
 
+ACCOUNT_PLANS: Final = frozenset(
+    {"free", "plus", "pro", "team", "business", "enterprise", "edu", "go", "unknown"}
+)
+
+
+class AccountCheckError(EngineRefused):
+    """An account RPC refusal with data kept apart from its printable message."""
+
+    def __init__(self, code: object, message: object) -> None:
+        super().__init__("the account check was refused")
+        self.code = code if type(code) is int else None
+        self.message = message if isinstance(message, str) else "no message"
+
+
 class _RpcError(Exception):
     def __init__(self, method: str, error: object) -> None:
         super().__init__(f"{method}: {error}")
         fields = cast(dict[str, Any], error) if isinstance(error, dict) else {}
+        self.code = fields.get("code")
+        self.message = fields.get("message")
         self.writer_conflict = (
             method == "thread/resume"
             and fields.get("code") == -32600
@@ -1398,6 +1469,8 @@ class CodexLine:
         self._next_id = 0
         self._thread_id = ""
         self._checking_start = False
+        self._checking_account = False
+        self._account_summary: dict[str, str] = {}
         self._connection: Connection | None = None
         self._clock = clock
         self._poll_seconds = poll_seconds
@@ -1500,6 +1573,21 @@ class CodexLine:
             self._checking_start = False
             self.session_id = session_id
 
+    async def check_account(self) -> dict[str, str]:
+        """Use the turn's launch preparation, without opening or resuming a thread.
+
+        Only fixed vocabulary leaves the account response. Unknown provider fields
+        are never reflected. The caller supplies the deadline and screens errors.
+        """
+        self._checking_start = True
+        self._checking_account = True
+        try:
+            await self._execute("", account_only=True)
+        finally:
+            self._checking_start = False
+            self._checking_account = False
+        return dict(self._account_summary)
+
     async def run_turn(self, prompt: str) -> TurnReport:
         result = await self._execute(prompt)
         if result is None:
@@ -1507,7 +1595,7 @@ class CodexLine:
         return result
 
     async def _execute(
-        self, prompt: str, *, check_only: bool = False
+        self, prompt: str, *, check_only: bool = False, account_only: bool = False
     ) -> TurnReport | None:
         """Run one turn for ``prompt`` and return what happened. A check that
         refuses the turn also closes a kept connection."""
@@ -1539,8 +1627,17 @@ class CodexLine:
                 if self.scratch is None
                 else checked_scratch(self.cwd, self.scratch)
             )
+            listed = (
+                await _joined(
+                    asyncio.create_task(
+                        asyncio.to_thread(self._list_servers, self.cwd, environment)
+                    )
+                )
+                if account_only
+                else self._list_servers(self.cwd, environment)
+            )
             arguments = server_arguments(
-                self._list_servers(self.cwd, environment),
+                listed,
                 self.config,
                 self.protected,
                 self.mark,
@@ -1555,11 +1652,15 @@ class CodexLine:
             # Persist the exact profile supplied at launch, even if a protected
             # path appears while initialize or the turn is in progress.
             self._session_fingerprint = self.tools_fingerprint(profile)
-            instructions = read_instructions(self.config.instructions, self.cwd)
+            instructions = (
+                ""
+                if account_only
+                else read_instructions(self.config.instructions, self.cwd)
+            )
         except Exception:
             await self.close()
             raise
-        if self.config.keep_session and not check_only:
+        if self.config.keep_session and not check_only and not account_only:
             return await self._kept_turn(
                 prompt, arguments, environment, instructions, request
             )
@@ -1572,6 +1673,8 @@ class CodexLine:
                 self._connection = connection
                 try:
                     credential = await self._start(turn)
+                    if account_only:
+                        return None
                     thread_id = await self._open_thread(turn)
                     if turn.refusal is None:
                         await self._check_isolation(thread_id, turn)
@@ -1583,6 +1686,8 @@ class CodexLine:
                     if turn.refusal is None and not check_only:
                         await self._run(thread_id, prompt, turn)
                 except _RpcError as error:
+                    if account_only:
+                        raise AccountCheckError(error.code, error.message) from None
                     raise EngineRefused(
                         f"the engine refused a request: {error}"
                     ) from error
@@ -1661,7 +1766,7 @@ class CodexLine:
             if message.get("id") == request_id and "method" not in message:
                 if "error" in message:
                     error = message["error"]
-                    limit = _plan_limit(error)
+                    limit = None if self._checking_account else _plan_limit(error)
                     if limit is not None:
                         raise EnginePlanLimit(limit)
                     raise _RpcError(method, error)
@@ -1670,6 +1775,13 @@ class CodexLine:
             await self._dispatch(message, turn)
 
     async def _dispatch(self, message: dict[str, Any], turn: _Turn) -> None:
+        if self._checking_account:
+            if "id" in message:
+                raise EngineRefused(
+                    "the engine requested an action during its account check"
+                )
+            # Account diagnostics never update budgets, tools or thread state.
+            return
         method = message.get("method")
         if not isinstance(method, str):
             return
@@ -1968,6 +2080,16 @@ class CodexLine:
             else None
         )
         credential = ACCOUNT_CREDENTIALS.get(str(kind))
+        fields = cast(dict[str, Any], account) if isinstance(account, dict) else {}
+        plan = fields.get("planType")
+        self._account_summary = {
+            "type": kind
+            if isinstance(kind, str) and kind in ACCOUNT_CREDENTIALS
+            else "unknown",
+            "plan": plan
+            if isinstance(plan, str) and plan in ACCOUNT_PLANS
+            else "unknown",
+        }
         if credential is None:
             raise EngineRefused(f"the engine reports an unrecognized account {kind!r}")
         verdict = self.driver.step(Event("credential", credential.value))
