@@ -276,6 +276,7 @@ MAX_OWN_COMMANDS: Final = 1024
 """The most background terminals a listing returns."""
 
 REQUEST_TIMEOUT_SECONDS: Final = 30.0
+MCP_STATUS_PAGE_LIMIT: Final = 32
 OUTPUT_CLOSE_SECONDS: Final = 2.0
 """Bound the wait for a live app-server whose output pipe has closed."""
 
@@ -655,8 +656,13 @@ def server_arguments(
             f"shell_environment_policy.set.{name}={_toml_string(value)}",
         ]
     listed: dict[str, bool] = {}
-    for server in servers:
+    for index, server in enumerate(servers):
         name = server if isinstance(server, str) else server.name
+        if BARE_KEY.fullmatch(name) is None:
+            raise EngineRefused(
+                f"codex mcp list field [{index}].name cannot be disabled by a Codex"
+                " override, so the line cannot be isolated"
+            )
         present = True if isinstance(server, str) else server.has_transport
         if name in listed and listed[name] != present:
             raise EngineRefused(
@@ -665,21 +671,12 @@ def server_arguments(
         listed[name] = present
     for name, present in sorted(listed.items()):
         # Codex's -c parser takes bare dotted keys only, and rejects a quoted one.
-        if BARE_KEY.fullmatch(name) is None:
+        if not present:
             raise EngineRefused(
-                f"the MCP server name {name!r} cannot be disabled by a Codex override,"
-                " so the line cannot be isolated"
+                "codex mcp list names a server without a usable transport,"
+                " so the line cannot start"
             )
-        # Preserve existing transports. Adding command to a URL table broke
-        # account/read on Codex 0.166.0. Only transport-less entries need a full
-        # inert table so their disabled override remains valid TOML configuration.
-        value = (
-            "enabled=false"
-            if present
-            else '={enabled=false,command="/usr/bin/false",args=[]}'
-        )
-        key = f"mcp_servers.{name}." if present else f"mcp_servers.{name}"
-        arguments += ["-c", key + value]
+        arguments += ["-c", f"mcp_servers.{name}.enabled=false"]
     for feature in DISABLED_FEATURES:
         arguments += ["--disable", feature]
     image = "enable" if VIEW_IMAGE in config.builtin_tools else "disable"
@@ -733,7 +730,7 @@ class Connection(Protocol):
 type ConnectionFactory = Callable[
     [list[str], Path, Mapping[str, str]], AbstractAsyncContextManager[Connection]
 ]
-type ServerLister = Callable[[Mapping[str, str]], Sequence[str | ListedServer]]
+type ServerLister = Callable[[Path, Mapping[str, str]], Sequence[str | ListedServer]]
 
 
 class _Process:
@@ -833,11 +830,76 @@ class _Process:
         return record
 
 
-def codex_path() -> str:
-    found = shutil.which("codex")
-    if found is None:
-        raise EngineRefused("the codex command is not installed or not on PATH")
-    return found
+def _executable_roots(
+    cwd: Path, environment: Mapping[str, str], writable_paths: Sequence[Path]
+) -> tuple[Path, ...]:
+    # /tmp is a deny root, never a temporary file to create.
+    roots = [cwd, Path("/tmp"), Path(tempfile.gettempdir()), *writable_paths]  # noqa: S108
+    for name in ("TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME"):
+        if value := environment.get(name):
+            roots.append(cwd / value)
+    return tuple(roots)
+
+
+def _line_writable(path: Path, roots: Sequence[Path]) -> bool:
+    selected, resolved = path.absolute(), path.resolve()
+    return any(
+        selected.is_relative_to(root.absolute())
+        or resolved.is_relative_to(root.resolve())
+        for root in roots
+    )
+
+
+def _command_environment(
+    cwd: Path, environment: Mapping[str, str], writable_paths: Sequence[Path]
+) -> dict[str, str]:
+    """Keep interpreter lookup out of writable roots too, including env shebangs.
+
+    The operator must still install trusted interpreters and helper programs in the
+    retained directories. This does not inspect arbitrary dependencies of Codex.
+    """
+    roots = _executable_roots(cwd, environment, writable_paths)
+    chosen = dict(environment)
+    chosen["PATH"] = os.pathsep.join(
+        entry
+        for entry in environment.get("PATH", os.defpath).split(os.pathsep)
+        if Path(entry).is_absolute() and not _line_writable(Path(entry), roots)
+    )
+    return chosen
+
+
+def codex_path(
+    cwd: Path,
+    environment: Mapping[str, str],
+    *,
+    writable_paths: Sequence[Path] = (),
+) -> str:
+    """Choose an executable outside line-writable roots from absolute PATH entries.
+
+    The listing runs without the launcher's isolation. Never execute workspace or
+    temporary content there, even for a read-only line. Check both the selected
+    spelling and its resolved target, since a trusted directory may hold a symlink
+    into a writable root. Operator-granted roots must accompany both launch paths.
+    Missing PATH uses the operating system default, never the daemon's PATH.
+    This does not prevent an operator replacing an installation after the check.
+    """
+    roots = _executable_roots(cwd, environment, writable_paths)
+    for entry in environment.get("PATH", os.defpath).split(os.pathsep):
+        if not Path(entry).is_absolute():
+            continue
+        found = shutil.which("codex", path=entry)
+        if found is None:
+            continue
+        selected = Path(found).absolute()
+        resolved = selected.resolve()
+        if _line_writable(selected, roots):
+            raise EngineRefused(
+                "the selected codex executable is inside a line-writable path"
+            )
+        return str(resolved)
+    raise EngineRefused(
+        "the codex command is not installed or not on PATH in an absolute entry"
+    )
 
 
 async def _joined[T](work: asyncio.Future[T]) -> T:
@@ -898,9 +960,34 @@ async def _close_server(
 
 @asynccontextmanager
 async def _app_server(
-    arguments: list[str], cwd: Path, environment: Mapping[str, str]
+    arguments: list[str],
+    cwd: Path,
+    environment: Mapping[str, str],
+    *,
+    writable_paths: Sequence[Path] = (),
 ) -> AsyncGenerator[Connection]:
-    command, launched, policy = launcher.wrap([codex_path(), *arguments], environment)
+    executable = codex_path(cwd, environment, writable_paths=writable_paths)
+    async with _app_server_process(
+        executable,
+        arguments,
+        cwd,
+        _command_environment(cwd, environment, writable_paths),
+    ) as connection:
+        yield connection
+
+
+@asynccontextmanager
+async def _app_server_process(
+    executable: str, arguments: list[str], cwd: Path, environment: Mapping[str, str]
+) -> AsyncGenerator[Connection]:
+    """Launch an explicitly trusted command through the shared process wrapper.
+
+    Normal lines reach this only after _app_server validates their executable.
+    The daemon's no-model smoke check supplies its own freshly generated stand-in,
+    without resolving a command from a line-controlled PATH. No line configuration
+    can select this entry point or supply an executable to it.
+    """
+    command, launched, policy = launcher.wrap([executable, *arguments], environment)
     recording = evidence.RECORDING.get()
     process = await spawn.subprocess_exec(
         *command,
@@ -921,13 +1008,34 @@ async def _app_server(
         await _joined(asyncio.create_task(_close_server(process, policy, draining)))
 
 
-def list_servers(environment: Mapping[str, str]) -> Sequence[ListedServer]:
-    """The names of every MCP server Codex would load, from ``codex mcp list``."""
+def list_servers(
+    cwd: Path,
+    environment: Mapping[str, str],
+    *,
+    writable_paths: Sequence[Path] = (),
+) -> Sequence[ListedServer]:
+    """List only the line's servers in its launch context, never the daemon's.
+
+    The environment is the filtered engine environment. Launcher control variables
+    are removed as they are before app-server exec. No transport values are retained
+    or included in a refusal. Configuration changes between listing and startup are
+    not locked, so the post-start isolation checks remain necessary.
+    """
     completed = spawn.run(
-        [codex_path(), "mcp", "list", "--json"],
+        [
+            codex_path(cwd, environment, writable_paths=writable_paths),
+            "mcp",
+            "list",
+            "--json",
+        ],
         capture_output=True,
         text=True,
-        env=dict(environment),
+        env={
+            k: v
+            for k, v in _command_environment(cwd, environment, writable_paths).items()
+            if k not in launcher.LAUNCH_VARIABLES
+        },
+        cwd=cwd,
         timeout=60,
         check=False,
     )
@@ -951,26 +1059,24 @@ def list_servers(environment: Mapping[str, str]) -> Sequence[ListedServer]:
                 continue
             raise EngineRefused(f"codex mcp list field [{index}].name must be text")
         transport = fields.get("transport")
-        present = False
-        if transport is not None:
-            if not isinstance(transport, dict):
-                raise EngineRefused(
-                    f"codex mcp list field [{index}].transport must be a table"
-                )
-            details = cast(dict[str, object], transport)
-            kind = details.get("type")
-            endpoint = details.get("command" if kind == "stdio" else "url")
-            if (
-                kind not in ("stdio", "streamable_http")
-                or not isinstance(endpoint, str)
-                or not endpoint
-            ):
-                raise EngineRefused(
-                    f"codex mcp list field [{index}].transport "
-                    "is unsupported or incomplete"
-                )
-            present = True
-        names.append(ListedServer(name, present))
+        if not isinstance(transport, dict):
+            raise EngineRefused(
+                f"codex mcp list field [{index}].transport must be a usable table,"
+                " so the line cannot start"
+            )
+        details = cast(dict[str, object], transport)
+        kind = details.get("type")
+        endpoint = details.get("command" if kind == "stdio" else "url")
+        if (
+            kind not in ("stdio", "streamable_http")
+            or not isinstance(endpoint, str)
+            or not endpoint.strip()
+        ):
+            raise EngineRefused(
+                f"codex mcp list field [{index}].transport "
+                "is unsupported or incomplete, so the line cannot start"
+            )
+        names.append(ListedServer(name, True))
     return names
 
 
@@ -1448,8 +1554,26 @@ class CodexLine:
         self.protected = tuple(protected)
         self.write_protected = tuple(write_protected)
         self._environment = os.environ if environment is None else environment
-        self._connect = connection_factory
-        self._list_servers = server_lister
+        # Bind the extra write grants without changing the injectable interfaces.
+        # The resolver always denies cwd and temporary roots too. These grants are
+        # treated conservatively even when the permission profile later denies one.
+        executable_roots = tuple(Path(path) for path in config.writable_paths)
+        if scratch is not None:
+            executable_roots += (scratch,)
+        self._connect: ConnectionFactory = (
+            (
+                lambda arguments, cwd, env: _app_server(
+                    arguments, cwd, env, writable_paths=executable_roots
+                )
+            )
+            if connection_factory is _app_server
+            else connection_factory
+        )
+        self._list_servers: ServerLister = (
+            (lambda cwd, env: list_servers(cwd, env, writable_paths=executable_roots))
+            if server_lister is list_servers
+            else server_lister
+        )
         self._observe = observe
         self.mark = mark
         self.git_ssh = git_ssh
@@ -1627,11 +1751,11 @@ class CodexLine:
             listed = (
                 await _joined(
                     asyncio.create_task(
-                        asyncio.to_thread(self._list_servers, environment)
+                        asyncio.to_thread(self._list_servers, self.cwd, environment)
                     )
                 )
                 if account_only
-                else self._list_servers(environment)
+                else self._list_servers(self.cwd, environment)
             )
             arguments = server_arguments(
                 listed,
@@ -2198,20 +2322,47 @@ class CodexLine:
         return thread_id
 
     async def _check_isolation(self, thread_id: str, turn: _Turn) -> None:
-        servers = await self._call(
-            "mcpServerStatus/list", {"threadId": thread_id}, turn
-        )
-        live = sorted(
-            str(entry.get("name"))
-            for entry in cast(list[dict[str, Any]], servers.get("data") or [])
-            if entry.get("runtimeStatus") != "disabled" or entry.get("tools")
-        )
-        if live:
-            turn.refusal = (
-                "the engine loads MCP servers the line was not given: "
-                + ", ".join(live)
-            )
-            return
+        # Check the started process, not another disk listing. Pagination and a
+        # malformed response must never silently turn into an empty inventory.
+        # This observes state after startup. It cannot undo a server's earlier
+        # startup side effects or prove that the engine reported every server.
+        cursor: str | None = None
+        seen: set[str] = set()
+        async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
+            for page in range(MCP_STATUS_PAGE_LIMIT):
+                params: dict[str, object] = {"threadId": thread_id}
+                if cursor is not None:
+                    params["cursor"] = cursor
+                servers = await self._call("mcpServerStatus/list", params, turn)
+                data = servers.get("data")
+                if not isinstance(data, list):
+                    raise EngineRefused("the engine MCP status inventory is malformed")
+                for index, entry in enumerate(cast(list[object], data)):
+                    if not isinstance(entry, dict):
+                        raise EngineRefused("the engine MCP status entry is malformed")
+                    fields = cast(dict[str, object], entry)
+                    if (
+                        fields.get("runtimeStatus") != "disabled"
+                        or not isinstance(fields.get("tools"), dict)
+                        or fields["tools"]
+                        or fields.get("enabled") is True
+                    ):
+                        turn.refusal = (
+                            "the engine loads MCP servers the line was not given"
+                            f" at status page [{page}] entry [{index}]"
+                        )
+                        return
+                following = servers.get("nextCursor")
+                if following is None:
+                    break
+                if not isinstance(following, str) or not following or following in seen:
+                    raise EngineRefused("the engine MCP status pagination is malformed")
+                seen.add(following)
+                cursor = following
+            else:
+                raise EngineRefused(
+                    "the engine MCP status inventory exceeds its page limit"
+                )
         apps = await self._call("app/list", {}, turn)
         if apps.get("data"):
             turn.refusal = "the engine offers apps the line was not given"

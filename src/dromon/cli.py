@@ -45,7 +45,7 @@ from dromon.paths import (
     ensure_private_dir,
     project_paths,
 )
-from dromon.disclosure import DisclosureError, load_terms
+from dromon.disclosure import DisclosureError, load_terms, matching_lines
 from dromon.driver import ENGINE_OF, MODELS, Credential, Driver, DriverError, Strategy
 from dromon import antigravity, capabilities, codex, cursor, evidence, grok, pi
 from dromon.engine import ENGINE_NAME as CLAUDE_CODE_ENGINE
@@ -410,6 +410,14 @@ def _preflight_argv(
     ]
 
 
+def _engine_check_safe(text: str, terms: Sequence[str]) -> bool:
+    """Screen complete diagnostic records and fail closed on screening failure."""
+    try:
+        return matching_lines(terms, text) == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _check_engines(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
     if arguments.account is not None:
         try:
@@ -435,12 +443,34 @@ def _check_engines(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return exits.FAILURE
+    from dromon.projectconfig import config_path, load
+
+    try:
+        file = config_path(paths.state_dir)
+        config = load(file, paths.root) if file.exists() else ProjectConfig()
+        terms = (
+            ()
+            if config.disclosure_terms is None
+            else load_terms(paths.root / config.disclosure_terms)
+        )
+    except (OSError, ValueError):
+        print("dromon check-engines: configuration_unavailable", file=sys.stderr)
+        return exits.FAILURE
     # Run installed daemon code in a separate process outside engine sandboxes.
     problem = _preflight(
-        _preflight_argv(paths, []), paths.runtime_dir, show_output=True
+        _preflight_argv(paths, []),
+        paths.runtime_dir,
+        show_output=True,
+        diagnostic_terms=terms,
     )
     if problem is not None:
-        print(f"dromon check-engines: {problem}", file=sys.stderr)
+        message = f"dromon check-engines: {problem}"
+        print(
+            "dromon check-engines: diagnostic withheld"
+            if not _engine_check_safe(message, terms)
+            else message,
+            file=sys.stderr,
+        )
         return exits.FAILURE
     print("dromon check-engines: all configured lines passed")
     return exits.OK
@@ -535,6 +565,7 @@ def _preflight(
     environment: Mapping[str, str] | None = None,
     *,
     show_output: bool = False,
+    diagnostic_terms: Sequence[str] = (),
 ) -> str | None:
     """Why the installed daemon would not start, or ``None``. A restart whose
     successor refuses to start leaves no daemon running, so this is checked before
@@ -556,12 +587,34 @@ def _preflight(
     except subprocess.TimeoutExpired as error:
         if runtime_dir is not None:
             restart.sweep_checks(runtime_dir, None)
-        return str(error)
+        return "startup_timeout" if show_output else str(error)
     except OSError as error:
-        return str(error)
+        return "engine_io_failed" if show_output else str(error)
     if show_output:
-        print(done.stdout or "", end="")
-        print(done.stderr or "", end="", file=sys.stderr)
+        # Treat child output as untrusted too, including output from older daemon
+        # versions. Only fixed result records cross this diagnostic boundary.
+        pattern = (
+            r"dromond: line [A-Za-z0-9_-]+ engine [a-z0-9-]+ "
+            r"(?:passed|failed: (?:startup_timeout|engine_refused|"
+            r"engine_io_failed|engine_start_failed)|not checkable: "
+            r"no no-prompt startup check; skipped without refusing restart)"
+            r"|dromond: line [A-Za-z0-9_-]+ skipped because it is "
+            r"(?:retired|hibernated)"
+        )
+        for line in ((done.stdout or "") + "\n" + (done.stderr or "")).splitlines():
+            if not line.strip():
+                continue
+            if re.fullmatch(pattern, line) and _engine_check_safe(
+                line, diagnostic_terms
+            ):
+                print(line, file=sys.stderr)
+            else:
+                print("dromond: engine check diagnostic withheld", file=sys.stderr)
+        return (
+            None
+            if done.returncode == 0
+            else f"engine_check_failed status {done.returncode}"
+        )
     if done.returncode == 0:
         return None
     lines = (done.stderr or done.stdout).strip().splitlines()

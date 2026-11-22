@@ -19,8 +19,9 @@ from pathlib import Path
 
 import pytest
 
-from dromon import launcher, launchsmoke, spawn
+from dromon import codex, daemon, launcher, launchsmoke, spawn
 from dromon.driver import ENGINE_OF
+from dromon.engine import EngineRefused
 from dromon.launcher import LaunchRecord
 from dromon.modulecommand import module_command
 from dromon.processes import (
@@ -112,6 +113,34 @@ def test_the_launchers_and_their_stand_ins_are_gone_when_the_check_returns() -> 
     while time.monotonic() < deadline and any(alive(pid) for pid in pids):
         time.sleep(0.1)
     assert not [pid for pid in pids if alive(pid)]
+
+
+def test_preflight_smoke_explicitly_launches_a_stand_in_the_line_guard_refuses(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exercise the real preflight smoke path without exempting temporary locations.
+
+    The exact generated command remains forbidden to a line's normal resolver.
+    Only the smoke check's explicit command reaches the shared process wrapper.
+    """
+    write_stand_in = launchsmoke._write_stand_in  # pyright: ignore[reportPrivateUsage]
+    refused: list[Path] = []
+
+    def guarded_stand_in(directory: Path, name: str) -> Path:
+        command = write_stand_in(directory, name)
+        with pytest.raises(EngineRefused, match="line-writable path"):
+            codex.codex_path(directory.parent, {"PATH": str(directory)})
+        refused.append(command)
+        return command
+
+    async def smoke() -> launchsmoke.SmokeReport:
+        return await REAL(kinds=(codex.ENGINE_NAME,), read=table)
+
+    monkeypatch.setattr(launchsmoke, "_write_stand_in", guarded_stand_in)
+    monkeypatch.setattr(launchsmoke, "check_launches", smoke)
+    assert asyncio.run(daemon.check_launch_survival())
+    assert len(refused) == 1
+    assert "2 of 2 launches survived" in capsys.readouterr().err
 
 
 def alive(pid: int) -> bool:

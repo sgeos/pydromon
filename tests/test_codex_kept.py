@@ -187,7 +187,7 @@ class World:
             mcp_tools=tools or [],
             environment={"SHELL": "/bin/bash"},
             connection_factory=connect,
-            server_lister=lambda env: [],
+            server_lister=lambda cwd, env: [],
             clock=clock or Clock(),
             poll_seconds=poll,
             task_ended=(ends if ends is not None else []).append,

@@ -107,6 +107,14 @@ def test_first_usage_notice_on_resumed_thread_excludes_inherited_totals() -> Non
 CWD = Path("/work")
 
 
+def unused_codex(
+    cwd: Path, environment: Mapping[str, str], *, writable_paths: Sequence[Path] = ()
+) -> str:
+    """A typed executable substitute for tests that replace process startup."""
+    del cwd, environment, writable_paths
+    return "/unused/codex"
+
+
 def luna(strategy: Strategy = Strategy.SUBSCRIPTION) -> Driver:
     return Driver.for_model(LUNA, strategy)
 
@@ -260,7 +268,7 @@ def line(
         session_id=session_id,
         environment={} if environment is None else environment,
         connection_factory=connect,
-        server_lister=lambda env: ["gmail", "slack"],
+        server_lister=lambda cwd, env: ["gmail", "slack"],
         observe=observe,
         credits_spent=(credits if credits is not None else []).append,
     )
@@ -758,7 +766,7 @@ def test_a_recorded_turn_replays_through_the_real_adapter(tmp_path: Path) -> Non
             mcp_tools=[RECORD],
             environment={},
             connection_factory=factory,
-            server_lister=lambda env: ["gmail"],
+            server_lister=lambda cwd, env: ["gmail"],
         )
 
     live = run(target(tapped))
@@ -831,9 +839,9 @@ def test_a_recorded_turn_replays_through_the_process_wrapper(
             workspace,
             config=LineConfig(),
             mcp_tools=[RECORD],
-            environment={},
+            environment={"PATH": str(directory)},
             connection_factory=factory,
-            server_lister=lambda env: ["gmail"],
+            server_lister=lambda cwd, env: ["gmail"],
         )
 
     live = run(target(tapped))
@@ -841,6 +849,14 @@ def test_a_recorded_turn_replays_through_the_process_wrapper(
     stand_in.write_text(f"#!{sys.executable}\n{STAND_IN}")
     stand_in.chmod(0o755)
     monkeypatch.setenv("PATH", str(directory))
+
+    def stand_in_path(
+        cwd: Path, env: Mapping[str, str], *, writable_paths: Sequence[Path] = ()
+    ) -> str:
+        # This process-wrapper test injects a stand-in independently of lookup.
+        return str(stand_in)
+
+    monkeypatch.setattr(codex_module, "codex_path", stand_in_path)
     second = Recording(
         tmp_path / "again.jsonl", codex_module.ENGINE_NAME, LUNA, stderr=True
     )
@@ -895,7 +911,7 @@ def test_an_unrecognized_account_is_refused(account: object) -> None:
         (FakeServer(provider="azure"), "model provider 'azure'"),
         (
             FakeServer(servers=[("gmail", "connected", 23)]),
-            "MCP servers the line was not given: gmail",
+            "MCP servers the line was not given",
         ),
         (
             FakeServer(servers=[("gmail", "disabled", 1)]),
@@ -1317,7 +1333,7 @@ def scratch_line(server: FakeServer, workdir: Path, config: LineConfig) -> Codex
         mcp_tools=[RECORD],
         environment={"SHELL": "/bin/sh"},
         connection_factory=connect,
-        server_lister=lambda env: [],
+        server_lister=lambda cwd, env: [],
         scratch=own_scratch(workdir, "beta"),
     )
 
@@ -1995,17 +2011,17 @@ def test_disabled_connector_does_not_need_a_name(
 ) -> None:
     from types import SimpleNamespace
 
-    monkeypatch.setattr(codex_module, "codex_path", lambda: "/unused/codex")
+    monkeypatch.setattr(codex_module, "codex_path", unused_codex)
 
     def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(returncode=0, stdout=json.dumps([{"enabled": enabled}]))
 
     monkeypatch.setattr(spawn, "run", fake_run)
     if enabled is False:
-        assert codex_module.list_servers({}) == []
+        assert codex_module.list_servers(CWD, {}) == []
     else:
         with pytest.raises(EngineRefused, match=r"\[0\].name"):
-            codex_module.list_servers({})
+            codex_module.list_servers(CWD, {})
 
 
 def test_replacement_failure_explains_resume(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2134,7 +2150,6 @@ def test_replacement_cannot_reuse_contested_id(monkeypatch: pytest.MonkeyPatch) 
 @pytest.mark.parametrize(
     "transport",
     [
-        None,
         {"type": "stdio", "command": "worker"},
         {"type": "streamable_http", "url": "https://example.invalid/mcp"},
     ],
@@ -2145,7 +2160,7 @@ def test_listing_preserves_transport_and_selects_valid_disabled_toml(
 ) -> None:
     from types import SimpleNamespace
 
-    monkeypatch.setattr(codex_module, "codex_path", lambda: "/unused/codex")
+    monkeypatch.setattr(codex_module, "codex_path", unused_codex)
 
     def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(
@@ -2153,14 +2168,12 @@ def test_listing_preserves_transport_and_selects_valid_disabled_toml(
         )
 
     monkeypatch.setattr(spawn, "run", fake_run)
-    listed = codex_module.list_servers({})
+    listed = codex_module.list_servers(CWD, {})
     arguments = server_arguments(listed, LineConfig())
     entry = next(value for value in arguments if value.startswith("mcp_servers.mail"))
     disabled = tomllib.loads(entry)["mcp_servers"]["mail"]
     assert disabled["enabled"] is False
-    if transport is None:
-        assert disabled == {"enabled": False, "command": "/usr/bin/false", "args": []}
-    else:
+    if transport is not None:
         assert disabled == {"enabled": False}
         # Model the ordinary table merge that must preserve the existing transport.
         assert isinstance(transport, dict)
@@ -2177,10 +2190,13 @@ def test_listing_preserves_transport_and_selects_valid_disabled_toml(
 @pytest.mark.parametrize(
     "transport",
     [
+        None,
         [],
         {},
         {"type": "stdio"},
+        {"type": "stdio", "command": "   "},
         {"type": "streamable_http", "url": ""},
+        {"type": "streamable_http", "url": "   "},
         {"type": "unknown", "url": "x"},
     ],
 )
@@ -2190,7 +2206,7 @@ def test_listing_refuses_malformed_transport_without_echoing_values(
 ) -> None:
     from types import SimpleNamespace
 
-    monkeypatch.setattr(codex_module, "codex_path", lambda: "/unused/codex")
+    monkeypatch.setattr(codex_module, "codex_path", unused_codex)
 
     def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(
@@ -2199,7 +2215,7 @@ def test_listing_refuses_malformed_transport_without_echoing_values(
 
     monkeypatch.setattr(spawn, "run", fake_run)
     with pytest.raises(EngineRefused, match=r"\[0\].transport"):
-        codex_module.list_servers({})
+        codex_module.list_servers(CWD, {})
 
 
 def test_conflicting_listed_transports_are_refused() -> None:
@@ -2275,7 +2291,7 @@ def test_cancelled_start_check_closes_its_connection_without_a_prompt(
             session_id="existing-session",
             environment={},
             connection_factory=connect,
-            server_lister=lambda env: [],
+            server_lister=lambda cwd, env: [],
         )
         task = asyncio.create_task(target.check_start())
         await asyncio.wait_for(opened.wait(), timeout=2)
@@ -2318,13 +2334,21 @@ def test_a_start_refusal_reaches_the_closing_reason_with_its_credential_masked(
     script.write_text(f"#!{sys.executable}\n{REFUSING_CODEX}")
     script.chmod(0o755)
     monkeypatch.setenv("PATH", str(directory))
+
+    def stand_in_path(
+        cwd: Path, env: Mapping[str, str], *, writable_paths: Sequence[Path] = ()
+    ) -> str:
+        # This process-wrapper test injects a stand-in independently of lookup.
+        return str(script)
+
+    monkeypatch.setattr(codex_module, "codex_path", stand_in_path)
     target = CodexLine(
         luna(),
         tmp_path,
         config=LineConfig(keep_session=keep_session),
         mcp_tools=[RECORD],
         environment={"PATH": str(directory)},
-        server_lister=lambda env: [],
+        server_lister=lambda cwd, env: [],
     )
 
     async def go() -> None:
@@ -2354,3 +2378,427 @@ def test_a_closed_connection_without_standard_error_keeps_its_reason() -> None:
     with pytest.raises(EngineClosed) as raised:
         run(line(Silent([])))
     assert str(raised.value) == "the engine closed its connection during the turn"
+
+
+def test_listing_uses_each_lines_project_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A root-only server must never become an override in a worktree.
+
+    The stand-in reads real project TOML, without launching Codex or a model.
+    Its merge check reproduces Codex's transport requirement at startup.
+    """
+    from types import SimpleNamespace
+
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / ".codex").mkdir()
+    (root / ".codex/config.toml").write_text(
+        '[mcp_servers.root_only]\ncommand = "worker"\n'
+    )
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(codex_module, "codex_path", unused_codex)
+    contexts: list[tuple[Path, dict[str, str]]] = []
+
+    def fake_list(*args: object, **kwargs: object) -> SimpleNamespace:
+        cwd = Path(cast(Path, kwargs.get("cwd") or Path.cwd()))
+        env = dict(cast(Mapping[str, str], kwargs["env"]))
+        contexts.append((cwd, env))
+        path = cwd / ".codex/config.toml"
+        config = tomllib.loads(path.read_text()) if path.exists() else {}
+        servers = config.get("mcp_servers", {})
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {"name": name, "transport": {"type": "stdio", **transport}}
+                    for name, transport in servers.items()
+                ]
+            ),
+        )
+
+    monkeypatch.setattr(spawn, "run", fake_list)
+    cases: tuple[tuple[Path, set[str]], ...] = (
+        (worktree, set()),
+        (root, {"root_only"}),
+    )
+    for directory, expected in cases:
+        server = FakeServer(servers=())
+
+        @asynccontextmanager
+        async def connect(
+            arguments: list[str],
+            cwd: Path,
+            env: Mapping[str, str],
+            *,
+            expected_names: set[str] = expected,
+            current: FakeServer = server,
+        ) -> AsyncGenerator[Connection]:
+            overrides = {
+                value.split(".")[1]
+                for value in arguments
+                if value.startswith("mcp_servers.")
+            }
+            assert overrides == expected_names, (
+                "override creates a table without transport"
+            )
+            assert contexts[-1] == (
+                cwd,
+                {
+                    **{k: v for k, v in env.items() if k not in LAUNCH_VARIABLES},
+                    "PATH": os.defpath,
+                },
+            )
+            assert "CODEX_HOME" not in env  # Reserved, excluded from both commands.
+            assert "OPENAI_API_KEY" not in env
+            yield current
+
+        target = CodexLine(
+            luna(),
+            directory,
+            environment={
+                "HOME": str(tmp_path),
+                "CODEX_HOME": "/discarded",
+                "OPENAI_API_KEY": "discarded",
+            },
+            connection_factory=connect,
+            server_lister=codex_module.list_servers,
+        )
+        asyncio.run(target.check_start())
+        assert "initialize" in server.methods()
+    assert [cwd for cwd, _ in contexts] == [worktree, root]
+
+
+def test_a_transportless_listing_refuses_before_connection(tmp_path: Path) -> None:
+    @asynccontextmanager
+    async def never_connect(
+        arguments: list[str], cwd: Path, env: Mapping[str, str]
+    ) -> AsyncGenerator[Connection]:
+        pytest.fail("a transportless server reached app-server startup")
+        yield FakeServer()
+
+    target = CodexLine(
+        luna(),
+        tmp_path,
+        environment={},
+        connection_factory=never_connect,
+        server_lister=lambda cwd, env: [codex_module.ListedServer("broken", False)],
+    )
+    with pytest.raises(EngineRefused, match="without a usable transport"):
+        asyncio.run(target.check_start())
+
+
+@pytest.mark.parametrize("path", ["/opt/trusted/bin", None])
+def test_codex_executable_lookup_uses_absolute_line_path(
+    monkeypatch: pytest.MonkeyPatch, path: str | None
+) -> None:
+    executable = "/opt/trusted/bin/codex"
+    searched: list[str | None] = []
+
+    def which(command: str, *, path: str | None = None) -> str:
+        assert command == "codex"
+        searched.append(path)
+        return executable
+
+    monkeypatch.setattr(codex_module.shutil, "which", which)
+    monkeypatch.setattr(os, "defpath", "/opt/trusted/bin")
+    monkeypatch.setenv("PATH", "/wrong")
+    environment = {} if path is None else {"PATH": path}
+    assert codex_module.codex_path(CWD, environment) == executable
+    assert searched == ["/opt/trusted/bin"]
+
+
+def test_codex_executable_missing_from_line_path_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(EngineRefused, match="not installed or not on PATH"):
+        codex_module.codex_path(tmp_path, {"PATH": str(tmp_path / "missing")})
+
+
+@pytest.mark.parametrize("entry", ["bin", ""])
+def test_planted_codex_in_relative_or_empty_path_is_never_run(
+    tmp_path: Path, entry: str
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory = workspace / "bin" if entry else workspace
+    directory.mkdir(exist_ok=True)
+    marker = workspace / "executed"
+    executable = directory / "codex"
+    executable.write_text(f"#!/bin/sh\ntouch '{marker}'\nprintf '[]'\n")
+    executable.chmod(0o700)
+    with pytest.raises(EngineRefused):
+        codex_module.list_servers(workspace, {"PATH": entry})
+    assert not marker.exists()
+
+
+def test_invalid_server_name_is_reported_only_by_listing_position() -> None:
+    name = "private-server\ncredential-value"
+    with pytest.raises(EngineRefused) as raised:
+        server_arguments(["valid", name], LineConfig())
+    reason = str(raised.value)
+    assert name not in reason
+    assert "private-server" not in reason
+    assert "credential-value" not in reason
+    assert "[1].name" in reason
+
+
+@pytest.mark.parametrize(
+    "root", ["workspace", "scratch", "grant", "temporary", "cache"]
+)
+def test_absolute_codex_in_line_writable_path_is_never_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root: str
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    directory = (
+        workspace / root if root in ("workspace", "scratch") else tmp_path / root
+    )
+    directory.mkdir()
+    marker = workspace / "executed"
+    executable = directory / "codex"
+    executable.write_text(f"#!/bin/sh\ntouch '{marker}'\nprintf '[]'\n")
+    executable.chmod(0o700)
+    environment = {"PATH": str(directory)}
+    grants: tuple[Path, ...] = ()
+    if root == "grant":
+        grants = (directory,)
+    elif root == "temporary":
+        environment["TMPDIR"] = str(directory)
+    elif root == "cache":
+        environment["XDG_CACHE_HOME"] = str(directory)
+    with pytest.raises(EngineRefused, match="line-writable"):
+        codex_module.list_servers(workspace, environment, writable_paths=grants)
+    assert not marker.exists()
+
+
+def test_codex_symlink_into_workspace_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    planted = workspace / "codex"
+    planted.write_text("#!/bin/sh\nexit 0\n")
+    planted.chmod(0o700)
+    link = tmp_path / "codex"
+    link.symlink_to(planted)
+
+    def which(command: str, *, path: str | None = None) -> str:
+        return str(link)
+
+    monkeypatch.setattr(codex_module.shutil, "which", which)
+    with pytest.raises(EngineRefused, match="line-writable"):
+        codex_module.codex_path(workspace, {"PATH": "/opt/trusted/bin"})
+
+
+def test_codex_skips_relative_entries_before_a_trusted_absolute_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    searched: list[str | None] = []
+
+    def which(command: str, *, path: str | None = None) -> str:
+        searched.append(path)
+        return "/opt/trusted/bin/codex"
+
+    monkeypatch.setattr(codex_module.shutil, "which", which)
+    assert (
+        codex_module.codex_path(
+            CWD, {"PATH": os.pathsep.join(("bin", "", "/opt/trusted/bin"))}
+        )
+        == "/opt/trusted/bin/codex"
+    )
+    assert searched == ["/opt/trusted/bin"]
+
+
+def test_default_lister_receives_operator_granted_write_roots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def which(command: str, *, path: str | None = None) -> str:
+        return "/opt/granted/bin/codex"
+
+    monkeypatch.setattr(codex_module.shutil, "which", which)
+    target = CodexLine(
+        luna(),
+        CWD,
+        config=LineConfig(builtin_tools=("Write",), writable_paths=("/opt/granted",)),
+        environment={"PATH": "/opt/granted/bin"},
+    )
+    with pytest.raises(EngineRefused, match="line-writable"):
+        asyncio.run(target.check_start())
+
+
+@pytest.mark.parametrize("app_server", [False, True])
+def test_command_environment_removes_unsafe_interpreter_search_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, app_server: bool
+) -> None:
+    from types import SimpleNamespace
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    grant = tmp_path / "grant"
+    grant.mkdir()
+    environments: list[Mapping[str, str]] = []
+
+    def fake_run(*args: object, **kwargs: object) -> SimpleNamespace:
+        environments.append(cast(Mapping[str, str], kwargs["env"]))
+        return SimpleNamespace(returncode=0, stdout="[]")
+
+    class Captured(Exception):
+        pass
+
+    async def fake_exec(*args: object, **kwargs: object) -> None:
+        environments.append(cast(Mapping[str, str], kwargs["env"]))
+        raise Captured
+
+    monkeypatch.setattr(codex_module, "codex_path", unused_codex)
+    monkeypatch.setattr(spawn, "run", fake_run)
+    monkeypatch.setattr(spawn, "subprocess_exec", fake_exec)
+    environment = {
+        "PATH": os.pathsep.join(
+            ("", "bin", str(workspace), str(grant), "/opt/trusted/bin")
+        )
+    }
+    if app_server:
+
+        async def connect() -> None:
+            async with codex_module._app_server(  # pyright: ignore[reportPrivateUsage]
+                ["app-server"], workspace, environment, writable_paths=(grant,)
+            ):
+                pytest.fail("the fake process unexpectedly started")
+
+        with pytest.raises(Captured):
+            asyncio.run(connect())
+    else:
+        codex_module.list_servers(workspace, environment, writable_paths=(grant,))
+    assert len(environments) == 1
+    assert environments[0]["PATH"] == "/opt/trusted/bin"
+
+
+@pytest.mark.parametrize(
+    "status", [{}, {"data": None}, {"data": "bad"}, {"data": [None]}]
+)
+def test_missing_or_malformed_mcp_status_refuses_before_prompt(
+    status: dict[str, Any],
+) -> None:
+    class Malformed(FakeServer):
+        def result(self, method: str) -> dict[str, Any]:
+            return (
+                status if method == "mcpServerStatus/list" else super().result(method)
+            )
+
+    server = Malformed()
+    with pytest.raises(EngineRefused, match="MCP status"):
+        run(line(server))
+    assert "turn/start" not in server.methods()
+
+
+def test_server_added_after_listing_is_refused_without_echoing_its_name() -> None:
+    server = FakeServer(servers=(("private-server\ncredential-value", "ready", 0),))
+    with pytest.raises(EngineRefused) as raised:
+        run(line(server))
+    assert "private-server" not in str(raised.value)
+    assert "credential-value" not in str(raised.value)
+    assert "turn/start" not in server.methods()
+
+
+def test_enabled_server_on_later_status_page_is_refused() -> None:
+    class Paged(FakeServer):
+        def result(self, method: str) -> dict[str, Any]:
+            if method == "mcpServerStatus/list":
+                requests = [sent for sent in self.sent if sent.get("method") == method]
+                if len(requests) == 1:
+                    return {"data": [], "nextCursor": "next"}
+                assert requests[-1]["params"]["cursor"] == "next"
+                return {
+                    "data": [{"name": "late", "runtimeStatus": "ready", "tools": {}}]
+                }
+            return super().result(method)
+
+    server = Paged()
+    with pytest.raises(EngineRefused):
+        run(line(server))
+    assert "turn/start" not in server.methods()
+
+
+@pytest.mark.parametrize("cursor", ["repeated", 5])
+def test_invalid_or_repeated_mcp_status_cursor_refuses(cursor: object) -> None:
+    class Paged(FakeServer):
+        def result(self, method: str) -> dict[str, Any]:
+            if method == "mcpServerStatus/list":
+                return {"data": [], "nextCursor": cursor}
+            return super().result(method)
+
+    server = Paged()
+    with pytest.raises(EngineRefused, match="pagination"):
+        run(line(server))
+    assert "turn/start" not in server.methods()
+
+
+def test_mcp_status_page_limit_refuses_before_prompt() -> None:
+    class Paged(FakeServer):
+        def result(self, method: str) -> dict[str, Any]:
+            if method == "mcpServerStatus/list":
+                return {"data": [], "nextCursor": str(len(self.sent))}
+            return super().result(method)
+
+    server = Paged()
+    with pytest.raises(EngineRefused, match="page limit"):
+        run(line(server))
+    assert (
+        server.methods().count("mcpServerStatus/list")
+        == codex_module.MCP_STATUS_PAGE_LIMIT
+    )
+    assert "turn/start" not in server.methods()
+
+
+def test_mcp_status_enabled_flag_cannot_be_hidden_by_disabled_runtime_status() -> None:
+    class Conflicting(FakeServer):
+        def result(self, method: str) -> dict[str, Any]:
+            if method == "mcpServerStatus/list":
+                return {
+                    "data": [
+                        {"runtimeStatus": "disabled", "tools": {}, "enabled": True}
+                    ]
+                }
+            return super().result(method)
+
+    server = Conflicting()
+    with pytest.raises(EngineRefused, match="MCP servers"):
+        run(line(server))
+    assert "turn/start" not in server.methods()
+
+
+def test_mcp_status_wait_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Stalled(FakeServer):
+        async def receive(self) -> dict[str, Any] | None:
+            if self.methods()[-1:] == ["mcpServerStatus/list"]:
+                await asyncio.Future[None]()
+            return await super().receive()
+
+    monkeypatch.setattr(codex_module, "REQUEST_TIMEOUT_SECONDS", 0.01)
+    server = Stalled()
+    with pytest.raises(TimeoutError):
+        run(line(server))
+    assert "turn/start" not in server.methods()
+
+
+def test_complete_paginated_disabled_mcp_inventory_allows_the_turn() -> None:
+    class Paged(FakeServer):
+        def result(self, method: str) -> dict[str, Any]:
+            if method == "mcpServerStatus/list":
+                requests = [sent for sent in self.sent if sent.get("method") == method]
+                result = super().result(method)
+                if len(requests) == 1:
+                    result["nextCursor"] = "next"
+                return result
+            return super().result(method)
+
+    server = Paged([message("allowed"), completed()])
+    assert run(line(server)).text == "allowed"
+    assert server.methods().count("mcpServerStatus/list") == 2

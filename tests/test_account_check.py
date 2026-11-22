@@ -94,7 +94,16 @@ def test_deadline_during_cleanup_joins_every_step(
         ) -> tuple[list[str], Mapping[str, str], codex.StopPolicy]:
             return arguments, environment, codex.StopPolicy.KILL_ALL
 
-        monkeypatch.setattr(codex, "codex_path", lambda: "codex")
+        def resolve(
+            cwd: Path,
+            environment: Mapping[str, str],
+            *,
+            writable_paths: Sequence[Path] = (),
+        ) -> str:
+            del cwd, environment, writable_paths
+            return "codex"
+
+        monkeypatch.setattr(codex, "codex_path", resolve)
         monkeypatch.setattr(codex.launcher, "wrap", wrap)
         monkeypatch.setattr(spawn, "subprocess_exec", start)
         monkeypatch.setattr(codex.launcher, "end", end)
@@ -235,8 +244,8 @@ def test_cancelled_listing_holds_the_diagnostic_slot_until_worker_ends(
     release = threading.Event()
     ended = threading.Event()
 
-    def listing(environment: Mapping[str, str]) -> Sequence[str]:
-        del environment
+    def listing(cwd: Path, environment: Mapping[str, str]) -> Sequence[str]:
+        del cwd, environment
         started.set()
         try:
             assert release.wait(5)

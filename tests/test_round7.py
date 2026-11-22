@@ -985,7 +985,7 @@ def codex_line(
         config=config_from_document({"allow_compact": True}),
         environment={},
         connection_factory=lambda arguments, cwd, env: served(server),
-        server_lister=lambda env: [],
+        server_lister=lambda cwd, env: [],
         compacted=compacted,
         compaction_estimated=estimated,
     )
@@ -1103,7 +1103,7 @@ def test_the_codex_estimate_reaches_the_status_within_its_turn(
             config=spec.config,
             environment={},
             connection_factory=lambda arguments, cwd, env: served(server),
-            server_lister=lambda env: [],
+            server_lister=lambda cwd, env: [],
             compacted=spec.compacted,
             compaction_estimated=estimated,
         )

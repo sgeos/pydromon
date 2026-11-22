@@ -1028,7 +1028,7 @@ def codex_line(
         config=config or LineConfig(allow_compact=True),
         environment={},
         connection_factory=connect,
-        server_lister=lambda env: [],
+        server_lister=lambda cwd, env: [],
         compacted=sink.append,
     )
 
@@ -1261,7 +1261,7 @@ def test_f1_an_unsized_codex_compaction_holds_automatic_compaction(
             config=spec.config,
             environment={},
             connection_factory=lambda arguments, cwd, env: served(server),
-            server_lister=lambda env: [],
+            server_lister=lambda cwd, env: [],
             compacted=spec.compacted,
         )
 
