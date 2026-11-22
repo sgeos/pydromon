@@ -1550,6 +1550,21 @@ not examined past it.
   next look compares again. The run's own receipt records the tree it ran in any
   case. A content that cannot be told is treated as changed, never as the same. A file
   edited while it is hashed may be read in either state.
+- **Coverage limits accepted on 2026-11-22.** A `.gitignore` the line writes can
+  hide an untracked input from the digest. If the rule is already present when the
+  digest is taken, changing the ignored input leaves the digest unchanged. Hashing
+  `.gitignore` itself does not prevent this. An unchanged symbolic link also hides
+  a changed referent outside the tree. The digest hashes the link target text and
+  mode rather than the bytes reached through it. Equal digests therefore do not
+  establish that all inputs read by a gate are unchanged.
+  A gate that depends on either kind of input should use a tracked regular-file
+  snapshot inside the checkout, prepared before queuing, and read that snapshot
+  instead of the ignored input or external referent. If this is not possible, the
+  operator must independently pin and validate those inputs and run a fresh gate
+  for the selected versions. Digest equality alone cannot preserve verification
+  coverage for them. These limits apply to both queued content comparisons and
+  receipt comparisons. The tests pin both observed equalities. Ignored files are
+  excluded deliberately because reading them all would include caches.
 - **Residuals.** Ignored untracked files are not compared. A submodule, a
   tracked path that is now a directory, that begins with a double quote, or that holds
   a carriage return or a newline, a tree past the bounds above, and an unborn `HEAD`,

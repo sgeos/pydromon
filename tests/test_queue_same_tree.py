@@ -803,3 +803,31 @@ def test_external_ignore_configuration_cannot_hide_a_new_file(tmp_path: Path) ->
     before = readiness.content_digest(work)
     (work / "new.txt").write_text("must be included")
     assert readiness.content_digest(work) != before
+
+
+@pytest.mark.real_git_status
+def test_line_written_ignore_rule_hides_changed_untracked_input(tmp_path: Path) -> None:
+    """Accepted coverage limit. An existing rule hides edits to a gate input."""
+    work = project(tmp_path / "w")
+    ignore = work / ".gitignore"
+    ignore.write_text(ignore.read_text() + "input.py\n")
+    source = work / "input.py"
+    source.write_text("first")
+    before = readiness.content_digest(work)
+    source.write_text("second")
+    assert source.read_text() == "second"
+    assert readiness.content_digest(work) == before
+
+
+@pytest.mark.real_git_status
+def test_unchanged_link_hides_changed_external_referent(tmp_path: Path) -> None:
+    """Accepted coverage limit. Link text is covered, external bytes are not."""
+    work = project(tmp_path / "w")
+    outside = tmp_path / "input.py"
+    outside.write_text("first")
+    link = work / "linked.py"
+    link.symlink_to(outside)
+    before = readiness.content_digest(work)
+    outside.write_text("second")
+    assert link.read_text() == "second"
+    assert readiness.content_digest(work) == before
