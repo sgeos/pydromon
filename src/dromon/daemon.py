@@ -360,6 +360,18 @@ class Daemon:
     )
     """The watch of a draining restart, kept so that it is not collected."""
 
+    def __post_init__(self) -> None:
+        self.scheduler.set_awaken_check(self.check_awaken_profile)
+
+    def check_awaken_profile(self, line_id: str) -> None:
+        check_grok_profiles(
+            self.project,
+            self.paths,
+            self.scheduler,
+            self.registry_dir,
+            waking=line_id,
+        )
+
     # Settings, at the project's scope and each line's.
 
     def project_layers(
@@ -3942,11 +3954,16 @@ def check_grok_profiles(
     paths: ProjectPaths,
     scheduler: Scheduler,
     registry_dir: Path,
+    *,
+    waking: str | None = None,
 ) -> None:
     """Check every effective Grok line without creating homes or starting engines.
 
-    Start and restart preflight share this check. A missing profile is an operator
-    action and the adapter's error supplies the table or missing entries to add.
+    Start and restart preflight share this check. Dormant lines warn because no
+    engine can run them. Awakening validates only the named line and refuses before
+    recording the wake. Every Grok turn also checks the profile again, so changing
+    the file after awakening does not grant a weaker sandbox. A missing profile is
+    an operator action and the adapter supplies the table or missing entries.
     """
     dynamic = registry_protected(paths, config.federation, registry_dir)
     protected = (
@@ -3955,22 +3972,23 @@ def check_grok_profiles(
     )
     home = Path.home()
     grok_home = home / grok.HOME_DIR
-    from dromon.overrides import apply_config
-
     for line_id in sorted(set(scheduler.state.lines) | set(config.lines)):
+        if waking is not None and line_id != waking:
+            continue
         definition = config.lines.get(line_id)
         existing = line_id in scheduler.state.lines
-        overrides = scheduler.line_overrides(line_id) if existing else {}
-        model = overrides.get("model") or (
-            definition.model if definition is not None else scheduler.model_of(line_id)
-        )
-        if ENGINE_OF[str(model)] != grok.ENGINE_NAME:
+        # A rebind or configure may supersede the declaration without clearing
+        # hibernation. Validate exactly what the scheduler would run now.
+        if existing:
+            model = scheduler.model_of(line_id)
+            line = scheduler.effective_config(line_id)
+        elif definition is not None:
+            model = definition.model
+            line = definition.config
+        else:
             continue
-        line = (
-            apply_config(definition.config, overrides)
-            if definition is not None
-            else scheduler.effective_config(line_id)
-        )
+        if ENGINE_OF[model] != grok.ENGINE_NAME:
+            continue
         try:
             workspace = resolve_workdir(line.workdir, paths.root, protected)
             grok.check_profile(
@@ -3983,7 +4001,18 @@ def check_grok_profiles(
                 resolve_read_only_paths(config.read_only_paths, workspace),
             )
         except (EngineRefused, ConfigError) as error:
-            raise SandboxError(f"Grok line {line_id}: {error}") from error
+            message = f"Grok line {line_id}, profile {grok.profile_name(line)}: {error}"
+            dormant = line_id in scheduler.state.retired_lines or (
+                existing and scheduler.state.lines[line_id].hibernated
+            )
+            if dormant and waking is None:
+                print(
+                    f"dromond: warning: {message}. Fix this profile before waking"
+                    " the line. Retired lines cannot be woken.",
+                    file=sys.stderr,
+                )
+            else:
+                raise SandboxError(message) from error
 
 
 def check_engines(config: ProjectConfig) -> None:
@@ -4404,6 +4433,7 @@ def run(
     check_only: bool = False,
     launch_checks: bool = False,
     observe: Callable[[EventLog], None] | None = None,
+    protection_paths: ProjectPaths | None = None,
 ) -> int:
     """Run the daemon for ``paths`` in the foreground and return its exit status.
 
@@ -4427,7 +4457,13 @@ def run(
     log once every check has passed, after the start applied the project file to it,
     so ``dromon upgrade-check`` can say which lines the started daemon would hold. It
     must only read.
+
+    ``protection_paths`` gives an upgrade check the live paths while its state is
+    replayed from a copy. It is refused outside checks that build no engine. The
+    copied directories cannot be reached by a line because no line is launched.
     """
+    if protection_paths is not None and (not check_only or launch_checks):
+        raise ValueError("protection_paths requires a check without engine launches")
     os.umask(0o077)
     given = overrides or Overrides()
     try:
@@ -4569,7 +4605,9 @@ def run(
             check_roles(scheduler, log, config)
             apply_project(scheduler, log, config)
             report_unsealed(scheduler)
-            check_grok_profiles(config, paths, scheduler, registry_dir)
+            check_grok_profiles(
+                config, protection_paths or paths, scheduler, registry_dir
+            )
             for event in plan_peers(log.state, config.federation):
                 log.append(event)
             scheduler.federation = config.federation

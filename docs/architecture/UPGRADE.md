@@ -226,3 +226,53 @@ Nothing here touches the running daemon or its checkout.
 - **Tested against one old revision.** `tests/test_upgrade.py` checks a log written by
   the code of `6567167`, from 2026-10-31. A log from another revision is checked by
   running the command on it, which is the procedure's point.
+
+## Older sandbox profiles
+
+**Fact.** The upgrade check replays copies but validates Grok profiles against the
+live project root and its normal state and runtime directories. Set
+`DROMON_RUNTIME_DIR` to the value used by the live daemon when that directory was
+moved. Never add the check's temporary directories to a profile. No engine runs
+against the copies. Engine launch checks cannot use this alternate path context.
+
+**Fact.** Codex and Claude Code receive state and runtime denials, project and
+worktree secret denials, and git and configured path write protections when Dromon
+builds their engines. An older project file does not need to repeat those paths in
+its own sandbox document. Explicit grants that conflict with those protections
+still fail. An explicitly disabled Claude Code sandbox retains its documented
+limitations.
+
+**Fact.** Grok has no supported sandbox overlay. Dromon cannot add protections to
+an existing operator-managed `sandbox.toml` without changing that file. Active
+Grok lines therefore still require that their profile deny the live state and
+runtime directories, fleet and federation paths, project and worktree secret
+directories and the credential paths named by the diagnostic. Writers must keep
+git metadata read-only. Every profile must keep configured instruction and
+configuration paths and the denial hook directory read-only. The diagnostic names
+the profile and the missing entries. Add those entries to that profile without
+removing existing restrictions or replacing other profiles. A plain ancestor deny
+covers its descendants. A glob is not treated as proof of that coverage.
+
+**Fact.** A deficient profile used only by hibernated or retired lines produces a
+warning naming each line, its profile and the repairs needed before awakening.
+The start check reports a warning rather than a failure. An active line using the
+same profile still fails the start. Awakening a deficient line refuses before the
+awakening event is recorded. Ownership plans also validate a dormant destination
+before recording their events. Retired lines cannot be awakened and must remain
+absent from the project file under the existing retirement rule.
+
+**Residual.** Grok profiles remain operator-managed and are checked again before
+every turn. An external edit after the start or awakening can therefore refuse a
+later turn. These checks do not establish the installed engine's live sandbox
+behaviour. The existing Grok confinement limits still apply.
+
+**Round 20 audit follow-up.** An empty `DROMON_RUNTIME_DIR` has the same meaning
+as an unset value and selects the default `.dromon/run` directory. Existing lines
+are checked using their current binding and effective configuration rather than
+a declaration that a client may have superseded.
+
+**Fact.** Only dormant Grok profile warnings change a successful start check to
+a warning outcome. Other daemon warnings remain diagnostic notes in the start
+detail. Host sandbox prerequisites therefore remain visible without changing
+the outcome of checking whether copied state can start. A failed start still
+fails the check regardless of its warnings.
