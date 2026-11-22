@@ -2350,10 +2350,15 @@ class CodexLine:
                     fields = cast(dict[str, object], entry)
                     if (
                         "runtimeStatus" not in fields
-                        or fields["runtimeStatus"] is not None
+                        # Inside a thread Codex 0.171.0 reports a disabled server as
+                        # "disabled", and before one as null, as observed live on
+                        # 2026-11-22. Any other status is a server that runs.
+                        or fields["runtimeStatus"] not in (None, "disabled")
                         or not isinstance(fields.get("tools"), dict)
                         or fields["tools"]
-                        or fields.get("enabled") is not False
+                        # Codex 0.171.0 sends no enabled field in a status entry, so a
+                        # missing field is not a refusal. A present one must be false.
+                        or ("enabled" in fields and fields["enabled"] is not False)
                     ):
                         turn.refusal = (
                             "the engine loads MCP servers the line was not given"
