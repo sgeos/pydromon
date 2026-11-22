@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
 from dromon import evidence, launcher, spawn
-from dromon.engine import EngineRefused
+from dromon.engine import EngineRefused, read_engine_record
 from dromon.launcher import StopPolicy
 
 MAX_LINE: Final = 64 * 1024 * 1024
@@ -150,14 +150,9 @@ class Process:
         stdout = self._process.stdout
         if stdout is None:
             raise EngineRefused("the engine was started without a standard output")
-        try:
-            line = await stdout.readuntil(b"\n")
-        except asyncio.IncompleteReadError as partial:
-            line = partial.partial
-        except asyncio.LimitOverrunError as error:
-            raise EngineRefused(
-                f"the engine sent a record longer than {MAX_LINE} bytes"
-            ) from error
+        line = await read_engine_record(
+            stdout, stream="JSON-lines engine stdout", limit=MAX_LINE
+        )
         if not line:
             return None
         try:

@@ -1,0 +1,2 @@
+Recoverable turn failures retain diagnostics without blocking the next turn.
+Turn ends may atomically restore mail that was not submitted to an engine.

@@ -213,6 +213,7 @@ from dromon.engine import (
     EngineClosed,
     EnginePlanLimit,
     EngineRefused,
+    EngineStreamTooLong,
     TurnReport,
     composed_instructions,
     instruction_sizes,
@@ -14218,6 +14219,9 @@ class Scheduler:
             stopped = self._engine_stop_notice(line_id)
             if stopped is not None:
                 prompt = f"{stopped}\n\n{prompt}"
+            recovered = self._stream_recovery_notice(line_id)
+            if recovered is not None:
+                prompt = f"{recovered}\n\n{prompt}"
             quiet = self._quiet_notice(line_id)
             if quiet is not None:
                 prompt = f"{quiet}\n\n{prompt}"
@@ -14272,6 +14276,7 @@ class Scheduler:
                 refused,
                 tuple(keys),
                 led_brief=brief is not None,
+                triggering_mail=tuple(message_id for message_id, _ in messages),
             )
         )
         self._running[line_id] = task
@@ -14287,6 +14292,7 @@ class Scheduler:
         keys: tuple[str, ...] = (),
         *,
         led_brief: bool = False,
+        triggering_mail: tuple[str, ...] = (),
     ) -> None:
         """Run one turn of ``line_id``. ``refused`` is a failure that came before the
         turn, as it was dispatched, which fails the turn before any engine runs.
@@ -14394,11 +14400,19 @@ class Scheduler:
         except Exception as error:  # noqa: BLE001
             # The boundary between the scheduler and an engine. Any engine failure
             # ends only this turn, and is reported rather than crashing the daemon.
-            self._failed.add(line_id)
+            recoverable_stream = (
+                isinstance(error, EngineStreamTooLong) and error.recoverable
+            )
+            if recoverable_stream:
+                self._failed.discard(line_id)
+                if isinstance(error, EngineStreamTooLong) and error.replace_session:
+                    self._log.append(LineSessionCleared(line_id))
+            else:
+                self._failed.add(line_id)
             if isinstance(error, EngineRefused):
                 stop_cause = str(error)
             ending = "failed"
-            failed = True
+            failed = not recoverable_stream
             closing_error = error
             failure = raised_failure(
                 error,
@@ -14435,11 +14449,31 @@ class Scheduler:
             self._running.pop(line_id, None)
             self._writer_turns.discard(line_id)
             self._last_turn_end[line_id] = self._clock()
+            if (
+                isinstance(closing_error, EngineStreamTooLong)
+                and closing_error.recoverable
+            ):
+                payload = json.dumps(
+                    {
+                        "mail": list(triggering_mail)
+                        if closing_error.prompt_may_have_run
+                        else [],
+                        "replaced": closing_error.replace_session,
+                    }
+                )
+                message_id = new_id("m")
+                self._log.append(
+                    MessageSent(
+                        message_id,
+                        HARNESS,
+                        LineAddress(line_id),
+                        MessageKind.NOTE,
+                        "Dromon stream recovery " + payload,
+                    )
+                )
+                self._log.append(MessageDelivered(message_id))
             if line is not None:
-                # Round 8 review, ON1. With no report the prompt may never have
-                # reached the engine, as when it could not be composed, so the turn
-                # retires none of the notes delivered into it.
-                self._end_turn(line_id, report, failure, closing_error)
+                self._end_turn(line_id, report, failure, closing_error, triggering_mail)
                 self._restart_turn_ended(line_id, report, asked=asked)
             if stop_cause is not None and line is not None:
                 self._note_engine_stop(line_id, stop_cause)
@@ -14491,12 +14525,17 @@ class Scheduler:
         report: TurnReport | None,
         failure: tuple[FailureCause, str | None] | None,
         closing_error: BaseException | None = None,
+        triggering_mail: tuple[str, ...] = (),
     ) -> None:
         """Record ``line_turn_ended`` for a turn of ``line_id``, with the cause of its
         failure if it failed, and write that cause to the daemon log. **Round 15
         follow-up of 2026-11-05.** A turn marked failed for which no path named a
         cause records ``unknown``, so no failed turn is recorded without one."""
-        failed = line_id in self._failed
+        # A recoverable stream failure records its cause without suppressing the
+        # next turn through the scheduler's failed-line set.
+        failed = line_id in self._failed or (
+            isinstance(closing_error, EngineStreamTooLong) and closing_error.recoverable
+        )
         if failed and failure is None:
             failure = (FailureCause.UNKNOWN, None)
         closing_reason = (
@@ -14504,6 +14543,16 @@ class Scheduler:
         )
         if closing_error is not None and closing_reason is None and failure is not None:
             failure = (failure[0], None)
+        recoverable = (
+            isinstance(closing_error, EngineStreamTooLong) and closing_error.recoverable
+        )
+        retry_messages = (
+            triggering_mail
+            if isinstance(closing_error, EngineStreamTooLong)
+            and closing_error.recoverable
+            and not closing_error.prompt_may_have_run
+            else ()
+        )
         self._log.append(
             LineTurnEnded(
                 line_id,
@@ -14513,8 +14562,11 @@ class Scheduler:
                 failure[0] if failed and failure is not None else None,
                 failure[1] if failed and failure is not None else None,
                 closing_reason,
+                True if recoverable else None,
+                retry_messages,
             )
         )
+        self._post_office.update(retry_messages)
         if failed and failure is not None:
             print(
                 f"dromond: line {line_id} turn ended as failed, cause"
@@ -14610,6 +14662,59 @@ class Scheduler:
         ):
             return
         self._log.append(MessageDelivered(message_id))
+
+    def _stream_recovery_notice(self, line_id: str) -> str | None:
+        """Render only validated identifiers and fixed text from persisted recovery.
+
+        Reported turn counts retire a notice once a subsequent turn reports.
+        Message bodies and discarded frame bytes never enter this notice.
+        """
+        prefix = "Dromon stream recovery "
+        current = self._state().reported_turn_ends.get(line_id, 0)
+        notices: list[str] = []
+        for message in self._state().messages.values():
+            if (
+                message.sender != HARNESS
+                or message.recipient != LineAddress(line_id)
+                or not message.body.startswith(prefix)
+                or message.reported_ends_at_delivery is None
+                or message.reported_ends_at_delivery < current
+            ):
+                continue
+            try:
+                payload: object = json.loads(message.body[len(prefix) :])
+            except ValueError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            fields = cast(dict[str, object], payload)
+            mail = fields.get("mail")
+            if not isinstance(mail, list):
+                continue
+            ids: list[str] = []
+            for value in cast(list[object], mail):
+                if not isinstance(value, str) or value not in self._state().messages:
+                    break
+                if self._state().messages[value].recipient != LineAddress(line_id):
+                    break
+                ids.append(value)
+            else:
+                text = "Dromon ended the previous turn after an oversized engine frame."
+                if ids:
+                    text += (
+                        " That turn had mail "
+                        + ", ".join(ids)
+                        + ". Its outcome is uncertain. This mail is not replayed."
+                        " Check for side effects before acting."
+                    )
+                if fields.get("replaced") is True:
+                    text += (
+                        " Dromon replaced your Codex session. This is a fresh session."
+                        " Mail, worktree, ownership and the evidence index"
+                        " are preserved."
+                    )
+                notices.append(text)
+        return "\n\n".join(notices) if notices else None
 
     def _engine_stop_notice(self, line_id: str) -> str | None:
         current = self._state().reported_turn_ends.get(line_id, 0)

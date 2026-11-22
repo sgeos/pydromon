@@ -715,6 +715,122 @@ def test_a_hold_asks_the_default_operator_when_none_messaged(
     assert recipient == OperatorAddress("operator")
 
 
+def test_stream_overrun_can_resume_after_answering_the_failure_question(
+    make_world: MakeWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dromon.engine import read_engine_record
+
+    target = make_world({"alpha": [[], []]})
+    engine = target.engine("alpha")
+    original = engine.run_turn
+
+    async def overrun(prompt: str) -> TurnReport:
+        del prompt
+        reader = asyncio.StreamReader(limit=16)
+        reader.feed_data(b"x" * 17)
+        await read_engine_record(reader, stream="test engine stdout", limit=16)
+        raise AssertionError("overrun was accepted")
+
+    monkeypatch.setattr(engine, "run_turn", overrun)
+    run(target, send(target, "alpha", "first"))
+    (question_id,) = questions_for(target)
+    assert target.log.state.lines["alpha"].held_by == question_id
+    assert "test engine stdout" in str(
+        target.log.state.lines["alpha"].last_closing_reason
+    )
+    monkeypatch.setattr(engine, "run_turn", original)
+    target.scheduler.send(ANA, LineAddress("alpha"), "resume", reply_to=question_id)
+    run(target, send(target, "alpha", "next"))
+    assert engine.prompts
+    assert target.log.state.lines["alpha"].held_by is None
+
+
+def test_recoverable_codex_overrun_does_not_hold_next_turn(
+    make_world: MakeWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dromon.engine import EngineStreamTooLong
+
+    target = make_world({"alpha": [[], []]})
+    engine = target.engine("alpha")
+    original = engine.run_turn
+
+    async def overrun(prompt: str) -> TurnReport:
+        del prompt
+        error = EngineStreamTooLong("ENGINE_STREAM_TOO_LONG: Codex stdout")
+        error.recoverable = True
+        error.replace_session = True
+        raise error
+
+    monkeypatch.setattr(engine, "run_turn", overrun)
+    run(target, send(target, "alpha", "first"))
+    assert target.log.state.lines["alpha"].held_by is None
+    assert not questions_for(target)
+    assert "ENGINE_STREAM_TOO_LONG" in str(
+        target.log.state.lines["alpha"].last_closing_reason
+    )
+    monkeypatch.setattr(engine, "run_turn", original)
+    run(target, send(target, "alpha", "next"))
+    assert len(engine.prompts) == 1
+    assert target.log.state.lines["alpha"].held_by is None
+
+
+@pytest.mark.parametrize("submitted", [False, True])
+def test_stream_recovery_mail_survives_restart_without_duplicate_delivery(
+    make_world: MakeWorld, monkeypatch: pytest.MonkeyPatch, submitted: bool
+) -> None:
+    from dromon.engine import EngineStreamTooLong
+
+    target = make_world({"alpha": [[], []]})
+    engine = target.engine("alpha")
+
+    async def overrun(prompt: str) -> TurnReport:
+        del prompt
+        error = EngineStreamTooLong("ENGINE_STREAM_TOO_LONG")
+        error.recoverable = True
+        error.prompt_may_have_run = submitted
+        raise error
+
+    monkeypatch.setattr(engine, "run_turn", overrun)
+    message_id = target.scheduler.send(ANA, LineAddress("alpha"), "original assignment")
+
+    async def one_turn() -> None:
+        target.scheduler._begin_turn(  # pyright: ignore[reportPrivateUsage]
+            "alpha", [(message_id, target.log.state.messages[message_id])]
+        )
+        await asyncio.gather(*target.scheduler._running.values())  # pyright: ignore[reportPrivateUsage]
+
+    asyncio.run(one_turn())
+    target.scheduler.stop_workers()
+    # The fixture closes target.log, which the restart replaces below. Close the
+    # original connection first so neither parameter case leaves it for collection.
+    target.log.close()
+    with EventLog(target.path) as replayed:
+        assert not replayed.state.lines["alpha"].failed
+        assert replayed.state.messages[message_id].delivered is submitted
+        target.log = replayed
+        target.scheduler = Scheduler(replayed, target.build, tick_seconds=0)
+
+        async def next_turn() -> None:
+            if submitted:
+                target.scheduler.send(ANA, LineAddress("alpha"), "new instruction")
+
+        run(target, next_turn)
+        prompts = target.engines["alpha"].prompts
+        assert len(prompts) == 1
+        if submitted:
+            assert "outcome is uncertain" in prompts[0]
+            assert message_id in prompts[0]
+            assert bodies(target, prompts[0]) == ["new instruction"]
+        else:
+            assert bodies(target, prompts[0]) == ["original assignment"]
+        run(target, send(target, "alpha", "one more"))
+        assert bodies(target, prompts[-1]) == ["one more"]
+        assert "outcome is uncertain" not in prompts[-1]
+        target.scheduler.stop_workers()
+    # Attribute a leaked connection in either scheduler cycle to this test.
+    gc.collect()
+
+
 def test_an_engine_failure_holds_the_line_and_asks_an_operator(
     make_world: MakeWorld, capsys: pytest.CaptureFixture[str]
 ) -> None:

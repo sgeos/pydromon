@@ -273,6 +273,51 @@ def test_a_reused_codex_connection_refuses_a_changed_account(tmp_path: Path) -> 
     assert world.servers[0].closed
 
 
+def test_kept_resume_overrun_preserves_reason_and_replaces_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dromon.engine import EngineStreamTooLong
+
+    world = World([[done()], [done()]])
+    engine = world.line(tmp_path)
+    original = Server.receive
+
+    async def receive(server: Server) -> dict[str, Any] | None:
+        message = await original(server)
+        if message is not None and any(
+            sent.get("method") == "thread/resume"
+            and sent.get("id") == message.get("id")
+            for sent in server.sent
+        ):
+            error = EngineStreamTooLong("ENGINE_STREAM_TOO_LONG: test frame")
+            error.recoverable = True
+            error.frame_id = message["id"]
+            error.frame_is_response = True
+            raise error
+        return message
+
+    monkeypatch.setattr(Server, "receive", receive)
+
+    async def go() -> None:
+        await engine.run_turn("first")
+        with pytest.raises(EngineStreamTooLong, match="thread/resume"):
+            await engine.run_turn("second")
+        assert engine.session_id is None
+        await engine.run_turn("third")
+        await engine.close()
+
+    asyncio.run(go())
+    assert world.servers[0].closed
+    assert "thread/start" in world.servers[1].methods()
+    assert "thread/resume" not in world.servers[1].methods()
+    prompts = [
+        m["params"]["input"]
+        for m in world.servers[1].sent
+        if m.get("method") == "turn/start"
+    ]
+    assert "replaced your Codex session" in str(prompts)
+
+
 def test_a_failed_check_request_closes_the_connection(tmp_path: Path) -> None:
     world = World([[done()], [done()]])
     engine = world.line(tmp_path)

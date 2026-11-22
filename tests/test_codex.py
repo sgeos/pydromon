@@ -466,7 +466,8 @@ def test_app_server_output_close_is_bounded_even_while_process_lives(
     monkeypatch.setattr(codex_module, "OUTPUT_CLOSE_SECONDS", 0.01)
 
     class Stdout:
-        async def readline(self) -> bytes:
+        async def read(self, size: int) -> bytes:
+            del size
             return b""
 
     class LiveProcess:
@@ -563,9 +564,43 @@ def test_the_next_turn_resumes_the_thread() -> None:
     run(line(server, session_id=f"th:{fingerprint}"))
     resume = server.params("thread/resume")
     assert resume["threadId"] == "th"
+    assert resume["excludeTurns"] is True
     assert "dynamicTools" not in resume
     assert "thread/start" not in server.methods()
     assert TOOLS_CHANGED_NOTE not in str(server.params("turn/start")["input"])
+
+
+@pytest.mark.parametrize("identity", ["matching", "other", "notice", "unknown"])
+def test_resume_overrun_replaces_session_and_next_turn_says_so(identity: str) -> None:
+    from dromon.engine import EngineStreamTooLong
+
+    class OverflowServer(FakeServer):
+        async def receive(self) -> dict[str, Any] | None:
+            if self.sent and self.sent[-1].get("method") == "thread/resume":
+                self.queue.clear()
+                error = EngineStreamTooLong("oversized frame")
+                error.recoverable = True
+                error.frame_id = self.sent[-1]["id"] if identity != "other" else -1
+                error.frame_is_response = identity != "unknown"
+                error.frame_method = "notice" if identity == "notice" else None
+                raise error
+            return await super().receive()
+
+    server = OverflowServer()
+    fingerprint = line(FakeServer()).tools_fingerprint()
+    target = line(server, session_id=f"th:{fingerprint}")
+    with pytest.raises(EngineStreamTooLong, match="thread/resume") as caught:
+        run(target)
+    if identity != "matching":
+        assert not caught.value.replace_session
+        assert target.session_id == f"th:{fingerprint}"
+        return
+    assert caught.value.replace_session
+    assert target.session_id is None
+    server.sent.clear()
+    run(target)
+    assert "thread/resume" not in server.methods()
+    assert "replaced your Codex session" in str(server.params("turn/start")["input"])
 
 
 @pytest.mark.parametrize("stored", ["th", "th:0000000000000000"])
