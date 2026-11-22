@@ -4,53 +4,47 @@
 
 A state file, overwritten whole after each task.
 
-## 2026-11-19, rounds 18 and 19, the other project's recovery, all known issues and drivers
+## 2026-11-22, round 20, the other project first, all known issues and drivers
 
-**The other project.** It was blocked pending a supported recovery and an independent
-review. Round 18 gave both. `docs/architecture/UPGRADE.md` and `dromon upgrade-check` are
-the supported path, and audit reviewed the diagnosis of its failed Codex starts, which
-names three candidates, all fixed on main, and proves none for that installation. Its
-later Codex `account/read` failure did not reproduce with its exact arguments a day
-later. Three notices went by the mailbox. It has not replied, and it still ran 6567167
-when last observed.
+**The other project.** Every message it sent after 2026-11-06 had gone unread, because
+the interline tool's `inbox` shows only the oldest twenty unacknowledged messages and
+pydromon acknowledged none. The operator's session read all 213 through the store,
+triaged them with six agents, acknowledged them, and answered requests 536, 539, 548 and
+570. Its Codex lines were blocked by three pydromon defects, now fixed on main.
 
-**Done, merged in pull requests 164 to 178.**
+- **An oversized resume frame**, "Separator is not found, and chunk exceed the limit",
+  held its Lead, Core and Review lines. Resumes now request `excludeTurns`, an oversized
+  frame ends the turn recoverably, and unsubmitted mail is requeued. Pull request 185.
+- **The listing context.** Servers were listed in the daemon's directory and overridden
+  in the worktree's. They are now listed in each line's context, and Codex is resolved
+  only outside line-writable roots. Pull request 183.
+- **The account failure.** The other project bisected it to one bare
+  `mcp_servers.S.enabled=false` for a server its project configuration defines. Disable
+  overrides are now complete placeholder tables, which the operator confirmed live from
+  its directory. Pull requests 188 and 189. The operator's session had first called this a
+  transient provider failure, which was wrong.
+- **Also for it.** An upgrade check that warns for dormant Grok profiles, 182. A no-model
+  account check, 184. Counter epochs, 186.
 
-- **Security.** Four client-created Claude Code lines could list the home ssh directory
-  and read the Codex sign-in file, which the round 18 report brief's confinement check
-  found. Every Claude Code line now denies the shared credential paths in its sandbox and
-  file tools, a line with no sandbox setting gets an enabled one, escape settings are
-  refused, and `daemon.default_profile` gives client-created lines the project profile's
-  commit guards. A live check on 2026-11-18 from six lines found all denied. Audit
-  reviewed the change four times.
-- **Runs and answers.** `dromon run status` overflowed the line cap and is bounded, with
-  other answers. A queued run follows a commit of the same content, hashed from the files
-  with hooks and filters off.
-- **Processes.** A launch record whose start time cannot be read is retained, and a
-  cancelled match closes its pipes, which a Linux CI failure exposed.
-- **Mail.** The evidence index screens only quoted text, and lines can acknowledge many
-  notes at once.
-- **Session names.** Claude Code sessions are named by the operator's pattern, such as
-  `PDr00-pydromon-runtime-Sn55hi`, configurable as `daemon.session_name`.
-- **Drivers.** Every model Anthropic, OpenAI, xAI and Google released publicly between
-  2026-08-21 and 2026-11-19 has a driver. GPT-6.2 Astra and Sol were added. Mythos 5.2
-  and GPT-6 Cyber are restricted, so they were not counted as public.
+**Drivers.** Gemini 4 Neon, released 2026-11-18, has a Pi driver. Cursor Agent and
+Antigravity list no identifier for it locally. No other pertinent release since
+2026-11-19.
 
-**Team.** Anthropic seats owned every role from 2026-11-18T07:17Z, renewed to 21:26Z.
-At about 20:30Z Claude's weekly window fell below 10 percent, and the roles failed over
-to their OpenAI seats as designed. The operator's session returned them after the reset.
+**Team.** From 2026-11-22T07:14Z OpenAI seats own every role, grok-review is
+hibernated, and Anthropic seats are fallback only through round 21.
 
-**Decided by the operator in session.** Session name rules, Sonnet's code `Sn`, the line
-identifier as the variant, and a version code from the package version.
+**Experience reports.** All seven OpenAI seats reported SATISFIED, in each worktree's
+`tmp/reports`. Every confinement check was denied. The operator's report is in the main
+checkout's `tmp/reports`. Their top requests were immutable gate snapshots and visible
+queued-run lifecycles.
 
-**Declined by the operator's session.** Locations in disclosure refusals, by the
-operator's decision of 2026-10-30. A brief that asked for them was withdrawn unbuilt.
+**Found broken and fixed.** After pull request 188 every Codex line failed its start check, because the
+isolation check required a null runtime status and an `enabled` field, and inside a thread
+Codex 0.171.0 reports a disabled server as "disabled" with no such field. The operator's
+brief had specified the null status from a probe made without a thread. `dromon restart`
+refused the new code, so the running daemon was untouched. The fix was verified live on
+all seven Codex lines before merge.
 
-**Experience reports.** Rounds 18 and 19 from every Anthropic line that worked and from
-capabilities-sol, in each worktree's `tmp/reports`, and the operator's in the main
-checkout's `tmp/reports`. Most were satisfied. Requests not yet built are in the
-handoff's Open list.
-
-**Not verified.** A live Claude Code turn after the session name change, Linux, and the
-GPT-6.2 drivers live. Several merges relied on continuous integration while memory
-pressure held local gates.
+**Not verified.** The other project has not upgraded, so no fix has run there. GitHub's
+macOS runners delayed every merge by hours, and local full gates were often held by
+memory pressure, so several merges rested on continuous integration and sandbox gates.
