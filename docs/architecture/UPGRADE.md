@@ -26,6 +26,17 @@ sessions and configuration. It sends no thread request or model request. It chec
 one Codex account and does not test a model turn, tool isolation or provider health
 over time. Claude Code has no equivalent supported account read.
 
+**Cancellation ownership.** The account deadline does not cancel the owned launcher
+cleanup task or detach the server listing worker. The diagnostic slot remains held
+until each finishes, including after repeated cancellation. Launcher termination,
+kill and reap waits keep their existing bounds. Standard output and standard error
+are drained with a separate ten second bound even when launcher cleanup fails.
+Standard input is closed. A client timeout can precede completion of this cleanup.
+Scripted tests cover cancellation at each cleanup stage and a blocked listing
+worker that later succeeds or fails. They do not prove operating system reaping
+under a stalled kernel or successful termination of every descendant after a
+reported launcher failure.
+
 **Fact from a scripted test.** Code `-32603` with the message about invalid workspace
 requirements is handled at `account/read` before a turn receives its task. The
 reported failure has not been reproduced against a provider here. A successful check later

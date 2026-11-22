@@ -729,6 +729,62 @@ def codex_path() -> str:
     return found
 
 
+async def _joined[T](work: asyncio.Future[T]) -> T:
+    """Join owned work before propagating even repeated caller cancellations.
+
+    The work supplies its own finite bound. Cancelling a shield alone would leave
+    it active after its owner returned. Each loop consumes a cancellation or ends
+    when the owned work finishes. Observe its exception even after cancellation.
+    """
+    cancelled = False
+    while not work.done():
+        try:
+            await asyncio.shield(work)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:  # noqa: BLE001, result below retrieves the owned failure
+            break
+    if cancelled:
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            work.result()
+        raise asyncio.CancelledError
+    return work.result()
+
+
+async def _close_server(
+    process: spawn.ChildProcess,
+    policy: StopPolicy,
+    draining: asyncio.Task[None] | None,
+) -> None:
+    """Use the launcher's bounded termination, kill and reap waits, then drain.
+
+    This task has an independent lifetime from the request deadline. Draining has
+    its own bound and still runs if launcher cleanup fails.
+    """
+
+    async def drain_output() -> None:
+        if process.stdout is not None:
+            while await process.stdout.read(64 * 1024):
+                pass
+
+    output = asyncio.create_task(drain_output())
+    try:
+        await launcher.end(process, policy, close_input=False)
+    finally:
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        finally:
+            results = await asyncio.gather(
+                evidence.stop_draining(draining),
+                evidence.stop_draining(output),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+
+
 @asynccontextmanager
 async def _app_server(
     arguments: list[str], cwd: Path, environment: Mapping[str, str]
@@ -751,8 +807,7 @@ async def _app_server(
     finally:
         # The launcher ends the app-server and, by the line's stop policy, its group
         # and every descendant.
-        await launcher.end(process, policy, close_input=False)
-        await evidence.stop_draining(draining)
+        await _joined(asyncio.create_task(_close_server(process, policy, draining)))
 
 
 def list_servers(environment: Mapping[str, str]) -> Sequence[ListedServer]:
@@ -1449,7 +1504,11 @@ class CodexLine:
                 else checked_scratch(self.cwd, self.scratch)
             )
             listed = (
-                await asyncio.to_thread(self._list_servers, environment)
+                await _joined(
+                    asyncio.create_task(
+                        asyncio.to_thread(self._list_servers, environment)
+                    )
+                )
                 if account_only
                 else self._list_servers(environment)
             )

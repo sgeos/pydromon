@@ -1,16 +1,17 @@
 """Account diagnostics run against scripted connections without a provider."""
 
 import asyncio
+import threading
 from collections.abc import Sequence
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from claude_agent_sdk import SdkMcpTool
 
-from dromon import cli, daemon as daemon_module, exits
+from dromon import cli, codex, daemon as daemon_module, exits, spawn
 from dromon.codex import AccountCheckError, Connection
 from dromon.daemon import Daemon
 from dromon.eventlog import EventLog
@@ -51,6 +52,229 @@ def test_account_check_never_touches_a_thread_or_session(keep: bool) -> None:
     )
     assert server.environment == ordinary.environment
     assert server.arguments == ordinary.arguments
+
+
+@pytest.mark.parametrize("stage", ["terminate", "kill", "reap", "drain"])
+@pytest.mark.parametrize("repeated", [False, True])
+def test_deadline_during_cleanup_joins_every_step(
+    monkeypatch: pytest.MonkeyPatch, stage: str, repeated: bool
+) -> None:
+    """A timer and a second cancellation must not detach any cleanup step."""
+
+    async def check() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        trace: list[str] = []
+
+        async def step(name: str) -> None:
+            trace.append(name)
+            if stage == name:
+                entered.set()
+                await release.wait()
+
+        async def end(*args: object, **kwargs: object) -> None:
+            for name in ("terminate", "kill", "reap"):
+                await step(name)
+
+        async def drain(*args: object, **kwargs: object) -> None:
+            await step("drain")
+
+        async def start(*args: object, **kwargs: object) -> spawn.ChildProcess:
+            return cast(spawn.ChildProcess, process)
+
+        class Process:
+            stdin = None
+            stdout = None
+            stderr = None
+
+        process = Process()
+
+        def wrap(
+            arguments: list[str], environment: Mapping[str, str]
+        ) -> tuple[list[str], Mapping[str, str], codex.StopPolicy]:
+            return arguments, environment, codex.StopPolicy.KILL_ALL
+
+        monkeypatch.setattr(codex, "codex_path", lambda: "codex")
+        monkeypatch.setattr(codex.launcher, "wrap", wrap)
+        monkeypatch.setattr(spawn, "subprocess_exec", start)
+        monkeypatch.setattr(codex.launcher, "end", end)
+        monkeypatch.setattr(codex.evidence, "stop_draining", drain)
+
+        async def request() -> None:
+            async with asyncio.timeout(0.02):
+                async with codex._app_server([], Path("."), {}):  # pyright: ignore[reportPrivateUsage]
+                    pass
+
+        task = asyncio.create_task(request())
+        await entered.wait()
+        await asyncio.sleep(0.04)
+        assert not task.done()
+        if repeated:
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError if repeated else TimeoutError):
+            await task
+        assert trace[:3] == ["terminate", "kill", "reap"]
+        assert trace.count("drain") == 2
+
+    asyncio.run(check())
+
+
+def test_cleanup_failure_still_drains(monkeypatch: pytest.MonkeyPatch) -> None:
+    trace: list[str] = []
+
+    async def end(*args: object, **kwargs: object) -> None:
+        raise OSError("synthetic cleanup failure")
+
+    async def drain(*args: object, **kwargs: object) -> None:
+        trace.append("drained")
+
+    class Process:
+        stdin = None
+        stdout = None
+
+    monkeypatch.setattr(codex.launcher, "end", end)
+    monkeypatch.setattr(codex.evidence, "stop_draining", drain)
+    with pytest.raises(OSError, match="synthetic"):
+        asyncio.run(
+            codex._close_server(  # pyright: ignore[reportPrivateUsage]
+                cast(spawn.ChildProcess, Process()), codex.StopPolicy.KILL_ALL, None
+            )
+        )
+    assert trace == ["drained", "drained"]
+
+
+def test_failed_stderr_drain_still_joins_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    joined: list[bool] = []
+
+    async def end(*args: object, **kwargs: object) -> None:
+        pass
+
+    async def drain(task: asyncio.Task[None] | None) -> None:
+        if task is None:
+            raise OSError("synthetic drain failure")
+        await asyncio.sleep(0.01)
+        await task
+        joined.append(True)
+
+    class Process:
+        stdin = None
+        stdout = None
+
+    monkeypatch.setattr(codex.launcher, "end", end)
+    monkeypatch.setattr(codex.evidence, "stop_draining", drain)
+    with pytest.raises(OSError, match="synthetic drain"):
+        asyncio.run(
+            codex._close_server(  # pyright: ignore[reportPrivateUsage]
+                cast(spawn.ChildProcess, Process()), codex.StopPolicy.KILL_ALL, None
+            )
+        )
+    assert joined == [True]
+
+
+@pytest.mark.parametrize("input_failure", [False, True])
+def test_cleanup_closes_input_and_bounds_unclosed_output_pipes(
+    monkeypatch: pytest.MonkeyPatch, input_failure: bool
+) -> None:
+    async def check() -> None:
+        closed: list[bool] = []
+        drains: list[asyncio.Task[None]] = []
+        stop = codex.evidence.stop_draining
+
+        class Input:
+            def close(self) -> None:
+                closed.append(True)
+                if input_failure:
+                    raise OSError("synthetic close failure")
+
+        class Process:
+            stdin = Input()
+            stdout = asyncio.StreamReader()
+
+        process = Process()
+        process.stdout.feed_data(b"unread output")
+
+        async def end(*args: object, **kwargs: object) -> None:
+            pass
+
+        async def drain(task: asyncio.Task[None] | None) -> None:
+            if task is not None:
+                drains.append(task)
+            await stop(task, seconds=0.01)
+
+        async def stderr() -> None:
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(codex.launcher, "end", end)
+        monkeypatch.setattr(codex.evidence, "stop_draining", drain)
+        pending = asyncio.create_task(stderr())
+        try:
+            await codex._close_server(  # pyright: ignore[reportPrivateUsage]
+                cast(spawn.ChildProcess, process), codex.StopPolicy.KILL_ALL, pending
+            )
+        except OSError:
+            assert input_failure
+        else:
+            assert not input_failure
+        assert closed == [True]
+        assert len(drains) == 2
+        assert all(task.cancelled() for task in drains)
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_cancelled_listing_holds_the_diagnostic_slot_until_worker_ends(
+    tmp_path: Path, short_runtime: Path, monkeypatch: pytest.MonkeyPatch, failure: bool
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    ended = threading.Event()
+
+    def listing(environment: Mapping[str, str]) -> Sequence[str]:
+        del environment
+        started.set()
+        try:
+            assert release.wait(5)
+            if failure:
+                raise OSError("synthetic listing failure")
+            return []
+        finally:
+            ended.set()
+
+    with EventLog(tmp_path / "events.sqlite3") as log:
+        log.append(LineCreated("alpha", LUNA, "subscription"))
+        target = line(FakeServer())
+        monkeypatch.setattr(target, "_list_servers", listing)
+        scheduler = Scheduler(log, lambda spec, tools: target)
+        daemon = Daemon(project_paths(tmp_path, short_runtime), log, "now", scheduler)
+        wire = encode_request(Request("r", Operation.ACCOUNT_CHECK, {"line": "alpha"}))
+
+        async def check() -> None:
+            task = asyncio.create_task(daemon.respond_operator(wire))
+            try:
+                async with asyncio.timeout(2):
+                    while not started.is_set():
+                        await asyncio.sleep(0.001)
+                task.cancel()
+                await asyncio.sleep(0.01)
+                task.cancel()
+                await asyncio.sleep(0.01)
+                assert not task.done()
+                assert not ended.is_set()
+                assert not (await daemon.respond_operator(wire)).ok
+            finally:
+                release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            assert ended.is_set()
+            assert not daemon._account_check_busy  # pyright: ignore[reportPrivateUsage]
+
+        asyncio.run(check())
 
 
 def test_account_check_does_not_reflect_unknown_plan() -> None:

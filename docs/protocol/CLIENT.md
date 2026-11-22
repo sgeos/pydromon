@@ -26,10 +26,20 @@ The process ends when the read completes or fails. No model request is sent.
 
 **Bound.** The engine check has a 90 second deadline, including its existing
 60 second MCP server listing, which runs off the event loop. Ordinary launcher
-cleanup follows the deadline. The client waits at most 120 seconds. These bounds
+cleanup follows the deadline in a separately owned task. Cancellation, including
+repeated cancellation during termination, kill, reaping or draining, waits for
+that task before releasing the diagnostic slot. Launcher termination and reaping
+retain their individual bounded waits. Output draining then has its own ten second
+bound and standard input is closed. Draining still runs if launcher cleanup fails.
+The listing worker is also joined before cancellation propagates. Its existing
+60 second subprocess timeout bounds ordinary listing work, with process startup
+and cleanup retaining their own bounds. A timed out check can therefore keep its
+slot while this work finishes. The client waits at most 120 seconds. These bounds
 avoid retry loops in the diagnostic and allow the same startup preparation as a
 turn. Operating system file reads and child cleanup retain their existing limits.
 The deadline does not prove an absolute wall clock bound on a stalled kernel call.
+Launcher cleanup reports a child that survives its kill rather than claiming it
+was reaped. A cleanup failure does not establish that every descendant ended.
 
 A completed request answers with `passed`. On success `type` and `plan` contain only
 recognized account vocabulary, with `unknown` for an unrecognized plan. On an RPC
