@@ -16,7 +16,7 @@ import sys
 import time
 import threading
 import tomllib
-from collections.abc import Callable, Generator, Iterator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
@@ -183,12 +183,26 @@ def test_descriptors_handed_over_are_closed_once_the_start_has_ended() -> None:
         os.close(read)
 
 
+@pytest.mark.parametrize("reuse", [False, True])
 def test_descriptors_of_a_stalled_start_stay_open_until_the_late_start_ends(
     stalled: "StalledStart",
+    monkeypatch: pytest.MonkeyPatch,
+    reuse: bool,
 ) -> None:
     """The caller is told of the stall while the start still holds the descriptors, so
     a descriptor number another thread reuses is never the one the late child gets."""
     read, write = os.pipe()
+    closed = threading.Event()
+    close_all = spawn._close_all  # pyright: ignore[reportPrivateUsage]
+
+    def close(descriptors: Sequence[int]) -> None:
+        close_all(descriptors)
+        if write in descriptors:
+            if reuse:
+                os.dup2(read, write)
+            closed.set()
+
+    monkeypatch.setattr(spawn, "_close_all", close)
     try:
         with pytest.raises(spawn.StartStalled):
             spawn.start(SLEEP, stdout=write, close_after=(write,))
@@ -197,8 +211,16 @@ def test_descriptors_of_a_stalled_start_stay_open_until_the_late_start_ends(
         stalled.gate.set()
         stalled.until_reaped()
         stalled.until_ended()
-        assert not is_open(write)
+        assert closed.wait(10), "the start did not release its descriptors"
+        if reuse:
+            assert is_open(write), "the regression did not reuse the descriptor"
+        # EOF observes this pipe's writer, even if another thread has already
+        # reused its numeric descriptor. A nonblocking read makes a leak fail.
+        os.set_blocking(read, False)
+        assert os.read(read, 1) == b""
     finally:
+        if reuse and closed.is_set():
+            os.close(write)
         os.close(read)
 
 

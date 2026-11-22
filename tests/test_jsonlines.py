@@ -57,7 +57,9 @@ async def gone(pid: int) -> bool:
     return False
 
 
-async def child_of(body: str, tmp_path: Path, *, stop: bool) -> int:
+async def child_of(
+    body: str, tmp_path: Path, *, stop: bool, release: Path | None = None
+) -> int:
     write_harness(tmp_path / "bin", body)
     factory = json_lines_factory("harness", keep_input=False)
     async with factory([], tmp_path, {"PATH": str(tmp_path / "bin")}) as harness:
@@ -65,6 +67,8 @@ async def child_of(body: str, tmp_path: Path, *, stop: bool) -> int:
         assert record is not None
         child = int(record["child"])
         assert alive(child)
+        if release is not None:
+            release.touch()
         if stop:
             await harness.stop()
     return child
@@ -84,9 +88,19 @@ def test_a_child_left_behind_by_an_exited_harness_is_ended(
     """The child holds the harness's output open, so the harness counts as running
     until the wait for its exit passes and its group is signalled."""
     monkeypatch.setattr(jsonlines, "EXIT_SECONDS", 0.5)
+    release = tmp_path / "release"
+    # Keep the harness alive until the test has observed the live child. Once it
+    # exits, the adapter may clean up before the waiting test is scheduled again.
+    body = CHILD_SCRIPT + (
+        "from pathlib import Path\n"
+        "deadline = time.monotonic() + 10\n"
+        f"while not Path({str(release)!r}).exists():\n"
+        "    if time.monotonic() >= deadline: raise RuntimeError('no release')\n"
+        "    time.sleep(0.01)\n"
+    )
 
     async def scenario() -> bool:
-        child = await child_of(CHILD_SCRIPT, tmp_path, stop=False)
+        child = await child_of(body, tmp_path, stop=False, release=release)
         return await gone(child)
 
     assert asyncio.run(scenario())
