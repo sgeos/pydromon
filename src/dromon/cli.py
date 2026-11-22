@@ -411,7 +411,30 @@ def _preflight_argv(
 
 
 def _check_engines(paths: ProjectPaths, arguments: argparse.Namespace) -> int:
-    del arguments
+    if arguments.account is not None:
+        try:
+            response = call(
+                paths.socket,
+                Operation.ACCOUNT_CHECK,
+                timeout_seconds=120,
+                args={"line": arguments.account},
+            )
+        except (DaemonNotRunning, ProtocolError, TimeoutError, OSError):
+            print("dromon check-engines: account check unavailable", file=sys.stderr)
+            return exits.FAILURE
+        if not response.ok:
+            print(response.error_message, file=sys.stderr)
+            return exits.FAILURE
+        result = response.result or {}
+        if result.get("passed") is True:
+            print(f"account type {result.get('type')}, plan {result.get('plan')}")
+            return exits.OK
+        print(
+            f"account check failed, code {result.get('code', 'unknown')},"
+            f" message {result.get('message')}",
+            file=sys.stderr,
+        )
+        return exits.FAILURE
     # Run installed daemon code in a separate process outside engine sandboxes.
     problem = _preflight(
         _preflight_argv(paths, []), paths.runtime_dir, show_output=True
@@ -3860,6 +3883,12 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     for name, help_text in SUBCOMMANDS.items():
         command = commands.add_parser(name, help=help_text, description=help_text)
+        if name == "check-engines":
+            command.add_argument(
+                "--account",
+                metavar="LINE",
+                help="read one line's account without a thread or model request",
+            )
         if name == "grok-home":
             command.add_argument(
                 "--apply",

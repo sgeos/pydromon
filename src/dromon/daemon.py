@@ -56,7 +56,7 @@ from OpenSSL.SSL import Context as OpenSSLContext
 
 from dromon.scheduler import StartCheckEngine, engine_config_refusal
 from dromon import __version__, exits, fleet, grok, peercred, registry, restart, runs
-from dromon import credentials, evidence, mcpstates, spawn
+from dromon import credentials, evidence, mcpstates, spawn, codex, redact
 from dromon import proposals as proposal_store
 from dromon.federation import (
     MAX_OPEN_REMOTE_PEERS,
@@ -318,6 +318,7 @@ def acquire_lock(path: Path) -> int:
 
 @dataclass(slots=True)
 class Daemon:
+    _account_check_busy: bool = field(default=False, init=False)
     """The request handling of one daemon, separate from its sockets for testing."""
 
     paths: ProjectPaths
@@ -461,6 +462,82 @@ class Daemon:
                 error_message=str(error),
             )
         return self.execute(request)
+
+    async def respond_operator(self, line: bytes) -> Response:
+        """The operator socket alone permits a bounded account diagnostic."""
+        try:
+            request = decode_request(line)
+        except ProtocolError:
+            return self.respond(line)
+        if request.operation is not Operation.ACCOUNT_CHECK:
+            return self.respond(line)
+        try:
+            (line_id,) = _text_args(request.args, ("line",))
+        except ProtocolError as error:
+            return _refusal(request.request_id, error.code, str(error))
+        if line_id not in self.log.state.lines:
+            return _refusal(request.request_id, ErrorCode.REJECTED, "no such line")
+        if self._account_check_busy:
+            return _refusal(
+                request.request_id,
+                ErrorCode.REJECTED,
+                "an account check is already running",
+            )
+        if ENGINE_OF[self.scheduler.model_of(line_id)] != codex.ENGINE_NAME:
+            return _refusal(
+                request.request_id,
+                ErrorCode.REJECTED,
+                "this engine has no supported account-only read",
+            )
+        self._account_check_busy = True
+        diagnostics = evidence.StartupDiagnostics()
+        token = evidence.STARTUP_STDERR.set(diagnostics)
+        try:
+            async with asyncio.timeout(ENGINE_CHECK_SECONDS):
+                engine = self.scheduler.engine_for(
+                    line_id, startup_only=True, fresh=True
+                )
+                if not isinstance(engine, codex.CodexLine):
+                    raise EngineRefused("the configured adapter has no account check")
+                account = await engine.check_account()
+            return Response(
+                request.request_id, True, result={"passed": True, **account}
+            )
+        except codex.AccountCheckError as error:
+            # Scrub and screen the whole message before bounding it. No error data,
+            # account object or standard error is included in this response.
+            message = redact.mask(
+                evidence.home_masked(self.log.scrub_text(error.message))
+            )
+            if self.scheduler.discloses(message):
+                message = "withheld by the disclosure list"
+            elif message not in {
+                "failed to load workspace requirements: invalid data",
+                "no message",
+            }:
+                # Unknown free text may contain identifiers in any syntax.
+                message = "unrecognized provider message withheld for privacy"
+            message = " ".join(message.split())[:512]
+            return Response(
+                request.request_id,
+                True,
+                result={"passed": False, "code": error.code, "message": message},
+            )
+        except TimeoutError:
+            return Response(
+                request.request_id,
+                True,
+                result={"passed": False, "message": "account check timed out"},
+            )
+        except Exception:  # noqa: BLE001
+            return Response(
+                request.request_id,
+                True,
+                result={"passed": False, "message": "account check could not complete"},
+            )
+        finally:
+            evidence.STARTUP_STDERR.reset(token)
+            self._account_check_busy = False
 
     def line_tools(self, line_id: str) -> list[SdkMcpTool[Any]]:
         """A line's own tools, the same ones an in-process engine receives."""
@@ -847,6 +924,12 @@ class Daemon:
     def execute(self, request: Request) -> Response:
         """Answer one decoded request with operator authority."""
         match request.operation:
+            case Operation.ACCOUNT_CHECK:
+                return _refusal(
+                    request.request_id,
+                    ErrorCode.REJECTED,
+                    "account checks require the asynchronous operator socket",
+                )
             case Operation.PING:
                 return Response(request.request_id, ok=True, result={})
             case Operation.STATUS:
@@ -3157,7 +3240,7 @@ async def serve(daemon: Daemon) -> None:
     writers: set[asyncio.StreamWriter] = set()
 
     async def operator_responder(line: bytes) -> Response:
-        return daemon.respond(line)
+        return await daemon.respond_operator(line)
 
     def accepting(
         responder: Callable[[], Responder], limit: int = MAX_LINE_BYTES

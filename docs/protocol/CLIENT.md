@@ -7,6 +7,66 @@ Normative. The Python modules `dromon.protocol`, `dromon.daemon` and `dromon.cli
 implement it. Until the specification is marked stable, a draft version may change
 without a new version number.
 
+## Account diagnostic
+
+**Fact.** `dromon check-engines --account LINE` sends the operator request
+`account_check` with exactly one string argument `line`. It requires a running daemon
+with this operation. The line and external agent sockets do not offer it. Only one
+account check may run in a daemon at a time. A missing line, malformed arguments,
+overlapping check or unsupported engine receives a rejection before an engine starts.
+
+The daemon builds a fresh Codex adapter through its production factory. The working
+directory, filtered environment, effective account home and app-server arguments are
+those a fresh turn would use at that moment. In particular the existing environment
+filter does not pass `CODEX_HOME`, so both a turn and this diagnostic use Codex's
+default home. No shared session is cleared, resumed or replaced. The check sends
+`initialize`, the `initialized` notification and `account/read` only. Engine action
+requests are refused and unsolicited notices do not change budgets or thread state.
+The process ends when the read completes or fails. No model request is sent.
+
+**Bound.** The engine check has a 90 second deadline, including its existing
+60 second MCP server listing, which runs off the event loop. Ordinary launcher
+cleanup follows the deadline in a separately owned task. Cancellation, including
+repeated cancellation during termination, kill, reaping or draining, waits for
+that task before releasing the diagnostic slot. Launcher termination and reaping
+retain their individual bounded waits. Output draining then has its own ten second
+bound and standard input is closed. Draining still runs if launcher cleanup fails.
+The listing worker is also joined before cancellation propagates. Its existing
+60 second subprocess timeout bounds ordinary listing work, with process startup
+and cleanup retaining their own bounds. A timed out check can therefore keep its
+slot while this work finishes. The client waits at most 120 seconds. These bounds
+avoid retry loops in the diagnostic and allow the same startup preparation as a
+turn. Operating system file reads and child cleanup retain their existing limits.
+The deadline does not prove an absolute wall clock bound on a stalled kernel call.
+Launcher cleanup reports a child that survives its kill rather than claiming it
+was reaped. A cleanup failure does not establish that every descendant ended.
+
+A completed request answers with `passed`. On success `type` and `plan` contain only
+recognized account vocabulary, with `unknown` for an unrecognized plan. On an RPC
+failure `code` is an integer or null and `message` is screened against the disclosure
+list before rendering. Only the recognized workspace requirements failure text and
+the fixed absent-message text may be reflected. Other provider messages are withheld
+because arbitrary free text may contain personal identifiers. No account object,
+email, user identifier, account identifier, error data or standard error is returned.
+Other failures give a fixed diagnostic. A failed check exits the client unsuccessfully.
+
+**Fact.** The supported Claude Code SDK has no equivalent account-only read. That
+engine is rejected without being started. Its startup initialization check does not
+establish the account type or plan and is not substituted for this diagnostic.
+
+**Current limit.** Ordinary Codex turns still convert an `account/read` RPC failure
+into a generic engine refusal. The scheduler marks that turn failed, applies its
+limits and normally asks the operator through its failed-turn hold. A typed transient
+classification and an automatic retry hold are not included in this change.
+
+**Proposed follow-up.** Treat an `account/read` code of `-32603` as a transient engine
+refusal rather than a configuration fault. A bounded policy would wait 60, 120 and
+300 seconds before three retries, then ask the operator. The first wait prevents a
+busy loop, the increasing waits reduce pressure on a failing service, and the finite
+retry count prevents indefinite silent holds. This is a design proposal, not current
+behaviour. A durable retry state needs separate scheduler and event-log changes so
+that a restart does not erase the wait or reset its attempt bound.
+
 ## Transport
 
 One daemon serves one project on a Unix domain socket. A client connects, sends

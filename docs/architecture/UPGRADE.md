@@ -16,6 +16,41 @@ Two revisions are named throughout. **FROM** is the commit the project's daemon 
 now. **TO** is the commit it moves to, a commit of `main` whose gate passed in
 continuous integration.
 
+## Account read failures after an upgrade
+
+**Supported diagnostic.** Run `dromon check-engines --account LINE` against the
+running daemon after installing and restarting on a revision that supports it.
+[`CLIENT.md`](../protocol/CLIENT.md) defines its privacy rules and bounds. The check
+uses a fresh engine with the line's effective startup settings and preserves shared
+sessions and configuration. It sends no thread request or model request. It checks
+one Codex account and does not test a model turn, tool isolation or provider health
+over time. Claude Code has no equivalent supported account read.
+
+**Cancellation ownership.** The account deadline does not cancel the owned launcher
+cleanup task or detach the server listing worker. The diagnostic slot remains held
+until each finishes, including after repeated cancellation. Launcher termination,
+kill and reap waits keep their existing bounds. Standard output and standard error
+are drained with a separate ten second bound even when launcher cleanup fails.
+Standard input is closed. A client timeout can precede completion of this cleanup.
+Scripted tests cover cancellation at each cleanup stage and a blocked listing
+worker that later succeeds or fails. They do not prove operating system reaping
+under a stalled kernel or successful termination of every descendant after a
+reported launcher failure.
+
+**Fact from a scripted test.** Code `-32603` with the message about invalid workspace
+requirements is handled at `account/read` before a turn receives its task. The
+reported failure has not been reproduced against a provider here. A successful check later
+establishes only that this invocation succeeded. **Hypothesis.** An intermittent
+provider failure can explain that difference, but a later success does not prove
+the cause or rule out local configuration or account state changes. Preserve the
+sanitized code and message and the installed versions when reporting the failure.
+Do not clear sessions or replace configuration solely on that hypothesis.
+
+**Residual.** Automatic transient retry holds remain a separate change. Ordinary
+turns currently follow the generic refusal and failed-turn hold described in the
+client protocol. The account diagnostic performs one attempt and changes no retry
+policy.
+
 ## What decides the outcome
 
 **Whether TO opens FROM's log.** **Fact, from the codec's rule.** Every change to the

@@ -48,6 +48,8 @@ REQUEST_ID_PATTERN: Final = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 class Operation(StrEnum):
+    ACCOUNT_CHECK = "account_check"
+    """Operator only. Reads account metadata without a thread or model request."""
     PING = "ping"
     STATUS = "status"
     STOP = "stop"
